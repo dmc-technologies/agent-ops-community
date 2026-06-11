@@ -1,0 +1,8 @@
+id: local-smoke
+title: Local Smoke
+runner: local
+mode: verify-only
+verification:
+  - name: shell
+    command: "true"
+
