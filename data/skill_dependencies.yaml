@@ -1,0 +1,34 @@
+- id: gstack
+  name: GStack
+  repo: https://github.com/garrytan/gstack.git
+  ref: 74895062fb8a3acbf9f66cd088a83359aaaa56cd
+  version: "0.13.3.0"
+  license: MIT
+  install:
+    codex:
+      strategy: gstack
+      destination: skills/gstack
+    claude-code:
+      strategy: gstack
+      destination: skills/gstack
+    portable:
+      strategy: copy-repo
+      destination: dependencies/gstack
+- id: superpowers
+  name: Superpowers
+  repo: https://github.com/obra/superpowers.git
+  ref: f2cbfbefebbfef77321e4c9abc9e949826bea9d7
+  version: "5.1.0"
+  license: MIT
+  install:
+    codex:
+      strategy: copy-skills
+      source: skills
+      destination: skills
+    claude-code:
+      strategy: copy-skills
+      source: skills
+      destination: skills
+    portable:
+      strategy: copy-repo
+      destination: dependencies/superpowers

@@ -1,0 +1,51 @@
+- id: agent-knowledge-mcp
+  name: agent-knowledge MCP
+  description: Shared memory MCP server; configure with KNOWLEDGE_MEMORY_DIR and KNOWLEDGE_GIT_URL,
+    and fall back to the agent-knowledge git repo when MCP is unavailable.
+  kind: mcp
+  frameworks:
+  - codex
+  - claude-code
+  - cursor
+  - roo-code
+  - cline
+  - openclaw
+  - local
+  env:
+  - KNOWLEDGE_MEMORY_DIR
+  - KNOWLEDGE_GIT_URL
+  config_paths:
+  - ${CODEX_HOME:-~/.codex}/config.toml
+  - ${CLAUDE_HOME:-~/.claude}
+  - ${AGENT_KNOWLEDGE_HOME:-~/agent-knowledge}
+  requires: []
+- id: github
+  name: GitHub
+  description: Repository, issue, PR, and CI access through GitHub CLI or MCP tooling.
+  kind: mcp-or-cli
+  frameworks:
+  - codex
+  - claude-code
+  - openclaw
+  - local
+  env:
+  - GITHUB_TOKEN
+  config_paths: []
+  requires: []
+- id: openclaw-filtered-mcp-catalogs
+  name: OpenClaw Filtered MCP Catalogs
+  description: OpenClaw-compatible wrapper pattern for reducing oversized MCP tool
+    schemas before context injection.
+  kind: mcp-wrapper-pattern
+  frameworks:
+  - openclaw
+  - local
+  config_paths: []
+  requires: []
+- id: codex-cli
+  name: Codex CLI
+  description: Local Codex CLI with goal support.
+  kind: local-command
+  frameworks:
+  - codex
+  requires: []

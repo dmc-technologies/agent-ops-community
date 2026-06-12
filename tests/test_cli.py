@@ -76,9 +76,56 @@ def test_harness_init_and_check_cli(tmp_path: Path) -> None:
 
 
 def test_bootstrap_writes_public_agentops_file(tmp_path: Path) -> None:
-    result = runner.invoke(app, ["bootstrap", "--output-dir", str(tmp_path)])
+    result = runner.invoke(app, ["bootstrap", "all", "--output-dir", str(tmp_path)])
 
     assert result.exit_code == 0
-    text = (tmp_path / "AGENTOPS.md").read_text(encoding="utf-8")
-    assert "Agent Ops Community Bootstrap" in text
-    assert "shared-memory" in text
+    assert (tmp_path / "codex/AGENTOPS.md").exists()
+    assert (tmp_path / "claude-code/AGENTOPS.md").exists()
+    assert (tmp_path / "cursor/AGENTOPS.md").exists()
+    text = (tmp_path / "codex/AGENTOPS.md").read_text(encoding="utf-8")
+    assert "Agent Ops Bootstrap: codex" in text
+    assert "agent-knowledge" in text
+
+
+def test_context_build_and_framework_command_are_public(tmp_path: Path) -> None:
+    job = tmp_path / "job.yaml"
+    job.write_text(
+        """
+id: framework-job
+title: Framework Job
+runner: local
+mode: verify-only
+verification:
+  - name: ok
+    command: "echo ok"
+""",
+        encoding="utf-8",
+    )
+
+    context_result = runner.invoke(
+        app,
+        [
+            "context",
+            "build",
+            str(job),
+            "--framework",
+            "codex",
+            "--output-dir",
+            str(tmp_path / "context"),
+        ],
+    )
+
+    assert context_result.exit_code == 0
+    assert (tmp_path / "context/framework-job-codex.json").exists()
+    markdown = (tmp_path / "context/framework-job-codex.md").read_text(encoding="utf-8")
+    assert "agent-knowledge" in markdown
+
+    command_result = runner.invoke(
+        app,
+        ["frameworks", "command", str(job), "--framework", "codex", "--json"],
+    )
+
+    assert command_result.exit_code == 0
+    command = json.loads(command_result.output)
+    assert command["framework"] == "codex"
+    assert command["command"][0] == "codex"

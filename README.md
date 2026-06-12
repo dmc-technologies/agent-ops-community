@@ -35,7 +35,15 @@ agentops verify examples/local-smoke.yaml --json
 Generate bootstrap instructions:
 
 ```bash
-agentops bootstrap
+agentops bootstrap all
+agentops bootstrap codex
+```
+
+Build framework context packs and handoff commands:
+
+```bash
+agentops context build examples/local-smoke.yaml --framework codex
+agentops frameworks command examples/local-smoke.yaml --framework codex --json
 ```
 
 ## Extension Model

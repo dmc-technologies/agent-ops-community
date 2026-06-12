@@ -1,0 +1,64 @@
+- id: direct-agent-cli
+  name: Direct Agent CLI Execution
+  description: Run a task directly through a local agent CLI with a context pack.
+  frameworks:
+  - claude-code
+  - codex
+  - roo-code
+  - cline
+  - local
+  requires:
+  - git
+- id: goal-oriented-session
+  name: Goal-Oriented Session
+  description: Keep a durable objective active for multi-turn execution.
+  frameworks:
+  - codex
+  requires:
+  - codex-cli
+- id: mcp-tooling
+  name: MCP Tooling
+  description: Use configured MCP tools such as agent-knowledge, GitHub, and Notion.
+  frameworks:
+  - claude-code
+  - codex
+  - cursor
+  - roo-code
+  - cline
+  - openclaw
+  - local
+  requires:
+  - mcp-config
+- id: context-safe-mcp-catalogs
+  name: Context-Safe MCP Catalogs
+  description: Keep approved connector families available while filtering oversized
+    MCP tool schemas before agent context injection.
+  frameworks:
+  - openclaw
+  - local
+  requires:
+  - mcp-config
+  notes: Use connector-specific wrappers and allow files instead of a tiny global
+    tool allowlist.
+- id: portable-skill-bundles
+  name: Portable Skill Bundles
+  description: Make superpowers and gstack-style skills available across supported
+    agent frameworks.
+  frameworks:
+  - claude-code
+  - codex
+  - cursor
+  - roo-code
+  - cline
+  - openclaw
+  - local
+  requires:
+  - skills-registry
+  - context-pack
+- id: external-orchestration
+  name: External Orchestration
+  description: Let OpenClaw or clanker submit, observe, retry, and approve jobs.
+  frameworks:
+  - openclaw
+  requires:
+  - agentops-cli

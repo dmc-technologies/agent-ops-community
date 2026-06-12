@@ -5,6 +5,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 CHECKED_PATHS = [
+    ROOT / "data",
     ROOT / "src",
     ROOT / "tests",
     ROOT / "docs",
@@ -19,6 +20,8 @@ FORBIDDEN_SNIPPETS = [
     "".join(("wig", "gum")),
     "".join(("sha", "ry")),
     "".join(("ra", "lph")),
+    "".join(("D", "MC")),
+    "".join(("Momen", "tum")),
     "".join(("/", "Users", "/")),
     "".join(("Documents", "/", "GitHub")),
 ]

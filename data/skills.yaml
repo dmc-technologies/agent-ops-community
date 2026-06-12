@@ -1,0 +1,226 @@
+- id: agent-knowledge
+  name: Agent Knowledge
+  description: Shared durable memory across agent frameworks.
+  category: memory
+  mappings:
+  - framework: codex
+    path: catalog/skills/agent-knowledge/spec.yaml
+    invocation: Use after important decisions and before nontrivial work; prefer MCP
+      and fall back to ${AGENT_KNOWLEDGE_HOME:-~/agent-knowledge} git writes.
+  - framework: claude-code
+    invocation: mcp__agent-knowledge__knowledge_search/read/write/sync, or git/file
+      fallback when MCP is unavailable.
+  - framework: cursor
+    invocation: Use agent-knowledge MCP when configured; otherwise consume context-pack
+      memory excerpts.
+  - framework: openclaw
+    invocation: Use the configured agent-knowledge MCP server; fall back to ${AGENT_KNOWLEDGE_HOME:-~/agent-knowledge}
+      when needed.
+  - framework: roo-code
+    invocation: Use agent-knowledge MCP when configured; otherwise consume context-pack
+      memory excerpts.
+  - framework: cline
+    invocation: Use agent-knowledge MCP when configured; otherwise consume context-pack
+      memory excerpts.
+  - framework: local
+    invocation: Read/write ${AGENT_KNOWLEDGE_HOME:-~/agent-knowledge} through agent-ops
+      fallback helpers.
+  - framework: opencode
+    invocation: Read as the portable skill definition; install with agentops skills
+      install opencode.
+- id: doc-migration
+  name: Doc Migration
+  description: Additive migration of external document exports into Google Drive as
+    human-readable native Docs and Sheets with pageless Docs, embedded inline images,
+    manifests, and audits.
+  category: workflow
+  mappings:
+  - framework: codex
+    path: catalog/skills/doc-migration/spec.yaml
+    invocation: Use before migrating Notion, Markdown, CSV, or other document exports
+      into Google Drive.
+    install_hint: agentops skills install codex
+  - framework: claude-code
+    invocation: Include the additive Google Drive document migration rules in the
+      context pack or equivalent Claude skill.
+  - framework: cursor
+    invocation: Include the doc-migration rules in Cursor context/rules when planning
+      Drive migrations.
+  - framework: openclaw
+    invocation: Use as the migration operating procedure for clanker-managed document
+      import jobs.
+  - framework: roo-code
+    invocation: Include the doc-migration rules in Roo task context.
+  - framework: cline
+    invocation: Include the doc-migration rules in Cline task context.
+  - framework: local
+    invocation: Read as the local fallback procedure for additive Google Drive document
+      migrations.
+  - framework: opencode
+    invocation: Read as the portable skill definition; install with agentops skills
+      install opencode.
+- id: superpowers
+  name: Superpowers Skill Bundle
+  description: Skill bundle for disciplined planning, execution, TDD, debugging, and
+    verification workflows.
+  category: skill-bundle
+  metadata:
+    dependency: superpowers
+  mappings:
+  - framework: codex
+    invocation: Use matching installed Codex skills when present; include bundle instructions
+      in context packs otherwise.
+    install_hint: agentops skills install codex
+  - framework: claude-code
+    invocation: Use superpowers skills in Claude Code when installed.
+    install_hint: agentops skills install claude-code
+  - framework: cursor
+    invocation: Include selected superpowers instructions in Cursor rules/context.
+  - framework: roo-code
+    invocation: Include selected superpowers instructions in Roo task context.
+  - framework: cline
+    invocation: Include selected superpowers instructions in Cline task context.
+  - framework: openclaw
+    invocation: Expose as selectable skill bundle for clanker-managed jobs.
+  - framework: local
+    invocation: Use context-pack instructions as the fallback skill surface.
+  - framework: opencode
+    invocation: Read as the portable skill definition; install with agentops skills
+      install opencode.
+- id: gstack
+  name: GStack Skill Bundle
+  description: Reusable operating skills for review, planning, safety guardrails,
+    and execution discipline.
+  category: skill-bundle
+  metadata:
+    dependency: gstack
+  mappings:
+  - framework: codex
+    invocation: Use installed gstack-flavored Codex skills such as review, autoplan,
+      careful, guard, and plan reviews.
+    install_hint: agentops skills install codex
+  - framework: claude-code
+    invocation: Use equivalent gstack/superpowers skills when available in Claude
+      Code.
+    install_hint: agentops skills install claude-code
+  - framework: cursor
+    invocation: Include relevant gstack instructions in Cursor rules/context.
+  - framework: roo-code
+    invocation: Include relevant gstack instructions in Roo task context.
+  - framework: cline
+    invocation: Include relevant gstack instructions in Cline task context.
+  - framework: openclaw
+    invocation: Expose as clanker-selectable skill bundle.
+  - framework: local
+    invocation: Use context-pack instructions as the fallback skill surface.
+  - framework: opencode
+    invocation: Read as the portable skill definition; install with agentops skills
+      install opencode.
+- id: steinberger-review
+  name: Steinberger Review
+  description: Peter Steinberger-inspired review persona for terminal-first agent
+    workflows, CLI ergonomics, harness complexity, and review loops.
+  category: review
+  mappings:
+  - framework: codex
+    path: catalog/skills/steinberger-review/spec.yaml
+    invocation: Use before locking in agent workflow or harness architecture decisions.
+  - framework: claude-code
+    invocation: Include the Steinberger review lens in the context pack or equivalent
+      Claude skill.
+  - framework: cursor
+    invocation: Include the Steinberger review lens in Cursor context/rules.
+  - framework: roo-code
+    invocation: Include the Steinberger review lens in Roo task context.
+  - framework: cline
+    invocation: Include the Steinberger review lens in Cline task context.
+  - framework: openclaw
+    invocation: Expose as a clanker-selectable review persona.
+  - framework: local
+    invocation: Use context-pack instructions as the fallback skill surface.
+  - framework: opencode
+    invocation: Read as the portable skill definition; install with agentops skills
+      install opencode.
+- id: verification-before-completion
+  name: Verification Before Completion
+  description: Require evidence from tests/checks before claiming work is complete.
+  category: quality
+  metadata:
+    dependency: superpowers
+  mappings:
+  - framework: codex
+    install_hint: agentops skills install codex
+  - framework: claude-code
+    invocation: Use equivalent project/global skill before final status.
+    install_hint: agentops skills install claude-code
+  - framework: opencode
+    invocation: Read as the portable skill definition; install with agentops skills
+      install opencode.
+- id: repo-ci-checks
+  name: Repo CI Checks
+  description: Prefer repository-provided CI, harness, and verification commands before
+    ad hoc checks when a repo supplies them.
+  category: quality
+  mappings:
+  - framework: codex
+    invocation: Run repo-provided CI-safe checks before final status.
+  - framework: claude-code
+    invocation: Run repo-provided CI-safe checks before final status.
+  - framework: cursor
+    invocation: Run repo-provided CI-safe checks before final status.
+  - framework: openclaw
+    invocation: Run repo-provided CI-safe checks before final status.
+  - framework: roo-code
+    invocation: Run repo-provided CI-safe checks before final status.
+  - framework: cline
+    invocation: Run repo-provided CI-safe checks before final status.
+  - framework: local
+    invocation: Run repo-provided CI-safe checks before final status.
+  - framework: opencode
+    invocation: Run repo-provided CI-safe checks before final status.
+- id: test-driven-development
+  name: Test Driven Development
+  description: Write or identify failing tests before implementation where practical.
+  category: engineering
+  metadata:
+    dependency: superpowers
+  mappings:
+  - framework: codex
+    install_hint: agentops skills install codex
+  - framework: claude-code
+    invocation: Use equivalent TDD skill.
+    install_hint: agentops skills install claude-code
+  - framework: opencode
+    invocation: Read as the portable skill definition; install with agentops skills
+      install opencode.
+- id: cursor-agent-bundle
+  name: Cursor Agent Bundle
+  description: Cursor-native agents bundled from the portable agent-ops source tree.
+  category: agent-bundle
+  mappings:
+  - framework: cursor
+    path: catalog/agents
+    invocation: Install with `agentops skills install cursor` so Cursor can load the
+      bundled agents.
+  - framework: openclaw
+    path: catalog/agents
+    invocation: Include selected agents in clanker-managed context packs.
+  - framework: local
+    path: catalog/agents
+    invocation: Read as portable agent role definitions.
+  - framework: opencode
+    invocation: Read as the portable agent definition.
+- id: claude-command-bundle
+  name: Claude Command Bundle
+  description: Claude Code command helpers bundled from the portable agent-ops source
+    tree.
+  category: command-bundle
+  mappings:
+  - framework: claude-code
+    path: catalog/commands
+    invocation: Install with `agentops skills install claude-code`.
+  - framework: local
+    path: catalog/commands
+    invocation: Read as portable command workflow references.
+  - framework: opencode
+    invocation: Read as the portable command definition.
