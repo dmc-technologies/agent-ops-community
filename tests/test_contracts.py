@@ -33,3 +33,24 @@ verification:
 def test_job_id_rejects_shell_metacharacters() -> None:
     with pytest.raises(ValueError, match="id may only contain"):
         AgentJob(id="bad;id", title="Bad")
+
+
+def test_load_job_preserves_plugin_specific_sections(tmp_path: Path) -> None:
+    job_file = tmp_path / "job.yaml"
+    job_file.write_text(
+        """
+id: plugin-job
+title: Plugin job
+runner: custom
+mode: batch
+custom:
+  root: /tmp/custom
+  flag: true
+""",
+        encoding="utf-8",
+    )
+
+    job = load_job(job_file)
+
+    assert job.runner == "custom"
+    assert job.custom == {"root": "/tmp/custom", "flag": True}

@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class JobMode(StrEnum):
@@ -36,6 +36,8 @@ class VerificationCommand(BaseModel):
 
 
 class AgentJob(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     id: str
     title: str
     profile: str = "local"
