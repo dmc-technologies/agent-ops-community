@@ -2,9 +2,11 @@
 
 ## Public Core Boundary
 
-Agent Ops Community owns generic harnesses, job contracts, verification helpers,
-and plugin interfaces. It does not own private runner implementations or
-organization-specific operational workflows.
+Agent Ops Community owns the general-purpose Agent Ops experience: harnesses,
+job contracts, context handoff, framework bootstrap, common framework command
+handoff, verification helpers, and plugin interfaces. It does not own
+proprietary runner/verifier implementations or organization-specific operational
+workflows.
 
 ## Runtime And Tooling
 
@@ -32,4 +34,3 @@ pytest
 
 The test suite includes a public-safety scan that rejects private terms and
 local absolute paths.
-

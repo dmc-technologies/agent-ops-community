@@ -5,9 +5,10 @@ development workflows. It provides repository harness templates, job contracts,
 context handoff, framework bootstrap guidance, plugin discovery, and verification
 helpers that can be used by local agents and framework-specific runners.
 
-This repository is intended to contain the full generic Agent Ops experience.
-Runner-specific internals, proprietary verifier prompts, and organization-owned
-operational workflows belong in separately installed extension packages.
+This repository is intended to contain the full Agent Ops experience for common
+agent frameworks. Only proprietary runner/verifier implementations and
+organization-owned operational workflows belong in separately installed
+extension packages.
 
 ## Install
 
@@ -55,7 +56,8 @@ frameworks:
 - bootstrap instructions for common agent frameworks
 - capability, skill, and tool registries
 - environment checks and verification gates
-- plugin interfaces for runner-specific execution
+- built-in support for common agent-framework handoff and execution paths
+- plugin interfaces for proprietary or specialized execution paths
 
 See [docs/roadmap.md](docs/roadmap.md) for the remaining generic scope planned
 for the community package.

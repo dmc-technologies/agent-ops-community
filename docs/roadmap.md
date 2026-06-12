@@ -1,7 +1,9 @@
 # Community Roadmap
 
 Agent Ops Community should provide the full generic Agent Ops experience for
-users who do not install organization-specific runner or verifier extensions.
+users who do not install proprietary runner or verifier extensions. A community
+user should get the same operational feel across common agent frameworks without
+needing access to organization-owned packages.
 
 ## Already Present
 
@@ -15,25 +17,27 @@ users who do not install organization-specific runner or verifier extensions.
 
 ## Next Generic Scope
 
-These capabilities should move into the community package because they are
-framework- and user-agnostic:
+These capabilities should move into the community package because they are part
+of the general Agent Ops product experience:
 
 - Context-pack builder and models.
 - Framework bootstrap generation for common agent frameworks.
-- Framework command handoff adapters.
+- Framework command handoff adapters for common agent frameworks.
 - Capability, skill, and tool registries.
 - Catalog loader, compiler, and validation.
 - Environment doctor profiles and checks.
 - Public skill bundle installation.
+- Built-in execution adapters for non-proprietary agent frameworks where a
+  stable public CLI or command contract exists.
 - Richer examples that demonstrate the same workflow shape across supported
   agent frameworks.
 
 ## Extension-Only Scope
 
-These capabilities should remain outside the community package and be supplied
-by separately installed extensions:
+Only these capabilities should remain outside the community package and be
+supplied by separately installed extensions:
 
-- Runner-specific execution internals.
+- Proprietary runner implementations.
 - Proprietary verifier prompts.
 - Organization-owned job examples.
 - Internal operational workflows.
