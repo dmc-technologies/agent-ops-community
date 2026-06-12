@@ -67,4 +67,17 @@ for the community package.
 ```bash
 ruff check .
 pytest
+agentops harness check .
 ```
+
+## Agent Harness
+
+This repository carries the standard Agent Ops harness:
+
+- `AGENTS.md`: portable agent entry point.
+- `CLAUDE.md`: Claude Code-specific routing.
+- `ARCHITECTURE.md`: package and workflow architecture.
+- `.agentops/harness/BOOTSTRAP.md`: clock-in and clock-out contract.
+- `.agentops/harness/PROGRESS.md`: active handoff state.
+- `.agentops/harness/DECISIONS.md`: durable local decisions.
+- `.agentops/harness/VERIFY.md`: verification gates.

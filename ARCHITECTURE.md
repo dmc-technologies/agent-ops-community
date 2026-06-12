@@ -22,6 +22,8 @@ workflows.
 - `agent_ops.plugins`: public extension interfaces and plugin discovery.
 - `agent_ops.verify`: deterministic local verification execution.
 - `agent_ops.cli`: thin Typer command surface.
+- `AGENTS.md`, `CLAUDE.md`, and `.agentops/harness/`: repo-local agent
+  operating contract and handoff state.
 
 ## Verification Architecture
 
@@ -30,6 +32,7 @@ The public repository must pass:
 ```bash
 ruff check .
 pytest
+agentops harness check .
 ```
 
 The test suite includes a public-safety scan that rejects private terms and
