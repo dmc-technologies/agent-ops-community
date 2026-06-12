@@ -42,7 +42,7 @@ class AgentJob(BaseModel):
     title: str
     profile: str = "local"
     runner: str = "local"
-    mode: JobMode = JobMode.VERIFY_ONLY
+    mode: str = JobMode.VERIFY_ONLY.value
     target_repo: str | None = None
     branch_suffix: str | None = None
     base_branch: str | None = None
@@ -62,6 +62,14 @@ class AgentJob(BaseModel):
                 "id may only contain letters, numbers, dash, underscore, dot, and slash"
             )
         return value
+
+    @field_validator("mode")
+    @classmethod
+    def mode_must_be_nonempty(cls, value: str | JobMode) -> str:
+        mode = value.value if isinstance(value, JobMode) else str(value)
+        if not mode:
+            raise ValueError("mode is required")
+        return mode
 
 
 def load_job(path: str | Path) -> AgentJob:

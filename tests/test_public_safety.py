@@ -34,6 +34,8 @@ def test_public_tree_has_no_private_terms_or_local_paths() -> None:
         for path in paths:
             if not path.is_file():
                 continue
+            if any(part.endswith(".egg-info") for part in path.parts):
+                continue
             if path.suffix and path.suffix not in TEXT_SUFFIXES:
                 continue
             text = path.read_text(encoding="utf-8")

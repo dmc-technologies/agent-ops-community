@@ -13,6 +13,10 @@ extension packages.
 ## Install
 
 ```bash
+git clone https://github.com/<your-org>/agent-ops-community.git
+cd agent-ops-community
+python -m venv .venv
+source .venv/bin/activate
 python -m pip install -e ".[dev]"
 ```
 
@@ -21,8 +25,9 @@ python -m pip install -e ".[dev]"
 Initialize a repo-local harness:
 
 ```bash
-agentops harness init . --repo-type python
-agentops harness check .
+mkdir -p /tmp/agentops-example
+agentops harness init /tmp/agentops-example --repo-name agentops-example --repo-type python
+agentops harness check /tmp/agentops-example
 ```
 
 Validate and run verification from a job contract:
@@ -63,7 +68,7 @@ frameworks:
 - context packs and framework handoff commands
 - bootstrap instructions for common agent frameworks
 - capability, skill, and tool registries
-- environment checks and verification gates
+- verification gates
 - built-in support for common agent-framework handoff and execution paths
 - plugin interfaces for proprietary or specialized execution paths
 
@@ -77,6 +82,14 @@ ruff check .
 pytest
 agentops harness check .
 ```
+
+## Troubleshooting
+
+- Use Python 3.11 or newer.
+- Run commands from an activated virtual environment, or prefix them with
+  `.venv/bin/`.
+- If `agentops` is not found, rerun `python -m pip install -e ".[dev]"` from
+  the repository root.
 
 ## Agent Harness
 

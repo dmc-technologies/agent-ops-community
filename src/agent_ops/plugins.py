@@ -9,6 +9,10 @@ from agent_ops.contracts.job import AgentJob
 from agent_ops.contracts.result import RunResult, RunStatus
 
 
+def _value(value: object) -> str:
+    return getattr(value, "value", str(value))
+
+
 class RunnerPlugin(Protocol):
     name: str
 
@@ -45,7 +49,7 @@ def run_with_plugins(
     return RunResult(
         job_id=job.id,
         runner=job.runner,
-        mode=job.mode.value,
+        mode=_value(job.mode),
         status=RunStatus.FAIL,
         finished_at=datetime.now(UTC),
         metadata={"error": f"No plugin runner is installed for runner {job.runner!r}"},

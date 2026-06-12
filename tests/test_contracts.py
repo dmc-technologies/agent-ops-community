@@ -26,7 +26,7 @@ verification:
 
     assert job.id == "public-smoke"
     assert job.runner == "local"
-    assert job.mode == JobMode.VERIFY_ONLY
+    assert job.mode == JobMode.VERIFY_ONLY.value
     assert job.verification == [VerificationCommand(name="ok", command="true")]
 
 
@@ -54,3 +54,23 @@ custom:
 
     assert job.runner == "custom"
     assert job.custom == {"root": "/tmp/custom", "flag": True}
+
+
+def test_load_job_accepts_plugin_specific_mode(tmp_path: Path) -> None:
+    job_file = tmp_path / "job.yaml"
+    job_file.write_text(
+        """
+id: plugin-mode-job
+title: Plugin mode job
+runner: custom
+mode: custom-chain
+custom:
+  root: /tmp/custom
+""",
+        encoding="utf-8",
+    )
+
+    job = load_job(job_file)
+
+    assert job.runner == "custom"
+    assert job.mode == "custom-chain"
