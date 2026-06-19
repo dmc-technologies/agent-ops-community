@@ -1,16 +1,5 @@
 name: Review Gate Dispatcher
 
-env:
-  REVIEW_GATE_PROMPT: |
-    Review this PR as a lightweight, shipping-focused engineering gate.
-
-    Look for:
-    - committed secrets, credentials, or private local paths;
-    - unresolved conflict markers or generated scratch artifacts;
-    - workflow changes that execute untrusted PR code with elevated privileges;
-    - missing command evidence for behavior changes;
-    - broad automation where a small script, status, comment, or PR review would do.
-
 on:
   pull_request:
     types: [opened, synchronize, reopened, labeled]
@@ -32,8 +21,10 @@ jobs:
     name: Review Gate Label Trigger
     if: >-
       github.event_name == 'pull_request' &&
-      github.event.action == 'labeled' &&
-      github.event.label.name == 'ai review'
+      (
+        (github.event.action == 'labeled' && github.event.label.name == 'ai review') ||
+        (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'ai review'))
+      )
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -42,29 +33,81 @@ jobs:
       statuses: write
 
     steps:
-      - name: Checkout workflow ref
+      - name: Checkout trusted review gate
         uses: actions/checkout@v6
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ github.event.repository.default_branch }}
           path: review-gate-main
           fetch-depth: 1
 
+      - name: Check trusted review gate availability
+        id: trusted-gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -f review-gate-main/.github/scripts/review_gate.py ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::Trusted Review Gate script is not on the default branch yet; skipping label review bootstrap without executing PR-controlled code."
+            RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            gh api "repos/${{ github.repository }}/statuses/${{ github.event.pull_request.head.sha }}" \
+              --method POST \
+              -f state=failure \
+              -f context="Review Gate" \
+              -f description="Review Gate unavailable: trusted gate missing" \
+              -f target_url="$RUN_URL"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Checkout PR branch
+        if: steps.trusted-gate.outputs.available == 'true'
         uses: actions/checkout@v6
         with:
           repository: ${{ github.event.pull_request.head.repo.full_name }}
           ref: ${{ github.event.pull_request.head.sha }}
           path: pr-workspace
-          fetch-depth: 2
+          fetch-depth: 0
 
       - uses: actions/setup-python@v6
+        if: steps.trusted-gate.outputs.available == 'true'
         with:
           python-version: "3.11"
 
+      - name: Install Codex CLI
+        if: steps.trusted-gate.outputs.available == 'true'
+        run: npm install -g @openai/codex@0.141.0
+
+      - name: Authenticate Codex CLI
+        if: steps.trusted-gate.outputs.available == 'true'
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ -z "$OPENAI_API_KEY" ]; then
+            echo "::error::OPENAI_API_KEY is required for Codex Review Gate."
+            exit 1
+          fi
+          export CODEX_HOME="${RUNNER_TEMP}/review-gate-codex"
+          mkdir -p "$CODEX_HOME"
+          echo "CODEX_HOME=$CODEX_HOME" >> "$GITHUB_ENV"
+          printf '%s' "$OPENAI_API_KEY" | codex login --with-api-key
+
+      - name: Load review prompt
+        if: steps.trusted-gate.outputs.available == 'true'
+        run: |
+          PROMPT_FILE="review-gate-main/.github/review-gate-prompt.md"
+          {
+            echo "REVIEW_GATE_PROMPT<<REVIEW_GATE_PROMPT_EOF"
+            if [ -f "$PROMPT_FILE" ]; then
+              cat "$PROMPT_FILE"
+            fi
+            echo "REVIEW_GATE_PROMPT_EOF"
+          } >> "$GITHUB_ENV"
+
       - name: Run review gate and submit approval
+        if: steps.trusted-gate.outputs.available == 'true'
         env:
           GH_TOKEN: ${{ secrets.REVIEW_GATE_APPROVAL_TOKEN || secrets.GITHUB_TOKEN }}
-          REVIEW_GATE_BACKEND: deterministic
+          REVIEW_GATE_BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: |
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           python review-gate-main/.github/scripts/review_gate.py \
@@ -91,7 +134,7 @@ jobs:
       - name: Checkout workflow ref
         uses: actions/checkout@v6
         with:
-          ref: ${{ github.ref_name }}
+          ref: ${{ github.event.repository.default_branch }}
           path: review-gate-main
           fetch-depth: 1
 
@@ -102,9 +145,11 @@ jobs:
         run: |
           PR_DATA=$(gh pr view "${{ github.event.inputs.pr_number }}" \
             --repo "${{ github.repository }}" \
-            --json headRefOid,headRepository)
+            --json baseRefName,headRefOid,headRepository)
+          BASE_REF=$(echo "$PR_DATA" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['baseRefName'])")
           HEAD_SHA=$(echo "$PR_DATA" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['headRefOid'])")
           HEAD_REPO=$(echo "$PR_DATA" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['headRepository']['nameWithOwner'])")
+          echo "base_ref=$BASE_REF" >> "$GITHUB_OUTPUT"
           echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
           echo "head_repo=$HEAD_REPO" >> "$GITHUB_OUTPUT"
 
@@ -114,16 +159,43 @@ jobs:
           repository: ${{ steps.pr.outputs.head_repo }}
           ref: ${{ steps.pr.outputs.head_sha }}
           path: pr-workspace
-          fetch-depth: 2
+          fetch-depth: 0
 
       - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
+      - name: Install Codex CLI
+        run: npm install -g @openai/codex@0.141.0
+
+      - name: Authenticate Codex CLI
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ -z "$OPENAI_API_KEY" ]; then
+            echo "::error::OPENAI_API_KEY is required for Codex Review Gate."
+            exit 1
+          fi
+          export CODEX_HOME="${RUNNER_TEMP}/review-gate-codex"
+          mkdir -p "$CODEX_HOME"
+          echo "CODEX_HOME=$CODEX_HOME" >> "$GITHUB_ENV"
+          printf '%s' "$OPENAI_API_KEY" | codex login --with-api-key
+
+      - name: Load review prompt
+        run: |
+          PROMPT_FILE="review-gate-main/.github/review-gate-prompt.md"
+          {
+            echo "REVIEW_GATE_PROMPT<<REVIEW_GATE_PROMPT_EOF"
+            if [ -f "$PROMPT_FILE" ]; then
+              cat "$PROMPT_FILE"
+            fi
+            echo "REVIEW_GATE_PROMPT_EOF"
+          } >> "$GITHUB_ENV"
+
       - name: Run review gate
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REVIEW_GATE_BACKEND: deterministic
+          GH_TOKEN: ${{ secrets.REVIEW_GATE_APPROVAL_TOKEN || secrets.GITHUB_TOKEN }}
+          REVIEW_GATE_BASE_REF: ${{ steps.pr.outputs.base_ref }}
         run: |
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           python review-gate-main/.github/scripts/review_gate.py \
@@ -133,4 +205,5 @@ jobs:
             --sha "${{ steps.pr.outputs.head_sha }}" \
             --post-status \
             --post-comment \
+            --submit-approval \
             --run-url "$RUN_URL"
