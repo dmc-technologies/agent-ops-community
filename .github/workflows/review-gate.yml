@@ -1,0 +1,136 @@
+name: Review Gate Dispatcher
+
+env:
+  REVIEW_GATE_PROMPT: |
+    Review this PR as a lightweight, shipping-focused engineering gate.
+
+    Look for:
+    - committed secrets, credentials, or private local paths;
+    - unresolved conflict markers or generated scratch artifacts;
+    - workflow changes that execute untrusted PR code with elevated privileges;
+    - missing command evidence for behavior changes;
+    - broad automation where a small script, status, comment, or PR review would do.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to review"
+        required: true
+      mode:
+        description: "Review mode"
+        required: true
+        default: agent-review
+        type: choice
+        options:
+          - agent-review
+
+jobs:
+  agent-review-label:
+    name: Review Gate Label Trigger
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.action == 'labeled' &&
+      github.event.label.name == 'ai review'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+      statuses: write
+
+    steps:
+      - name: Checkout workflow ref
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          path: review-gate-main
+          fetch-depth: 1
+
+      - name: Checkout PR branch
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: pr-workspace
+          fetch-depth: 2
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Run review gate and submit approval
+        env:
+          GH_TOKEN: ${{ secrets.REVIEW_GATE_APPROVAL_TOKEN || secrets.GITHUB_TOKEN }}
+          REVIEW_GATE_BACKEND: deterministic
+        run: |
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          python review-gate-main/.github/scripts/review_gate.py \
+            --pr "${{ github.event.pull_request.number }}" \
+            --repo "${{ github.repository }}" \
+            --workspace pr-workspace \
+            --sha "${{ github.event.pull_request.head.sha }}" \
+            --post-status \
+            --post-comment \
+            --submit-approval \
+            --run-url "$RUN_URL"
+
+  agent-review-dispatch:
+    name: Review Gate Dispatcher
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+      statuses: write
+
+    steps:
+      - name: Checkout workflow ref
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.ref_name }}
+          path: review-gate-main
+          fetch-depth: 1
+
+      - name: Get PR head branch and SHA
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_DATA=$(gh pr view "${{ github.event.inputs.pr_number }}" \
+            --repo "${{ github.repository }}" \
+            --json headRefOid,headRepository)
+          HEAD_SHA=$(echo "$PR_DATA" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['headRefOid'])")
+          HEAD_REPO=$(echo "$PR_DATA" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['headRepository']['nameWithOwner'])")
+          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          echo "head_repo=$HEAD_REPO" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout PR branch
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ steps.pr.outputs.head_repo }}
+          ref: ${{ steps.pr.outputs.head_sha }}
+          path: pr-workspace
+          fetch-depth: 2
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Run review gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REVIEW_GATE_BACKEND: deterministic
+        run: |
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          python review-gate-main/.github/scripts/review_gate.py \
+            --pr "${{ github.event.inputs.pr_number }}" \
+            --repo "${{ github.repository }}" \
+            --workspace pr-workspace \
+            --sha "${{ steps.pr.outputs.head_sha }}" \
+            --post-status \
+            --post-comment \
+            --run-url "$RUN_URL"
