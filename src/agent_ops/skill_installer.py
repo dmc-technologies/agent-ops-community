@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -65,6 +66,10 @@ def install_skill_dependencies(
             f"skill dependency id(s) not supported for {framework.value}: "
             f"{', '.join(unsupported)}"
         )
+    if not selected and not any(
+        framework.value in dependency.install for dependency in dependencies
+    ):
+        raise ValueError(f"no skill dependencies support framework {framework.value}")
 
     target_home = (home or default_framework_home(framework)).expanduser()
     cache_root = (cache_dir or Path("~/.cache/agentops/skill-dependencies")).expanduser()
@@ -89,7 +94,12 @@ def install_skill_dependencies(
         if dry_run:
             continue
         source = _checkout_dependency(dependency, cache_root)
-        _install_dependency(source=source, destination=destination, install=install)
+        _install_dependency(
+            dependency_id=dependency.id,
+            source=source,
+            destination=destination,
+            install=install,
+        )
 
     return installed
 
@@ -123,6 +133,7 @@ def _checkout_dependency(dependency: SkillDependency, cache_root: Path) -> Path:
 
 def _install_dependency(
     *,
+    dependency_id: str,
     source: Path,
     destination: Path,
     install: SkillDependencyInstall,
@@ -137,13 +148,18 @@ def _install_dependency(
         if not skill_source.exists():
             raise FileNotFoundError(skill_source)
         destination.mkdir(parents=True, exist_ok=True)
-        for child in skill_source.iterdir():
+        children = sorted(child.name for child in skill_source.iterdir())
+        for stale in sorted(set(_read_manifest(destination, dependency_id)) - set(children)):
+            _remove_path(destination / stale)
+        for child_name in children:
+            child = skill_source / child_name
             target = destination / child.name
             if child.is_dir():
                 _replace_tree(child, target)
             elif child.is_file():
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(child, target)
+        _write_manifest(destination, dependency_id, children)
         return
     raise ValueError(f"unsupported skill dependency install strategy {install.strategy!r}")
 
@@ -156,3 +172,31 @@ def _replace_tree(source: Path, destination: Path) -> None:
         destination,
         ignore=shutil.ignore_patterns(".git", "node_modules"),
     )
+
+
+def _manifest_path(destination: Path, dependency_id: str) -> Path:
+    return destination / f".agentops-{dependency_id}-manifest.json"
+
+
+def _read_manifest(destination: Path, dependency_id: str) -> list[str]:
+    path = _manifest_path(destination, dependency_id)
+    if not path.exists():
+        return []
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, list):
+        return []
+    return [str(item) for item in data]
+
+
+def _write_manifest(destination: Path, dependency_id: str, children: list[str]) -> None:
+    _manifest_path(destination, dependency_id).write_text(
+        json.dumps(children, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _remove_path(path: Path) -> None:
+    if path.is_dir():
+        shutil.rmtree(path)
+    elif path.exists():
+        path.unlink()
