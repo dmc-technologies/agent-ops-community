@@ -31,6 +31,9 @@ jobs:
       issues: write
       pull-requests: write
       statuses: write
+    concurrency:
+      group: review-gate-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+      cancel-in-progress: true
 
     steps:
       - name: Checkout trusted review gate
@@ -129,6 +132,9 @@ jobs:
       issues: write
       pull-requests: write
       statuses: write
+    concurrency:
+      group: review-gate-dispatch-${{ github.event.inputs.pr_number }}
+      cancel-in-progress: true
 
     steps:
       - name: Checkout workflow ref

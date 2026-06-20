@@ -52,8 +52,34 @@ def run_command(
     args: list[str],
     cwd: Path | None = None,
     env: dict[str, str] | None = None,
+    input_text: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(args, cwd=cwd, env=env, text=True, capture_output=True, check=False)
+    return subprocess.run(
+        args,
+        cwd=cwd,
+        env=env,
+        input=input_text,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def bounded_tail(text: str, limit: int = 6000) -> str:
+    if len(text) <= limit:
+        return text
+    return f"[truncated to last {limit} characters]\n{text[-limit:]}"
+
+
+def codex_failure_detail(result: subprocess.CompletedProcess[str], raw_review: str) -> str:
+    sections = [f"Codex CLI exited with status {result.returncode}."]
+    if result.stderr.strip():
+        sections.extend(["", "stderr tail:", bounded_tail(result.stderr.strip())])
+    if result.stdout.strip():
+        sections.extend(["", "stdout tail:", bounded_tail(result.stdout.strip())])
+    if raw_review.strip() and raw_review != result.stdout:
+        sections.extend(["", "last-message output tail:", bounded_tail(raw_review.strip())])
+    return "\n".join(sections)
 
 
 def codex_child_env() -> dict[str, str]:
@@ -285,10 +311,10 @@ def run_codex_review(
             "danger-full-access",
             "--output-last-message",
             str(output_path),
-            prompt,
         ],
         cwd=workspace,
         env=codex_child_env(),
+        input_text=prompt,
     )
     raw_review = output_path.read_text(encoding="utf-8") if output_path.exists() else result.stdout
     output_path.unlink(missing_ok=True)
@@ -301,7 +327,7 @@ def run_codex_review(
                     "P1",
                     "CODEX_REVIEW_FAILED",
                     "Codex review did not complete",
-                    (result.stderr or result.stdout).strip()[:4000],
+                    codex_failure_detail(result, raw_review),
                 ),
             ),
             raw_review=raw_review,

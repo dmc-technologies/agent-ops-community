@@ -25,6 +25,9 @@ def test_ai_review_label_triggers_review_and_approval() -> None:
     workflow = WORKFLOW_PATH.read_text()
 
     assert "types: [opened, synchronize, reopened, labeled]" in workflow
+    assert "review-gate-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}" in workflow
+    assert "review-gate-dispatch-${{ github.event.inputs.pr_number }}" in workflow
+    assert "cancel-in-progress: true" in workflow
     assert "github.event.label.name == 'ai review'" in workflow
     assert "github.event.action != 'labeled'" in workflow
     assert "contains(github.event.pull_request.labels.*.name, 'ai review')" not in workflow
@@ -105,12 +108,14 @@ def test_codex_review_invokes_codex_exec_and_parses_findings(monkeypatch, tmp_pa
     review_gate = load_review_gate()
     calls = []
 
-    def fake_run_command(args, cwd=None, env=None):
+    def fake_run_command(args, cwd=None, env=None, input_text=None):
         calls.append((args, env))
         if args[:3] == ["git", "fetch", "--force"]:
             assert args[-1] == "main:refs/remotes/review-gate-base/main"
             return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
         if args[:2] == ["codex", "exec"]:
+            assert input_text is not None
+            assert "Review strictly." in input_text
             output_path = Path(args[args.index("--output-last-message") + 1])
             output_path.write_text(
                 """
@@ -147,6 +152,7 @@ def test_codex_review_invokes_codex_exec_and_parses_findings(monkeypatch, tmp_pa
     assert "--ignore-rules" in codex_args
     assert "--sandbox" in codex_args
     assert "danger-full-access" in codex_args
+    assert "Review strictly." not in codex_args
     assert "read-only" not in codex_args
     assert codex_env is not None
     assert "GH_TOKEN" not in codex_env
@@ -156,6 +162,44 @@ def test_codex_review_invokes_codex_exec_and_parses_findings(monkeypatch, tmp_pa
     assert result.backend == "codex"
     assert result.summary == "The PR is not safe to merge yet."
     assert result.blocking[0].title == "Fix the unsafe workflow"
+
+
+def test_codex_review_failure_reports_tail(monkeypatch, tmp_path: Path) -> None:
+    review_gate = load_review_gate()
+
+    def fake_run_command(args, cwd=None, env=None, input_text=None):
+        if args[:3] == ["git", "fetch", "--force"]:
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        if args[:2] == ["codex", "exec"]:
+            output_path = Path(args[args.index("--output-last-message") + 1])
+            output_path.write_text("partial last message")
+            return subprocess.CompletedProcess(
+                args,
+                42,
+                stdout="stdout prefix\n" + ("x" * 7000) + "\nstdout actionable tail",
+                stderr="stderr prefix\n" + ("y" * 7000) + "\nstderr actionable tail",
+            )
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(review_gate, "run_command", fake_run_command)
+
+    result = review_gate.run_codex_review(
+        tmp_path,
+        "Review strictly.",
+        repo="example-org/example",
+        pr_number=7,
+        sha="abc123",
+        base_ref="main",
+    )
+
+    assert not result.passed
+    detail = result.blocking[0].detail
+    assert "Codex CLI exited with status 42." in detail
+    assert "stderr tail:" in detail
+    assert "stdout tail:" in detail
+    assert "stderr actionable tail" in detail
+    assert "stdout actionable tail" in detail
+    assert "partial last message" in detail
 
 
 def test_submit_pr_approval_posts_approve_review(monkeypatch) -> None:
