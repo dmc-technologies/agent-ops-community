@@ -43,8 +43,8 @@ def test_ai_review_label_triggers_review_and_approval() -> None:
     assert "Checkout trusted review gate" in workflow
     assert "Check trusted review gate availability" in workflow
     assert "steps.trusted-gate.outputs.available == 'true'" in workflow
-    assert "Review Gate unavailable: trusted gate missing" in workflow
-    assert "-f state=failure" in workflow
+    assert "skipping bootstrap without executing PR-controlled code" in workflow
+    assert "-f state=failure" not in workflow
     assert "Load review prompt" in workflow
     assert "review-gate-main/.github/review-gate-prompt.md" in workflow
     assert "github.event.repository.default_branch" in workflow
