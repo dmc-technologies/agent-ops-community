@@ -106,6 +106,25 @@ def test_skills_install_dry_run_reports_gstack_destination(tmp_path: Path) -> No
     assert f"would install: gstack -> {tmp_path / 'home' / 'skills' / 'gstack'}" in result.output
 
 
+def test_skills_install_fails_on_unknown_dependency(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app,
+        [
+            "skills",
+            "install",
+            "codex",
+            "--dependency",
+            "typo",
+            "--home",
+            str(tmp_path / "home"),
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "unknown skill dependency id(s): typo" in result.output
+
+
 def test_context_build_and_framework_command_are_public(tmp_path: Path) -> None:
     job = tmp_path / "job.yaml"
     job.write_text(

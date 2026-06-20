@@ -32,6 +32,10 @@
       strategy: copy-skills
       source: skills
       destination: skills
+    opencode:
+      strategy: copy-skills
+      source: skills
+      destination: skills
     portable:
       strategy: copy-repo
       destination: dependencies/superpowers

@@ -47,6 +47,25 @@ def install_skill_dependencies(
     dry_run: bool = False,
 ) -> list[InstalledSkillDependency]:
     selected = set(dependency_ids or [])
+    by_id = {dependency.id: dependency for dependency in dependencies}
+    unknown = sorted(selected - set(by_id))
+    if unknown:
+        known = ", ".join(sorted(by_id))
+        raise ValueError(
+            f"unknown skill dependency id(s): {', '.join(unknown)}; known dependencies: {known}"
+        )
+
+    unsupported = sorted(
+        dependency_id
+        for dependency_id in selected
+        if framework.value not in by_id[dependency_id].install
+    )
+    if unsupported:
+        raise ValueError(
+            f"skill dependency id(s) not supported for {framework.value}: "
+            f"{', '.join(unsupported)}"
+        )
+
     target_home = (home or default_framework_home(framework)).expanduser()
     cache_root = (cache_dir or Path("~/.cache/agentops/skill-dependencies")).expanduser()
     installed: list[InstalledSkillDependency] = []
