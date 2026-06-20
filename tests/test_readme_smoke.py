@@ -53,7 +53,7 @@ def test_readme_quick_start_commands_work(tmp_path: Path) -> None:
 
 def test_public_docs_do_not_advertise_unimplemented_commands() -> None:
     checked = [Path("README.md"), *Path("docs").rglob("*.md")]
-    unsupported = ["agentops doctor", "agentops catalog", "agentops skills install"]
+    unsupported = ["agentops doctor", "agentops catalog"]
     offenders: list[str] = []
 
     for path in checked:

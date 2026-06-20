@@ -81,6 +81,7 @@ rg -n "<project|repo|workflow keyword>" "$AGENT_KNOWLEDGE_HOME"
    ```bash
    agentops capabilities list
    agentops skills list
+   agentops skills install {framework.value}
    agentops tools list
    agentops frameworks list
    ```

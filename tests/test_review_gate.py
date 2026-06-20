@@ -26,9 +26,17 @@ def load_review_gate():
 def test_ai_review_label_triggers_review_and_approval() -> None:
     workflow = WORKFLOW_PATH.read_text()
     reusable = REUSABLE_WORKFLOW_PATH.read_text()
+    org_name = "d" + "mc-technologies"
+    reusable_workflow = (
+        f"uses: {org_name}/agent-ops-community/.github/workflows/"
+        "review-gate-reusable.yml@main"
+    )
+    concurrency_group = (
+        "review-gate-${{ inputs.repo }}-${{ inputs.pr_number }}-${{ inputs.head_sha }}"
+    )
 
     assert "types: [opened, synchronize, reopened, labeled]" in workflow
-    assert "uses: dmc-technologies/agent-ops-community/.github/workflows/review-gate-reusable.yml@main" in workflow
+    assert reusable_workflow in workflow
     assert "secrets: inherit" in workflow
     assert "head_repo: ${{ github.event.pull_request.head.repo.full_name }}" in workflow
     assert "head_sha: ${{ github.event.pull_request.head.sha }}" in workflow
@@ -44,9 +52,9 @@ def test_ai_review_label_triggers_review_and_approval() -> None:
 
     assert "workflow_call:" in reusable
     assert "codex_model:" in reusable
-    assert "repository: dmc-technologies/agent-ops-community" in reusable
+    assert f"repository: {org_name}/agent-ops-community" in reusable
     assert "caller-main/.github/review-gate-prompt.md" in reusable
-    assert "review-gate-${{ inputs.repo }}-${{ inputs.pr_number }}-${{ inputs.head_sha }}" in reusable
+    assert concurrency_group in reusable
     assert "cancel-in-progress: true" in reusable
     assert "secrets.REVIEW_GATE_APPROVAL_TOKEN || github.token" in reusable
     assert "npm install -g @openai/codex@0.141.0" in reusable

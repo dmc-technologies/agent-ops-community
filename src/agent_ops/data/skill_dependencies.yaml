@@ -11,6 +11,9 @@
     claude-code:
       strategy: gstack
       destination: skills/gstack
+    opencode:
+      strategy: gstack
+      destination: skills/gstack
     portable:
       strategy: copy-repo
       destination: dependencies/gstack

@@ -87,6 +87,25 @@ def test_bootstrap_writes_public_agentops_file(tmp_path: Path) -> None:
     assert "agent-knowledge" in text
 
 
+def test_skills_install_dry_run_reports_gstack_destination(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app,
+        [
+            "skills",
+            "install",
+            "codex",
+            "--dependency",
+            "gstack",
+            "--home",
+            str(tmp_path / "home"),
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert f"would install: gstack -> {tmp_path / 'home' / 'skills' / 'gstack'}" in result.output
+
+
 def test_context_build_and_framework_command_are_public(tmp_path: Path) -> None:
     job = tmp_path / "job.yaml"
     job.write_text(
