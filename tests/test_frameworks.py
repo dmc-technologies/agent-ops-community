@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from agent_ops.bootstrap import SUPPORTED_BOOTSTRAPS, write_all_bootstraps
+from agent_ops.bootstrap import SUPPORTED_BOOTSTRAPS, bootstrap_text, write_all_bootstraps
 from agent_ops.context import build_context_pack
 from agent_ops.contracts.job import AgentJob, JobMode, VerificationCommand
 from agent_ops.frameworks import ADAPTERS, get_adapter
@@ -41,6 +41,13 @@ def test_public_bootstrap_writes_generic_framework_files(tmp_path: Path) -> None
     assert "README.md" in written_paths
     for framework in GENERIC_PRIVATE_FRAMEWORKS:
         assert f"{framework.value}/AGENTOPS.md" in written_paths
+
+
+def test_public_bootstrap_only_advertises_supported_skill_installs() -> None:
+    assert "agentops skills install codex" in bootstrap_text(Framework.CODEX)
+    assert "agentops skills install claude-code" in bootstrap_text(Framework.CLAUDE_CODE)
+    assert "agentops skills install cursor" not in bootstrap_text(Framework.CURSOR)
+    assert "agentops skills install local" not in bootstrap_text(Framework.LOCAL)
 
 
 def test_public_context_and_handoff_work_for_generic_frameworks() -> None:

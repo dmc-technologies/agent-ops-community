@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 from typing import Annotated
 
@@ -14,7 +15,15 @@ from agent_ops.contracts.result import RunResult
 from agent_ops.frameworks import ADAPTERS, get_adapter
 from agent_ops.harness import check_harness, default_verification, init_harness
 from agent_ops.plugins import run_with_plugins
-from agent_ops.registries import Framework, get_by_id, load_capabilities, load_skills, load_tools
+from agent_ops.registries import (
+    Framework,
+    get_by_id,
+    load_capabilities,
+    load_skill_dependencies,
+    load_skills,
+    load_tools,
+)
+from agent_ops.skill_installer import install_skill_dependencies
 from agent_ops.verify import run_verification
 
 app = typer.Typer(help="Community agent operations control plane.")
@@ -208,6 +217,46 @@ def list_skills(json_output: Annotated[bool, typer.Option("--json")] = False) ->
 def show_skill(skill_id: str) -> None:
     skill = get_by_id(load_skills(), skill_id)
     typer.echo(skill.model_dump_json(indent=2))
+
+
+@skills_app.command("install")
+def install_skills(
+    framework: Annotated[Framework, typer.Argument(help="Framework home to install into.")],
+    dependency: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--dependency",
+            "--dep",
+            help="Dependency bundle id to install. Repeat to install several. Defaults to all.",
+        ),
+    ] = None,
+    home: Annotated[
+        Path | None,
+        typer.Option("--home", help="Override the selected framework home."),
+    ] = None,
+    cache_dir: Annotated[
+        Path | None,
+        typer.Option("--cache-dir", help="Override dependency checkout cache directory."),
+    ] = None,
+    dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
+) -> None:
+    """Install dependency-backed skill bundles such as gstack and Superpowers."""
+    try:
+        rows = install_skill_dependencies(
+            framework=framework,
+            dependencies=load_skill_dependencies(),
+            home=home,
+            dependency_ids=dependency,
+            cache_dir=cache_dir,
+            dry_run=dry_run,
+        )
+    except (FileNotFoundError, ValueError, subprocess.CalledProcessError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from exc
+
+    verb = "would install" if dry_run else "installed"
+    for row in rows:
+        typer.echo(f"{verb}: {row.id} -> {row.destination}")
 
 
 @tools_app.command("list")

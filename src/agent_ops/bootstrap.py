@@ -19,6 +19,17 @@ KNOWLEDGE_GIT_EXPORT = (
     'git@github.com:your-org/agent-knowledge.git}"'
 )
 
+SKILL_INSTALL_BOOTSTRAPS = {
+    Framework.CODEX,
+    Framework.CLAUDE_CODE,
+}
+
+
+def skill_install_command(framework: Framework) -> str:
+    if framework not in SKILL_INSTALL_BOOTSTRAPS:
+        return ""
+    return f"   agentops skills install {framework.value}\n"
+
 
 def bootstrap_text(framework: Framework) -> str:
     return f"""# Agent Ops Bootstrap: {framework.value}
@@ -81,6 +92,7 @@ rg -n "<project|repo|workflow keyword>" "$AGENT_KNOWLEDGE_HOME"
    ```bash
    agentops capabilities list
    agentops skills list
+{skill_install_command(framework).rstrip()}
    agentops tools list
    agentops frameworks list
    ```
