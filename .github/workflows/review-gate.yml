@@ -48,7 +48,14 @@ jobs:
           if [ -f review-gate-main/.github/scripts/review_gate.py ]; then
             echo "available=true" >> "$GITHUB_OUTPUT"
           else
-            echo "::notice::Trusted Review Gate script is not on the default branch yet; skipping bootstrap without executing PR-controlled code."
+            echo "::notice::Trusted Review Gate script is not on the default branch yet; skipping label review bootstrap without executing PR-controlled code."
+            RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            gh api "repos/${{ github.repository }}/statuses/${{ github.event.pull_request.head.sha }}" \
+              --method POST \
+              -f state=failure \
+              -f context="Review Gate" \
+              -f description="Review Gate unavailable: trusted gate missing" \
+              -f target_url="$RUN_URL"
             echo "available=false" >> "$GITHUB_OUTPUT"
           fi
 
