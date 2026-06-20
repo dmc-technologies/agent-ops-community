@@ -1,0 +1,128 @@
+name: Reusable Review Gate
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        description: "Pull request number to review"
+        required: true
+        type: string
+      repo:
+        description: "Repository being reviewed, as owner/name"
+        required: true
+        type: string
+      head_repo:
+        description: "PR head repository, as owner/name"
+        required: true
+        type: string
+      head_sha:
+        description: "PR head SHA to review"
+        required: true
+        type: string
+      base_ref:
+        description: "PR base branch/ref"
+        required: true
+        type: string
+      codex_model:
+        description: "Optional Codex model override"
+        required: false
+        type: string
+        default: ""
+    secrets:
+      OPENAI_API_KEY:
+        required: true
+      REVIEW_GATE_APPROVAL_TOKEN:
+        required: false
+
+jobs:
+  review:
+    name: Review Gate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+      statuses: write
+    concurrency:
+      group: review-gate-${{ inputs.repo }}-${{ inputs.pr_number }}-${{ inputs.head_sha }}
+      cancel-in-progress: true
+
+    steps:
+      - name: Checkout Review Gate implementation
+        uses: actions/checkout@v6
+        with:
+          repository: dmc-technologies/agent-ops-community
+          ref: main
+          path: review-gate-main
+          fetch-depth: 1
+
+      - name: Checkout trusted caller prompt
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.repo }}
+          ref: ${{ inputs.base_ref }}
+          path: caller-main
+          fetch-depth: 1
+
+      - name: Check trusted Review Gate availability
+        run: |
+          if [ ! -f review-gate-main/.github/scripts/review_gate.py ]; then
+            echo "::error::Trusted Review Gate script is missing from dmc-technologies/agent-ops."
+            exit 1
+          fi
+
+      - name: Checkout PR branch
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.head_repo }}
+          ref: ${{ inputs.head_sha }}
+          path: pr-workspace
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install Codex CLI
+        run: npm install -g @openai/codex@0.141.0
+
+      - name: Authenticate Codex CLI
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ -z "$OPENAI_API_KEY" ]; then
+            echo "::error::OPENAI_API_KEY is required for Codex Review Gate."
+            exit 1
+          fi
+          export CODEX_HOME="${RUNNER_TEMP}/review-gate-codex"
+          mkdir -p "$CODEX_HOME"
+          echo "CODEX_HOME=$CODEX_HOME" >> "$GITHUB_ENV"
+          printf '%s' "$OPENAI_API_KEY" | codex login --with-api-key
+
+      - name: Load repo review prompt
+        run: |
+          PROMPT_FILE="caller-main/.github/review-gate-prompt.md"
+          {
+            echo "REVIEW_GATE_PROMPT<<REVIEW_GATE_PROMPT_EOF"
+            if [ -f "$PROMPT_FILE" ]; then
+              cat "$PROMPT_FILE"
+            fi
+            echo "REVIEW_GATE_PROMPT_EOF"
+          } >> "$GITHUB_ENV"
+
+      - name: Run review gate
+        env:
+          GH_TOKEN: ${{ secrets.REVIEW_GATE_APPROVAL_TOKEN || github.token }}
+          REVIEW_GATE_BASE_REF: ${{ inputs.base_ref }}
+          REVIEW_GATE_CODEX_MODEL: ${{ inputs.codex_model }}
+        run: |
+          RUN_URL="${{ github.server_url }}/${{ inputs.repo }}/actions/runs/${{ github.run_id }}"
+          python review-gate-main/.github/scripts/review_gate.py \
+            --pr "${{ inputs.pr_number }}" \
+            --repo "${{ inputs.repo }}" \
+            --workspace pr-workspace \
+            --sha "${{ inputs.head_sha }}" \
+            --post-status \
+            --post-comment \
+            --submit-approval \
+            --run-url "$RUN_URL"

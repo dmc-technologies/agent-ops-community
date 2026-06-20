@@ -30,7 +30,7 @@ jobs:
       issues: write
       pull-requests: write
       statuses: write
-    uses: dmc-technologies/agent-ops/.github/workflows/review-gate-reusable.yml@main
+    uses: dmc-technologies/agent-ops-community/.github/workflows/review-gate-reusable.yml@main
     with:
       pr_number: ${{ github.event.pull_request.number }}
       repo: ${{ github.repository }}
@@ -76,7 +76,7 @@ jobs:
       issues: write
       pull-requests: write
       statuses: write
-    uses: dmc-technologies/agent-ops/.github/workflows/review-gate-reusable.yml@main
+    uses: dmc-technologies/agent-ops-community/.github/workflows/review-gate-reusable.yml@main
     with:
       pr_number: ${{ github.event.inputs.pr_number }}
       repo: ${{ github.repository }}
