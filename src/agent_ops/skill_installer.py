@@ -167,6 +167,7 @@ def _install_dependency(
 def _replace_tree(source: Path, destination: Path) -> None:
     if destination.exists():
         shutil.rmtree(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(
         source,
         destination,

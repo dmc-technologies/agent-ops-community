@@ -75,6 +75,7 @@ def test_install_gstack_dependency_copies_full_bundle(tmp_path: Path) -> None:
         },
     )
 
+    assert not (tmp_path / "home" / "skills").exists()
     rows = install_skill_dependencies(
         framework=Framework.CODEX,
         dependencies=[dependency],
@@ -118,6 +119,7 @@ def test_install_copy_skills_dependency_merges_skill_directories(tmp_path: Path)
         },
     )
 
+    assert not (tmp_path / "home" / "skills").exists()
     install_skill_dependencies(
         framework=Framework.CODEX,
         dependencies=[dependency],
