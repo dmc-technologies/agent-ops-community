@@ -532,8 +532,6 @@ def post_finding_comments(
     run_url: str,
 ) -> None:
     findings = (*result.blocking, *result.warnings)
-    if not findings:
-        return
     comments = run_command(
         ["gh", "api", f"repos/{repo}/issues/{pr_number}/comments", "--paginate"]
     )
@@ -545,9 +543,25 @@ def post_finding_comments(
         for comment in existing
         if comment.get("body", "").startswith(FINDING_MARKER_PREFIX)
     }
+    desired = {}
     for finding in findings:
         body = build_finding_comment(finding, sha=sha, run_url=run_url)
-        marker = body.split("-->", 1)[0] + "-->"
+        desired[body.split("-->", 1)[0] + "-->"] = body
+    for marker, comment_id in by_marker.items():
+        if marker in desired:
+            continue
+        delete_result = run_command(
+            [
+                "gh",
+                "api",
+                f"repos/{repo}/issues/comments/{comment_id}",
+                "--method",
+                "DELETE",
+            ]
+        )
+        if delete_result.returncode != 0:
+            raise RuntimeError(delete_result.stderr.strip())
+    for marker, body in desired.items():
         comment_id = by_marker.get(marker)
         if comment_id:
             args = [

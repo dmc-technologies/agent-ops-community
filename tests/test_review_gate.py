@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -226,6 +227,44 @@ def test_submit_pr_approval_posts_approve_review(monkeypatch) -> None:
             "body=AI review passed",
         ]
     ]
+
+
+def test_post_finding_comments_deletes_stale_findings(monkeypatch) -> None:
+    review_gate = load_review_gate()
+    calls = []
+    existing = [
+        {
+            "id": 101,
+            "body": "<!-- review-gate-finding:stale -->\n## P1: Old finding",
+        },
+        {
+            "id": 102,
+            "body": "Unrelated human comment",
+        },
+    ]
+
+    def fake_run_command(args, cwd=None, env=None, input_text=None):
+        calls.append(args)
+        if args[:3] == ["gh", "api", "repos/example-org/example/issues/7/comments"]:
+            return subprocess.CompletedProcess(args, 0, stdout=json.dumps(existing), stderr="")
+        if args[:3] == ["gh", "api", "repos/example-org/example/issues/comments/101"]:
+            assert "--method" in args
+            assert "DELETE" in args
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(review_gate, "run_command", fake_run_command)
+
+    review_gate.post_finding_comments(
+        "example-org/example",
+        7,
+        review_gate.ReviewResult("codex", summary="ok"),
+        sha="abc123",
+        run_url="https://example.test/run",
+    )
+
+    assert any("issues/comments/101" in call[2] and "DELETE" in call for call in calls)
+    assert not any("issues/comments/102" in call[2] for call in calls if len(call) > 2)
 
 
 def test_analyze_workspace_blocks_conflict_markers(tmp_path: Path) -> None:
