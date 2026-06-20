@@ -110,6 +110,14 @@ jobs:
             echo "REVIEW_GATE_PROMPT_EOF"
           } >> "$GITHUB_ENV"
 
+      - name: Show selected Codex model
+        run: |
+          if [ -n "${{ inputs.codex_model }}" ]; then
+            echo "Review Gate Codex model: ${{ inputs.codex_model }}"
+          else
+            echo "Review Gate Codex model: Codex CLI default"
+          fi
+
       - name: Run review gate
         env:
           GH_TOKEN: ${{ secrets.REVIEW_GATE_APPROVAL_TOKEN || github.token }}
