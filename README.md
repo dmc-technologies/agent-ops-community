@@ -24,8 +24,13 @@ Install common skill bundles for your agent framework:
 
 ```bash
 agentops skills install codex
-agentops skills install opencode --dependency gstack
+agentops skills install opencode
 ```
+
+By default, supported frameworks install all configured skill dependency
+bundles. The pinned gstack repository is installed as a complete bundle under
+`skills/gstack`; Superpowers installs every skill from its pinned `skills/`
+tree.
 
 ## Quick Start
 

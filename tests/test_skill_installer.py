@@ -46,14 +46,23 @@ def _commit(path: Path) -> str:
     return result.stdout.strip()
 
 
-def test_install_gstack_dependency_copies_bundle_with_office_hours(tmp_path: Path) -> None:
+def test_install_gstack_dependency_copies_full_bundle(tmp_path: Path) -> None:
     repo = tmp_path / "gstack-src"
     repo_url = _git_repo(repo)
-    (repo / "office-hours").mkdir()
+    (repo / "office-hours").mkdir(parents=True)
     (repo / "office-hours" / "SKILL.md").write_text(
         "---\nname: office-hours\n---\n",
         encoding="utf-8",
     )
+    (repo / "review").mkdir()
+    (repo / "review" / "SKILL.md").write_text(
+        "---\nname: review\n---\n",
+        encoding="utf-8",
+    )
+    (repo / "bin").mkdir()
+    (repo / "bin" / "gstack-config").write_text("#!/bin/sh\n", encoding="utf-8")
+    (repo / "node_modules" / "ignored").mkdir(parents=True)
+    (repo / "node_modules" / "ignored" / "index.js").write_text("", encoding="utf-8")
     ref = _commit(repo)
 
     dependency = SkillDependency(
@@ -75,6 +84,9 @@ def test_install_gstack_dependency_copies_bundle_with_office_hours(tmp_path: Pat
 
     assert rows[0].destination == tmp_path / "home" / "skills" / "gstack"
     assert (tmp_path / "home" / "skills" / "gstack" / "office-hours" / "SKILL.md").exists()
+    assert (tmp_path / "home" / "skills" / "gstack" / "review" / "SKILL.md").exists()
+    assert (tmp_path / "home" / "skills" / "gstack" / "bin" / "gstack-config").exists()
+    assert not (tmp_path / "home" / "skills" / "gstack" / "node_modules").exists()
 
 
 def test_install_copy_skills_dependency_merges_skill_directories(tmp_path: Path) -> None:
@@ -83,6 +95,11 @@ def test_install_copy_skills_dependency_merges_skill_directories(tmp_path: Path)
     (repo / "skills" / "writing-plans").mkdir(parents=True)
     (repo / "skills" / "writing-plans" / "SKILL.md").write_text(
         "---\nname: writing-plans\n---\n",
+        encoding="utf-8",
+    )
+    (repo / "skills" / "verification-before-completion").mkdir()
+    (repo / "skills" / "verification-before-completion" / "SKILL.md").write_text(
+        "---\nname: verification-before-completion\n---\n",
         encoding="utf-8",
     )
     ref = _commit(repo)
@@ -109,6 +126,9 @@ def test_install_copy_skills_dependency_merges_skill_directories(tmp_path: Path)
     )
 
     assert (tmp_path / "home" / "skills" / "writing-plans" / "SKILL.md").exists()
+    assert (
+        tmp_path / "home" / "skills" / "verification-before-completion" / "SKILL.md"
+    ).exists()
 
 
 def test_install_copy_skills_dependency_supports_opencode(tmp_path: Path) -> None:
@@ -117,6 +137,11 @@ def test_install_copy_skills_dependency_supports_opencode(tmp_path: Path) -> Non
     (repo / "skills" / "writing-plans").mkdir(parents=True)
     (repo / "skills" / "writing-plans" / "SKILL.md").write_text(
         "---\nname: writing-plans\n---\n",
+        encoding="utf-8",
+    )
+    (repo / "skills" / "verification-before-completion").mkdir()
+    (repo / "skills" / "verification-before-completion" / "SKILL.md").write_text(
+        "---\nname: verification-before-completion\n---\n",
         encoding="utf-8",
     )
     ref = _commit(repo)
@@ -143,6 +168,9 @@ def test_install_copy_skills_dependency_supports_opencode(tmp_path: Path) -> Non
     )
 
     assert (tmp_path / "home" / "skills" / "writing-plans" / "SKILL.md").exists()
+    assert (
+        tmp_path / "home" / "skills" / "verification-before-completion" / "SKILL.md"
+    ).exists()
 
 
 def test_copy_skills_dependency_removes_stale_manifest_entries(tmp_path: Path) -> None:
