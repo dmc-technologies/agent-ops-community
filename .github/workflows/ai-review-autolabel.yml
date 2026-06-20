@@ -1,0 +1,29 @@
+name: AI Review Auto Label
+
+on:
+  pull_request_target:
+    types: [opened, reopened, ready_for_review, synchronize]
+
+jobs:
+  apply-ai-review-label:
+    name: Apply AI review label
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+
+    steps:
+      - name: Apply ai review label
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          gh label create "ai review" \
+            --repo "${{ github.repository }}" \
+            --description "Run Codex Review Gate" \
+            --color "5319e7" || true
+          gh pr edit "$PR_NUMBER" \
+            --repo "${{ github.repository }}" \
+            --add-label "ai review"
