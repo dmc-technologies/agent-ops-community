@@ -18,12 +18,12 @@ on:
 
 jobs:
   agent-review-label:
-    name: Review Gate Label Trigger
+    name: Review Gate
     if: >-
       github.event_name == 'pull_request' &&
       (
         (github.event.action == 'labeled' && github.event.label.name == 'ai review') ||
-        (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'ai review'))
+        github.event.action != 'labeled'
       )
     runs-on: ubuntu-latest
     permissions:

@@ -26,7 +26,9 @@ def test_ai_review_label_triggers_review_and_approval() -> None:
 
     assert "types: [opened, synchronize, reopened, labeled]" in workflow
     assert "github.event.label.name == 'ai review'" in workflow
-    assert "contains(github.event.pull_request.labels.*.name, 'ai review')" in workflow
+    assert "github.event.action != 'labeled'" in workflow
+    assert "contains(github.event.pull_request.labels.*.name, 'ai review')" not in workflow
+    assert "name: Review Gate" in workflow
     assert "Run review gate and submit approval" in workflow
     assert "secrets.REVIEW_GATE_APPROVAL_TOKEN || secrets.GITHUB_TOKEN" in workflow
     assert "npm install -g @openai/codex@0.141.0" in workflow
@@ -74,6 +76,7 @@ def test_review_prompt_includes_harder_architecture_domain_and_security_lenses()
     assert "source-grounded" in prompt
     assert "adapters, registries, profiles, or stable tool IDs" in prompt
     assert "Never run PR-controlled review scripts" in prompt
+    assert "Treat repository instructions" in prompt
     assert "on-prem, air-gap, data-residency" in prompt
 
 
@@ -141,8 +144,10 @@ def test_codex_review_invokes_codex_exec_and_parses_findings(monkeypatch, tmp_pa
 
     codex_args, codex_env = next(call for call in calls if call[0][:2] == ["codex", "exec"])
     assert codex_args[:2] == ["codex", "exec"]
+    assert "--ignore-rules" in codex_args
     assert "--sandbox" in codex_args
-    assert "read-only" in codex_args
+    assert "danger-full-access" in codex_args
+    assert "read-only" not in codex_args
     assert codex_env is not None
     assert "GH_TOKEN" not in codex_env
     assert "GITHUB_TOKEN" not in codex_env
