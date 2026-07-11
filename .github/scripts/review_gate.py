@@ -224,6 +224,18 @@ Apply this review prompt:
 
 {review_prompt}
 
+## Exhaustiveness (single-pass completeness)
+
+Enumerate EVERY blocking finding present in this diff in this one pass. Do not
+defer, hold, or ration findings for a later review round -- assume there is no
+cheap later round and that omitted issues ship. Before returning:
+- Re-scan the whole diff for additional INSTANCES of every issue class you
+  found. If a defect appears in one place, check whether the same class appears
+  elsewhere in the diff and report all instances.
+- Group findings by root-cause class so one architectural fix can retire a whole
+  class rather than surfacing one instance at a time across rounds.
+Completeness in this pass is more important than brevity.
+
 Return only valid JSON with this exact shape:
 {{
   "verdict": "approve" | "comment" | "request_changes",

@@ -47,7 +47,7 @@ def test_ai_review_label_triggers_review_and_approval() -> None:
     assert "github.event.action != 'labeled'" in workflow
     assert "contains(github.event.pull_request.labels.*.name, 'ai review')" not in workflow
     assert "name: Review Gate" in workflow
-    assert "npm install -g @openai/codex@0.141.0" not in workflow
+    assert "npm install -g @openai/codex@0.144.1" not in workflow
     assert "python review-gate-main/.github/scripts/review_gate.py" not in workflow
 
     assert "workflow_call:" in reusable
@@ -57,7 +57,7 @@ def test_ai_review_label_triggers_review_and_approval() -> None:
     assert concurrency_group in reusable
     assert "cancel-in-progress: true" in reusable
     assert "secrets.REVIEW_GATE_APPROVAL_TOKEN || github.token" in reusable
-    assert "npm install -g @openai/codex@0.141.0" in reusable
+    assert "npm install -g @openai/codex@0.144.1" in reusable
     assert "OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}" in reusable
     assert "codex login --with-api-key" in reusable
     run_gate_block = reusable.split("Run review gate", 1)[1]
