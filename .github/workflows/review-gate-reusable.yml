@@ -84,7 +84,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install Codex CLI
-        run: npm install -g @openai/codex@0.141.0
+        run: npm install -g @openai/codex@0.144.1
 
       - name: Authenticate Codex CLI
         env:
