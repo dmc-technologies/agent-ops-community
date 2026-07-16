@@ -75,36 +75,19 @@ class CursorAdapter(FrameworkAdapter):
         )
 
 
-class RooCodeAdapter(FrameworkAdapter):
-    framework = Framework.ROO_CODE
-    executable = "roo"
+class OpenCodeAdapter(FrameworkAdapter):
+    framework = Framework.OPENCODE
+    executable = "opencode"
 
     def build_command(self, job: AgentJob, context_pack: ContextPack, cwd: Path) -> AdapterCommand:
+        prompt = context_pack.to_markdown()
         return AdapterCommand(
             framework=self.framework,
-            command=["roo", "run", "--stdin"],
+            command=["opencode", "run", prompt],
             cwd=str(cwd),
             notes=[
-                "Roo Code CLI names vary by installation.",
-                "This command is the agent-ops contract and may require local alias setup.",
-                context_pack.to_markdown(),
-            ],
-        )
-
-
-class ClineAdapter(FrameworkAdapter):
-    framework = Framework.CLINE
-    executable = "cline"
-
-    def build_command(self, job: AgentJob, context_pack: ContextPack, cwd: Path) -> AdapterCommand:
-        return AdapterCommand(
-            framework=self.framework,
-            command=["cline", "run", "--stdin"],
-            cwd=str(cwd),
-            notes=[
-                "Cline CLI names vary by installation.",
-                "This command is the agent-ops contract and may require local alias setup.",
-                context_pack.to_markdown(),
+                "Uses the opencode CLI non-interactive run mode with the context pack as prompt.",
+                "Skills and bootstrap install into ${OPENCODE_HOME:-~/.agents}.",
             ],
         )
 
@@ -130,8 +113,7 @@ ADAPTERS: dict[Framework, FrameworkAdapter] = {
     Framework.CLAUDE_CODE: ClaudeCodeAdapter(),
     Framework.CODEX: CodexAdapter(),
     Framework.CURSOR: CursorAdapter(),
-    Framework.ROO_CODE: RooCodeAdapter(),
-    Framework.CLINE: ClineAdapter(),
+    Framework.OPENCODE: OpenCodeAdapter(),
     Framework.OPENCLAW: OpenClawAdapter(),
 }
 

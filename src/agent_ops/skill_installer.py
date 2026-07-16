@@ -28,10 +28,6 @@ def default_framework_home(framework: Framework) -> Path:
             return Path("~/.agents").expanduser()
         case Framework.CURSOR:
             return Path("~/.cursor").expanduser()
-        case Framework.ROO_CODE:
-            return Path("~/.roo-code").expanduser()
-        case Framework.CLINE:
-            return Path("~/.cline").expanduser()
         case Framework.OPENCLAW:
             return Path("~/.openclaw").expanduser()
         case Framework.LOCAL:

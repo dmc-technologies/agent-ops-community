@@ -10,8 +10,6 @@ class Framework(StrEnum):
     CLAUDE_CODE = "claude-code"
     CODEX = "codex"
     CURSOR = "cursor"
-    ROO_CODE = "roo-code"
-    CLINE = "cline"
     OPENCLAW = "openclaw"
     OPENCODE = "opencode"
     LOCAL = "local"

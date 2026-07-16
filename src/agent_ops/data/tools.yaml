@@ -7,8 +7,7 @@
   - codex
   - claude-code
   - cursor
-  - roo-code
-  - cline
+  - opencode
   - openclaw
   - local
   env:
@@ -26,6 +25,7 @@
   frameworks:
   - codex
   - claude-code
+  - opencode
   - openclaw
   - local
   env:
