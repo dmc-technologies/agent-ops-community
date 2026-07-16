@@ -12,8 +12,7 @@ GENERIC_PRIVATE_FRAMEWORKS = {
     Framework.CLAUDE_CODE,
     Framework.CODEX,
     Framework.CURSOR,
-    Framework.ROO_CODE,
-    Framework.CLINE,
+    Framework.OPENCODE,
     Framework.OPENCLAW,
     Framework.LOCAL,
 }
@@ -46,6 +45,7 @@ def test_public_bootstrap_writes_generic_framework_files(tmp_path: Path) -> None
 def test_public_bootstrap_only_advertises_supported_skill_installs() -> None:
     assert "agentops skills install codex" in bootstrap_text(Framework.CODEX)
     assert "agentops skills install claude-code" in bootstrap_text(Framework.CLAUDE_CODE)
+    assert "agentops skills install opencode" in bootstrap_text(Framework.OPENCODE)
     assert "agentops skills install cursor" not in bootstrap_text(Framework.CURSOR)
     assert "agentops skills install local" not in bootstrap_text(Framework.LOCAL)
 

@@ -4,8 +4,7 @@
   frameworks:
   - claude-code
   - codex
-  - roo-code
-  - cline
+  - opencode
   - local
   requires:
   - git
@@ -23,8 +22,7 @@
   - claude-code
   - codex
   - cursor
-  - roo-code
-  - cline
+  - opencode
   - openclaw
   - local
   requires:
@@ -48,8 +46,7 @@
   - claude-code
   - codex
   - cursor
-  - roo-code
-  - cline
+  - opencode
   - openclaw
   - local
   requires:

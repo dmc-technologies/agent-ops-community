@@ -8,9 +8,8 @@ SUPPORTED_BOOTSTRAPS = [
     Framework.CODEX,
     Framework.CLAUDE_CODE,
     Framework.CURSOR,
-    Framework.ROO_CODE,
-    Framework.CLINE,
     Framework.OPENCLAW,
+    Framework.OPENCODE,
     Framework.LOCAL,
 ]
 
@@ -22,6 +21,7 @@ KNOWLEDGE_GIT_EXPORT = (
 SKILL_INSTALL_BOOTSTRAPS = {
     Framework.CODEX,
     Framework.CLAUDE_CODE,
+    Framework.OPENCODE,
 }
 
 
@@ -46,9 +46,8 @@ export AGENT_KNOWLEDGE_HOME="${{AGENT_KNOWLEDGE_HOME:-~/agent-knowledge}}"
 export CODEX_HOME="${{CODEX_HOME:-~/.codex}}"
 export CLAUDE_HOME="${{CLAUDE_HOME:-~/.claude}}"
 export CURSOR_HOME="${{CURSOR_HOME:-~/.cursor}}"
-export ROO_CODE_HOME="${{ROO_CODE_HOME:-~/.roo-code}}"
-export CLINE_HOME="${{CLINE_HOME:-~/.cline}}"
 export OPENCLAW_HOME="${{OPENCLAW_HOME:-~/.openclaw}}"
+export OPENCODE_HOME="${{OPENCODE_HOME:-~/.agents}}"
 export AGENT_OPS_LOCAL_HOME="${{AGENT_OPS_LOCAL_HOME:-~/.agentops}}"
 export KNOWLEDGE_MEMORY_DIR="${{KNOWLEDGE_MEMORY_DIR:-$AGENT_KNOWLEDGE_HOME}}"
 {KNOWLEDGE_GIT_EXPORT}

@@ -16,12 +16,6 @@
   - framework: openclaw
     invocation: Use the configured agent-knowledge MCP server; fall back to ${AGENT_KNOWLEDGE_HOME:-~/agent-knowledge}
       when needed.
-  - framework: roo-code
-    invocation: Use agent-knowledge MCP when configured; otherwise consume context-pack
-      memory excerpts.
-  - framework: cline
-    invocation: Use agent-knowledge MCP when configured; otherwise consume context-pack
-      memory excerpts.
   - framework: local
     invocation: Read/write ${AGENT_KNOWLEDGE_HOME:-~/agent-knowledge} through agent-ops
       fallback helpers.
@@ -49,10 +43,6 @@
   - framework: openclaw
     invocation: Use as the migration operating procedure for clanker-managed document
       import jobs.
-  - framework: roo-code
-    invocation: Include the doc-migration rules in Roo task context.
-  - framework: cline
-    invocation: Include the doc-migration rules in Cline task context.
   - framework: local
     invocation: Read as the local fallback procedure for additive Google Drive document
       migrations.
@@ -76,10 +66,6 @@
     install_hint: agentops skills install claude-code
   - framework: cursor
     invocation: Include selected superpowers instructions in Cursor rules/context.
-  - framework: roo-code
-    invocation: Include selected superpowers instructions in Roo task context.
-  - framework: cline
-    invocation: Include selected superpowers instructions in Cline task context.
   - framework: openclaw
     invocation: Expose as selectable skill bundle for clanker-managed jobs.
   - framework: local
@@ -105,10 +91,6 @@
     install_hint: agentops skills install claude-code
   - framework: cursor
     invocation: Include relevant gstack instructions in Cursor rules/context.
-  - framework: roo-code
-    invocation: Include relevant gstack instructions in Roo task context.
-  - framework: cline
-    invocation: Include relevant gstack instructions in Cline task context.
   - framework: openclaw
     invocation: Expose as clanker-selectable skill bundle.
   - framework: local
@@ -130,10 +112,6 @@
       Claude skill.
   - framework: cursor
     invocation: Include the Steinberger review lens in Cursor context/rules.
-  - framework: roo-code
-    invocation: Include the Steinberger review lens in Roo task context.
-  - framework: cline
-    invocation: Include the Steinberger review lens in Cline task context.
   - framework: openclaw
     invocation: Expose as a clanker-selectable review persona.
   - framework: local
@@ -169,10 +147,6 @@
   - framework: cursor
     invocation: Run repo-provided CI-safe checks before final status.
   - framework: openclaw
-    invocation: Run repo-provided CI-safe checks before final status.
-  - framework: roo-code
-    invocation: Run repo-provided CI-safe checks before final status.
-  - framework: cline
     invocation: Run repo-provided CI-safe checks before final status.
   - framework: local
     invocation: Run repo-provided CI-safe checks before final status.
