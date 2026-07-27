@@ -46,7 +46,10 @@ on:
 
 jobs:
   review:
-    name: Review Gate
+    # Mode-specific check-run name so branch protection can require the thorough
+    # "Review Gate" check-run and a fast advisory run can NEVER satisfy it: fast
+    # surfaces as a distinct "Review Gate (fast advisory)" check-run.
+    name: ${{ inputs.mode == 'fast' && 'Review Gate (fast advisory)' || 'Review Gate' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read

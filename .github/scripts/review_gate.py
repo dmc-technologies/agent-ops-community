@@ -220,27 +220,24 @@ def analyze_workspace(workspace: Path, changed_files: list[str] | None = None) -
     return ReviewResult("preflight", warnings=tuple(warnings), blocking=tuple(blocking))
 
 
-def build_delta_section(delta_from_sha: str | None, carried_findings: tuple[str, ...]) -> str:
-    """Rounds >1 in fast mode: focus on new commits + re-verify prior findings."""
-    if not delta_from_sha:
+def build_carried_section(carried_findings: tuple[str, ...]) -> str:
+    """Delta rounds separately require explicit revalidation of prior findings.
+
+    The diff SCOPE for a delta round is set once (the single `git diff` line in
+    the prompt); this section does not restate a scope, only the carry-forward
+    contract, so the prompt has exactly one authoritative diff scope.
+    """
+    if not carried_findings:
         return ""
     lines = [
-        "## Delta re-review (rounds after the first)",
+        "## Carried findings — revalidate each explicitly",
         "",
-        f"A prior fast round already reviewed everything up to {delta_from_sha}.",
-        "Focus this pass on the commits added since then:",
-        "",
-        f"git diff {delta_from_sha}...HEAD",
-        "",
-        "Report every blocking issue you can still see at the CURRENT head — both",
-        "issues in these new commits and any prior issue that is still present.",
+        "Prior fast rounds reported the findings below. For EACH one, re-check it",
+        "against the current head and state whether it still applies; include it as",
+        "a finding if it is still present, even if it lies outside the delta above.",
     ]
-    if carried_findings:
-        lines.append("")
-        lines.append("Re-verify each prior finding against the current head and include")
-        lines.append("it again if it still applies:")
-        for title in carried_findings:
-            lines.append(f"- {title}")
+    for title in carried_findings:
+        lines.append(f"- {title}")
     return "\n".join(lines) + "\n\n"
 
 
@@ -276,9 +273,17 @@ def build_codex_prompt(
     if mode != "fast":
         delta_from_sha = None
         carried_findings = ()
-    mode_and_delta = build_mode_section(mode) + build_delta_section(
-        delta_from_sha, carried_findings
-    )
+    # Exactly one authoritative diff scope: the delta base on a fast delta round,
+    # otherwise the full base...HEAD. The prompt never names a second scope.
+    diff_scope_ref = delta_from_sha or base_diff_ref
+    scope_note = ""
+    if delta_from_sha:
+        scope_note = (
+            f"\nThis is a delta re-review: prior fast rounds already reviewed up to "
+            f"{delta_from_sha}, so the diff above is exactly the new work since then "
+            f"and is your authoritative review scope for new issues.\n"
+        )
+    mode_and_delta = build_mode_section(mode) + build_carried_section(carried_findings)
     return f"""You are executing the repository PR review gate.
 
 Repository: {repo}
@@ -288,20 +293,21 @@ Base ref: {base_ref}
 
 Use the local checkout as the source of truth. Review the PR diff with:
 
-git diff {base_diff_ref}...HEAD
-
+git diff {diff_scope_ref}...HEAD
+{scope_note}
 Apply this review prompt:
 
 {review_prompt}
 
 {mode_and_delta}## Exhaustiveness (single-pass completeness)
 
-Enumerate EVERY blocking finding present in this diff in this one pass. Do not
-defer, hold, or ration findings for a later review round -- assume there is no
-cheap later round and that omitted issues ship. Before returning:
-- Re-scan the whole diff for additional INSTANCES of every issue class you
-  found. If a defect appears in one place, check whether the same class appears
-  elsewhere in the diff and report all instances.
+Enumerate EVERY blocking finding present in the diff scope shown above in this
+one pass. Do not defer, hold, or ration findings for a later review round --
+assume there is no cheap later round and that omitted issues ship. Before
+returning:
+- Re-scan the changes under review for additional INSTANCES of every issue class
+  you found. If a defect appears in one place, check whether the same class
+  appears elsewhere in that scope and report all instances.
 - Group findings by root-cause class so one architectural fix can retire a whole
   class rather than surfacing one instance at a time across rounds.
 Completeness in this pass is more important than brevity.
@@ -710,21 +716,55 @@ def submit_pr_approval(repo: str, pr_number: int, body: str) -> bool:
     return True
 
 
+def acting_identity() -> tuple[str | None, bool]:
+    """Identity the gate posts as, used to trust its own advisory state.
+
+    Returns (login, bot_only). With a user/PAT token the login resolves and is
+    the trust key. With the GitHub App token (github.token) `gh api user` is not
+    accessible, so bot_only=True means: trust only Bot-authored comments (a PR
+    participant cannot author a comment as a Bot, closing the forge vector).
+    """
+    result = run_command(["gh", "api", "user", "-q", ".login"])
+    login = result.stdout.strip() if result.returncode == 0 else ""
+    if login:
+        return login, False
+    return None, True
+
+
+def trusted_fast_comment(comments: list[dict]) -> dict | None:
+    """The latest advisory comment authored by the gate's own identity, or None.
+
+    Comments carrying the public marker but authored by anyone else are ignored:
+    delta focus and carried findings must never be steerable by PR participants.
+    """
+    login, bot_only = acting_identity()
+    trusted = None
+    for comment in comments:
+        if FAST_COMMENT_MARKER not in comment.get("body", ""):
+            continue
+        user = comment.get("user") or {}
+        if login is not None:
+            if user.get("login") == login:
+                trusted = comment
+        elif bot_only and user.get("type") == "Bot":
+            trusted = comment
+    return trusted
+
+
 def read_fast_advisory_state(repo: str, pr_number: int) -> tuple[str | None, tuple[str, ...]]:
     """Return (last_reviewed_sha, prior_finding_titles) from the fast advisory comment.
 
-    Fast mode reads only its OWN advisory comment so it never depends on, or
-    interferes with, the thorough gate's merge-authority comment surface.
+    Fast mode reads only its OWN advisory comment (authored by the gate identity)
+    so it never depends on, interferes with, or can be steered through the
+    thorough gate's merge-authority comment surface or a forged participant comment.
     """
     comments = run_command(
         ["gh", "api", f"repos/{repo}/issues/{pr_number}/comments", "--paginate"]
     )
     if comments.returncode != 0:
         return None, ()
-    body = ""
-    for comment in json.loads(comments.stdout or "[]"):
-        if FAST_COMMENT_MARKER in comment.get("body", ""):
-            body = comment.get("body", "")
+    trusted = trusted_fast_comment(json.loads(comments.stdout or "[]"))
+    body = trusted.get("body", "") if trusted else ""
     if not body:
         return None, ()
     last_sha = None
@@ -787,11 +827,11 @@ def post_or_update_fast_comment(repo: str, pr_number: int, body: str) -> None:
     )
     if comments.returncode != 0:
         raise RuntimeError(comments.stderr.strip())
-    comment_id = None
-    for comment in json.loads(comments.stdout or "[]"):
-        if FAST_COMMENT_MARKER in comment.get("body", ""):
-            comment_id = comment["id"]
-            break
+    # Only ever edit our OWN advisory comment. If a participant forged the marker,
+    # trusted_fast_comment returns None and we post a fresh gate-owned comment
+    # rather than trying (and failing) to PATCH a comment we do not own.
+    trusted = trusted_fast_comment(json.loads(comments.stdout or "[]"))
+    comment_id = trusted["id"] if trusted else None
     if comment_id:
         result = run_command(
             [
@@ -848,12 +888,19 @@ def run_fast_advisory(
         delta_from_sha=delta_from_sha,
         carried_findings=carried,
     )
-    if preflight.blocking:
+    # Deterministic preflight blockers (committed secrets, merge-conflict markers)
+    # are always major in fast mode. Normalize their severity to P0 so the P0/P1
+    # filter surfaces them and the advisory status reflects them; a fast pass must
+    # never report "no major findings" while a secret or conflict marker is staged.
+    promoted_blocking = tuple(
+        Finding("P0", f.code, f.title, f.detail, f.files) for f in preflight.blocking
+    )
+    if promoted_blocking or preflight.warnings:
         result = ReviewResult(
             result.backend,
             summary=result.summary,
-            warnings=(*preflight.blocking, *preflight.warnings, *result.warnings),
-            blocking=result.blocking,
+            warnings=(*preflight.warnings, *result.warnings),
+            blocking=(*promoted_blocking, *result.blocking),
             raw_review=result.raw_review,
         )
     major = [
