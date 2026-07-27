@@ -28,6 +28,16 @@ on:
         required: false
         type: string
         default: ""
+      mode:
+        description: "Review mode: thorough (merge-authority full-diff gate) or fast (non-blocking advisory)"
+        required: false
+        type: string
+        default: "thorough"
+      fast_codex_model:
+        description: "Optional cheaper/faster Codex model for fast advisory mode only"
+        required: false
+        type: string
+        default: ""
     secrets:
       OPENAI_API_KEY:
         required: true
@@ -123,13 +133,17 @@ jobs:
           GH_TOKEN: ${{ secrets.REVIEW_GATE_APPROVAL_TOKEN || github.token }}
           REVIEW_GATE_BASE_REF: ${{ inputs.base_ref }}
           REVIEW_GATE_CODEX_MODEL: ${{ inputs.codex_model }}
+          REVIEW_GATE_FAST_CODEX_MODEL: ${{ inputs.fast_codex_model }}
         run: |
           RUN_URL="${{ github.server_url }}/${{ inputs.repo }}/actions/runs/${{ github.run_id }}"
+          # Thorough mode submits the approving review (merge authority). Fast mode
+          # ignores --submit-approval entirely: it is advisory and never approves.
           python review-gate-main/.github/scripts/review_gate.py \
             --pr "${{ inputs.pr_number }}" \
             --repo "${{ inputs.repo }}" \
             --workspace pr-workspace \
             --sha "${{ inputs.head_sha }}" \
+            --mode "${{ inputs.mode }}" \
             --post-status \
             --post-comment \
             --submit-approval \

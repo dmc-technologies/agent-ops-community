@@ -324,3 +324,172 @@ def test_analyze_workspace_blocks_conflict_markers(tmp_path: Path) -> None:
 
     assert not result.passed
     assert result.blocking[0].code == "MERGE_CONFLICT_MARKERS"
+
+
+def test_fast_prompt_focuses_on_major_and_carries_delta_findings() -> None:
+    review_gate = load_review_gate()
+
+    fast = review_gate.build_codex_prompt(
+        "Review strictly.",
+        repo="example-org/example",
+        pr_number=7,
+        sha="newsha",
+        base_ref="main",
+        base_diff_ref="refs/remotes/review-gate-base/main",
+        mode="fast",
+        delta_from_sha="oldsha1",
+        carried_findings=("Fix the unsafe workflow",),
+    )
+    assert "Fast advisory mode" in fast
+    assert "P0/P1" in fast
+    assert "git diff oldsha1...HEAD" in fast
+    assert "Fix the unsafe workflow" in fast
+
+    # Thorough mode ignores delta entirely: always the full base...HEAD diff.
+    thorough = review_gate.build_codex_prompt(
+        "Review strictly.",
+        repo="example-org/example",
+        pr_number=7,
+        sha="newsha",
+        base_ref="main",
+        base_diff_ref="refs/remotes/review-gate-base/main",
+        mode="thorough",
+        delta_from_sha="oldsha1",
+        carried_findings=("Fix the unsafe workflow",),
+    )
+    assert "Fast advisory mode" not in thorough
+    assert "git diff oldsha1...HEAD" not in thorough
+    assert "git diff refs/remotes/review-gate-base/main...HEAD" in thorough
+
+
+def test_fast_mode_prefers_fast_model_then_falls_back(monkeypatch) -> None:
+    review_gate = load_review_gate()
+    monkeypatch.setenv("REVIEW_GATE_CODEX_MODEL", "thorough-model")
+    monkeypatch.setenv("REVIEW_GATE_FAST_CODEX_MODEL", "fast-model")
+    assert review_gate.codex_model_args("fast") == ["--model", "fast-model"]
+    assert review_gate.codex_model_args("thorough") == ["--model", "thorough-model"]
+
+    monkeypatch.delenv("REVIEW_GATE_FAST_CODEX_MODEL")
+    # Fast falls back to the thorough model when no fast tier is configured.
+    assert review_gate.codex_model_args("fast") == ["--model", "thorough-model"]
+
+
+def test_build_fast_comment_is_advisory_and_embeds_last_sha() -> None:
+    review_gate = load_review_gate()
+    Finding = review_gate.Finding
+    result = review_gate.ReviewResult(
+        "codex",
+        summary="Quick pass.",
+        blocking=(Finding("P1", "CODEX_P1_1", "Major bug", "Details.", (".github/x.py",)),),
+        warnings=(Finding("P2", "CODEX_P2_1", "Minor nit", "Nit.", ()),),
+    )
+
+    comment = review_gate.build_fast_comment(
+        result, sha="abc1234def", run_url="https://run", pr_number=7, delta_from_sha="old1234def"
+    )
+
+    assert review_gate.FAST_COMMENT_MARKER in comment
+    assert review_gate.COMMENT_MARKER not in comment  # never the merge-gate marker
+    assert f"{review_gate.LAST_SHA_MARKER_PREFIX}abc1234def" in comment
+    assert "Advisory only" in comment
+    assert "does not approve" in comment
+    assert "Major bug" in comment  # P1 surfaced
+    assert "Minor nit" not in comment  # P2 suppressed in fast pass
+    assert "Delta re-review since:** `old1234d`" in comment
+
+
+def test_read_fast_advisory_state_parses_marker_and_titles(monkeypatch) -> None:
+    review_gate = load_review_gate()
+    body = (
+        f"{review_gate.FAST_COMMENT_MARKER}\n"
+        f"{review_gate.LAST_SHA_MARKER_PREFIX}deadbeef1234 -->\n"
+        "## Major findings (P0/P1)\n"
+        "- **P1**: Confine the manifest paths\n"
+        "- **P0**: Fail closed on lineage\n"
+    )
+
+    def fake_run_command(args, cwd=None, env=None, input_text=None):
+        if args[:3] == ["gh", "api", "repos/example-org/example/issues/7/comments"]:
+            payload = json.dumps([{"id": 1, "body": "human note"}, {"id": 2, "body": body}])
+            return subprocess.CompletedProcess(args, 0, stdout=payload, stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout="[]", stderr="")
+
+    monkeypatch.setattr(review_gate, "run_command", fake_run_command)
+    last_sha, titles = review_gate.read_fast_advisory_state("example-org/example", 7)
+    assert last_sha == "deadbeef1234"
+    assert titles == ("Confine the manifest paths", "Fail closed on lineage")
+
+
+def test_run_fast_advisory_never_approves_uses_fast_context(monkeypatch, tmp_path) -> None:
+    review_gate = load_review_gate()
+    (tmp_path / "module.py").write_text("print('clean')\n")
+    calls = []
+
+    def fake_run_command(args, cwd=None, env=None, input_text=None):
+        calls.append(args)
+        if args[:4] == ["gh", "pr", "diff", "7"] or args[:3] == ["gh", "pr", "diff"]:
+            return subprocess.CompletedProcess(args, 0, stdout="module.py\n", stderr="")
+        if args[:3] == ["gh", "api"] and args[3].endswith("/issues/7/comments"):
+            return subprocess.CompletedProcess(args, 0, stdout="[]", stderr="")
+        if args[:2] == ["codex", "exec"]:
+            out = Path(args[args.index("--output-last-message") + 1])
+            out.write_text(
+                '{"verdict":"request_changes","summary":"quick",'
+                '"findings":[{"severity":"P1","title":"Major","body":"b","files":[]},'
+                '{"severity":"P2","title":"Nit","body":"n","files":[]}]}'
+            )
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(review_gate, "run_command", fake_run_command)
+
+    args = review_gate.argparse.Namespace(
+        pr=7,
+        repo="example-org/example",
+        sha="abc123",
+        base_ref="main",
+        post_status=True,
+        post_comment=True,
+        run_url="https://run",
+    )
+
+    import pytest
+
+    with pytest.raises(SystemExit) as exc:
+        review_gate.run_fast_advisory(args, "Review strictly.", workspace=tmp_path)
+    assert exc.value.code == 0
+
+    # Never submits an approving review.
+    assert not any("/reviews" in a for call in calls for a in call if isinstance(a, str))
+    # Posts only the distinct fast advisory status context, never "Review Gate".
+    status_calls = [c for c in calls if any("/statuses/" in str(a) for a in c)]
+    assert status_calls, "expected a commit status post"
+    status_args = [a for c in status_calls for a in c]
+    # Uses the distinct fast context as an exact arg; never the thorough context.
+    assert f"context={review_gate.STATUS_CONTEXT_FAST}" in status_args
+    assert f"context={review_gate.STATUS_CONTEXT_THOROUGH}" not in status_args
+
+
+def test_post_commit_status_defaults_to_thorough_context(monkeypatch) -> None:
+    review_gate = load_review_gate()
+    calls = []
+
+    def fake_run_command(args, cwd=None, env=None, input_text=None):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(review_gate, "run_command", fake_run_command)
+    review_gate.post_commit_status("example-org/example", "abc", "success", "ok")
+    joined = " ".join(calls[0])
+    assert f"context={review_gate.STATUS_CONTEXT_THOROUGH}" in joined
+
+
+def test_reusable_workflow_supports_mode_and_fast_model() -> None:
+    reusable = REUSABLE_WORKFLOW_PATH.read_text()
+    assert "mode:" in reusable
+    assert 'default: "thorough"' in reusable
+    assert "fast_codex_model:" in reusable
+    assert '--mode "${{ inputs.mode }}"' in reusable
+    assert "REVIEW_GATE_FAST_CODEX_MODEL: ${{ inputs.fast_codex_model }}" in reusable
+    # Thorough remains the default merge-authority path with approval intact.
+    assert "--submit-approval" in reusable

@@ -15,6 +15,16 @@ from pathlib import Path
 
 COMMENT_MARKER = "<!-- review-gate-agent-review -->"
 FINDING_MARKER_PREFIX = "<!-- review-gate-finding:"
+# Fast mode is a NON-MERGE-AUTHORITY advisory lane. It uses its own comment
+# marker and status context so it can never touch, overwrite, or approve the
+# thorough gate's merge-authority surface (the COMMENT_MARKER summary, the
+# per-finding FINDING_MARKER comments, the "Review Gate" status, and the
+# approving PR review).
+FAST_COMMENT_MARKER = "<!-- review-gate-fast-advisory -->"
+LAST_SHA_MARKER_PREFIX = "<!-- review-gate-fast-last-sha:"
+STATUS_CONTEXT_THOROUGH = "Review Gate"
+STATUS_CONTEXT_FAST = "Review Gate (fast advisory)"
+FAST_ADVISORY_SEVERITIES = {"P0", "P1"}
 DEFAULT_REVIEW_PROMPT = """# Review Gate Prompt
 
 Review this PR for necessity, company-policy alignment, architecture, AI safety,
@@ -88,6 +98,7 @@ def codex_child_env() -> dict[str, str]:
         "HOME",
         "PATH",
         "REVIEW_GATE_CODEX_MODEL",
+        "REVIEW_GATE_FAST_CODEX_MODEL",
         "TEMP",
         "TMPDIR",
         "USER",
@@ -95,8 +106,17 @@ def codex_child_env() -> dict[str, str]:
     return {key: value for key, value in os.environ.items() if key in allowed}
 
 
-def codex_model_args() -> list[str]:
-    model = os.environ.get("REVIEW_GATE_CODEX_MODEL", "").strip()
+def resolve_codex_model(mode: str = "thorough") -> str:
+    """Fast mode may use a cheaper/faster tier; falls back to the thorough model."""
+    if mode == "fast":
+        fast = os.environ.get("REVIEW_GATE_FAST_CODEX_MODEL", "").strip()
+        if fast:
+            return fast
+    return os.environ.get("REVIEW_GATE_CODEX_MODEL", "").strip()
+
+
+def codex_model_args(mode: str = "thorough") -> list[str]:
+    model = resolve_codex_model(mode)
     if not model:
         return []
     return ["--model", model]
@@ -200,6 +220,45 @@ def analyze_workspace(workspace: Path, changed_files: list[str] | None = None) -
     return ReviewResult("preflight", warnings=tuple(warnings), blocking=tuple(blocking))
 
 
+def build_delta_section(delta_from_sha: str | None, carried_findings: tuple[str, ...]) -> str:
+    """Rounds >1 in fast mode: focus on new commits + re-verify prior findings."""
+    if not delta_from_sha:
+        return ""
+    lines = [
+        "## Delta re-review (rounds after the first)",
+        "",
+        f"A prior fast round already reviewed everything up to {delta_from_sha}.",
+        "Focus this pass on the commits added since then:",
+        "",
+        f"git diff {delta_from_sha}...HEAD",
+        "",
+        "Report every blocking issue you can still see at the CURRENT head — both",
+        "issues in these new commits and any prior issue that is still present.",
+    ]
+    if carried_findings:
+        lines.append("")
+        lines.append("Re-verify each prior finding against the current head and include")
+        lines.append("it again if it still applies:")
+        for title in carried_findings:
+            lines.append(f"- {title}")
+    return "\n".join(lines) + "\n\n"
+
+
+def build_mode_section(mode: str) -> str:
+    if mode == "fast":
+        return (
+            "## Fast advisory mode\n\n"
+            "This is a fast, ADVISORY pass to give the author a quick directional\n"
+            "signal during iteration. It is not the merge gate. Report only the\n"
+            "highest-severity, clearly-blocking issues (P0/P1): correctness bugs,\n"
+            "broken contracts, security regressions, and fabricated or untraceable\n"
+            "engineering values. Skip P2/P3 stylistic or hardening notes in this\n"
+            "pass -- the thorough gate covers those. Prefer a few high-confidence\n"
+            "findings over exhaustive breadth.\n\n"
+        )
+    return ""
+
+
 def build_codex_prompt(
     review_prompt: str,
     *,
@@ -208,7 +267,18 @@ def build_codex_prompt(
     sha: str,
     base_ref: str,
     base_diff_ref: str,
+    mode: str = "thorough",
+    delta_from_sha: str | None = None,
+    carried_findings: tuple[str, ...] = (),
 ) -> str:
+    # Thorough mode always reviews the complete base...HEAD diff. Delta focus is
+    # a fast-mode-only optimization; the thorough merge gate never narrows scope.
+    if mode != "fast":
+        delta_from_sha = None
+        carried_findings = ()
+    mode_and_delta = build_mode_section(mode) + build_delta_section(
+        delta_from_sha, carried_findings
+    )
     return f"""You are executing the repository PR review gate.
 
 Repository: {repo}
@@ -224,7 +294,7 @@ Apply this review prompt:
 
 {review_prompt}
 
-## Exhaustiveness (single-pass completeness)
+{mode_and_delta}## Exhaustiveness (single-pass completeness)
 
 Enumerate EVERY blocking finding present in this diff in this one pass. Do not
 defer, hold, or ration findings for a later review round -- assume there is no
@@ -309,6 +379,9 @@ def run_codex_review(
     pr_number: int,
     sha: str,
     base_ref: str,
+    mode: str = "thorough",
+    delta_from_sha: str | None = None,
+    carried_findings: tuple[str, ...] = (),
 ) -> ReviewResult:
     base_diff_ref = ensure_base_ref(workspace, repo, base_ref)
     output_path = workspace / ".review-gate-codex-output.json"
@@ -319,6 +392,9 @@ def run_codex_review(
         sha=sha,
         base_ref=base_ref,
         base_diff_ref=base_diff_ref,
+        mode=mode,
+        delta_from_sha=delta_from_sha,
+        carried_findings=carried_findings,
     )
     result = run_command(
         [
@@ -331,7 +407,7 @@ def run_codex_review(
             "danger-full-access",
             "--output-last-message",
             str(output_path),
-            *codex_model_args(),
+            *codex_model_args(mode),
         ],
         cwd=workspace,
         env=codex_child_env(),
@@ -458,6 +534,7 @@ def post_commit_status(
     state: str,
     description: str,
     target_url: str = "",
+    context: str = STATUS_CONTEXT_THOROUGH,
 ) -> None:
     if not sha:
         return
@@ -470,7 +547,7 @@ def post_commit_status(
         "-f",
         f"state={state}",
         "-f",
-        "context=Review Gate",
+        f"context={context}",
         "-f",
         f"description={description[:140]}",
     ]
@@ -633,6 +710,187 @@ def submit_pr_approval(repo: str, pr_number: int, body: str) -> bool:
     return True
 
 
+def read_fast_advisory_state(repo: str, pr_number: int) -> tuple[str | None, tuple[str, ...]]:
+    """Return (last_reviewed_sha, prior_finding_titles) from the fast advisory comment.
+
+    Fast mode reads only its OWN advisory comment so it never depends on, or
+    interferes with, the thorough gate's merge-authority comment surface.
+    """
+    comments = run_command(
+        ["gh", "api", f"repos/{repo}/issues/{pr_number}/comments", "--paginate"]
+    )
+    if comments.returncode != 0:
+        return None, ()
+    body = ""
+    for comment in json.loads(comments.stdout or "[]"):
+        if FAST_COMMENT_MARKER in comment.get("body", ""):
+            body = comment.get("body", "")
+    if not body:
+        return None, ()
+    last_sha = None
+    match = re.search(re.escape(LAST_SHA_MARKER_PREFIX) + r"([0-9a-f]{7,40})", body)
+    if match:
+        last_sha = match.group(1)
+    titles = tuple(
+        line.split("**:", 1)[1].strip()
+        for line in body.splitlines()
+        if line.strip().startswith("- **P") and "**:" in line
+    )
+    return last_sha, titles
+
+
+def build_fast_comment(
+    result: ReviewResult,
+    *,
+    sha: str,
+    run_url: str,
+    pr_number: int,
+    delta_from_sha: str | None,
+) -> str:
+    all_findings = (*result.blocking, *result.warnings)
+    major = [f for f in all_findings if f.severity in FAST_ADVISORY_SEVERITIES]
+    lines = [
+        FAST_COMMENT_MARKER,
+        f"{LAST_SHA_MARKER_PREFIX}{sha} -->",
+        "# Review Gate — fast advisory",
+        "",
+        "**Advisory only.** This is a fast, non-blocking pass to speed iteration. "
+        "It does not approve, does not block merge, and is not merge evidence. The "
+        "thorough `Review Gate` review remains required to merge.",
+        f"**PR:** #{pr_number}",
+    ]
+    if sha:
+        lines.append(f"**Head SHA:** `{sha[:8]}`")
+    if delta_from_sha:
+        lines.append(f"**Delta re-review since:** `{delta_from_sha[:8]}`")
+    if run_url:
+        lines.append(f"**Run:** {run_url}")
+    lines.append("")
+    if result.summary:
+        lines.extend(["## Summary", result.summary, ""])
+    lines.append("## Major findings (P0/P1)")
+    if not major:
+        lines.append("- None flagged in this fast pass. Run the thorough gate before merge.")
+    else:
+        for finding in major:
+            lines.append(f"- **{finding.severity}**: {finding.title}")
+            if finding.detail:
+                lines.append(f"  - {finding.detail}")
+            if finding.files:
+                lines.append(f"  - Files: {', '.join(finding.files)}")
+    return "\n".join(lines)
+
+
+def post_or_update_fast_comment(repo: str, pr_number: int, body: str) -> None:
+    comments = run_command(
+        ["gh", "api", f"repos/{repo}/issues/{pr_number}/comments", "--paginate"]
+    )
+    if comments.returncode != 0:
+        raise RuntimeError(comments.stderr.strip())
+    comment_id = None
+    for comment in json.loads(comments.stdout or "[]"):
+        if FAST_COMMENT_MARKER in comment.get("body", ""):
+            comment_id = comment["id"]
+            break
+    if comment_id:
+        result = run_command(
+            [
+                "gh",
+                "api",
+                f"repos/{repo}/issues/comments/{comment_id}",
+                "--method",
+                "PATCH",
+                "-f",
+                f"body={body}",
+            ]
+        )
+    else:
+        result = run_command(
+            [
+                "gh",
+                "api",
+                f"repos/{repo}/issues/{pr_number}/comments",
+                "--method",
+                "POST",
+                "-f",
+                f"body={body}",
+            ]
+        )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip())
+
+
+def run_fast_advisory(
+    args: argparse.Namespace,
+    review_prompt: str,
+    *,
+    workspace: Path,
+) -> None:
+    """Fast, advisory, non-merge-authority pass. Never approves, never blocks."""
+    preflight = analyze_workspace(workspace, changed_files_for_pr(args.repo, args.pr))
+    delta_from_sha, carried = read_fast_advisory_state(args.repo, args.pr)
+    # Only treat the stored SHA as a delta base when it is a real, different
+    # ancestor of the current head; otherwise fall back to a full review.
+    if delta_from_sha:
+        ancestor = run_command(
+            ["git", "merge-base", "--is-ancestor", delta_from_sha, "HEAD"], cwd=workspace
+        )
+        if delta_from_sha == args.sha or ancestor.returncode != 0:
+            delta_from_sha, carried = None, ()
+    result = run_codex_review(
+        workspace,
+        review_prompt,
+        repo=args.repo,
+        pr_number=args.pr,
+        sha=args.sha,
+        base_ref=args.base_ref,
+        mode="fast",
+        delta_from_sha=delta_from_sha,
+        carried_findings=carried,
+    )
+    if preflight.blocking:
+        result = ReviewResult(
+            result.backend,
+            summary=result.summary,
+            warnings=(*preflight.blocking, *preflight.warnings, *result.warnings),
+            blocking=result.blocking,
+            raw_review=result.raw_review,
+        )
+    major = [
+        f for f in (*result.blocking, *result.warnings) if f.severity in FAST_ADVISORY_SEVERITIES
+    ]
+    print(f"Fast advisory review complete: {len(major)} major (P0/P1) finding(s).")
+    if args.post_comment:
+        post_or_update_fast_comment(
+            args.repo,
+            args.pr,
+            build_fast_comment(
+                result,
+                sha=args.sha,
+                run_url=args.run_url,
+                pr_number=args.pr,
+                delta_from_sha=delta_from_sha,
+            ),
+        )
+    if args.post_status:
+        # Distinct, NON-required context. Never touches the "Review Gate" context
+        # the merge gate owns. state=failure only signals P0/P1 to the author; a
+        # non-required context cannot block merge.
+        post_commit_status(
+            args.repo,
+            args.sha,
+            "failure" if major else "success",
+            f"Fast advisory: {len(major)} major finding(s) - not a merge gate"
+            if major
+            else "Fast advisory: no major findings - run thorough gate before merge",
+            args.run_url,
+            context=STATUS_CONTEXT_FAST,
+        )
+    # Advisory lane always exits 0: it must never fail the workflow in a way that
+    # could read as a merge blocker.
+    sys.exit(0)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--pr", type=int, required=True)
@@ -644,9 +902,23 @@ def main() -> None:
     parser.add_argument("--submit-approval", action="store_true")
     parser.add_argument("--run-url", default="")
     parser.add_argument("--base-ref", default=os.environ.get("REVIEW_GATE_BASE_REF", "main"))
+    parser.add_argument(
+        "--mode",
+        choices=("thorough", "fast"),
+        default=os.environ.get("REVIEW_GATE_MODE", "thorough"),
+        help="thorough = merge-authority full-diff review (default); "
+        "fast = non-blocking advisory pass (delta re-review, P0/P1 only).",
+    )
     args = parser.parse_args()
 
     review_prompt = os.environ.get("REVIEW_GATE_PROMPT", "").strip() or DEFAULT_REVIEW_PROMPT
+
+    if args.mode == "fast":
+        # Advisory lane: separate comment marker + status context, no approval,
+        # always exits 0. Cannot touch the thorough merge-authority surface.
+        run_fast_advisory(args, review_prompt, workspace=Path(args.workspace).resolve())
+        return
+
     preflight = analyze_workspace(
         Path(args.workspace).resolve(),
         changed_files_for_pr(args.repo, args.pr),
