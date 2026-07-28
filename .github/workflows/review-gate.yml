@@ -15,7 +15,6 @@ on:
         type: choice
         options:
           - agent-review
-          - fast
 
 jobs:
   agent-review-label:
@@ -39,35 +38,6 @@ jobs:
       head_sha: ${{ github.event.pull_request.head.sha }}
       base_ref: ${{ github.event.pull_request.base.ref }}
       codex_model: ${{ vars.REVIEW_GATE_CODEX_MODEL || '' }}
-    secrets: inherit
-
-  # Fast advisory lane: opt-in via the "ai review fast" label. Non-merge-authority
-  # (distinct check-run + status, no approval); the thorough job above stays the
-  # only merge gate. Runs alongside thorough, never in place of it.
-  fast-advisory-label:
-    name: Review Gate (fast advisory)
-    if: >-
-      github.event_name == 'pull_request' &&
-      (
-        (github.event.action == 'labeled' && github.event.label.name == 'ai review fast') ||
-        (github.event.action != 'labeled' &&
-          contains(github.event.pull_request.labels.*.name, 'ai review fast'))
-      )
-    permissions:
-      contents: read
-      issues: write
-      pull-requests: write
-      statuses: write
-    uses: dmc-technologies/agent-ops-community/.github/workflows/review-gate-reusable.yml@main
-    with:
-      pr_number: ${{ github.event.pull_request.number }}
-      repo: ${{ github.repository }}
-      head_repo: ${{ github.event.pull_request.head.repo.full_name }}
-      head_sha: ${{ github.event.pull_request.head.sha }}
-      base_ref: ${{ github.event.pull_request.base.ref }}
-      codex_model: ${{ vars.REVIEW_GATE_CODEX_MODEL || '' }}
-      mode: fast
-      fast_codex_model: ${{ vars.REVIEW_GATE_FAST_CODEX_MODEL || '' }}
     secrets: inherit
 
   resolve-dispatch-pr:
@@ -114,6 +84,4 @@ jobs:
       head_sha: ${{ needs.resolve-dispatch-pr.outputs.head_sha }}
       base_ref: ${{ needs.resolve-dispatch-pr.outputs.base_ref }}
       codex_model: ${{ vars.REVIEW_GATE_CODEX_MODEL || '' }}
-      mode: ${{ github.event.inputs.mode == 'fast' && 'fast' || 'thorough' }}
-      fast_codex_model: ${{ vars.REVIEW_GATE_FAST_CODEX_MODEL || '' }}
     secrets: inherit
