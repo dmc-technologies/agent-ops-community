@@ -57,7 +57,11 @@ jobs:
       pull-requests: write
       statuses: write
     concurrency:
-      group: review-gate-${{ inputs.repo }}-${{ inputs.pr_number }}-${{ inputs.head_sha }}
+      # Key by repo/PR/MODE (not head SHA): a newer revision cancels the older
+      # run of the SAME mode (no stale advisory-state overwrites, no wasted
+      # runs), while fast and thorough are isolated so an advisory fast run can
+      # never cancel the required thorough merge gate.
+      group: review-gate-${{ inputs.repo }}-${{ inputs.pr_number }}-${{ inputs.mode }}
       cancel-in-progress: true
 
     steps:

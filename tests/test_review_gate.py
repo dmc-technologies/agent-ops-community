@@ -32,7 +32,7 @@ def test_ai_review_label_triggers_review_and_approval() -> None:
         "review-gate-reusable.yml@main"
     )
     concurrency_group = (
-        "review-gate-${{ inputs.repo }}-${{ inputs.pr_number }}-${{ inputs.head_sha }}"
+        "review-gate-${{ inputs.repo }}-${{ inputs.pr_number }}-${{ inputs.mode }}"
     )
 
     assert "types: [opened, synchronize, reopened, labeled]" in workflow
@@ -433,6 +433,40 @@ def test_read_fast_advisory_state_parses_marker_and_titles(monkeypatch) -> None:
     last_sha, titles = review_gate.read_fast_advisory_state("example-org/example", 7)
     assert last_sha == "deadbeef1234"
     assert titles == ("Confine the manifest paths", "Fail closed on lineage")
+
+
+def test_fetch_issue_comments_flattens_multiple_pages(monkeypatch) -> None:
+    """gh --paginate --slurp yields an array-of-pages; it must be flattened."""
+    review_gate = load_review_gate()
+
+    def fake_run_command(args, cwd=None, env=None, input_text=None):
+        assert "--slurp" in args and "--paginate" in args
+        pages = [
+            [{"id": 1, "body": "a"}, {"id": 2, "body": "b"}],
+            [{"id": 3, "body": "c"}],
+        ]
+        return subprocess.CompletedProcess(args, 0, stdout=json.dumps(pages), stderr="")
+
+    monkeypatch.setattr(review_gate, "run_command", fake_run_command)
+    comments = review_gate.fetch_issue_comments("example-org/example", 7)
+    assert [c["id"] for c in comments] == [1, 2, 3]
+
+
+def test_trusted_fast_comment_requires_exact_login_under_app_token(monkeypatch) -> None:
+    """Under github.token, only the exact expected bot login is trusted."""
+    review_gate = load_review_gate()
+    monkeypatch.setenv("REVIEW_GATE_BOT_LOGIN", "github-actions[bot]")
+
+    def fake_run_command(args, cwd=None, env=None, input_text=None):
+        # App token: user endpoint not accessible.
+        return subprocess.CompletedProcess(args, 1, stdout="", stderr="not accessible")
+
+    monkeypatch.setattr(review_gate, "run_command", fake_run_command)
+    marker = review_gate.FAST_COMMENT_MARKER
+    other_bot = {"id": 1, "body": marker, "user": {"login": "dependabot[bot]", "type": "Bot"}}
+    ours = {"id": 2, "body": marker, "user": {"login": "github-actions[bot]", "type": "Bot"}}
+    assert review_gate.trusted_fast_comment([other_bot]) is None  # different bot rejected
+    assert review_gate.trusted_fast_comment([other_bot, ours])["id"] == 2
 
 
 def test_fast_advisory_state_ignores_forged_participant_comment(monkeypatch) -> None:

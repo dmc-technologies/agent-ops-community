@@ -564,16 +564,31 @@ def post_commit_status(
         raise RuntimeError(result.stderr.strip())
 
 
-def post_or_update_pr_comment(repo: str, pr_number: int, body: str) -> None:
-    comments = run_command(
-        ["gh", "api", f"repos/{repo}/issues/{pr_number}/comments", "--paginate"]
-    )
-    if comments.returncode != 0:
-        raise RuntimeError(comments.stderr.strip())
-    import json
+def fetch_issue_comments(repo: str, pr_number: int) -> list[dict]:
+    """All issue comments as one flat list, correct across pagination.
 
+    `gh api --paginate` emits one JSON array PER PAGE; `--slurp` wraps those pages
+    into an outer array. We flatten one level so multi-page PRs don't crash
+    json.loads on concatenated arrays (and a single flat page still works).
+    """
+    result = run_command(
+        ["gh", "api", f"repos/{repo}/issues/{pr_number}/comments", "--paginate", "--slurp"]
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip())
+    data = json.loads(result.stdout or "[]")
+    comments: list[dict] = []
+    for item in data:
+        if isinstance(item, list):
+            comments.extend(item)
+        elif isinstance(item, dict):
+            comments.append(item)
+    return comments
+
+
+def post_or_update_pr_comment(repo: str, pr_number: int, body: str) -> None:
     comment_id = None
-    for comment in json.loads(comments.stdout or "[]"):
+    for comment in fetch_issue_comments(repo, pr_number):
         if COMMENT_MARKER in comment.get("body", ""):
             comment_id = comment["id"]
             break
@@ -636,12 +651,7 @@ def post_finding_comments(
     run_url: str,
 ) -> None:
     findings = (*result.blocking, *result.warnings)
-    comments = run_command(
-        ["gh", "api", f"repos/{repo}/issues/{pr_number}/comments", "--paginate"]
-    )
-    if comments.returncode != 0:
-        raise RuntimeError(comments.stderr.strip())
-    existing = json.loads(comments.stdout or "[]")
+    existing = fetch_issue_comments(repo, pr_number)
     by_marker = {
         comment.get("body", "").split("-->", 1)[0] + "-->": comment["id"]
         for comment in existing
@@ -716,37 +726,40 @@ def submit_pr_approval(repo: str, pr_number: int, body: str) -> bool:
     return True
 
 
-def acting_identity() -> tuple[str | None, bool]:
-    """Identity the gate posts as, used to trust its own advisory state.
+def expected_advisory_login() -> str | None:
+    """The EXACT author login the gate's own advisory comments must carry.
 
-    Returns (login, bot_only). With a user/PAT token the login resolves and is
-    the trust key. With the GitHub App token (github.token) `gh api user` is not
-    accessible, so bot_only=True means: trust only Bot-authored comments (a PR
-    participant cannot author a comment as a Bot, closing the forge vector).
+    With a user/PAT token `gh api user` resolves the login directly. Under the
+    GitHub App token (github.token) that endpoint is not accessible, so we use the
+    configured expected bot login (default the Actions app, `github-actions[bot]`)
+    -- an exact identity, never "any Bot". Returns None when no identity can be
+    established, so callers fail closed to a full review.
     """
     result = run_command(["gh", "api", "user", "-q", ".login"])
     login = result.stdout.strip() if result.returncode == 0 else ""
     if login:
-        return login, False
-    return None, True
+        return login
+    configured = os.environ.get("REVIEW_GATE_BOT_LOGIN", "github-actions[bot]").strip()
+    return configured or None
 
 
 def trusted_fast_comment(comments: list[dict]) -> dict | None:
-    """The latest advisory comment authored by the gate's own identity, or None.
+    """The latest advisory comment authored by the gate's EXACT identity, or None.
 
-    Comments carrying the public marker but authored by anyone else are ignored:
-    delta focus and carried findings must never be steerable by PR participants.
+    Comments carrying the public marker but authored by any other login (another
+    human, another app/bot) are ignored: delta focus and carried findings must
+    never be steerable by anyone but the gate. Unknown identity -> None (full
+    review), the fail-closed default.
     """
-    login, bot_only = acting_identity()
+    expected = expected_advisory_login()
+    if expected is None:
+        return None
     trusted = None
     for comment in comments:
         if FAST_COMMENT_MARKER not in comment.get("body", ""):
             continue
         user = comment.get("user") or {}
-        if login is not None:
-            if user.get("login") == login:
-                trusted = comment
-        elif bot_only and user.get("type") == "Bot":
+        if user.get("login") == expected:
             trusted = comment
     return trusted
 
@@ -758,12 +771,11 @@ def read_fast_advisory_state(repo: str, pr_number: int) -> tuple[str | None, tup
     so it never depends on, interferes with, or can be steered through the
     thorough gate's merge-authority comment surface or a forged participant comment.
     """
-    comments = run_command(
-        ["gh", "api", f"repos/{repo}/issues/{pr_number}/comments", "--paginate"]
-    )
-    if comments.returncode != 0:
+    try:
+        comments = fetch_issue_comments(repo, pr_number)
+    except RuntimeError:
         return None, ()
-    trusted = trusted_fast_comment(json.loads(comments.stdout or "[]"))
+    trusted = trusted_fast_comment(comments)
     body = trusted.get("body", "") if trusted else ""
     if not body:
         return None, ()
@@ -822,15 +834,10 @@ def build_fast_comment(
 
 
 def post_or_update_fast_comment(repo: str, pr_number: int, body: str) -> None:
-    comments = run_command(
-        ["gh", "api", f"repos/{repo}/issues/{pr_number}/comments", "--paginate"]
-    )
-    if comments.returncode != 0:
-        raise RuntimeError(comments.stderr.strip())
     # Only ever edit our OWN advisory comment. If a participant forged the marker,
     # trusted_fast_comment returns None and we post a fresh gate-owned comment
     # rather than trying (and failing) to PATCH a comment we do not own.
-    trusted = trusted_fast_comment(json.loads(comments.stdout or "[]"))
+    trusted = trusted_fast_comment(fetch_issue_comments(repo, pr_number))
     comment_id = trusted["id"] if trusted else None
     if comment_id:
         result = run_command(
