@@ -378,7 +378,8 @@ def test_fast_mode_prefers_fast_model_then_falls_back(monkeypatch) -> None:
     assert review_gate.codex_model_args("fast") == ["--model", "thorough-model"]
 
 
-def test_build_fast_comment_is_advisory_and_embeds_last_sha() -> None:
+def test_build_fast_comment_is_advisory_and_signs_state(monkeypatch) -> None:
+    monkeypatch.setenv("REVIEW_GATE_STATE_KEY", "test-secret")
     review_gate = load_review_gate()
     Finding = review_gate.Finding
     result = review_gate.ReviewResult(
@@ -395,24 +396,66 @@ def test_build_fast_comment_is_advisory_and_embeds_last_sha() -> None:
         pr_number=7,
         delta_from_sha="old1234def",
         checkpoint_sha="abc1234def",
+        carried_forward=("Major bug",),
     )
 
     assert review_gate.FAST_COMMENT_MARKER in comment
     assert review_gate.COMMENT_MARKER not in comment  # never the merge-gate marker
-    assert f"{review_gate.LAST_SHA_MARKER_PREFIX}abc1234def" in comment
+    assert review_gate.STATE_MARKER_PREFIX in comment
+    # The signed token round-trips to the checkpoint sha + carry-forward list.
+    token = comment.split(review_gate.STATE_MARKER_PREFIX, 1)[1].split(" -->", 1)[0].strip()
+    assert review_gate.verify_fast_state(token) == ("abc1234def", ("Major bug",))
     assert "Advisory only" in comment
     assert "does not approve" in comment
     assert "Major bug" in comment  # P1 surfaced
     assert "Minor nit" not in comment  # P2 suppressed in fast pass
     assert "Delta re-review since:** `old1234d`" in comment
 
-    # A failed round (checkpoint_sha=None) must NOT stamp a last-reviewed marker,
-    # so the next run re-reviews the failed round's diff from the base.
+    # A failed round (checkpoint_sha=None) must NOT stamp signed state, so the next
+    # run re-reviews the failed round's diff from the base.
     no_checkpoint = review_gate.build_fast_comment(
         result, sha="abc1234def", run_url="", pr_number=7,
         delta_from_sha=None, checkpoint_sha=None,
     )
-    assert review_gate.LAST_SHA_MARKER_PREFIX not in no_checkpoint
+    assert review_gate.STATE_MARKER_PREFIX not in no_checkpoint
+
+
+def test_fast_state_sign_verify_roundtrip_and_tamper(monkeypatch) -> None:
+    monkeypatch.setenv("REVIEW_GATE_STATE_KEY", "k1")
+    review_gate = load_review_gate()
+    token = review_gate.sign_fast_state("sha123", ("A", "B"))
+    assert review_gate.verify_fast_state(token) == ("sha123", ("A", "B"))
+    # Tampered signature is rejected.
+    b64, _, _sig = token.partition(".")
+    assert review_gate.verify_fast_state(f"{b64}.deadbeef") == (None, ())
+    # A token signed under a different key does not verify.
+    monkeypatch.setenv("REVIEW_GATE_STATE_KEY", "k2")
+    assert review_gate.verify_fast_state(token) == (None, ())
+    # With no key, no state is trusted (fail closed to full review).
+    monkeypatch.delenv("REVIEW_GATE_STATE_KEY")
+    assert review_gate.sign_fast_state("sha123", ("A",)) is None
+    assert review_gate.verify_fast_state(token) == (None, ())
+
+
+def test_run_codex_review_rejects_invalid_output_contract(monkeypatch, tmp_path) -> None:
+    review_gate = load_review_gate()
+
+    def fake_run_command(args, cwd=None, env=None, input_text=None):
+        if args[:3] == ["git", "fetch", "--force"]:
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        if args[:2] == ["codex", "exec"]:
+            out = Path(args[args.index("--output-last-message") + 1])
+            # Unknown verdict + no findings would otherwise be a silent pass.
+            out.write_text('{"verdict":"looks-fine","summary":"ok","findings":[]}')
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(review_gate, "run_command", fake_run_command)
+    result = review_gate.run_codex_review(
+        tmp_path, "Review.", repo="o/r", pr_number=7, sha="abc", base_ref="main"
+    )
+    assert not result.passed
+    assert result.blocking[0].code == "CODEX_REVIEW_INVALID"
 
 
 def test_run_fast_advisory_does_not_advance_checkpoint_on_review_failure(
@@ -445,12 +488,13 @@ def test_run_fast_advisory_does_not_advance_checkpoint_on_review_failure(
     with pytest.raises(SystemExit) as exc:
         review_gate.run_fast_advisory(args, "Review strictly.", workspace=tmp_path)
     assert exc.value.code == 0
-    # First round + failed review => no checkpoint marker stamped.
-    assert review_gate.LAST_SHA_MARKER_PREFIX not in posted_body.get("body", "")
+    # First round + failed review => no signed state stamped.
+    assert review_gate.STATE_MARKER_PREFIX not in posted_body.get("body", "")
 
 
 def test_failed_delta_round_preserves_carried_findings(monkeypatch, tmp_path) -> None:
     """A failed review keeps the prior round's carried list and prior checkpoint."""
+    monkeypatch.setenv("REVIEW_GATE_STATE_KEY", "test-secret")
     review_gate = load_review_gate()
     (tmp_path / "module.py").write_text("print('clean')\n")
     prior = _fast_body(review_gate, "0000000aaaa")  # prior good sha + carried titles
@@ -482,27 +526,30 @@ def test_failed_delta_round_preserves_carried_findings(monkeypatch, tmp_path) ->
     with pytest.raises(SystemExit):
         review_gate.run_fast_advisory(args, "Review strictly.", workspace=tmp_path)
     body = posted_body.get("body", "")
-    # Carried findings preserved; checkpoint kept at the prior good sha (not the new head).
+    # Carried findings preserved (display) and in the signed state; checkpoint kept
+    # at the prior good sha, not the failed new head.
     assert "Confine the manifest paths" in body
     assert "Fail closed on lineage" in body
-    # Checkpoint stays at the prior good sha, not the failed new head.
-    assert f"{review_gate.LAST_SHA_MARKER_PREFIX}0000000aaaa" in body
-    assert f"{review_gate.LAST_SHA_MARKER_PREFIX}ffffffbbbb" not in body
+    token = body.split(review_gate.STATE_MARKER_PREFIX, 1)[1].split(" -->", 1)[0].strip()
+    sha, carried = review_gate.verify_fast_state(token)
+    assert sha == "0000000aaaa"
+    assert carried == ("Confine the manifest paths", "Fail closed on lineage")
 
 
 def _fast_body(review_gate, sha: str) -> str:
-    carried = json.dumps(["Confine the manifest paths", "Fail closed on lineage"])
+    # Requires REVIEW_GATE_STATE_KEY set by the caller so the token is signed.
+    token = review_gate.sign_fast_state(
+        sha, ("Confine the manifest paths", "Fail closed on lineage")
+    )
     return (
         f"{review_gate.FAST_COMMENT_MARKER}\n"
-        f"{review_gate.LAST_SHA_MARKER_PREFIX}{sha} -->\n"
-        f"{review_gate.CARRIED_MARKER_PREFIX}{carried} -->\n"
+        f"{review_gate.STATE_MARKER_PREFIX}{token} -->\n"
         "## Major findings (P0/P1)\n"
-        "- **P1**: Confine the manifest paths\n"
-        "- **P0**: Fail closed on lineage\n"
     )
 
 
 def test_read_fast_advisory_state_parses_marker_and_titles(monkeypatch) -> None:
+    monkeypatch.setenv("REVIEW_GATE_STATE_KEY", "test-secret")
     review_gate = load_review_gate()
     body = _fast_body(review_gate, "deadbeef1234")
 
@@ -559,26 +606,33 @@ def test_trusted_fast_comment_requires_exact_login_under_app_token(monkeypatch) 
     assert review_gate.trusted_fast_comment([other_bot, ours])["id"] == 2
 
 
-def test_fast_advisory_state_ignores_forged_participant_comment(monkeypatch) -> None:
-    """A PR participant cannot steer delta focus by forging the public marker."""
+def test_fast_advisory_state_rejects_state_forged_under_another_key(monkeypatch) -> None:
+    """Even a same-identity actor cannot forge state without the signing key."""
     review_gate = load_review_gate()
-    forged = _fast_body(review_gate, "attacker00sha")
+    # Attacker signs state with a key the gate does not use.
+    monkeypatch.setenv("REVIEW_GATE_STATE_KEY", "attacker-key")
+    forged_token = review_gate.sign_fast_state("attacker00sha", ("evil delta",))
+    forged = (
+        f"{review_gate.FAST_COMMENT_MARKER}\n"
+        f"{review_gate.STATE_MARKER_PREFIX}{forged_token} -->\n"
+    )
+    # The gate reads with ITS key; the forged signature does not verify.
+    monkeypatch.setenv("REVIEW_GATE_STATE_KEY", "gate-key")
 
     def fake_run_command(args, cwd=None, env=None, input_text=None):
-        # GitHub App token: `gh api user` is not accessible -> bot_only trust.
         if args[:3] == ["gh", "api", "user"]:
-            return subprocess.CompletedProcess(args, 1, stdout="", stderr="not accessible")
+            return subprocess.CompletedProcess(args, 0, stdout="gate-bot\n", stderr="")
         if args[:3] == ["gh", "api", "repos/example-org/example/issues/7/comments"]:
+            # Authored by the gate's own identity (the same-identity threat model).
             payload = json.dumps(
-                [{"id": 9, "body": forged, "user": {"login": "attacker", "type": "User"}}]
+                [{"id": 9, "body": forged, "user": {"login": "gate-bot", "type": "Bot"}}]
             )
             return subprocess.CompletedProcess(args, 0, stdout=payload, stderr="")
         return subprocess.CompletedProcess(args, 0, stdout="[]", stderr="")
 
     monkeypatch.setattr(review_gate, "run_command", fake_run_command)
     last_sha, titles = review_gate.read_fast_advisory_state("example-org/example", 7)
-    # Forged (non-Bot) comment is not trusted -> full review, no carried state.
-    assert last_sha is None
+    assert last_sha is None  # bad signature -> full review
     assert titles == ()
 
 
@@ -691,3 +745,19 @@ def test_reusable_workflow_supports_mode_and_fast_model() -> None:
     # Fast mode gets a distinct check-run name so it can never satisfy a required
     # "Review Gate" check-run in branch protection.
     assert "inputs.mode == 'fast' && 'Review Gate (fast advisory)' || 'Review Gate'" in reusable
+
+
+def test_fast_mode_invocation_contract_is_documented() -> None:
+    doc = (ROOT / "docs" / "review-gate-fast-mode.md").read_text()
+    # The supported external invocation contract is documented and testable.
+    assert "mode: fast" in doc
+    assert "fast_codex_model:" in doc
+    assert "review-gate-reusable.yml@main" in doc
+    # Non-merge-authority guarantees are stated.
+    assert "non-required" in doc
+    assert "never submits an approving review" in doc
+    # The @main ordering constraint is called out so callers don't startup_failure.
+    assert "startup_failure" in doc
+    # Delta-state signing / fail-closed default is documented.
+    assert "REVIEW_GATE_STATE_KEY" in doc
+    assert "full review" in doc

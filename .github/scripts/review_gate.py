@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -21,14 +23,23 @@ FINDING_MARKER_PREFIX = "<!-- review-gate-finding:"
 # per-finding FINDING_MARKER comments, the "Review Gate" status, and the
 # approving PR review).
 FAST_COMMENT_MARKER = "<!-- review-gate-fast-advisory -->"
-LAST_SHA_MARKER_PREFIX = "<!-- review-gate-fast-last-sha:"
-# Machine-readable carry-forward state (JSON list of finding titles) so the next
-# round's re-verification list survives independently of the human-visible list —
-# in particular a failed round preserves the prior round's carried findings.
-CARRIED_MARKER_PREFIX = "<!-- review-gate-fast-carried:"
+# Machine-trusted delta state (checkpoint SHA + carry-forward titles) is stored as
+# an HMAC-SIGNED token so it cannot be forged or altered by any other actor that
+# shares the gate's comment-author identity (the shared Actions bot, a PAT owner's
+# other comments). Without a signing key the gate stores no state and every fast
+# round does a full review -- the fail-closed default. A human-readable copy is
+# rendered separately for display only and is never trusted for state.
+STATE_MARKER_PREFIX = "<!-- review-gate-fast-state:"
 STATUS_CONTEXT_THOROUGH = "Review Gate"
 STATUS_CONTEXT_FAST = "Review Gate (fast advisory)"
 FAST_ADVISORY_SEVERITIES = {"P0", "P1"}
+# Backend-failure finding codes: the review did not produce a valid disposition,
+# so fast mode must not advance its delta checkpoint on any of these.
+REVIEW_FAILURE_CODES = {
+    "CODEX_REVIEW_FAILED",
+    "CODEX_REVIEW_UNPARSEABLE",
+    "CODEX_REVIEW_INVALID",
+}
 DEFAULT_REVIEW_PROMPT = """# Review Gate Prompt
 
 Review this PR for necessity, company-policy alignment, architecture, AI safety,
@@ -457,9 +468,35 @@ def run_codex_review(
             raw_review=raw_review,
         )
 
-    verdict = str(payload.get("verdict") or "request_changes").lower()
+    # Validate the full output contract before trusting the result. A payload
+    # with an unknown verdict or a non-list findings field must NOT be treated as
+    # a clean review: otherwise it can produce zero blockers (a silent pass) and,
+    # in fast mode, advance the delta checkpoint past work that got no valid
+    # disposition. Such payloads are a review failure, same as unparseable output.
+    verdict_raw = payload.get("verdict")
+    findings_payload = payload.get("findings")
+    valid_verdict = (
+        isinstance(verdict_raw, str)
+        and verdict_raw.strip().lower() in {"approve", "comment", "request_changes"}
+    )
+    if not valid_verdict or not isinstance(findings_payload, list):
+        return ReviewResult(
+            "codex",
+            summary="Codex review violated the required output contract.",
+            blocking=(
+                Finding(
+                    "P1",
+                    "CODEX_REVIEW_INVALID",
+                    "Codex review output did not satisfy the required schema",
+                    "Expected verdict in {approve, comment, request_changes} and a "
+                    f"list `findings`. Got verdict={verdict_raw!r}, "
+                    f"findings type={type(findings_payload).__name__}.",
+                ),
+            ),
+            raw_review=raw_review,
+        )
+    verdict = verdict_raw.strip().lower()
     summary = str(payload.get("summary") or "").strip()
-    findings_payload = payload.get("findings") or []
     findings = tuple(
         finding_from_payload(item, index)
         for index, item in enumerate(findings_payload)
@@ -768,6 +805,46 @@ def trusted_fast_comment(comments: list[dict]) -> dict | None:
     return trusted
 
 
+def _state_key() -> bytes | None:
+    key = os.environ.get("REVIEW_GATE_STATE_KEY", "").strip()
+    return key.encode("utf-8") if key else None
+
+
+def sign_fast_state(sha: str | None, carried: tuple[str, ...]) -> str | None:
+    """HMAC-signed `<b64(payload)>.<sig>` token, or None when unsigned/unavailable.
+
+    Returns None when there is no signing key or no checkpoint SHA, so the comment
+    carries no trusted state and the next round falls back to a full review.
+    """
+    key = _state_key()
+    if key is None or not sha:
+        return None
+    payload = json.dumps(
+        {"sha": sha, "carried": list(carried)}, sort_keys=True, separators=(",", ":")
+    )
+    b64 = base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii")
+    sig = hmac.new(key, b64.encode("ascii"), hashlib.sha256).hexdigest()
+    return f"{b64}.{sig}"
+
+
+def verify_fast_state(token: str) -> tuple[str | None, tuple[str, ...]]:
+    """Verify a signed state token; (None, ()) if no key, bad signature, or garbage."""
+    key = _state_key()
+    if key is None or "." not in token:
+        return None, ()
+    b64, _, sig = token.partition(".")
+    expected = hmac.new(key, b64.encode("ascii"), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(sig, expected):
+        return None, ()
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(b64.encode("ascii")).decode("utf-8"))
+    except (ValueError, json.JSONDecodeError):
+        return None, ()
+    sha = payload.get("sha")
+    carried = tuple(str(t) for t in payload.get("carried", []) if str(t).strip())
+    return (sha if isinstance(sha, str) and sha else None), carried
+
+
 def read_fast_advisory_state(repo: str, pr_number: int) -> tuple[str | None, tuple[str, ...]]:
     """Return (last_reviewed_sha, prior_finding_titles) from the fast advisory comment.
 
@@ -783,19 +860,12 @@ def read_fast_advisory_state(repo: str, pr_number: int) -> tuple[str | None, tup
     body = trusted.get("body", "") if trusted else ""
     if not body:
         return None, ()
-    last_sha = None
-    match = re.search(re.escape(LAST_SHA_MARKER_PREFIX) + r"([0-9a-f]{7,40})", body)
-    if match:
-        last_sha = match.group(1)
-    titles: tuple[str, ...] = ()
-    carried = re.search(re.escape(CARRIED_MARKER_PREFIX) + r"(.*?)-->", body, re.DOTALL)
-    if carried:
-        try:
-            parsed = json.loads(carried.group(1).strip())
-            titles = tuple(str(t) for t in parsed if str(t).strip())
-        except (ValueError, json.JSONDecodeError):
-            titles = ()
-    return last_sha, titles
+    match = re.search(re.escape(STATE_MARKER_PREFIX) + r"\s*(\S+?)\s*-->", body)
+    if not match:
+        return None, ()
+    # Trust the delta scope only if the signature verifies. Authorship (above) is
+    # defense in depth; the signature is what makes the state unforgeable.
+    return verify_fast_state(match.group(1))
 
 
 def build_fast_comment(
@@ -811,15 +881,13 @@ def build_fast_comment(
     all_findings = (*result.blocking, *result.warnings)
     major = [f for f in all_findings if f.severity in FAST_ADVISORY_SEVERITIES]
     lines = [FAST_COMMENT_MARKER]
-    # Only advance the last-reviewed checkpoint to a SHA that was actually reviewed
-    # successfully. On a failed/unparseable run checkpoint_sha is the prior good
-    # SHA (or None), so the next round re-reviews the failed round's diff instead
-    # of skipping it.
-    if checkpoint_sha:
-        lines.append(f"{LAST_SHA_MARKER_PREFIX}{checkpoint_sha} -->")
-    # Machine-readable carry-forward list for the next round's re-verification,
-    # independent of the visible list so a failed round preserves it.
-    lines.append(f"{CARRIED_MARKER_PREFIX}{json.dumps(list(carried_forward))} -->")
+    # Signed machine state: the checkpoint SHA is advanced only to a
+    # successfully-reviewed SHA (checkpoint_sha is the prior good SHA, or None, on
+    # a failed round) and the carry-forward list rides along, all HMAC-signed so
+    # it cannot be forged. Emitted only when a signing key is configured.
+    signed = sign_fast_state(checkpoint_sha, carried_forward)
+    if signed:
+        lines.append(f"{STATE_MARKER_PREFIX}{signed} -->")
     lines += [
         "# Review Gate — fast advisory",
         "",
@@ -847,6 +915,13 @@ def build_fast_comment(
                 lines.append(f"  - {finding.detail}")
             if finding.files:
                 lines.append(f"  - Files: {', '.join(finding.files)}")
+    # Display-only echo of the carry-forward list (the trusted copy is the signed
+    # token above). Lets a human see what the next round will re-verify, including
+    # findings preserved from a round whose review did not complete.
+    if carried_forward:
+        lines.append("## Carry-forward (re-verified next round)")
+        for title in carried_forward:
+            lines.append(f"- {title}")
     return "\n".join(lines)
 
 
@@ -933,9 +1008,7 @@ def run_fast_advisory(
     # If Codex did not produce a valid review, do NOT advance the checkpoint:
     # keep the prior successfully-reviewed SHA (None on the first round -> the
     # next run does a full review) so the failed round's diff is never skipped.
-    review_failed = any(
-        f.code in {"CODEX_REVIEW_FAILED", "CODEX_REVIEW_UNPARSEABLE"} for f in result.blocking
-    )
+    review_failed = any(f.code in REVIEW_FAILURE_CODES for f in result.blocking)
     checkpoint_sha = delta_from_sha if review_failed else args.sha
     # Carry forward the re-verification list. A failed round produced no valid
     # findings, so it preserves the PRIOR round's carried list; a successful round
@@ -944,9 +1017,7 @@ def run_fast_advisory(
         carried_forward = carried
     else:
         carried_forward = tuple(
-            f.title
-            for f in major
-            if f.code not in {"CODEX_REVIEW_FAILED", "CODEX_REVIEW_UNPARSEABLE"}
+            f.title for f in major if f.code not in REVIEW_FAILURE_CODES
         )
     print(
         f"Fast advisory review complete: {len(major)} major (P0/P1) finding(s)."
