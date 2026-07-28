@@ -28,15 +28,30 @@ on:
         required: false
         type: string
         default: ""
+      mode:
+        description: "Review mode: thorough (merge-authority full-diff gate) or fast (non-blocking advisory)"
+        required: false
+        type: string
+        default: "thorough"
+      fast_codex_model:
+        description: "Optional cheaper/faster Codex model for fast advisory mode only"
+        required: false
+        type: string
+        default: ""
     secrets:
       OPENAI_API_KEY:
         required: true
       REVIEW_GATE_APPROVAL_TOKEN:
         required: false
+      REVIEW_GATE_STATE_KEY:
+        required: false
 
 jobs:
   review:
-    name: Review Gate
+    # Mode-specific check-run name so branch protection can require the thorough
+    # "Review Gate" check-run and a fast advisory run can NEVER satisfy it: fast
+    # surfaces as a distinct "Review Gate (fast advisory)" check-run.
+    name: ${{ inputs.mode == 'fast' && 'Review Gate (fast advisory)' || 'Review Gate' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -44,7 +59,11 @@ jobs:
       pull-requests: write
       statuses: write
     concurrency:
-      group: review-gate-${{ inputs.repo }}-${{ inputs.pr_number }}-${{ inputs.head_sha }}
+      # Key by repo/PR/MODE (not head SHA): a newer revision cancels the older
+      # run of the SAME mode (no stale advisory-state overwrites, no wasted
+      # runs), while fast and thorough are isolated so an advisory fast run can
+      # never cancel the required thorough merge gate.
+      group: review-gate-${{ inputs.repo }}-${{ inputs.pr_number }}-${{ inputs.mode }}
       cancel-in-progress: true
 
     steps:
@@ -123,13 +142,20 @@ jobs:
           GH_TOKEN: ${{ secrets.REVIEW_GATE_APPROVAL_TOKEN || github.token }}
           REVIEW_GATE_BASE_REF: ${{ inputs.base_ref }}
           REVIEW_GATE_CODEX_MODEL: ${{ inputs.codex_model }}
+          REVIEW_GATE_FAST_CODEX_MODEL: ${{ inputs.fast_codex_model }}
+          # Signs fast-mode delta state. Unset -> every fast round does a full
+          # review (fail-closed). Not passed to Codex (not in the allowed child env).
+          REVIEW_GATE_STATE_KEY: ${{ secrets.REVIEW_GATE_STATE_KEY }}
         run: |
           RUN_URL="${{ github.server_url }}/${{ inputs.repo }}/actions/runs/${{ github.run_id }}"
+          # Thorough mode submits the approving review (merge authority). Fast mode
+          # ignores --submit-approval entirely: it is advisory and never approves.
           python review-gate-main/.github/scripts/review_gate.py \
             --pr "${{ inputs.pr_number }}" \
             --repo "${{ inputs.repo }}" \
             --workspace pr-workspace \
             --sha "${{ inputs.head_sha }}" \
+            --mode "${{ inputs.mode }}" \
             --post-status \
             --post-comment \
             --submit-approval \
