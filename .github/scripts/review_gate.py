@@ -22,6 +22,10 @@ FINDING_MARKER_PREFIX = "<!-- review-gate-finding:"
 # approving PR review).
 FAST_COMMENT_MARKER = "<!-- review-gate-fast-advisory -->"
 LAST_SHA_MARKER_PREFIX = "<!-- review-gate-fast-last-sha:"
+# Machine-readable carry-forward state (JSON list of finding titles) so the next
+# round's re-verification list survives independently of the human-visible list —
+# in particular a failed round preserves the prior round's carried findings.
+CARRIED_MARKER_PREFIX = "<!-- review-gate-fast-carried:"
 STATUS_CONTEXT_THOROUGH = "Review Gate"
 STATUS_CONTEXT_FAST = "Review Gate (fast advisory)"
 FAST_ADVISORY_SEVERITIES = {"P0", "P1"}
@@ -783,11 +787,14 @@ def read_fast_advisory_state(repo: str, pr_number: int) -> tuple[str | None, tup
     match = re.search(re.escape(LAST_SHA_MARKER_PREFIX) + r"([0-9a-f]{7,40})", body)
     if match:
         last_sha = match.group(1)
-    titles = tuple(
-        line.split("**:", 1)[1].strip()
-        for line in body.splitlines()
-        if line.strip().startswith("- **P") and "**:" in line
-    )
+    titles: tuple[str, ...] = ()
+    carried = re.search(re.escape(CARRIED_MARKER_PREFIX) + r"(.*?)-->", body, re.DOTALL)
+    if carried:
+        try:
+            parsed = json.loads(carried.group(1).strip())
+            titles = tuple(str(t) for t in parsed if str(t).strip())
+        except (ValueError, json.JSONDecodeError):
+            titles = ()
     return last_sha, titles
 
 
@@ -799,6 +806,7 @@ def build_fast_comment(
     pr_number: int,
     delta_from_sha: str | None,
     checkpoint_sha: str | None,
+    carried_forward: tuple[str, ...] = (),
 ) -> str:
     all_findings = (*result.blocking, *result.warnings)
     major = [f for f in all_findings if f.severity in FAST_ADVISORY_SEVERITIES]
@@ -809,6 +817,9 @@ def build_fast_comment(
     # of skipping it.
     if checkpoint_sha:
         lines.append(f"{LAST_SHA_MARKER_PREFIX}{checkpoint_sha} -->")
+    # Machine-readable carry-forward list for the next round's re-verification,
+    # independent of the visible list so a failed round preserves it.
+    lines.append(f"{CARRIED_MARKER_PREFIX}{json.dumps(list(carried_forward))} -->")
     lines += [
         "# Review Gate — fast advisory",
         "",
@@ -926,6 +937,17 @@ def run_fast_advisory(
         f.code in {"CODEX_REVIEW_FAILED", "CODEX_REVIEW_UNPARSEABLE"} for f in result.blocking
     )
     checkpoint_sha = delta_from_sha if review_failed else args.sha
+    # Carry forward the re-verification list. A failed round produced no valid
+    # findings, so it preserves the PRIOR round's carried list; a successful round
+    # carries its own current major findings (minus the backend-failure markers).
+    if review_failed:
+        carried_forward = carried
+    else:
+        carried_forward = tuple(
+            f.title
+            for f in major
+            if f.code not in {"CODEX_REVIEW_FAILED", "CODEX_REVIEW_UNPARSEABLE"}
+        )
     print(
         f"Fast advisory review complete: {len(major)} major (P0/P1) finding(s)."
         + (" Review did not complete; checkpoint not advanced." if review_failed else "")
@@ -941,6 +963,7 @@ def run_fast_advisory(
                 pr_number=args.pr,
                 delta_from_sha=delta_from_sha,
                 checkpoint_sha=checkpoint_sha,
+                carried_forward=carried_forward,
             ),
         )
     if args.post_status:

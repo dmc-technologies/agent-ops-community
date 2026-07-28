@@ -449,10 +449,53 @@ def test_run_fast_advisory_does_not_advance_checkpoint_on_review_failure(
     assert review_gate.LAST_SHA_MARKER_PREFIX not in posted_body.get("body", "")
 
 
+def test_failed_delta_round_preserves_carried_findings(monkeypatch, tmp_path) -> None:
+    """A failed review keeps the prior round's carried list and prior checkpoint."""
+    review_gate = load_review_gate()
+    (tmp_path / "module.py").write_text("print('clean')\n")
+    prior = _fast_body(review_gate, "0000000aaaa")  # prior good sha + carried titles
+    posted_body = {}
+
+    def fake_run_command(args, cwd=None, env=None, input_text=None):
+        if args[:3] == ["gh", "pr", "diff"]:
+            return subprocess.CompletedProcess(args, 0, stdout="module.py\n", stderr="")
+        if args[:3] == ["gh", "api", "user"]:
+            return subprocess.CompletedProcess(args, 0, stdout="gate-bot\n", stderr="")
+        if args[:3] == ["git", "merge-base"]:
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")  # is ancestor
+        if args[:2] == ["gh", "api"] and args[2].endswith("/issues/7/comments"):
+            payload = json.dumps([[{"id": 5, "body": prior, "user": {"login": "gate-bot"}}]])
+            return subprocess.CompletedProcess(args, 0, stdout=payload, stderr="")
+        if args[:2] == ["codex", "exec"]:
+            return subprocess.CompletedProcess(args, 1, stdout="boom", stderr="boom")
+        if args[:2] == ["gh", "api"] and args[-2] == "-f" and args[-1].startswith("body="):
+            posted_body["body"] = args[-1]
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(review_gate, "run_command", fake_run_command)
+    args = review_gate.argparse.Namespace(
+        pr=7, repo="example-org/example", sha="ffffffbbbb",
+        base_ref="main", post_status=True, post_comment=True, run_url="",
+    )
+    import pytest
+
+    with pytest.raises(SystemExit):
+        review_gate.run_fast_advisory(args, "Review strictly.", workspace=tmp_path)
+    body = posted_body.get("body", "")
+    # Carried findings preserved; checkpoint kept at the prior good sha (not the new head).
+    assert "Confine the manifest paths" in body
+    assert "Fail closed on lineage" in body
+    # Checkpoint stays at the prior good sha, not the failed new head.
+    assert f"{review_gate.LAST_SHA_MARKER_PREFIX}0000000aaaa" in body
+    assert f"{review_gate.LAST_SHA_MARKER_PREFIX}ffffffbbbb" not in body
+
+
 def _fast_body(review_gate, sha: str) -> str:
+    carried = json.dumps(["Confine the manifest paths", "Fail closed on lineage"])
     return (
         f"{review_gate.FAST_COMMENT_MARKER}\n"
         f"{review_gate.LAST_SHA_MARKER_PREFIX}{sha} -->\n"
+        f"{review_gate.CARRIED_MARKER_PREFIX}{carried} -->\n"
         "## Major findings (P0/P1)\n"
         "- **P1**: Confine the manifest paths\n"
         "- **P0**: Fail closed on lineage\n"
