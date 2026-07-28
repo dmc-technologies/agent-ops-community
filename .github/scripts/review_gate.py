@@ -381,6 +381,18 @@ def extract_json_object(text: str) -> dict:
     return data
 
 
+def _valid_finding_entry(item: object) -> bool:
+    """A finding must be an object with correctly-typed fields (all optional)."""
+    if not isinstance(item, dict):
+        return False
+    for field in ("severity", "title", "body", "detail"):
+        value = item.get(field)
+        if value is not None and not isinstance(value, str):
+            return False
+    files = item.get("files")
+    return files is None or isinstance(files, list)
+
+
 def finding_from_payload(payload: dict, index: int) -> Finding:
     severity = str(payload.get("severity") or "P2").upper()
     if severity not in {"P0", "P1", "P2", "P3"}:
@@ -479,7 +491,15 @@ def run_codex_review(
         isinstance(verdict_raw, str)
         and verdict_raw.strip().lower() in {"approve", "comment", "request_changes"}
     )
-    if not valid_verdict or not isinstance(findings_payload, list):
+    # Every findings entry must be a well-formed object. A non-object entry (e.g.
+    # `[null]`) or a wrong-typed field must NOT be silently dropped: dropping it
+    # reduces the blocking count and can turn request_changes into a false PASS
+    # that submits an approving review. Any malformed entry is a contract failure.
+    findings_well_formed = isinstance(findings_payload, list) and all(
+        _valid_finding_entry(item) for item in findings_payload
+    )
+    if not valid_verdict or not findings_well_formed:
+        findings_type = type(findings_payload).__name__
         return ReviewResult(
             "codex",
             summary="Codex review violated the required output contract.",
@@ -489,8 +509,9 @@ def run_codex_review(
                     "CODEX_REVIEW_INVALID",
                     "Codex review output did not satisfy the required schema",
                     "Expected verdict in {approve, comment, request_changes} and a "
-                    f"list `findings`. Got verdict={verdict_raw!r}, "
-                    f"findings type={type(findings_payload).__name__}.",
+                    "list of well-formed finding objects (each an object with "
+                    "string severity/title/body and a list `files`). Got "
+                    f"verdict={verdict_raw!r}, findings type={findings_type}.",
                 ),
             ),
             raw_review=raw_review,
@@ -498,9 +519,7 @@ def run_codex_review(
     verdict = verdict_raw.strip().lower()
     summary = str(payload.get("summary") or "").strip()
     findings = tuple(
-        finding_from_payload(item, index)
-        for index, item in enumerate(findings_payload)
-        if isinstance(item, dict)
+        finding_from_payload(item, index) for index, item in enumerate(findings_payload)
     )
     blocking = tuple(
         finding
@@ -965,6 +984,42 @@ def run_fast_advisory(
     *,
     workspace: Path,
 ) -> None:
+    """Advisory lane wrapper: ALWAYS exits 0, even on operational failure.
+
+    The fast lane is non-merge-authority; a nonzero job exit could be mistaken for
+    a merge blocker. Any error fetching the base, calling the GitHub API, or
+    running Codex is caught here, logged as a diagnostic, and reported (best
+    effort) on the non-required advisory status, then the job exits 0.
+    """
+    try:
+        _run_fast_advisory(args, review_prompt, workspace=workspace)
+    except Exception as exc:  # noqa: BLE001 - advisory lane must never exit nonzero
+        print(
+            f"Fast advisory encountered an operational error (advisory, "
+            f"non-blocking): {exc}",
+            file=sys.stderr,
+        )
+        if args.post_status:
+            try:
+                post_commit_status(
+                    args.repo,
+                    args.sha,
+                    "success",
+                    "Fast advisory could not complete - advisory, not a merge gate",
+                    args.run_url,
+                    context=STATUS_CONTEXT_FAST,
+                )
+            except Exception as status_exc:  # noqa: BLE001 - best effort only
+                print(f"(could not post advisory status: {status_exc})", file=sys.stderr)
+    sys.exit(0)
+
+
+def _run_fast_advisory(
+    args: argparse.Namespace,
+    review_prompt: str,
+    *,
+    workspace: Path,
+) -> None:
     """Fast, advisory, non-merge-authority pass. Never approves, never blocks."""
     preflight = analyze_workspace(workspace, changed_files_for_pr(args.repo, args.pr))
     delta_from_sha, carried = read_fast_advisory_state(args.repo, args.pr)
@@ -1051,9 +1106,8 @@ def run_fast_advisory(
             args.run_url,
             context=STATUS_CONTEXT_FAST,
         )
-    # Advisory lane always exits 0: it must never fail the workflow in a way that
-    # could read as a merge blocker.
-    sys.exit(0)
+    # Returns normally; the run_fast_advisory wrapper performs the sys.exit(0) so
+    # both the success and the operational-failure paths exit 0 identically.
 
 
 def main() -> None:

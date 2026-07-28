@@ -43,6 +43,8 @@ on:
         required: true
       REVIEW_GATE_APPROVAL_TOKEN:
         required: false
+      REVIEW_GATE_STATE_KEY:
+        required: false
 
 jobs:
   review:
@@ -141,6 +143,9 @@ jobs:
           REVIEW_GATE_BASE_REF: ${{ inputs.base_ref }}
           REVIEW_GATE_CODEX_MODEL: ${{ inputs.codex_model }}
           REVIEW_GATE_FAST_CODEX_MODEL: ${{ inputs.fast_codex_model }}
+          # Signs fast-mode delta state. Unset -> every fast round does a full
+          # review (fail-closed). Not passed to Codex (not in the allowed child env).
+          REVIEW_GATE_STATE_KEY: ${{ secrets.REVIEW_GATE_STATE_KEY }}
         run: |
           RUN_URL="${{ github.server_url }}/${{ inputs.repo }}/actions/runs/${{ github.run_id }}"
           # Thorough mode submits the approving review (merge authority). Fast mode

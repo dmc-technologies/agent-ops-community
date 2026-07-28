@@ -458,6 +458,59 @@ def test_run_codex_review_rejects_invalid_output_contract(monkeypatch, tmp_path)
     assert result.blocking[0].code == "CODEX_REVIEW_INVALID"
 
 
+def test_run_codex_review_rejects_malformed_finding_entries(monkeypatch, tmp_path) -> None:
+    """A non-object finding entry must fail the contract, not be silently dropped."""
+    review_gate = load_review_gate()
+
+    def make_fake(findings_json):
+        def fake(args, cwd=None, env=None, input_text=None):
+            if args[:3] == ["git", "fetch", "--force"]:
+                return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+            if args[:2] == ["codex", "exec"]:
+                out = Path(args[args.index("--output-last-message") + 1])
+                out.write_text(
+                    '{"verdict":"request_changes","summary":"s","findings":' + findings_json + "}"
+                )
+                return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        return fake
+
+    for bad in ("[null]", "[123]", '[{"severity":5,"title":"x"}]', '[{"files":"nope"}]'):
+        monkeypatch.setattr(review_gate, "run_command", make_fake(bad))
+        result = review_gate.run_codex_review(
+            tmp_path, "Review.", repo="o/r", pr_number=7, sha="abc", base_ref="main"
+        )
+        assert not result.passed, bad
+        assert result.blocking[0].code == "CODEX_REVIEW_INVALID", bad
+
+
+def test_run_fast_advisory_exits_zero_on_operational_error(monkeypatch, tmp_path) -> None:
+    """Any operational failure in the advisory lane still exits 0 (never a blocker)."""
+    review_gate = load_review_gate()
+    (tmp_path / "module.py").write_text("print('clean')\n")
+
+    def fake_run_command(args, cwd=None, env=None, input_text=None):
+        if args[:3] == ["gh", "pr", "diff"]:
+            return subprocess.CompletedProcess(args, 0, stdout="module.py\n", stderr="")
+        if args[:3] == ["gh", "api", "user"]:
+            return subprocess.CompletedProcess(args, 1, stdout="", stderr="")
+        # Base-ref fetch fails -> run_codex_review raises RuntimeError mid-lane.
+        if args[:3] == ["git", "fetch", "--force"]:
+            return subprocess.CompletedProcess(args, 1, stdout="", stderr="boom fetch")
+        return subprocess.CompletedProcess(args, 0, stdout="[]", stderr="")
+
+    monkeypatch.setattr(review_gate, "run_command", fake_run_command)
+    args = review_gate.argparse.Namespace(
+        pr=7, repo="example-org/example", sha="abc123",
+        base_ref="main", post_status=True, post_comment=True, run_url="",
+    )
+    import pytest
+
+    with pytest.raises(SystemExit) as exc:
+        review_gate.run_fast_advisory(args, "Review strictly.", workspace=tmp_path)
+    assert exc.value.code == 0
+
+
 def test_run_fast_advisory_does_not_advance_checkpoint_on_review_failure(
     monkeypatch, tmp_path
 ) -> None:
@@ -745,6 +798,10 @@ def test_reusable_workflow_supports_mode_and_fast_model() -> None:
     # Fast mode gets a distinct check-run name so it can never satisfy a required
     # "Review Gate" check-run in branch protection.
     assert "inputs.mode == 'fast' && 'Review Gate (fast advisory)' || 'Review Gate'" in reusable
+    # The delta-signing secret is declared and mapped into the review step so the
+    # feature can actually function in the supported workflow.
+    assert "REVIEW_GATE_STATE_KEY:" in reusable
+    assert "REVIEW_GATE_STATE_KEY: ${{ secrets.REVIEW_GATE_STATE_KEY }}" in reusable
 
 
 def test_fast_mode_invocation_contract_is_documented() -> None:
