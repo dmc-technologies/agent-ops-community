@@ -389,7 +389,12 @@ def test_build_fast_comment_is_advisory_and_embeds_last_sha() -> None:
     )
 
     comment = review_gate.build_fast_comment(
-        result, sha="abc1234def", run_url="https://run", pr_number=7, delta_from_sha="old1234def"
+        result,
+        sha="abc1234def",
+        run_url="https://run",
+        pr_number=7,
+        delta_from_sha="old1234def",
+        checkpoint_sha="abc1234def",
     )
 
     assert review_gate.FAST_COMMENT_MARKER in comment
@@ -400,6 +405,48 @@ def test_build_fast_comment_is_advisory_and_embeds_last_sha() -> None:
     assert "Major bug" in comment  # P1 surfaced
     assert "Minor nit" not in comment  # P2 suppressed in fast pass
     assert "Delta re-review since:** `old1234d`" in comment
+
+    # A failed round (checkpoint_sha=None) must NOT stamp a last-reviewed marker,
+    # so the next run re-reviews the failed round's diff from the base.
+    no_checkpoint = review_gate.build_fast_comment(
+        result, sha="abc1234def", run_url="", pr_number=7,
+        delta_from_sha=None, checkpoint_sha=None,
+    )
+    assert review_gate.LAST_SHA_MARKER_PREFIX not in no_checkpoint
+
+
+def test_run_fast_advisory_does_not_advance_checkpoint_on_review_failure(
+    monkeypatch, tmp_path
+) -> None:
+    review_gate = load_review_gate()
+    (tmp_path / "module.py").write_text("print('clean')\n")
+    posted_body = {}
+
+    def fake_run_command(args, cwd=None, env=None, input_text=None):
+        if args[:3] == ["gh", "pr", "diff"]:
+            return subprocess.CompletedProcess(args, 0, stdout="module.py\n", stderr="")
+        if args[:3] == ["gh", "api", "user"]:
+            return subprocess.CompletedProcess(args, 1, stdout="", stderr="")
+        if args[:2] == ["codex", "exec"]:
+            # Non-zero exit -> CODEX_REVIEW_FAILED, no valid review produced.
+            return subprocess.CompletedProcess(args, 1, stdout="boom", stderr="boom")
+        # Capture the POSTed advisory comment body.
+        if args[:2] == ["gh", "api"] and args[-2] == "-f" and args[-1].startswith("body="):
+            posted_body["body"] = args[-1]
+        return subprocess.CompletedProcess(args, 0, stdout="[]", stderr="")
+
+    monkeypatch.setattr(review_gate, "run_command", fake_run_command)
+    args = review_gate.argparse.Namespace(
+        pr=7, repo="example-org/example", sha="abc123",
+        base_ref="main", post_status=True, post_comment=True, run_url="",
+    )
+    import pytest
+
+    with pytest.raises(SystemExit) as exc:
+        review_gate.run_fast_advisory(args, "Review strictly.", workspace=tmp_path)
+    assert exc.value.code == 0
+    # First round + failed review => no checkpoint marker stamped.
+    assert review_gate.LAST_SHA_MARKER_PREFIX not in posted_body.get("body", "")
 
 
 def _fast_body(review_gate, sha: str) -> str:

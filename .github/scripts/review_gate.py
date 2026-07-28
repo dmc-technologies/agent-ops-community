@@ -798,12 +798,18 @@ def build_fast_comment(
     run_url: str,
     pr_number: int,
     delta_from_sha: str | None,
+    checkpoint_sha: str | None,
 ) -> str:
     all_findings = (*result.blocking, *result.warnings)
     major = [f for f in all_findings if f.severity in FAST_ADVISORY_SEVERITIES]
-    lines = [
-        FAST_COMMENT_MARKER,
-        f"{LAST_SHA_MARKER_PREFIX}{sha} -->",
+    lines = [FAST_COMMENT_MARKER]
+    # Only advance the last-reviewed checkpoint to a SHA that was actually reviewed
+    # successfully. On a failed/unparseable run checkpoint_sha is the prior good
+    # SHA (or None), so the next round re-reviews the failed round's diff instead
+    # of skipping it.
+    if checkpoint_sha:
+        lines.append(f"{LAST_SHA_MARKER_PREFIX}{checkpoint_sha} -->")
+    lines += [
         "# Review Gate — fast advisory",
         "",
         "**Advisory only.** This is a fast, non-blocking pass to speed iteration. "
@@ -913,7 +919,17 @@ def run_fast_advisory(
     major = [
         f for f in (*result.blocking, *result.warnings) if f.severity in FAST_ADVISORY_SEVERITIES
     ]
-    print(f"Fast advisory review complete: {len(major)} major (P0/P1) finding(s).")
+    # If Codex did not produce a valid review, do NOT advance the checkpoint:
+    # keep the prior successfully-reviewed SHA (None on the first round -> the
+    # next run does a full review) so the failed round's diff is never skipped.
+    review_failed = any(
+        f.code in {"CODEX_REVIEW_FAILED", "CODEX_REVIEW_UNPARSEABLE"} for f in result.blocking
+    )
+    checkpoint_sha = delta_from_sha if review_failed else args.sha
+    print(
+        f"Fast advisory review complete: {len(major)} major (P0/P1) finding(s)."
+        + (" Review did not complete; checkpoint not advanced." if review_failed else "")
+    )
     if args.post_comment:
         post_or_update_fast_comment(
             args.repo,
@@ -924,6 +940,7 @@ def run_fast_advisory(
                 run_url=args.run_url,
                 pr_number=args.pr,
                 delta_from_sha=delta_from_sha,
+                checkpoint_sha=checkpoint_sha,
             ),
         )
     if args.post_status:
