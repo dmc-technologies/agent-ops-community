@@ -423,18 +423,18 @@ def test_build_fast_comment_is_advisory_and_signs_state(monkeypatch) -> None:
 def test_fast_state_sign_verify_roundtrip_and_tamper(monkeypatch) -> None:
     monkeypatch.setenv("REVIEW_GATE_STATE_KEY", "k1")
     review_gate = load_review_gate()
-    token = review_gate.sign_fast_state("sha123", ("A", "B"))
-    assert review_gate.verify_fast_state(token) == ("sha123", ("A", "B"))
+    state_blob = review_gate.sign_fast_state("sha123", ("A", "B"))
+    assert review_gate.verify_fast_state(state_blob) == ("sha123", ("A", "B"))
     # Tampered signature is rejected.
-    b64, _, _sig = token.partition(".")
+    b64, _, _sig = state_blob.partition(".")
     assert review_gate.verify_fast_state(f"{b64}.deadbeef") == (None, ())
-    # A token signed under a different key does not verify.
+    # A signed blob made under a different key does not verify.
     monkeypatch.setenv("REVIEW_GATE_STATE_KEY", "k2")
-    assert review_gate.verify_fast_state(token) == (None, ())
+    assert review_gate.verify_fast_state(state_blob) == (None, ())
     # With no key, no state is trusted (fail closed to full review).
     monkeypatch.delenv("REVIEW_GATE_STATE_KEY")
     assert review_gate.sign_fast_state("sha123", ("A",)) is None
-    assert review_gate.verify_fast_state(token) == (None, ())
+    assert review_gate.verify_fast_state(state_blob) == (None, ())
 
 
 def test_run_codex_review_rejects_invalid_output_contract(monkeypatch, tmp_path) -> None:
@@ -537,13 +537,13 @@ def test_failed_delta_round_preserves_carried_findings(monkeypatch, tmp_path) ->
 
 
 def _fast_body(review_gate, sha: str) -> str:
-    # Requires REVIEW_GATE_STATE_KEY set by the caller so the token is signed.
-    token = review_gate.sign_fast_state(
+    # Requires REVIEW_GATE_STATE_KEY set by the caller so the state is signed.
+    state_blob = review_gate.sign_fast_state(
         sha, ("Confine the manifest paths", "Fail closed on lineage")
     )
     return (
         f"{review_gate.FAST_COMMENT_MARKER}\n"
-        f"{review_gate.STATE_MARKER_PREFIX}{token} -->\n"
+        f"{review_gate.STATE_MARKER_PREFIX}{state_blob} -->\n"
         "## Major findings (P0/P1)\n"
     )
 
@@ -611,10 +611,10 @@ def test_fast_advisory_state_rejects_state_forged_under_another_key(monkeypatch)
     review_gate = load_review_gate()
     # Attacker signs state with a key the gate does not use.
     monkeypatch.setenv("REVIEW_GATE_STATE_KEY", "attacker-key")
-    forged_token = review_gate.sign_fast_state("attacker00sha", ("evil delta",))
+    forged_blob = review_gate.sign_fast_state("attacker00sha", ("evil delta",))
     forged = (
         f"{review_gate.FAST_COMMENT_MARKER}\n"
-        f"{review_gate.STATE_MARKER_PREFIX}{forged_token} -->\n"
+        f"{review_gate.STATE_MARKER_PREFIX}{forged_blob} -->\n"
     )
     # The gate reads with ITS key; the forged signature does not verify.
     monkeypatch.setenv("REVIEW_GATE_STATE_KEY", "gate-key")
