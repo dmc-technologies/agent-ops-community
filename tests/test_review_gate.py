@@ -691,3 +691,20 @@ def test_reusable_workflow_supports_mode_and_fast_model() -> None:
     # Fast mode gets a distinct check-run name so it can never satisfy a required
     # "Review Gate" check-run in branch protection.
     assert "inputs.mode == 'fast' && 'Review Gate (fast advisory)' || 'Review Gate'" in reusable
+
+
+def test_dispatcher_wires_fast_mode_via_label_and_dispatch() -> None:
+    workflow = WORKFLOW_PATH.read_text()
+    # A dedicated fast advisory job, opt-in via the "ai review fast" label.
+    assert "name: Review Gate (fast advisory)" in workflow
+    assert "github.event.label.name == 'ai review fast'" in workflow
+    assert "contains(github.event.pull_request.labels.*.name, 'ai review fast')" in workflow
+    assert "mode: fast" in workflow
+    assert "fast_codex_model: ${{ vars.REVIEW_GATE_FAST_CODEX_MODEL || '' }}" in workflow
+    # Manual dispatch offers a fast option and routes mode accordingly.
+    assert "- fast" in workflow
+    assert "github.event.inputs.mode == 'fast' && 'fast' || 'thorough'" in workflow
+    # The thorough merge-authority job is unchanged and still present.
+    assert "github.event.label.name == 'ai review'" in workflow
+    # The forbidden bare-'ai review' label-array check must not appear.
+    assert "contains(github.event.pull_request.labels.*.name, 'ai review')" not in workflow
