@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from markdown_it import MarkdownIt
 from pydantic import BaseModel
 
 REQUIRED_FILES = (
@@ -75,30 +75,14 @@ def default_verification(repo_type: str) -> tuple[str, ...]:
 
 def _markdown_headings(text: str) -> set[str]:
     headings: set[str] = set()
-    fence: tuple[str, int] | None = None
-    for line in text.splitlines():
-        if fence is not None:
-            marker, width = fence
-            if re.fullmatch(rf" {{0,3}}{re.escape(marker)}{{{width},}}[ \t]*", line):
-                fence = None
+    tokens = MarkdownIt("commonmark").parse(text)
+    for index, token in enumerate(tokens):
+        if token.type != "heading_open" or token.level != 0:
             continue
-
-        fence_match = re.match(r"^ {0,3}(`{3,}|~{3,})", line)
-        if fence_match:
-            opening_marker = fence_match.group(1)
-            fence = (opening_marker[0], len(opening_marker))
+        if index + 1 >= len(tokens) or tokens[index + 1].type != "inline":
             continue
-
-        if line.startswith("\t") or len(line) - len(line.lstrip(" ")) >= 4:
-            continue
-
-        heading_match = re.fullmatch(r" {0,3}(#{1,6})[ \t]+(.+?)[ \t]*", line)
-        if heading_match is None:
-            continue
-
-        marker, title = heading_match.groups()
-        title = re.sub(r"[ \t]+#+[ \t]*$", "", title)
-        normalized_title = " ".join(title.strip().split())
+        marker = "#" * int(token.tag.removeprefix("h"))
+        normalized_title = " ".join(tokens[index + 1].content.strip().split())
         if normalized_title:
             headings.add(f"{marker} {normalized_title}")
     return headings
