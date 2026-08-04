@@ -6,12 +6,9 @@ Repository: `agent-ops-community`
 
 - Preferred local command: `agentops harness check .`
 
-## Fast Gate
+## CI Contract
 
 - `ruff check .`
 - `pytest`
 
-## Full Gate
-
-Use the repo's complete CI-equivalent command when the fast gate is not enough.
 Record exact command output summaries in `.agentops/harness/PROGRESS.md`.

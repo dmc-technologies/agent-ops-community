@@ -37,7 +37,7 @@ REQUIRED_SECTIONS = {
     ),
     ".agentops/harness/DECISIONS.md": ("## Template",),
     ".agentops/harness/TASKS.md": ("## Ready", "## Acceptance Criteria Format"),
-    ".agentops/harness/VERIFY.md": ("## Harness Check", "## Fast Gate", "## Full Gate"),
+    ".agentops/harness/VERIFY.md": ("## Harness Check", "## CI Contract"),
 }
 
 
@@ -279,13 +279,13 @@ Repository: `{repo_name}`
 
 - Preferred local command: `agentops harness check .`
 
-## Fast Gate
+## CI Contract
 
 {command_lines}
 
-## Full Gate
-
-Use the repo's complete CI-equivalent command when the fast gate is not enough.
+Replace or expand these commands with the repository's named local CI tiers.
+The repository owns tier names and hosted routing; Agent Ops does not impose
+generic fast/full terminology.
 Record exact command output summaries in `.agentops/harness/PROGRESS.md`.
 """,
     }

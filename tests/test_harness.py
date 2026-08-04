@@ -31,6 +31,10 @@ def test_init_harness_creates_files_that_pass_check(tmp_path: Path) -> None:
     assert "## Clock In" in bootstrap
     assert "Search or recall relevant shared-memory entries" in bootstrap
     assert "Do not write automatic session summaries" in bootstrap
+    verification = (tmp_path / ".agentops/harness/VERIFY.md").read_text(encoding="utf-8")
+    assert "## CI Contract" in verification
+    assert "## Fast Gate" not in verification
+    assert "## Full Gate" not in verification
 
 
 def test_check_harness_rejects_missing_files(tmp_path: Path) -> None:
