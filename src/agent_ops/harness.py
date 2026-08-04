@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -74,12 +75,30 @@ def default_verification(repo_type: str) -> tuple[str, ...]:
 
 def _markdown_headings(text: str) -> set[str]:
     headings: set[str] = set()
+    fence: tuple[str, int] | None = None
     for line in text.splitlines():
-        stripped = line.strip()
-        marker, separator, title = stripped.partition(" ")
-        if not separator or not marker or set(marker) != {"#"}:
+        if fence is not None:
+            marker, width = fence
+            if re.fullmatch(rf" {{0,3}}{re.escape(marker)}{{{width},}}[ \t]*", line):
+                fence = None
             continue
-        normalized_title = " ".join(title.rstrip("#").strip().split())
+
+        fence_match = re.match(r"^ {0,3}(`{3,}|~{3,})", line)
+        if fence_match:
+            opening_marker = fence_match.group(1)
+            fence = (opening_marker[0], len(opening_marker))
+            continue
+
+        if line.startswith("\t") or len(line) - len(line.lstrip(" ")) >= 4:
+            continue
+
+        heading_match = re.fullmatch(r" {0,3}(#{1,6})[ \t]+(.+?)[ \t]*", line)
+        if heading_match is None:
+            continue
+
+        marker, title = heading_match.groups()
+        title = re.sub(r"[ \t]+#+[ \t]*$", "", title)
+        normalized_title = " ".join(title.strip().split())
         if normalized_title:
             headings.add(f"{marker} {normalized_title}")
     return headings

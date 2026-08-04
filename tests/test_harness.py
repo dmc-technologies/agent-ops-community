@@ -111,3 +111,50 @@ def test_check_harness_rejects_legacy_heading_lookalikes(tmp_path: Path) -> None
 
     assert report.ok is False
     assert any("missing CI contract" in finding.message for finding in report.findings)
+
+
+def test_check_harness_ignores_ci_headings_rendered_as_code(tmp_path: Path) -> None:
+    replacements = (
+        "```markdown\n## CI Contract\n```",
+        "    ## CI Contract",
+        "~~~markdown\n## Fast Gate\n## Full Gate\n~~~",
+        "    ## Fast Gate\n\n    ## Full Gate",
+    )
+    for index, replacement in enumerate(replacements):
+        repo = tmp_path / str(index)
+        init_harness(repo, repo_name="code-heading", repo_type="python")
+        verification_path = repo / ".agentops/harness/VERIFY.md"
+        verification = verification_path.read_text(encoding="utf-8")
+        verification_path.write_text(
+            verification.replace("## CI Contract", replacement),
+            encoding="utf-8",
+        )
+
+        report = check_harness(repo)
+
+        assert report.ok is False
+        assert any("missing CI contract" in finding.message for finding in report.findings)
+
+
+def test_check_harness_ignores_required_heading_rendered_as_code(tmp_path: Path) -> None:
+    replacements = (
+        "```markdown\n## Project\n```",
+        "    ## Project",
+    )
+    for index, replacement in enumerate(replacements):
+        repo = tmp_path / str(index)
+        init_harness(repo, repo_name="code-heading", repo_type="python")
+        agents_path = repo / "AGENTS.md"
+        agents = agents_path.read_text(encoding="utf-8")
+        agents_path.write_text(
+            agents.replace("## Project", replacement),
+            encoding="utf-8",
+        )
+
+        report = check_harness(repo)
+
+        assert report.ok is False
+        assert any(
+            finding.path == "AGENTS.md" and "## Project" in finding.message
+            for finding in report.findings
+        )
