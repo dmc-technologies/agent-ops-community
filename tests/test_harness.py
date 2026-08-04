@@ -76,3 +76,38 @@ def test_check_harness_rejects_partial_legacy_verification_contract(tmp_path: Pa
 
     assert report.ok is False
     assert any("missing CI contract" in finding.message for finding in report.findings)
+
+
+def test_check_harness_rejects_ci_contract_heading_lookalikes(tmp_path: Path) -> None:
+    for index, heading in enumerate(("## CI Contract Notes", "## CI Contractual")):
+        repo = tmp_path / str(index)
+        init_harness(repo, repo_name="lookalike", repo_type="python")
+        verification_path = repo / ".agentops/harness/VERIFY.md"
+        verification = verification_path.read_text(encoding="utf-8")
+        verification_path.write_text(
+            verification.replace("## CI Contract", heading),
+            encoding="utf-8",
+        )
+
+        report = check_harness(repo)
+
+        assert report.ok is False
+        assert any("missing CI contract" in finding.message for finding in report.findings)
+
+
+def test_check_harness_rejects_legacy_heading_lookalikes(tmp_path: Path) -> None:
+    init_harness(tmp_path, repo_name="legacy-lookalike", repo_type="python")
+    verification_path = tmp_path / ".agentops/harness/VERIFY.md"
+    verification = verification_path.read_text(encoding="utf-8")
+    verification_path.write_text(
+        verification.replace(
+            "## CI Contract",
+            "## Fast Gateway\n\n- `pytest -q`\n\n## Full Gateway",
+        ),
+        encoding="utf-8",
+    )
+
+    report = check_harness(tmp_path)
+
+    assert report.ok is False
+    assert any("missing CI contract" in finding.message for finding in report.findings)

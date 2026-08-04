@@ -72,6 +72,19 @@ def default_verification(repo_type: str) -> tuple[str, ...]:
             return ("replace with this repo's fastest deterministic verification command",)
 
 
+def _markdown_headings(text: str) -> set[str]:
+    headings: set[str] = set()
+    for line in text.splitlines():
+        stripped = line.strip()
+        marker, separator, title = stripped.partition(" ")
+        if not separator or not marker or set(marker) != {"#"}:
+            continue
+        normalized_title = " ".join(title.rstrip("#").strip().split())
+        if normalized_title:
+            headings.add(f"{marker} {normalized_title}")
+    return headings
+
+
 def init_harness(
     repo_root: Path,
     repo_name: str,
@@ -118,8 +131,9 @@ def check_harness(repo_root: Path) -> HarnessReport:
             )
             continue
         text = path.read_text(encoding="utf-8")
+        headings = _markdown_headings(text)
         for section in REQUIRED_SECTIONS[relative_path]:
-            if section not in text:
+            if section not in headings:
                 findings.append(
                     HarnessFinding(
                         severity="error",
@@ -128,7 +142,7 @@ def check_harness(repo_root: Path) -> HarnessReport:
                     )
                 )
         if relative_path == ".agentops/harness/VERIFY.md" and not any(
-            all(section in text for section in alternative)
+            all(section in headings for section in alternative)
             for alternative in VERIFY_CI_SECTION_ALTERNATIVES
         ):
             findings.append(
