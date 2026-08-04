@@ -6,8 +6,9 @@ Record durable architecture, workflow, and harness decisions here.
 
 ### 2026-08-03: Repositories own their CI tier vocabulary
 
-- Decision: the generic harness requires `Harness Check` and `CI Contract`
-  sections. It does not require generic fast/full headings. Each repository
+- Decision: newly generated harnesses use `Harness Check` and `CI Contract`
+  sections. The checker also accepts a complete legacy `Fast Gate` and `Full
+  Gate` pair so released harnesses remain valid after upgrade. Each repository
   defines its named local tiers and hosted routing inside `CI Contract`.
 - Rationale: verification cost and deployment boundaries differ by project.
   The shared harness should ensure the contract is visible without imposing

@@ -43,3 +43,36 @@ def test_check_harness_rejects_missing_files(tmp_path: Path) -> None:
     assert report.ok is False
     assert any(finding.path == "AGENTS.md" for finding in report.findings)
     assert any(finding.path == ".agentops/harness/BOOTSTRAP.md" for finding in report.findings)
+
+
+def test_check_harness_accepts_complete_legacy_verification_contract(tmp_path: Path) -> None:
+    init_harness(tmp_path, repo_name="legacy", repo_type="python")
+    verification_path = tmp_path / ".agentops/harness/VERIFY.md"
+    verification = verification_path.read_text(encoding="utf-8")
+    verification_path.write_text(
+        verification.replace(
+            "## CI Contract",
+            "## Fast Gate\n\n- `pytest -q`\n\n## Full Gate",
+        ),
+        encoding="utf-8",
+    )
+
+    report = check_harness(tmp_path)
+
+    assert report.ok is True
+    assert report.findings == []
+
+
+def test_check_harness_rejects_partial_legacy_verification_contract(tmp_path: Path) -> None:
+    init_harness(tmp_path, repo_name="partial", repo_type="python")
+    verification_path = tmp_path / ".agentops/harness/VERIFY.md"
+    verification = verification_path.read_text(encoding="utf-8")
+    verification_path.write_text(
+        verification.replace("## CI Contract", "## Fast Gate"),
+        encoding="utf-8",
+    )
+
+    report = check_harness(tmp_path)
+
+    assert report.ok is False
+    assert any("missing CI contract" in finding.message for finding in report.findings)

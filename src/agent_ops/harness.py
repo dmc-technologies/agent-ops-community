@@ -37,8 +37,13 @@ REQUIRED_SECTIONS = {
     ),
     ".agentops/harness/DECISIONS.md": ("## Template",),
     ".agentops/harness/TASKS.md": ("## Ready", "## Acceptance Criteria Format"),
-    ".agentops/harness/VERIFY.md": ("## Harness Check", "## CI Contract"),
+    ".agentops/harness/VERIFY.md": ("## Harness Check",),
 }
+
+VERIFY_CI_SECTION_ALTERNATIVES = (
+    ("## CI Contract",),
+    ("## Fast Gate", "## Full Gate"),
+)
 
 
 class HarnessFinding(BaseModel):
@@ -122,6 +127,20 @@ def check_harness(repo_root: Path) -> HarnessReport:
                         message=f"missing section {section!r}",
                     )
                 )
+        if relative_path == ".agentops/harness/VERIFY.md" and not any(
+            all(section in text for section in alternative)
+            for alternative in VERIFY_CI_SECTION_ALTERNATIVES
+        ):
+            findings.append(
+                HarnessFinding(
+                    severity="error",
+                    path=relative_path,
+                    message=(
+                        "missing CI contract: add '## CI Contract' or preserve "
+                        "both legacy '## Fast Gate' and '## Full Gate' sections"
+                    ),
+                )
+            )
 
     return HarnessReport(ok=not findings, root=str(root), findings=findings)
 

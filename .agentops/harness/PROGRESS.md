@@ -24,6 +24,8 @@ Repository: `agent-ops-community`
 
 - 2026-08-03: Changed the generic verification template and validator to
   require `CI Contract` while leaving tier names to each repository.
+- 2026-08-03: Preserved upgrade safety by accepting a complete legacy
+  `Fast Gate` and `Full Gate` pair while generating only the new contract.
 - 2026-06-19: Ported an engineering-repository Review Gate into a generic
   label-driven workflow for public Agent Ops. Adding the `ai review` label runs
   deterministic preflight plus Codex review on the PR diff, posts a status,
@@ -35,10 +37,11 @@ Repository: `agent-ops-community`
 
 ## Verification Log
 
-- 2026-08-03: `PYTHONPATH=src python -m pytest tests/test_harness.py -q`
-  passed (`2 passed`); `ruff check src/agent_ops/harness.py
-  tests/test_harness.py` passed; `PYTHONPATH=src agentops harness check .`
-  passed; `git diff --check` passed.
+- 2026-08-03: `PYTHONPATH=src python -m pytest tests/test_harness.py
+  tests/test_public_safety.py -q` passed (`5 passed`); `ruff check
+  src/agent_ops/harness.py tests/test_harness.py tests/test_public_safety.py`
+  passed; `PYTHONPATH=src agentops harness check .` passed; `git diff --check`
+  passed.
 - 2026-06-19: `python -m pytest tests/test_review_gate.py -q` passed (`4 passed`).
 - 2026-06-19: `ruff check .github/scripts/review_gate.py tests/test_review_gate.py` passed.
 - 2026-06-19: Codex review dry-run against the committed deterministic Review
