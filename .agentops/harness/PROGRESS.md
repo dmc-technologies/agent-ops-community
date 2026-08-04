@@ -24,8 +24,8 @@ Repository: `agent-ops-community`
 
 - 2026-08-03: Changed the generic verification template and validator to
   require `CI Contract` while leaving tier names to each repository.
-- 2026-06-19: Ported Momentum commit `c3a49fc` into a generic label-driven
-  Review Gate workflow for public Agent Ops. Adding the `ai review` label runs
+- 2026-06-19: Ported an engineering-repository Review Gate into a generic
+  label-driven workflow for public Agent Ops. Adding the `ai review` label runs
   deterministic preflight plus Codex review on the PR diff, posts a status,
   summary comment, per-finding comments, and attempts an approving PR review.
 - 2026-06-19: Hardened Review Gate after external review: label-triggered
@@ -35,13 +35,10 @@ Repository: `agent-ops-community`
 
 ## Verification Log
 
-- 2026-08-03: `PYTHONPATH=src
-  /home/dmc-openclaw/agent-ops/.venv/bin/python -m pytest
-  tests/test_harness.py -q` passed (`2 passed`);
-  `/home/dmc-openclaw/agent-ops/.venv/bin/ruff check
-  src/agent_ops/harness.py tests/test_harness.py` passed;
-  `PYTHONPATH=src /home/dmc-openclaw/agent-ops/.venv/bin/agentops harness check
-  .` passed; `git diff --check` passed.
+- 2026-08-03: `PYTHONPATH=src python -m pytest tests/test_harness.py -q`
+  passed (`2 passed`); `ruff check src/agent_ops/harness.py
+  tests/test_harness.py` passed; `PYTHONPATH=src agentops harness check .`
+  passed; `git diff --check` passed.
 - 2026-06-19: `python -m pytest tests/test_review_gate.py -q` passed (`4 passed`).
 - 2026-06-19: `ruff check .github/scripts/review_gate.py tests/test_review_gate.py` passed.
 - 2026-06-19: Codex review dry-run against the committed deterministic Review
