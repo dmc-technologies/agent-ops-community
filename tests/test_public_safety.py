@@ -10,6 +10,7 @@ CHECKED_PATHS = [
     ROOT / "tests",
     ROOT / "docs",
     ROOT / "examples",
+    ROOT / ".agentops",
     ROOT / "README.md",
     ROOT / "SECURITY.md",
     ROOT / "pyproject.toml",
@@ -23,6 +24,7 @@ FORBIDDEN_SNIPPETS = [
     "".join(("D", "MC")),
     "".join(("Momen", "tum")),
     "".join(("/", "Users", "/")),
+    "".join(("/", "home", "/")),
     "".join(("Documents", "/", "GitHub")),
 ]
 

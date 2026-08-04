@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from markdown_it import MarkdownIt
 from pydantic import BaseModel
 
 REQUIRED_FILES = (
@@ -37,8 +38,13 @@ REQUIRED_SECTIONS = {
     ),
     ".agentops/harness/DECISIONS.md": ("## Template",),
     ".agentops/harness/TASKS.md": ("## Ready", "## Acceptance Criteria Format"),
-    ".agentops/harness/VERIFY.md": ("## Harness Check", "## Fast Gate", "## Full Gate"),
+    ".agentops/harness/VERIFY.md": ("## Harness Check",),
 }
+
+VERIFY_CI_SECTION_ALTERNATIVES = (
+    ("## CI Contract",),
+    ("## Fast Gate", "## Full Gate"),
+)
 
 
 class HarnessFinding(BaseModel):
@@ -65,6 +71,21 @@ def default_verification(repo_type: str) -> tuple[str, ...]:
             return ("ruff check .", "pytest")
         case _:
             return ("replace with this repo's fastest deterministic verification command",)
+
+
+def _markdown_headings(text: str) -> set[str]:
+    headings: set[str] = set()
+    tokens = MarkdownIt("commonmark").parse(text)
+    for index, token in enumerate(tokens):
+        if token.type != "heading_open" or token.level != 0:
+            continue
+        if index + 1 >= len(tokens) or tokens[index + 1].type != "inline":
+            continue
+        marker = "#" * int(token.tag.removeprefix("h"))
+        normalized_title = " ".join(tokens[index + 1].content.strip().split())
+        if normalized_title:
+            headings.add(f"{marker} {normalized_title}")
+    return headings
 
 
 def init_harness(
@@ -113,8 +134,9 @@ def check_harness(repo_root: Path) -> HarnessReport:
             )
             continue
         text = path.read_text(encoding="utf-8")
+        headings = _markdown_headings(text)
         for section in REQUIRED_SECTIONS[relative_path]:
-            if section not in text:
+            if section not in headings:
                 findings.append(
                     HarnessFinding(
                         severity="error",
@@ -122,6 +144,20 @@ def check_harness(repo_root: Path) -> HarnessReport:
                         message=f"missing section {section!r}",
                     )
                 )
+        if relative_path == ".agentops/harness/VERIFY.md" and not any(
+            all(section in headings for section in alternative)
+            for alternative in VERIFY_CI_SECTION_ALTERNATIVES
+        ):
+            findings.append(
+                HarnessFinding(
+                    severity="error",
+                    path=relative_path,
+                    message=(
+                        "missing CI contract: add '## CI Contract' or preserve "
+                        "both legacy '## Fast Gate' and '## Full Gate' sections"
+                    ),
+                )
+            )
 
     return HarnessReport(ok=not findings, root=str(root), findings=findings)
 
@@ -279,13 +315,13 @@ Repository: `{repo_name}`
 
 - Preferred local command: `agentops harness check .`
 
-## Fast Gate
+## CI Contract
 
 {command_lines}
 
-## Full Gate
-
-Use the repo's complete CI-equivalent command when the fast gate is not enough.
+Replace or expand these commands with the repository's named local CI tiers.
+The repository owns tier names and hosted routing; Agent Ops does not impose
+generic fast/full terminology.
 Record exact command output summaries in `.agentops/harness/PROGRESS.md`.
 """,
     }

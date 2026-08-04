@@ -4,6 +4,20 @@ Repository: `agent-ops-community`
 
 Record durable architecture, workflow, and harness decisions here.
 
+### 2026-08-03: Repositories own their CI tier vocabulary
+
+- Decision: newly generated harnesses use `Harness Check` and `CI Contract`
+  sections. The checker also accepts a complete legacy `Fast Gate` and `Full
+  Gate` pair so released harnesses remain valid after upgrade. Each repository
+  defines its named local tiers and hosted routing inside `CI Contract`.
+- Rationale: verification cost and deployment boundaries differ by project.
+  The shared harness should ensure the contract is visible without imposing
+  terminology that conflicts with the repository's executable CI interface.
+- Applies to: `src/agent_ops/harness.py`, generated
+  `.agentops/harness/VERIFY.md` files, and `tests/test_harness.py`.
+- Revisit when: Agent Ops gains a typed, machine-readable CI-tier schema shared
+  by multiple repositories.
+
 ### 2026-06-19: AI review is label-driven, Codex-backed, and PR-backed
 
 - Decision: PRs can run Codex-backed AI review by adding the `ai review` label. The workflow runs deterministic preflight checks first, invokes Codex with `.github/review-gate-prompt.md` against the PR diff, posts the `Review Gate` status, writes a durable summary comment plus per-finding comments, and attempts an approving PR review on pass.
