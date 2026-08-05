@@ -9,6 +9,20 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
+  windows-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - run: python -m pip install -e ".[dev]"
+      - run: python -m pip check
+      - run: ruff check .
+      - run: pytest
+      - run: agentops verify examples/local-smoke.yaml --json
+      - run: agentops harness check .
+
   test:
     runs-on: ubuntu-latest
     steps:

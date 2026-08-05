@@ -1,11 +1,23 @@
 from __future__ import annotations
 
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 
 from agent_ops.contracts.job import AgentJob
 from agent_ops.contracts.result import RunResult, RunStatus, VerificationResult
 from agent_ops.process import run_command
+
+
+def verification_shell_command(
+    command: str,
+    *,
+    os_name: str | None = None,
+) -> list[str]:
+    selected_os = os_name or os.name
+    if selected_os == "nt":
+        return ["cmd.exe", "/d", "/s", "/c", command]
+    return ["/bin/sh", "-lc", command]
 
 
 def run_verification(job: AgentJob, base_dir: str | Path) -> RunResult:
@@ -18,7 +30,7 @@ def run_verification(job: AgentJob, base_dir: str | Path) -> RunResult:
         if not cwd.is_absolute():
             cwd = (root / cwd).resolve()
         command_result = run_command(
-            ["/bin/sh", "-lc", check.command],
+            verification_shell_command(check.command),
             cwd=cwd,
             timeout_seconds=check.timeout_seconds,
         )

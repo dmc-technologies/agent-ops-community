@@ -4,5 +4,5 @@ runner: local
 mode: verify-only
 verification:
   - name: shell
-    command: "true"
+    command: "echo agent-ops-local-smoke"
 
