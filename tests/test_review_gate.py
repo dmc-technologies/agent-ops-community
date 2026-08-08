@@ -23,6 +23,32 @@ def load_review_gate():
     return module
 
 
+def material_finding(
+    *,
+    severity: str = "P1",
+    title: str = "Fix the unsafe workflow",
+    body: str = "The workflow executes untrusted PR code.",
+    root_cause: str = "untrusted-workflow-execution",
+    files: list[str] | None = None,
+) -> dict:
+    return {
+        "disposition": "block",
+        "severity": severity,
+        "title": title,
+        "body": body,
+        "files": files or [".github/workflows/review-gate.yml"],
+        "introduced_by_pr": True,
+        "current_behavior_defect": "The privileged job executes PR-controlled code.",
+        "current_failure_path": "A pull request changes the privileged workflow.",
+        "consequence_class": "security",
+        "consequence": "Untrusted code can execute with repository credentials.",
+        "confidence": "high",
+        "root_cause": root_cause,
+        "already_caught_by": "none",
+        "required_correction": "Keep PR-controlled code out of the privileged job.",
+    }
+
+
 def test_ai_review_label_triggers_review_and_approval() -> None:
     workflow = WORKFLOW_PATH.read_text()
     reusable = REUSABLE_WORKFLOW_PATH.read_text()
@@ -31,11 +57,9 @@ def test_ai_review_label_triggers_review_and_approval() -> None:
         f"uses: {org_name}/agent-ops-community/.github/workflows/"
         "review-gate-reusable.yml@main"
     )
-    concurrency_group = (
-        "review-gate-${{ inputs.repo }}-${{ inputs.pr_number }}-${{ inputs.mode }}"
-    )
+    concurrency_group = "review-gate-${{ inputs.repo }}-${{ inputs.pr_number }}"
 
-    assert "types: [opened, synchronize, reopened, labeled]" in workflow
+    assert "types: [labeled]" in workflow
     assert reusable_workflow in workflow
     assert "secrets: inherit" in workflow
     assert "head_repo: ${{ github.event.pull_request.head.repo.full_name }}" in workflow
@@ -44,7 +68,7 @@ def test_ai_review_label_triggers_review_and_approval() -> None:
     assert "codex_model: ${{ vars.REVIEW_GATE_CODEX_MODEL || '' }}" in workflow
     assert "Resolve PR" in workflow
     assert "github.event.label.name == 'ai review'" in workflow
-    assert "github.event.action != 'labeled'" in workflow
+    assert "github.event.action != 'labeled'" not in workflow
     assert "contains(github.event.pull_request.labels.*.name, 'ai review')" not in workflow
     assert "name: Review Gate" in workflow
     assert "npm install -g @openai/codex@0.144.1" not in workflow
@@ -56,6 +80,7 @@ def test_ai_review_label_triggers_review_and_approval() -> None:
     assert "caller-main/.github/review-gate-prompt.md" in reusable
     assert concurrency_group in reusable
     assert "cancel-in-progress: true" in reusable
+    assert "timeout-minutes: 30" in reusable
     assert "secrets.REVIEW_GATE_APPROVAL_TOKEN || github.token" in reusable
     assert "npm install -g @openai/codex@0.144.1" in reusable
     assert "OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}" in reusable
@@ -73,14 +98,12 @@ def test_ai_review_label_triggers_review_and_approval() -> None:
     assert "/agent-review" not in workflow
 
 
-def test_ai_review_label_is_applied_to_prs_by_default() -> None:
-    workflow = AUTO_LABEL_WORKFLOW_PATH.read_text()
-
-    assert "pull_request_target:" in workflow
-    assert "types: [opened, reopened, ready_for_review, synchronize]" in workflow
-    assert "actions/checkout" not in workflow
-    assert "--add-label \"ai review\"" in workflow
-    assert "gh label create \"ai review\"" in workflow
+def test_ai_review_label_is_only_applied_by_a_person_at_final_review() -> None:
+    assert not AUTO_LABEL_WORKFLOW_PATH.exists()
+    workflow = WORKFLOW_PATH.read_text()
+    assert "types: [labeled]" in workflow
+    assert "opened" not in workflow
+    assert "synchronize" not in workflow
 
 
 def test_review_prompt_includes_harder_architecture_domain_and_security_lenses() -> None:
@@ -133,20 +156,13 @@ def test_codex_review_invokes_codex_exec_and_parses_findings(monkeypatch, tmp_pa
             assert "Review strictly." in input_text
             output_path = Path(args[args.index("--output-last-message") + 1])
             output_path.write_text(
-                """
-                {
-                  "verdict": "request_changes",
-                  "summary": "The PR is not safe to merge yet.",
-                  "findings": [
+                json.dumps(
                     {
-                      "severity": "P1",
-                      "title": "Fix the unsafe workflow",
-                      "body": "The workflow executes untrusted PR code.",
-                      "files": [".github/workflows/review-gate.yml"]
+                        "verdict": "request_changes",
+                        "summary": "The PR is not safe to merge yet.",
+                        "findings": [material_finding()],
                     }
-                  ]
-                }
-                """
+                )
             )
             return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
         return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
@@ -213,6 +229,178 @@ def test_codex_review_uses_configured_model(monkeypatch, tmp_path: Path) -> None
     assert codex_env["REVIEW_GATE_CODEX_MODEL"] == "gpt-5.4-test"
 
 
+def test_review_gate_defaults_to_sol_and_explicit_reasoning_effort(monkeypatch) -> None:
+    review_gate = load_review_gate()
+    monkeypatch.delenv("REVIEW_GATE_CODEX_MODEL", raising=False)
+
+    assert review_gate.resolve_codex_model() == "gpt-5.6-sol"
+    assert review_gate.codex_model_args(effort="xhigh") == [
+        "--model",
+        "gpt-5.6-sol",
+        "-c",
+        'model_reasoning_effort="xhigh"',
+    ]
+
+
+def test_classifier_uses_sol_low_and_raises_uncertain_or_critical_changes_to_xhigh(
+    monkeypatch, tmp_path: Path
+) -> None:
+    review_gate = load_review_gate()
+    calls = []
+
+    def fake_run_command(args, cwd=None, env=None, input_text=None):
+        calls.append((args, input_text))
+        if args[:3] == ["git", "fetch", "--force"]:
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        if args[:2] == ["codex", "exec"]:
+            output_path = Path(args[args.index("--output-last-message") + 1])
+            output_path.write_text(
+                json.dumps(
+                    {
+                        "recommended_effort": "medium",
+                        "confidence": "low",
+                        "risk_domains": ["authorization"],
+                        "reasons": ["The change alters approval evaluation."],
+                        "review_questions": ["Can stale approval state authorize a mutation?"],
+                    }
+                )
+            )
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(review_gate, "run_command", fake_run_command)
+    profile = review_gate.run_codex_classification(
+        tmp_path,
+        repo="example-org/example",
+        pr_number=7,
+        sha="abc123",
+        base_ref="main",
+    )
+
+    codex_args, prompt = next(call for call in calls if call[0][:2] == ["codex", "exec"])
+    assert codex_args[codex_args.index("--model") + 1] == "gpt-5.6-sol"
+    assert 'model_reasoning_effort="low"' in codex_args
+    assert "Classify impact and review difficulty" in prompt
+    assert profile.effort == "xhigh"
+    assert profile.confidence == "low"
+    assert profile.risk_domains == ("authorization",)
+
+
+def test_classifier_routes_incomplete_low_effort_output_to_xhigh() -> None:
+    review_gate = load_review_gate()
+
+    profile = review_gate.review_profile_from_payload(
+        {"recommended_effort": "low", "confidence": "high"}
+    )
+
+    assert profile.effort == "xhigh"
+    assert profile.confidence == "low"
+
+
+def test_routed_review_passes_profile_and_selected_effort_to_full_review(
+    monkeypatch, tmp_path: Path
+) -> None:
+    review_gate = load_review_gate()
+    calls = []
+    responses = [
+        {
+            "recommended_effort": "high",
+            "confidence": "high",
+            "risk_domains": ["concurrency"],
+            "reasons": ["Lock ordering changes."],
+            "review_questions": ["Can two callers enter the mutation concurrently?"],
+        },
+        {"verdict": "approve", "summary": "No material findings.", "findings": []},
+    ]
+
+    def fake_run_command(args, cwd=None, env=None, input_text=None):
+        calls.append((args, input_text))
+        if args[:3] == ["git", "fetch", "--force"]:
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        if args[:2] == ["codex", "exec"]:
+            output_path = Path(args[args.index("--output-last-message") + 1])
+            output_path.write_text(json.dumps(responses.pop(0)))
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(review_gate, "run_command", fake_run_command)
+    result = review_gate.run_routed_codex_review(
+        tmp_path,
+        "Review strictly.",
+        repo="example-org/example",
+        pr_number=7,
+        sha="abc123",
+        base_ref="main",
+    )
+
+    codex_calls = [call for call in calls if call[0][:2] == ["codex", "exec"]]
+    assert len(codex_calls) == 2
+    full_args, full_prompt = codex_calls[1]
+    assert 'model_reasoning_effort="high"' in full_args
+    assert "concurrency" in full_prompt
+    assert "Can two callers enter the mutation concurrently?" in full_prompt
+    assert result.passed
+    assert result.profile.effort == "high"
+    rendered = review_gate.render_structured_summary(result)
+    assert "## Review profile" in rendered
+    assert "- Model: gpt-5.6-sol" in rendered
+    assert "- Reasoning effort: high" in rendered
+
+
+def test_materiality_contract_suppresses_noise_and_groups_one_root_cause(
+    monkeypatch, tmp_path: Path
+) -> None:
+    review_gate = load_review_gate()
+    first = material_finding()
+    duplicate = material_finding(
+        title="Fix the second unsafe workflow instance",
+        body="A second job executes the same untrusted checkout.",
+        files=[".github/workflows/second.yml"],
+    )
+    p3 = material_finding(severity="P3", title="Document another example")
+    already_caught = material_finding(title="Repeat the failing CI assertion")
+    already_caught["already_caught_by"] = "CI: workflow-policy"
+    suppressed = material_finding(title="Rename the helper")
+    suppressed["disposition"] = "suppress"
+
+    def fake_run_command(args, cwd=None, env=None, input_text=None):
+        if args[:3] == ["git", "fetch", "--force"]:
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        if args[:2] == ["codex", "exec"]:
+            output_path = Path(args[args.index("--output-last-message") + 1])
+            output_path.write_text(
+                json.dumps(
+                    {
+                        "verdict": "request_changes",
+                        "summary": "One material root cause remains.",
+                        "findings": [first, duplicate, p3, already_caught, suppressed],
+                    }
+                )
+            )
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(review_gate, "run_command", fake_run_command)
+    result = review_gate.run_codex_review(
+        tmp_path,
+        "Review strictly.",
+        repo="example-org/example",
+        pr_number=7,
+        sha="abc123",
+        base_ref="main",
+        profile=review_gate.ReviewProfile(effort="high"),
+    )
+
+    assert not result.passed
+    assert len(result.blocking) == 1
+    assert result.blocking[0].title == "Fix the unsafe workflow"
+    assert set(result.blocking[0].files) == {
+        ".github/workflows/review-gate.yml",
+        ".github/workflows/second.yml",
+    }
+    assert result.warnings == ()
+
+
 def test_codex_review_failure_reports_tail(monkeypatch, tmp_path: Path) -> None:
     review_gate = load_review_gate()
 
@@ -261,7 +449,9 @@ def test_submit_pr_approval_posts_approve_review(monkeypatch) -> None:
 
     monkeypatch.setattr(review_gate, "run_command", fake_run_command)
 
-    assert review_gate.submit_pr_approval("example-org/example", 12, "AI review passed")
+    assert review_gate.submit_pr_approval(
+        "example-org/example", 12, "abc123", "AI review passed"
+    )
     assert calls == [
         [
             "gh",
@@ -271,6 +461,8 @@ def test_submit_pr_approval_posts_approve_review(monkeypatch) -> None:
             "POST",
             "-f",
             "event=APPROVE",
+            "-f",
+            "commit_id=abc123",
             "-f",
             "body=AI review passed",
         ]
@@ -326,117 +518,6 @@ def test_analyze_workspace_blocks_conflict_markers(tmp_path: Path) -> None:
     assert result.blocking[0].code == "MERGE_CONFLICT_MARKERS"
 
 
-def test_fast_prompt_focuses_on_major_and_carries_delta_findings() -> None:
-    review_gate = load_review_gate()
-
-    fast = review_gate.build_codex_prompt(
-        "Review strictly.",
-        repo="example-org/example",
-        pr_number=7,
-        sha="newsha",
-        base_ref="main",
-        base_diff_ref="refs/remotes/review-gate-base/main",
-        mode="fast",
-        delta_from_sha="oldsha1",
-        carried_findings=("Fix the unsafe workflow",),
-    )
-    assert "Fast advisory mode" in fast
-    assert "P0/P1" in fast
-    # Exactly one authoritative diff scope in a delta round: the delta, never base.
-    assert "git diff oldsha1...HEAD" in fast
-    assert "git diff refs/remotes/review-gate-base/main...HEAD" not in fast
-    assert "delta re-review" in fast
-    assert "Carried findings" in fast
-    assert "Fix the unsafe workflow" in fast
-
-    # Thorough mode ignores delta entirely: always the full base...HEAD diff.
-    thorough = review_gate.build_codex_prompt(
-        "Review strictly.",
-        repo="example-org/example",
-        pr_number=7,
-        sha="newsha",
-        base_ref="main",
-        base_diff_ref="refs/remotes/review-gate-base/main",
-        mode="thorough",
-        delta_from_sha="oldsha1",
-        carried_findings=("Fix the unsafe workflow",),
-    )
-    assert "Fast advisory mode" not in thorough
-    assert "git diff oldsha1...HEAD" not in thorough
-    assert "git diff refs/remotes/review-gate-base/main...HEAD" in thorough
-
-
-def test_fast_mode_prefers_fast_model_then_falls_back(monkeypatch) -> None:
-    review_gate = load_review_gate()
-    monkeypatch.setenv("REVIEW_GATE_CODEX_MODEL", "thorough-model")
-    monkeypatch.setenv("REVIEW_GATE_FAST_CODEX_MODEL", "fast-model")
-    assert review_gate.codex_model_args("fast") == ["--model", "fast-model"]
-    assert review_gate.codex_model_args("thorough") == ["--model", "thorough-model"]
-
-    monkeypatch.delenv("REVIEW_GATE_FAST_CODEX_MODEL")
-    # Fast falls back to the thorough model when no fast tier is configured.
-    assert review_gate.codex_model_args("fast") == ["--model", "thorough-model"]
-
-
-def test_build_fast_comment_is_advisory_and_signs_state(monkeypatch) -> None:
-    monkeypatch.setenv("REVIEW_GATE_STATE_KEY", "test-secret")
-    review_gate = load_review_gate()
-    Finding = review_gate.Finding
-    result = review_gate.ReviewResult(
-        "codex",
-        summary="Quick pass.",
-        blocking=(Finding("P1", "CODEX_P1_1", "Major bug", "Details.", (".github/x.py",)),),
-        warnings=(Finding("P2", "CODEX_P2_1", "Minor nit", "Nit.", ()),),
-    )
-
-    comment = review_gate.build_fast_comment(
-        result,
-        sha="abc1234def",
-        run_url="https://run",
-        pr_number=7,
-        delta_from_sha="old1234def",
-        checkpoint_sha="abc1234def",
-        carried_forward=("Major bug",),
-    )
-
-    assert review_gate.FAST_COMMENT_MARKER in comment
-    assert review_gate.COMMENT_MARKER not in comment  # never the merge-gate marker
-    assert review_gate.STATE_MARKER_PREFIX in comment
-    # The signed token round-trips to the checkpoint sha + carry-forward list.
-    token = comment.split(review_gate.STATE_MARKER_PREFIX, 1)[1].split(" -->", 1)[0].strip()
-    assert review_gate.verify_fast_state(token) == ("abc1234def", ("Major bug",))
-    assert "Advisory only" in comment
-    assert "does not approve" in comment
-    assert "Major bug" in comment  # P1 surfaced
-    assert "Minor nit" not in comment  # P2 suppressed in fast pass
-    assert "Delta re-review since:** `old1234d`" in comment
-
-    # A failed round (checkpoint_sha=None) must NOT stamp signed state, so the next
-    # run re-reviews the failed round's diff from the base.
-    no_checkpoint = review_gate.build_fast_comment(
-        result, sha="abc1234def", run_url="", pr_number=7,
-        delta_from_sha=None, checkpoint_sha=None,
-    )
-    assert review_gate.STATE_MARKER_PREFIX not in no_checkpoint
-
-
-def test_fast_state_sign_verify_roundtrip_and_tamper(monkeypatch) -> None:
-    monkeypatch.setenv("REVIEW_GATE_STATE_KEY", "k1")
-    review_gate = load_review_gate()
-    state_blob = review_gate.sign_fast_state("sha123", ("A", "B"))
-    assert review_gate.verify_fast_state(state_blob) == ("sha123", ("A", "B"))
-    # Tampered signature is rejected.
-    b64, _, _sig = state_blob.partition(".")
-    assert review_gate.verify_fast_state(f"{b64}.deadbeef") == (None, ())
-    # A signed blob made under a different key does not verify.
-    monkeypatch.setenv("REVIEW_GATE_STATE_KEY", "k2")
-    assert review_gate.verify_fast_state(state_blob) == (None, ())
-    # With no key, no state is trusted (fail closed to full review).
-    monkeypatch.delenv("REVIEW_GATE_STATE_KEY")
-    assert review_gate.sign_fast_state("sha123", ("A",)) is None
-    assert review_gate.verify_fast_state(state_blob) == (None, ())
-
-
 def test_run_codex_review_rejects_invalid_output_contract(monkeypatch, tmp_path) -> None:
     review_gate = load_review_gate()
 
@@ -484,147 +565,6 @@ def test_run_codex_review_rejects_malformed_finding_entries(monkeypatch, tmp_pat
         assert result.blocking[0].code == "CODEX_REVIEW_INVALID", bad
 
 
-def test_run_fast_advisory_exits_zero_on_operational_error(monkeypatch, tmp_path) -> None:
-    """Any operational failure in the advisory lane still exits 0 (never a blocker)."""
-    review_gate = load_review_gate()
-    (tmp_path / "module.py").write_text("print('clean')\n")
-
-    def fake_run_command(args, cwd=None, env=None, input_text=None):
-        if args[:3] == ["gh", "pr", "diff"]:
-            return subprocess.CompletedProcess(args, 0, stdout="module.py\n", stderr="")
-        if args[:3] == ["gh", "api", "user"]:
-            return subprocess.CompletedProcess(args, 1, stdout="", stderr="")
-        # Base-ref fetch fails -> run_codex_review raises RuntimeError mid-lane.
-        if args[:3] == ["git", "fetch", "--force"]:
-            return subprocess.CompletedProcess(args, 1, stdout="", stderr="boom fetch")
-        return subprocess.CompletedProcess(args, 0, stdout="[]", stderr="")
-
-    monkeypatch.setattr(review_gate, "run_command", fake_run_command)
-    args = review_gate.argparse.Namespace(
-        pr=7, repo="example-org/example", sha="abc123",
-        base_ref="main", post_status=True, post_comment=True, run_url="",
-    )
-    import pytest
-
-    with pytest.raises(SystemExit) as exc:
-        review_gate.run_fast_advisory(args, "Review strictly.", workspace=tmp_path)
-    assert exc.value.code == 0
-
-
-def test_run_fast_advisory_does_not_advance_checkpoint_on_review_failure(
-    monkeypatch, tmp_path
-) -> None:
-    review_gate = load_review_gate()
-    (tmp_path / "module.py").write_text("print('clean')\n")
-    posted_body = {}
-
-    def fake_run_command(args, cwd=None, env=None, input_text=None):
-        if args[:3] == ["gh", "pr", "diff"]:
-            return subprocess.CompletedProcess(args, 0, stdout="module.py\n", stderr="")
-        if args[:3] == ["gh", "api", "user"]:
-            return subprocess.CompletedProcess(args, 1, stdout="", stderr="")
-        if args[:2] == ["codex", "exec"]:
-            # Non-zero exit -> CODEX_REVIEW_FAILED, no valid review produced.
-            return subprocess.CompletedProcess(args, 1, stdout="boom", stderr="boom")
-        # Capture the POSTed advisory comment body.
-        if args[:2] == ["gh", "api"] and args[-2] == "-f" and args[-1].startswith("body="):
-            posted_body["body"] = args[-1]
-        return subprocess.CompletedProcess(args, 0, stdout="[]", stderr="")
-
-    monkeypatch.setattr(review_gate, "run_command", fake_run_command)
-    args = review_gate.argparse.Namespace(
-        pr=7, repo="example-org/example", sha="abc123",
-        base_ref="main", post_status=True, post_comment=True, run_url="",
-    )
-    import pytest
-
-    with pytest.raises(SystemExit) as exc:
-        review_gate.run_fast_advisory(args, "Review strictly.", workspace=tmp_path)
-    assert exc.value.code == 0
-    # First round + failed review => no signed state stamped.
-    assert review_gate.STATE_MARKER_PREFIX not in posted_body.get("body", "")
-
-
-def test_failed_delta_round_preserves_carried_findings(monkeypatch, tmp_path) -> None:
-    """A failed review keeps the prior round's carried list and prior checkpoint."""
-    monkeypatch.setenv("REVIEW_GATE_STATE_KEY", "test-secret")
-    review_gate = load_review_gate()
-    (tmp_path / "module.py").write_text("print('clean')\n")
-    prior = _fast_body(review_gate, "0000000aaaa")  # prior good sha + carried titles
-    posted_body = {}
-
-    def fake_run_command(args, cwd=None, env=None, input_text=None):
-        if args[:3] == ["gh", "pr", "diff"]:
-            return subprocess.CompletedProcess(args, 0, stdout="module.py\n", stderr="")
-        if args[:3] == ["gh", "api", "user"]:
-            return subprocess.CompletedProcess(args, 0, stdout="gate-bot\n", stderr="")
-        if args[:3] == ["git", "merge-base"]:
-            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")  # is ancestor
-        if args[:2] == ["gh", "api"] and args[2].endswith("/issues/7/comments"):
-            payload = json.dumps([[{"id": 5, "body": prior, "user": {"login": "gate-bot"}}]])
-            return subprocess.CompletedProcess(args, 0, stdout=payload, stderr="")
-        if args[:2] == ["codex", "exec"]:
-            return subprocess.CompletedProcess(args, 1, stdout="boom", stderr="boom")
-        if args[:2] == ["gh", "api"] and args[-2] == "-f" and args[-1].startswith("body="):
-            posted_body["body"] = args[-1]
-        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
-
-    monkeypatch.setattr(review_gate, "run_command", fake_run_command)
-    args = review_gate.argparse.Namespace(
-        pr=7, repo="example-org/example", sha="ffffffbbbb",
-        base_ref="main", post_status=True, post_comment=True, run_url="",
-    )
-    import pytest
-
-    with pytest.raises(SystemExit):
-        review_gate.run_fast_advisory(args, "Review strictly.", workspace=tmp_path)
-    body = posted_body.get("body", "")
-    # Carried findings preserved (display) and in the signed state; checkpoint kept
-    # at the prior good sha, not the failed new head.
-    assert "Confine the manifest paths" in body
-    assert "Fail closed on lineage" in body
-    token = body.split(review_gate.STATE_MARKER_PREFIX, 1)[1].split(" -->", 1)[0].strip()
-    sha, carried = review_gate.verify_fast_state(token)
-    assert sha == "0000000aaaa"
-    assert carried == ("Confine the manifest paths", "Fail closed on lineage")
-
-
-def _fast_body(review_gate, sha: str) -> str:
-    # Requires REVIEW_GATE_STATE_KEY set by the caller so the state is signed.
-    state_blob = review_gate.sign_fast_state(
-        sha, ("Confine the manifest paths", "Fail closed on lineage")
-    )
-    return (
-        f"{review_gate.FAST_COMMENT_MARKER}\n"
-        f"{review_gate.STATE_MARKER_PREFIX}{state_blob} -->\n"
-        "## Major findings (P0/P1)\n"
-    )
-
-
-def test_read_fast_advisory_state_parses_marker_and_titles(monkeypatch) -> None:
-    monkeypatch.setenv("REVIEW_GATE_STATE_KEY", "test-secret")
-    review_gate = load_review_gate()
-    body = _fast_body(review_gate, "deadbeef1234")
-
-    def fake_run_command(args, cwd=None, env=None, input_text=None):
-        if args[:3] == ["gh", "api", "user"]:
-            return subprocess.CompletedProcess(args, 0, stdout="gate-bot\n", stderr="")
-        if args[:3] == ["gh", "api", "repos/example-org/example/issues/7/comments"]:
-            payload = json.dumps(
-                [
-                    {"id": 1, "body": "human note", "user": {"login": "someone", "type": "User"}},
-                    {"id": 2, "body": body, "user": {"login": "gate-bot", "type": "User"}},
-                ]
-            )
-            return subprocess.CompletedProcess(args, 0, stdout=payload, stderr="")
-        return subprocess.CompletedProcess(args, 0, stdout="[]", stderr="")
-
-    monkeypatch.setattr(review_gate, "run_command", fake_run_command)
-    last_sha, titles = review_gate.read_fast_advisory_state("example-org/example", 7)
-    assert last_sha == "deadbeef1234"
-    assert titles == ("Confine the manifest paths", "Fail closed on lineage")
-
-
 def test_fetch_issue_comments_flattens_multiple_pages(monkeypatch) -> None:
     """gh --paginate --slurp yields an array-of-pages; it must be flattened."""
     review_gate = load_review_gate()
@@ -642,136 +582,6 @@ def test_fetch_issue_comments_flattens_multiple_pages(monkeypatch) -> None:
     assert [c["id"] for c in comments] == [1, 2, 3]
 
 
-def test_trusted_fast_comment_requires_exact_login_under_app_token(monkeypatch) -> None:
-    """Under github.token, only the exact expected bot login is trusted."""
-    review_gate = load_review_gate()
-    monkeypatch.setenv("REVIEW_GATE_BOT_LOGIN", "github-actions[bot]")
-
-    def fake_run_command(args, cwd=None, env=None, input_text=None):
-        # App token: user endpoint not accessible.
-        return subprocess.CompletedProcess(args, 1, stdout="", stderr="not accessible")
-
-    monkeypatch.setattr(review_gate, "run_command", fake_run_command)
-    marker = review_gate.FAST_COMMENT_MARKER
-    other_bot = {"id": 1, "body": marker, "user": {"login": "dependabot[bot]", "type": "Bot"}}
-    ours = {"id": 2, "body": marker, "user": {"login": "github-actions[bot]", "type": "Bot"}}
-    assert review_gate.trusted_fast_comment([other_bot]) is None  # different bot rejected
-    assert review_gate.trusted_fast_comment([other_bot, ours])["id"] == 2
-
-
-def test_fast_advisory_state_rejects_state_forged_under_another_key(monkeypatch) -> None:
-    """Even a same-identity actor cannot forge state without the signing key."""
-    review_gate = load_review_gate()
-    # Attacker signs state with a key the gate does not use.
-    monkeypatch.setenv("REVIEW_GATE_STATE_KEY", "attacker-key")
-    forged_blob = review_gate.sign_fast_state("attacker00sha", ("evil delta",))
-    forged = (
-        f"{review_gate.FAST_COMMENT_MARKER}\n"
-        f"{review_gate.STATE_MARKER_PREFIX}{forged_blob} -->\n"
-    )
-    # The gate reads with ITS key; the forged signature does not verify.
-    monkeypatch.setenv("REVIEW_GATE_STATE_KEY", "gate-key")
-
-    def fake_run_command(args, cwd=None, env=None, input_text=None):
-        if args[:3] == ["gh", "api", "user"]:
-            return subprocess.CompletedProcess(args, 0, stdout="gate-bot\n", stderr="")
-        if args[:3] == ["gh", "api", "repos/example-org/example/issues/7/comments"]:
-            # Authored by the gate's own identity (the same-identity threat model).
-            payload = json.dumps(
-                [{"id": 9, "body": forged, "user": {"login": "gate-bot", "type": "Bot"}}]
-            )
-            return subprocess.CompletedProcess(args, 0, stdout=payload, stderr="")
-        return subprocess.CompletedProcess(args, 0, stdout="[]", stderr="")
-
-    monkeypatch.setattr(review_gate, "run_command", fake_run_command)
-    last_sha, titles = review_gate.read_fast_advisory_state("example-org/example", 7)
-    assert last_sha is None  # bad signature -> full review
-    assert titles == ()
-
-
-def test_run_fast_advisory_promotes_preflight_blockers_to_major(monkeypatch, tmp_path) -> None:
-    """A committed conflict marker must show as a major finding, not a green pass."""
-    review_gate = load_review_gate()
-    (tmp_path / "conflicted.py").write_text("<<<<<<< HEAD\na\n=======\nb\n>>>>>>> x\n")
-    statuses = []
-
-    def fake_run_command(args, cwd=None, env=None, input_text=None):
-        if args[:3] == ["gh", "pr", "diff"]:
-            return subprocess.CompletedProcess(args, 0, stdout="conflicted.py\n", stderr="")
-        if args[:3] == ["gh", "api", "user"]:
-            return subprocess.CompletedProcess(args, 1, stdout="", stderr="")
-        if args[:2] == ["codex", "exec"]:
-            out = Path(args[args.index("--output-last-message") + 1])
-            out.write_text('{"verdict":"approve","summary":"looks clean","findings":[]}')
-            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
-        if len(args) > 3 and "/statuses/" in str(args[2]):
-            statuses.append(args)
-        return subprocess.CompletedProcess(args, 0, stdout="[]", stderr="")
-
-    monkeypatch.setattr(review_gate, "run_command", fake_run_command)
-    args = review_gate.argparse.Namespace(
-        pr=7, repo="example-org/example", sha="abc123",
-        base_ref="main", post_status=True, post_comment=True, run_url="",
-    )
-    import pytest
-
-    with pytest.raises(SystemExit) as exc:
-        review_gate.run_fast_advisory(args, "Review strictly.", workspace=tmp_path)
-    assert exc.value.code == 0
-    joined = " ".join(str(a) for c in statuses for a in c)
-    assert "state=failure" in joined  # conflict marker surfaced as major
-
-
-def test_run_fast_advisory_never_approves_uses_fast_context(monkeypatch, tmp_path) -> None:
-    review_gate = load_review_gate()
-    (tmp_path / "module.py").write_text("print('clean')\n")
-    calls = []
-
-    def fake_run_command(args, cwd=None, env=None, input_text=None):
-        calls.append(args)
-        if args[:4] == ["gh", "pr", "diff", "7"] or args[:3] == ["gh", "pr", "diff"]:
-            return subprocess.CompletedProcess(args, 0, stdout="module.py\n", stderr="")
-        if args[:3] == ["gh", "api"] and args[3].endswith("/issues/7/comments"):
-            return subprocess.CompletedProcess(args, 0, stdout="[]", stderr="")
-        if args[:2] == ["codex", "exec"]:
-            out = Path(args[args.index("--output-last-message") + 1])
-            out.write_text(
-                '{"verdict":"request_changes","summary":"quick",'
-                '"findings":[{"severity":"P1","title":"Major","body":"b","files":[]},'
-                '{"severity":"P2","title":"Nit","body":"n","files":[]}]}'
-            )
-            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
-        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
-
-    monkeypatch.setattr(review_gate, "run_command", fake_run_command)
-
-    args = review_gate.argparse.Namespace(
-        pr=7,
-        repo="example-org/example",
-        sha="abc123",
-        base_ref="main",
-        post_status=True,
-        post_comment=True,
-        run_url="https://run",
-    )
-
-    import pytest
-
-    with pytest.raises(SystemExit) as exc:
-        review_gate.run_fast_advisory(args, "Review strictly.", workspace=tmp_path)
-    assert exc.value.code == 0
-
-    # Never submits an approving review.
-    assert not any("/reviews" in a for call in calls for a in call if isinstance(a, str))
-    # Posts only the distinct fast advisory status context, never "Review Gate".
-    status_calls = [c for c in calls if any("/statuses/" in str(a) for a in c)]
-    assert status_calls, "expected a commit status post"
-    status_args = [a for c in status_calls for a in c]
-    # Uses the distinct fast context as an exact arg; never the thorough context.
-    assert f"context={review_gate.STATUS_CONTEXT_FAST}" in status_args
-    assert f"context={review_gate.STATUS_CONTEXT_THOROUGH}" not in status_args
-
-
 def test_post_commit_status_defaults_to_thorough_context(monkeypatch) -> None:
     review_gate = load_review_gate()
     calls = []
@@ -786,35 +596,16 @@ def test_post_commit_status_defaults_to_thorough_context(monkeypatch) -> None:
     assert f"context={review_gate.STATUS_CONTEXT_THOROUGH}" in joined
 
 
-def test_reusable_workflow_supports_mode_and_fast_model() -> None:
+def test_fast_mode_is_removed_from_the_supported_interface() -> None:
     reusable = REUSABLE_WORKFLOW_PATH.read_text()
-    assert "mode:" in reusable
-    assert 'default: "thorough"' in reusable
-    assert "fast_codex_model:" in reusable
-    assert '--mode "${{ inputs.mode }}"' in reusable
-    assert "REVIEW_GATE_FAST_CODEX_MODEL: ${{ inputs.fast_codex_model }}" in reusable
-    # Thorough remains the default merge-authority path with approval intact.
+    script = SCRIPT_PATH.read_text()
+
+    assert "fast_codex_model:" not in reusable
+    assert '--mode "${{ inputs.mode }}"' not in reusable
+    assert "REVIEW_GATE_FAST_CODEX_MODEL" not in reusable
+    assert "REVIEW_GATE_STATE_KEY" not in reusable
+    assert "fast advisory" not in reusable.lower()
+    assert "FAST_COMMENT_MARKER" not in script
+    assert "run_fast_advisory" not in script
+    assert not (ROOT / "docs" / "review-gate-fast-mode.md").exists()
     assert "--submit-approval" in reusable
-    # Fast mode gets a distinct check-run name so it can never satisfy a required
-    # "Review Gate" check-run in branch protection.
-    assert "inputs.mode == 'fast' && 'Review Gate (fast advisory)' || 'Review Gate'" in reusable
-    # The delta-signing secret is declared and mapped into the review step so the
-    # feature can actually function in the supported workflow.
-    assert "REVIEW_GATE_STATE_KEY:" in reusable
-    assert "REVIEW_GATE_STATE_KEY: ${{ secrets.REVIEW_GATE_STATE_KEY }}" in reusable
-
-
-def test_fast_mode_invocation_contract_is_documented() -> None:
-    doc = (ROOT / "docs" / "review-gate-fast-mode.md").read_text()
-    # The supported external invocation contract is documented and testable.
-    assert "mode: fast" in doc
-    assert "fast_codex_model:" in doc
-    assert "review-gate-reusable.yml@main" in doc
-    # Non-merge-authority guarantees are stated.
-    assert "non-required" in doc
-    assert "never submits an approving review" in doc
-    # The @main ordering constraint is called out so callers don't startup_failure.
-    assert "startup_failure" in doc
-    # Delta-state signing / fail-closed default is documented.
-    assert "REVIEW_GATE_STATE_KEY" in doc
-    assert "full review" in doc

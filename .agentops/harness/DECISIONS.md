@@ -4,6 +4,20 @@ Repository: `agent-ops-community`
 
 Record durable architecture, workflow, and harness decisions here.
 
+### 2026-08-08: AI review runs once on the final head with risk-routed Sol effort
+
+- Decision: a person applies `ai review` once when a pull request's final head is ready. A low-effort `gpt-5.6-sol` classifier evaluates the complete diff and routes the full review to the same model at low, medium, high, or xhigh effort. Low confidence and critical authority domains route to xhigh. Auto-labeling and fast advisory mode are removed.
+- Rationale: historical review data showed repeated full reviews concentrated cost and comments on a few difficult pull requests. Final-head triggering removes repeated full reviews, while risk routing preserves xhigh for credentials, authorization, engineering source authority, persistent evidence, and similarly difficult changes regardless of diff size.
+- Applies to: `.github/workflows/review-gate.yml`, `.github/workflows/review-gate-reusable.yml`, `.github/scripts/review_gate.py`, and `tests/test_review_gate.py`.
+- Revisit when: production profile summaries provide enough low, medium, high, and xhigh outcomes to compare material-finding recall and run cost by tier.
+
+### 2026-08-08: Review Gate blocks only current material implementation defects
+
+- Decision: a Codex observation blocks only when the pull request introduced an incorrect current behavior, a plausible current path reaches it, the consequence is material, evidence and confidence are high, the issue is not already reported by deterministic checks, and a correction is required before merge. Missing tests, possible future regressions, style, general hardening, and approval prerequisites do not block. Repeated instances are grouped by root cause.
+- Rationale: the historical sample contained many requests for coverage, documentation, hardening, and prerequisites without a demonstrated current material consequence. Exact-head shadow evaluation removed one such test-only blocker while retaining a current false-verification defect.
+- Applies to: `.github/review-gate-prompt.md`, `.github/scripts/review_gate.py`, `tests/test_review_gate.py`, and `docs/review-gate-evaluation.md`.
+- Revisit when: shadow or production review shows a material defect was suppressed, or non-material observations still create review cycles.
+
 ### 2026-08-03: Repositories own their CI tier vocabulary
 
 - Decision: newly generated harnesses use `Harness Check` and `CI Contract`
