@@ -4,9 +4,7 @@
 from __future__ import annotations
 
 import argparse
-import base64
 import hashlib
-import hmac
 import json
 import os
 import re
@@ -17,28 +15,31 @@ from pathlib import Path
 
 COMMENT_MARKER = "<!-- review-gate-agent-review -->"
 FINDING_MARKER_PREFIX = "<!-- review-gate-finding:"
-# Fast mode is a NON-MERGE-AUTHORITY advisory lane. It uses its own comment
-# marker and status context so it can never touch, overwrite, or approve the
-# thorough gate's merge-authority surface (the COMMENT_MARKER summary, the
-# per-finding FINDING_MARKER comments, the "Review Gate" status, and the
-# approving PR review).
-FAST_COMMENT_MARKER = "<!-- review-gate-fast-advisory -->"
-# Machine-trusted delta state (checkpoint SHA + carry-forward titles) is stored as
-# an HMAC-SIGNED token so it cannot be forged or altered by any other actor that
-# shares the gate's comment-author identity (the shared Actions bot, a PAT owner's
-# other comments). Without a signing key the gate stores no state and every fast
-# round does a full review -- the fail-closed default. A human-readable copy is
-# rendered separately for display only and is never trusted for state.
-STATE_MARKER_PREFIX = "<!-- review-gate-fast-state:"
 STATUS_CONTEXT_THOROUGH = "Review Gate"
-STATUS_CONTEXT_FAST = "Review Gate (fast advisory)"
-FAST_ADVISORY_SEVERITIES = {"P0", "P1"}
-# Backend-failure finding codes: the review did not produce a valid disposition,
-# so fast mode must not advance its delta checkpoint on any of these.
-REVIEW_FAILURE_CODES = {
-    "CODEX_REVIEW_FAILED",
-    "CODEX_REVIEW_UNPARSEABLE",
-    "CODEX_REVIEW_INVALID",
+DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
+REVIEW_EFFORTS = ("low", "medium", "high", "xhigh")
+CRITICAL_RISK_DOMAINS = {
+    "authorization",
+    "credentials",
+    "engineering_source_authority",
+    "irreversible_state",
+    "privileged_workflow",
+    "safety",
+}
+HIGH_RISK_DOMAINS = {
+    "ci_policy",
+    "concurrency",
+    "persistence",
+    "provider_boundary",
+    "public_contract",
+}
+MATERIAL_CONSEQUENCE_CLASSES = {
+    "compatibility",
+    "correctness",
+    "data",
+    "engineering",
+    "operations",
+    "security",
 }
 DEFAULT_REVIEW_PROMPT = """# Review Gate Prompt
 
@@ -58,6 +59,16 @@ class Finding:
     title: str
     detail: str
     files: tuple[str, ...] = ()
+    root_cause: str = ""
+
+
+@dataclass(frozen=True)
+class ReviewProfile:
+    effort: str = "xhigh"
+    confidence: str = "low"
+    risk_domains: tuple[str, ...] = ()
+    reasons: tuple[str, ...] = ()
+    review_questions: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -67,6 +78,7 @@ class ReviewResult:
     warnings: tuple[Finding, ...] = ()
     blocking: tuple[Finding, ...] = ()
     raw_review: str = ""
+    profile: ReviewProfile | None = None
 
     @property
     def passed(self) -> bool:
@@ -113,7 +125,6 @@ def codex_child_env() -> dict[str, str]:
         "HOME",
         "PATH",
         "REVIEW_GATE_CODEX_MODEL",
-        "REVIEW_GATE_FAST_CODEX_MODEL",
         "TEMP",
         "TMPDIR",
         "USER",
@@ -121,20 +132,15 @@ def codex_child_env() -> dict[str, str]:
     return {key: value for key, value in os.environ.items() if key in allowed}
 
 
-def resolve_codex_model(mode: str = "thorough") -> str:
-    """Fast mode may use a cheaper/faster tier; falls back to the thorough model."""
-    if mode == "fast":
-        fast = os.environ.get("REVIEW_GATE_FAST_CODEX_MODEL", "").strip()
-        if fast:
-            return fast
-    return os.environ.get("REVIEW_GATE_CODEX_MODEL", "").strip()
+def resolve_codex_model() -> str:
+    return os.environ.get("REVIEW_GATE_CODEX_MODEL", "").strip() or DEFAULT_CODEX_MODEL
 
 
-def codex_model_args(mode: str = "thorough") -> list[str]:
-    model = resolve_codex_model(mode)
-    if not model:
-        return []
-    return ["--model", model]
+def codex_model_args(*, effort: str = "medium") -> list[str]:
+    if effort not in REVIEW_EFFORTS:
+        effort = "xhigh"
+    model = resolve_codex_model()
+    return ["--model", model, "-c", f'model_reasoning_effort="{effort}"']
 
 
 def iter_text_files(workspace: Path, changed_files: list[str] | None = None) -> list[Path]:
@@ -235,40 +241,31 @@ def analyze_workspace(workspace: Path, changed_files: list[str] | None = None) -
     return ReviewResult("preflight", warnings=tuple(warnings), blocking=tuple(blocking))
 
 
-def build_carried_section(carried_findings: tuple[str, ...]) -> str:
-    """Delta rounds separately require explicit revalidation of prior findings.
-
-    The diff SCOPE for a delta round is set once (the single `git diff` line in
-    the prompt); this section does not restate a scope, only the carry-forward
-    contract, so the prompt has exactly one authoritative diff scope.
-    """
-    if not carried_findings:
+def build_profile_section(profile: ReviewProfile | None) -> str:
+    if profile is None:
         return ""
-    lines = [
-        "## Carried findings — revalidate each explicitly",
-        "",
-        "Prior fast rounds reported the findings below. For EACH one, re-check it",
-        "against the current head and state whether it still applies; include it as",
-        "a finding if it is still present, even if it lies outside the delta above.",
-    ]
-    for title in carried_findings:
-        lines.append(f"- {title}")
-    return "\n".join(lines) + "\n\n"
+    domains = ", ".join(profile.risk_domains) or "none identified"
+    reasons = "\n".join(f"- {reason}" for reason in profile.reasons) or "- None supplied"
+    questions = (
+        "\n".join(f"- {question}" for question in profile.review_questions)
+        or "- Apply the repository review prompt to the complete diff."
+    )
+    return f"""## Classified review profile
 
+Reasoning effort: {profile.effort}
+Risk domains: {domains}
 
-def build_mode_section(mode: str) -> str:
-    if mode == "fast":
-        return (
-            "## Fast advisory mode\n\n"
-            "This is a fast, ADVISORY pass to give the author a quick directional\n"
-            "signal during iteration. It is not the merge gate. Report only the\n"
-            "highest-severity, clearly-blocking issues (P0/P1): correctness bugs,\n"
-            "broken contracts, security regressions, and fabricated or untraceable\n"
-            "engineering values. Skip P2/P3 stylistic or hardening notes in this\n"
-            "pass -- the thorough gate covers those. Prefer a few high-confidence\n"
-            "findings over exhaustive breadth.\n\n"
-        )
-    return ""
+Classification reasons:
+{reasons}
+
+Questions requiring focused review:
+{questions}
+
+The profile focuses the review; it does not narrow the diff and it is not
+authoritative. Report a material defect outside these domains when the evidence
+requires it.
+
+"""
 
 
 def build_codex_prompt(
@@ -279,26 +276,13 @@ def build_codex_prompt(
     sha: str,
     base_ref: str,
     base_diff_ref: str,
-    mode: str = "thorough",
-    delta_from_sha: str | None = None,
-    carried_findings: tuple[str, ...] = (),
+    profile: ReviewProfile | None = None,
 ) -> str:
-    # Thorough mode always reviews the complete base...HEAD diff. Delta focus is
-    # a fast-mode-only optimization; the thorough merge gate never narrows scope.
-    if mode != "fast":
-        delta_from_sha = None
-        carried_findings = ()
-    # Exactly one authoritative diff scope: the delta base on a fast delta round,
-    # otherwise the full base...HEAD. The prompt never names a second scope.
-    diff_scope_ref = delta_from_sha or base_diff_ref
-    scope_note = ""
-    if delta_from_sha:
-        scope_note = (
-            f"\nThis is a delta re-review: prior fast rounds already reviewed up to "
-            f"{delta_from_sha}, so the diff above is exactly the new work since then "
-            f"and is your authoritative review scope for new issues.\n"
-        )
-    mode_and_delta = build_mode_section(mode) + build_carried_section(carried_findings)
+    consequence_classes = (
+        '"compatibility" | "correctness" | "data" | "engineering" | '
+        '"operations" | "security" | "none"'
+    )
+    profile_section = build_profile_section(profile)
     return f"""You are executing the repository PR review gate.
 
 Repository: {repo}
@@ -308,24 +292,37 @@ Base ref: {base_ref}
 
 Use the local checkout as the source of truth. Review the PR diff with:
 
-git diff {diff_scope_ref}...HEAD
-{scope_note}
+git diff {base_diff_ref}...HEAD
+
 Apply this review prompt:
 
 {review_prompt}
 
-{mode_and_delta}## Exhaustiveness (single-pass completeness)
+{profile_section}## Complete material-defect search
 
 Enumerate EVERY blocking finding present in the diff scope shown above in this
-one pass. Do not defer, hold, or ration findings for a later review round --
+one pass. Do not defer or ration findings for a later review round --
 assume there is no cheap later round and that omitted issues ship. Before
 returning:
 - Re-scan the changes under review for additional INSTANCES of every issue class
-  you found. If a defect appears in one place, check whether the same class
-  appears elsewhere in that scope and report all instances.
-- Group findings by root-cause class so one architectural fix can retire a whole
-  class rather than surfacing one instance at a time across rounds.
-Completeness in this pass is more important than brevity.
+  you found, but report one finding per root cause and include the affected files
+  in that single finding.
+- Investigate broadly in reasoning. A finding is reportable only when the PR
+  introduced an implementation defect that exists now, a plausible current path
+  reaches that defect, it has a concrete material consequence, the evidence is
+  specific, confidence is high, and a correction is required before merge.
+- A missing test, proof, comment, or documentation is not a current implementation
+  defect. Possible future regression is not a current failure path. If current
+  behavior is correct, suppress the observation. If implementation behavior is
+  incorrect, report that behavior as the defect; coverage may be part of the
+  correction but never the root cause.
+- Suppress style, naming, formatting, general refactoring, hypothetical future
+  extensions, documentation maintenance without a broken operational path,
+  missing coverage without a demonstrated material consequence, pre-existing
+  issues, approval prerequisites, and failures already reported by deterministic
+  checks or CI.
+- P3 can never block. A P2 finding blocks only when it independently satisfies
+  every materiality field below.
 
 Return only valid JSON with this exact shape:
 {{
@@ -334,15 +331,27 @@ Return only valid JSON with this exact shape:
   "findings": [
     {{
       "severity": "P0" | "P1" | "P2" | "P3",
+      "disposition": "block" | "suppress",
       "title": "Short imperative finding title",
-      "body": "Specific evidence, risk, and required fix.",
-      "files": ["relative/path.ext"]
+      "body": "Specific evidence from the changed code.",
+      "files": ["relative/path.ext"],
+      "introduced_by_pr": true | false,
+      "current_behavior_defect": "Specific changed behavior that is incorrect now.",
+      "current_failure_path": "Plausible current path that reaches the behavior.",
+      "consequence_class": {consequence_classes},
+      "consequence": "Concrete consequence, or empty when suppressed.",
+      "confidence": "high" | "medium" | "low",
+      "root_cause": "Stable identifier shared by related instances.",
+      "already_caught_by": "none" | "CI/check name or explicit prerequisite",
+      "required_correction": "Correction required before merge, or empty when suppressed."
     }}
   ]
 }}
 
-Use P0/P1/P2 for findings that should block merge. Use P3 only for non-blocking advisory comments.
-If there are no actionable findings, return "approve" with an empty findings array.
+Use disposition=suppress for observations that fail any materiality condition.
+Suppressed observations are retained only for shadow evaluation and are never
+posted to the pull request. If there are no reportable findings, return
+"approve"; the findings array may contain suppressed observations.
 Do not include markdown fences or prose outside the JSON object.
 """
 
@@ -366,6 +375,146 @@ def ensure_base_ref(workspace: Path, repo: str, base_ref: str) -> str:
     return target_ref
 
 
+def build_classification_prompt(
+    *,
+    repo: str,
+    pr_number: int,
+    sha: str,
+    base_ref: str,
+    base_diff_ref: str,
+) -> str:
+    return f"""Classify impact and review difficulty for this pull request.
+
+Repository: {repo}
+Pull request: #{pr_number}
+Head SHA: {sha}
+Base ref: {base_ref}
+
+Inspect the complete change with:
+
+git diff {base_diff_ref}...HEAD
+
+This is classification, not code review. Do not report defects and do not
+suggest fixes. Identify the effects that could make a small change consequential
+and choose the lowest Sol reasoning effort that can reliably review them.
+
+Routing rules:
+- low: clearly mechanical, generated, or presentation-only changes whose source
+  authority and behavior are unchanged.
+- medium: contained behavior with familiar local failure modes and no authority,
+  persistence, public-contract, concurrency, or engineering-source change.
+- high: cross-component behavior, persistence, public contracts, provider
+  behavior, concurrency, CI policy, or uncertain scope.
+- xhigh: authorization, credentials, privileged execution, irreversible state,
+  engineering source authority, safety decisions, or difficult novel behavior.
+- Low confidence must route to xhigh. Change size never lowers effort.
+
+Return only valid JSON:
+{{
+  "recommended_effort": "low" | "medium" | "high" | "xhigh",
+  "confidence": "high" | "medium" | "low",
+  "risk_domains": ["lower_snake_case_domain"],
+  "reasons": ["Concrete changed behavior used for routing."],
+  "review_questions": ["Question the full reviewer must answer."]
+}}
+"""
+
+
+def _string_tuple(value: object) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        return ()
+    return tuple(str(item).strip() for item in value if str(item).strip())
+
+
+def review_profile_from_payload(payload: dict) -> ReviewProfile:
+    effort = str(payload.get("recommended_effort") or "").lower()
+    confidence = str(payload.get("confidence") or "").lower()
+    reasons = _string_tuple(payload.get("reasons"))
+    questions = _string_tuple(payload.get("review_questions"))
+    valid = (
+        effort in REVIEW_EFFORTS
+        and confidence in {"high", "medium", "low"}
+        and isinstance(payload.get("risk_domains"), list)
+        and bool(reasons)
+        and bool(questions)
+    )
+    if not valid:
+        return ReviewProfile(
+            effort="xhigh",
+            confidence="low",
+            reasons=("Classification output was incomplete; routed fail-closed to xhigh.",),
+        )
+    domains = tuple(
+        domain.lower().replace("-", "_")
+        for domain in _string_tuple(payload.get("risk_domains"))
+    )
+    if confidence == "low" or CRITICAL_RISK_DOMAINS.intersection(domains):
+        effort = "xhigh"
+    elif HIGH_RISK_DOMAINS.intersection(domains) and REVIEW_EFFORTS.index(effort) < 2:
+        effort = "high"
+    return ReviewProfile(
+        effort=effort,
+        confidence=confidence,
+        risk_domains=domains,
+        reasons=reasons,
+        review_questions=questions,
+    )
+
+
+def run_codex_classification(
+    workspace: Path,
+    *,
+    repo: str,
+    pr_number: int,
+    sha: str,
+    base_ref: str,
+    base_diff_ref: str | None = None,
+) -> ReviewProfile:
+    base_diff_ref = base_diff_ref or ensure_base_ref(workspace, repo, base_ref)
+    output_path = workspace / ".review-gate-classification.json"
+    prompt = build_classification_prompt(
+        repo=repo,
+        pr_number=pr_number,
+        sha=sha,
+        base_ref=base_ref,
+        base_diff_ref=base_diff_ref,
+    )
+    result = run_command(
+        [
+            "codex",
+            "exec",
+            "--skip-git-repo-check",
+            "--ephemeral",
+            "--ignore-rules",
+            "--sandbox",
+            "danger-full-access",
+            "--output-last-message",
+            str(output_path),
+            *codex_model_args(effort="low"),
+        ],
+        cwd=workspace,
+        env=codex_child_env(),
+        input_text=prompt,
+    )
+    raw = output_path.read_text(encoding="utf-8") if output_path.exists() else result.stdout
+    output_path.unlink(missing_ok=True)
+    if result.returncode != 0:
+        return ReviewProfile(
+            effort="xhigh",
+            confidence="low",
+            reasons=("Classification did not complete; routed fail-closed to xhigh.",),
+        )
+    try:
+        payload = extract_json_object(raw)
+    except (ValueError, json.JSONDecodeError):
+        return ReviewProfile(
+            effort="xhigh",
+            confidence="low",
+            reasons=("Classification was invalid; routed fail-closed to xhigh.",),
+        )
+    return review_profile_from_payload(payload)
+
+
 def extract_json_object(text: str) -> dict:
     stripped = text.strip()
     if stripped.startswith("```"):
@@ -382,26 +531,121 @@ def extract_json_object(text: str) -> dict:
 
 
 def _valid_finding_entry(item: object) -> bool:
-    """A finding must be an object with correctly-typed fields (all optional)."""
+    """A finding must satisfy the materiality output contract."""
     if not isinstance(item, dict):
         return False
-    for field in ("severity", "title", "body", "detail"):
+    for field in (
+        "severity",
+        "disposition",
+        "title",
+        "body",
+        "detail",
+        "current_behavior_defect",
+        "current_failure_path",
+        "consequence_class",
+        "consequence",
+        "confidence",
+        "root_cause",
+        "already_caught_by",
+        "required_correction",
+    ):
         value = item.get(field)
         if value is not None and not isinstance(value, str):
             return False
     files = item.get("files")
-    return files is None or isinstance(files, list)
+    introduced = item.get("introduced_by_pr")
+    if files is not None and not isinstance(files, list):
+        return False
+    if introduced is not None and not isinstance(introduced, bool):
+        return False
+    disposition = str(item.get("disposition") or "").lower()
+    if disposition not in {"block", "suppress"}:
+        return False
+    if disposition == "suppress":
+        return True
+    required_strings = (
+        "severity",
+        "title",
+        "current_behavior_defect",
+        "current_failure_path",
+        "consequence_class",
+        "consequence",
+        "confidence",
+        "root_cause",
+        "already_caught_by",
+        "required_correction",
+    )
+    return introduced is not None and all(
+        str(item.get(field) or "").strip() for field in required_strings
+    )
 
 
-def finding_from_payload(payload: dict, index: int) -> Finding:
+def finding_from_payload(payload: dict, index: int) -> Finding | None:
+    if str(payload.get("disposition") or "").lower() != "block":
+        return None
     severity = str(payload.get("severity") or "P2").upper()
     if severity not in {"P0", "P1", "P2", "P3"}:
         severity = "P2"
+    consequence_class = str(payload.get("consequence_class") or "none").lower()
+    confidence = str(payload.get("confidence") or "low").lower()
+    already_caught = str(payload.get("already_caught_by") or "").strip().lower()
+    reportable = (
+        severity != "P3"
+        and payload.get("introduced_by_pr") is True
+        and confidence == "high"
+        and consequence_class in MATERIAL_CONSEQUENCE_CLASSES
+        and already_caught == "none"
+    )
+    if not reportable:
+        return None
     title = str(payload.get("title") or f"Codex finding {index + 1}").strip()
-    detail = str(payload.get("body") or payload.get("detail") or "").strip()
+    evidence = str(payload.get("body") or payload.get("detail") or "").strip()
+    failure_path = str(payload.get("current_failure_path") or "").strip()
+    consequence = str(payload.get("consequence") or "").strip()
+    correction = str(payload.get("required_correction") or "").strip()
+    detail = "\n".join(
+        (
+            f"Behavior: {failure_path}",
+            f"Consequence: {consequence}",
+            f"Required correction: {correction}",
+            f"Evidence: {evidence}",
+        )
+    )
     files_payload = payload.get("files") or []
     files = tuple(str(item) for item in files_payload if str(item).strip())
-    return Finding(severity, f"CODEX_{severity}_{index + 1}", title, detail, files)
+    root_cause = str(payload.get("root_cause") or "").strip()
+    return Finding(
+        severity,
+        f"CODEX_{severity}_{index + 1}",
+        title,
+        detail,
+        files,
+        root_cause,
+    )
+
+
+def group_root_cause_findings(findings: tuple[Finding, ...]) -> tuple[Finding, ...]:
+    grouped: dict[str, Finding] = {}
+    order: list[str] = []
+    for finding in findings:
+        key = finding.root_cause or finding.code
+        if key not in grouped:
+            grouped[key] = finding
+            order.append(key)
+            continue
+        existing = grouped[key]
+        details = existing.detail
+        if finding.detail not in details:
+            details = f"{details}\n\nAdditional instance:\n{finding.detail}"
+        grouped[key] = Finding(
+            existing.severity,
+            existing.code,
+            existing.title,
+            details,
+            tuple(dict.fromkeys((*existing.files, *finding.files))),
+            key,
+        )
+    return tuple(grouped[key] for key in order)
 
 
 def run_codex_review(
@@ -412,11 +656,10 @@ def run_codex_review(
     pr_number: int,
     sha: str,
     base_ref: str,
-    mode: str = "thorough",
-    delta_from_sha: str | None = None,
-    carried_findings: tuple[str, ...] = (),
+    profile: ReviewProfile | None = None,
+    base_diff_ref: str | None = None,
 ) -> ReviewResult:
-    base_diff_ref = ensure_base_ref(workspace, repo, base_ref)
+    base_diff_ref = base_diff_ref or ensure_base_ref(workspace, repo, base_ref)
     output_path = workspace / ".review-gate-codex-output.json"
     prompt = build_codex_prompt(
         review_prompt,
@@ -425,9 +668,7 @@ def run_codex_review(
         sha=sha,
         base_ref=base_ref,
         base_diff_ref=base_diff_ref,
-        mode=mode,
-        delta_from_sha=delta_from_sha,
-        carried_findings=carried_findings,
+        profile=profile,
     )
     result = run_command(
         [
@@ -440,7 +681,7 @@ def run_codex_review(
             "danger-full-access",
             "--output-last-message",
             str(output_path),
-            *codex_model_args(mode),
+            *codex_model_args(effort=profile.effort if profile else "medium"),
         ],
         cwd=workspace,
         env=codex_child_env(),
@@ -482,9 +723,7 @@ def run_codex_review(
 
     # Validate the full output contract before trusting the result. A payload
     # with an unknown verdict or a non-list findings field must NOT be treated as
-    # a clean review: otherwise it can produce zero blockers (a silent pass) and,
-    # in fast mode, advance the delta checkpoint past work that got no valid
-    # disposition. Such payloads are a review failure, same as unparseable output.
+    # a clean review: otherwise it can produce zero blockers and silently pass.
     verdict_raw = payload.get("verdict")
     findings_payload = payload.get("findings")
     valid_verdict = (
@@ -516,23 +755,49 @@ def run_codex_review(
             ),
             raw_review=raw_review,
         )
-    verdict = verdict_raw.strip().lower()
     summary = str(payload.get("summary") or "").strip()
     findings = tuple(
-        finding_from_payload(item, index) for index, item in enumerate(findings_payload)
-    )
-    blocking = tuple(
         finding
-        for finding in findings
-        if verdict == "request_changes" or finding.severity in {"P0", "P1", "P2"}
+        for index, item in enumerate(findings_payload)
+        if (finding := finding_from_payload(item, index)) is not None
     )
-    warnings = tuple(finding for finding in findings if finding not in blocking)
+    blocking = group_root_cause_findings(findings)
     return ReviewResult(
         "codex",
         summary=summary,
-        warnings=warnings,
         blocking=blocking,
         raw_review=raw_review,
+        profile=profile,
+    )
+
+
+def run_routed_codex_review(
+    workspace: Path,
+    review_prompt: str,
+    *,
+    repo: str,
+    pr_number: int,
+    sha: str,
+    base_ref: str,
+) -> ReviewResult:
+    base_diff_ref = ensure_base_ref(workspace, repo, base_ref)
+    profile = run_codex_classification(
+        workspace,
+        repo=repo,
+        pr_number=pr_number,
+        sha=sha,
+        base_ref=base_ref,
+        base_diff_ref=base_diff_ref,
+    )
+    return run_codex_review(
+        workspace,
+        review_prompt,
+        repo=repo,
+        pr_number=pr_number,
+        sha=sha,
+        base_ref=base_ref,
+        profile=profile,
+        base_diff_ref=base_diff_ref,
     )
 
 
@@ -558,6 +823,14 @@ def render_structured_summary(result: ReviewResult, review_prompt: str = "") -> 
     if result.summary:
         lines.append("## Codex summary")
         lines.append(result.summary)
+        lines.append("")
+    if result.profile:
+        lines.append("## Review profile")
+        lines.append(f"- Model: {resolve_codex_model()}")
+        lines.append(f"- Reasoning effort: {result.profile.effort}")
+        lines.append(f"- Classifier confidence: {result.profile.confidence}")
+        domains = ", ".join(result.profile.risk_domains) or "none identified"
+        lines.append(f"- Risk domains: {domains}")
         lines.append("")
     lines.extend(render_section("Blocking findings", result.blocking, "- None"))
     lines.append("")
@@ -710,7 +983,7 @@ def post_finding_comments(
     sha: str,
     run_url: str,
 ) -> None:
-    findings = (*result.blocking, *result.warnings)
+    findings = result.blocking
     existing = fetch_issue_comments(repo, pr_number)
     by_marker = {
         comment.get("body", "").split("-->", 1)[0] + "-->": comment["id"]
@@ -762,7 +1035,7 @@ def post_finding_comments(
             raise RuntimeError(post_result.stderr.strip())
 
 
-def submit_pr_approval(repo: str, pr_number: int, body: str) -> bool:
+def submit_pr_approval(repo: str, pr_number: int, sha: str, body: str) -> bool:
     result = run_command(
         [
             "gh",
@@ -772,6 +1045,8 @@ def submit_pr_approval(repo: str, pr_number: int, body: str) -> bool:
             "POST",
             "-f",
             "event=APPROVE",
+            "-f",
+            f"commit_id={sha}",
             "-f",
             f"body={body}",
         ]
@@ -786,329 +1061,6 @@ def submit_pr_approval(repo: str, pr_number: int, body: str) -> bool:
     return True
 
 
-def expected_advisory_login() -> str | None:
-    """The EXACT author login the gate's own advisory comments must carry.
-
-    With a user/PAT token `gh api user` resolves the login directly. Under the
-    GitHub App token (github.token) that endpoint is not accessible, so we use the
-    configured expected bot login (default the Actions app, `github-actions[bot]`)
-    -- an exact identity, never "any Bot". Returns None when no identity can be
-    established, so callers fail closed to a full review.
-    """
-    result = run_command(["gh", "api", "user", "-q", ".login"])
-    login = result.stdout.strip() if result.returncode == 0 else ""
-    if login:
-        return login
-    configured = os.environ.get("REVIEW_GATE_BOT_LOGIN", "github-actions[bot]").strip()
-    return configured or None
-
-
-def trusted_fast_comment(comments: list[dict]) -> dict | None:
-    """The latest advisory comment authored by the gate's EXACT identity, or None.
-
-    Comments carrying the public marker but authored by any other login (another
-    human, another app/bot) are ignored: delta focus and carried findings must
-    never be steerable by anyone but the gate. Unknown identity -> None (full
-    review), the fail-closed default.
-    """
-    expected = expected_advisory_login()
-    if expected is None:
-        return None
-    trusted = None
-    for comment in comments:
-        if FAST_COMMENT_MARKER not in comment.get("body", ""):
-            continue
-        user = comment.get("user") or {}
-        if user.get("login") == expected:
-            trusted = comment
-    return trusted
-
-
-def _state_key() -> bytes | None:
-    key = os.environ.get("REVIEW_GATE_STATE_KEY", "").strip()
-    return key.encode("utf-8") if key else None
-
-
-def sign_fast_state(sha: str | None, carried: tuple[str, ...]) -> str | None:
-    """HMAC-signed `<b64(payload)>.<sig>` token, or None when unsigned/unavailable.
-
-    Returns None when there is no signing key or no checkpoint SHA, so the comment
-    carries no trusted state and the next round falls back to a full review.
-    """
-    key = _state_key()
-    if key is None or not sha:
-        return None
-    payload = json.dumps(
-        {"sha": sha, "carried": list(carried)}, sort_keys=True, separators=(",", ":")
-    )
-    b64 = base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii")
-    sig = hmac.new(key, b64.encode("ascii"), hashlib.sha256).hexdigest()
-    return f"{b64}.{sig}"
-
-
-def verify_fast_state(token: str) -> tuple[str | None, tuple[str, ...]]:
-    """Verify a signed state token; (None, ()) if no key, bad signature, or garbage."""
-    key = _state_key()
-    if key is None or "." not in token:
-        return None, ()
-    b64, _, sig = token.partition(".")
-    expected = hmac.new(key, b64.encode("ascii"), hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(sig, expected):
-        return None, ()
-    try:
-        payload = json.loads(base64.urlsafe_b64decode(b64.encode("ascii")).decode("utf-8"))
-    except (ValueError, json.JSONDecodeError):
-        return None, ()
-    sha = payload.get("sha")
-    carried = tuple(str(t) for t in payload.get("carried", []) if str(t).strip())
-    return (sha if isinstance(sha, str) and sha else None), carried
-
-
-def read_fast_advisory_state(repo: str, pr_number: int) -> tuple[str | None, tuple[str, ...]]:
-    """Return (last_reviewed_sha, prior_finding_titles) from the fast advisory comment.
-
-    Fast mode reads only its OWN advisory comment (authored by the gate identity)
-    so it never depends on, interferes with, or can be steered through the
-    thorough gate's merge-authority comment surface or a forged participant comment.
-    """
-    try:
-        comments = fetch_issue_comments(repo, pr_number)
-    except RuntimeError:
-        return None, ()
-    trusted = trusted_fast_comment(comments)
-    body = trusted.get("body", "") if trusted else ""
-    if not body:
-        return None, ()
-    match = re.search(re.escape(STATE_MARKER_PREFIX) + r"\s*(\S+?)\s*-->", body)
-    if not match:
-        return None, ()
-    # Trust the delta scope only if the signature verifies. Authorship (above) is
-    # defense in depth; the signature is what makes the state unforgeable.
-    return verify_fast_state(match.group(1))
-
-
-def build_fast_comment(
-    result: ReviewResult,
-    *,
-    sha: str,
-    run_url: str,
-    pr_number: int,
-    delta_from_sha: str | None,
-    checkpoint_sha: str | None,
-    carried_forward: tuple[str, ...] = (),
-) -> str:
-    all_findings = (*result.blocking, *result.warnings)
-    major = [f for f in all_findings if f.severity in FAST_ADVISORY_SEVERITIES]
-    lines = [FAST_COMMENT_MARKER]
-    # Signed machine state: the checkpoint SHA is advanced only to a
-    # successfully-reviewed SHA (checkpoint_sha is the prior good SHA, or None, on
-    # a failed round) and the carry-forward list rides along, all HMAC-signed so
-    # it cannot be forged. Emitted only when a signing key is configured.
-    signed = sign_fast_state(checkpoint_sha, carried_forward)
-    if signed:
-        lines.append(f"{STATE_MARKER_PREFIX}{signed} -->")
-    lines += [
-        "# Review Gate — fast advisory",
-        "",
-        "**Advisory only.** This is a fast, non-blocking pass to speed iteration. "
-        "It does not approve, does not block merge, and is not merge evidence. The "
-        "thorough `Review Gate` review remains required to merge.",
-        f"**PR:** #{pr_number}",
-    ]
-    if sha:
-        lines.append(f"**Head SHA:** `{sha[:8]}`")
-    if delta_from_sha:
-        lines.append(f"**Delta re-review since:** `{delta_from_sha[:8]}`")
-    if run_url:
-        lines.append(f"**Run:** {run_url}")
-    lines.append("")
-    if result.summary:
-        lines.extend(["## Summary", result.summary, ""])
-    lines.append("## Major findings (P0/P1)")
-    if not major:
-        lines.append("- None flagged in this fast pass. Run the thorough gate before merge.")
-    else:
-        for finding in major:
-            lines.append(f"- **{finding.severity}**: {finding.title}")
-            if finding.detail:
-                lines.append(f"  - {finding.detail}")
-            if finding.files:
-                lines.append(f"  - Files: {', '.join(finding.files)}")
-    # Display-only echo of the carry-forward list (the trusted copy is the signed
-    # token above). Lets a human see what the next round will re-verify, including
-    # findings preserved from a round whose review did not complete.
-    if carried_forward:
-        lines.append("## Carry-forward (re-verified next round)")
-        for title in carried_forward:
-            lines.append(f"- {title}")
-    return "\n".join(lines)
-
-
-def post_or_update_fast_comment(repo: str, pr_number: int, body: str) -> None:
-    # Only ever edit our OWN advisory comment. If a participant forged the marker,
-    # trusted_fast_comment returns None and we post a fresh gate-owned comment
-    # rather than trying (and failing) to PATCH a comment we do not own.
-    trusted = trusted_fast_comment(fetch_issue_comments(repo, pr_number))
-    comment_id = trusted["id"] if trusted else None
-    if comment_id:
-        result = run_command(
-            [
-                "gh",
-                "api",
-                f"repos/{repo}/issues/comments/{comment_id}",
-                "--method",
-                "PATCH",
-                "-f",
-                f"body={body}",
-            ]
-        )
-    else:
-        result = run_command(
-            [
-                "gh",
-                "api",
-                f"repos/{repo}/issues/{pr_number}/comments",
-                "--method",
-                "POST",
-                "-f",
-                f"body={body}",
-            ]
-        )
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip())
-
-
-def run_fast_advisory(
-    args: argparse.Namespace,
-    review_prompt: str,
-    *,
-    workspace: Path,
-) -> None:
-    """Advisory lane wrapper: ALWAYS exits 0, even on operational failure.
-
-    The fast lane is non-merge-authority; a nonzero job exit could be mistaken for
-    a merge blocker. Any error fetching the base, calling the GitHub API, or
-    running Codex is caught here, logged as a diagnostic, and reported (best
-    effort) on the non-required advisory status, then the job exits 0.
-    """
-    try:
-        _run_fast_advisory(args, review_prompt, workspace=workspace)
-    except Exception as exc:  # noqa: BLE001 - advisory lane must never exit nonzero
-        print(
-            f"Fast advisory encountered an operational error (advisory, "
-            f"non-blocking): {exc}",
-            file=sys.stderr,
-        )
-        if args.post_status:
-            try:
-                post_commit_status(
-                    args.repo,
-                    args.sha,
-                    "success",
-                    "Fast advisory could not complete - advisory, not a merge gate",
-                    args.run_url,
-                    context=STATUS_CONTEXT_FAST,
-                )
-            except Exception as status_exc:  # noqa: BLE001 - best effort only
-                print(f"(could not post advisory status: {status_exc})", file=sys.stderr)
-    sys.exit(0)
-
-
-def _run_fast_advisory(
-    args: argparse.Namespace,
-    review_prompt: str,
-    *,
-    workspace: Path,
-) -> None:
-    """Fast, advisory, non-merge-authority pass. Never approves, never blocks."""
-    preflight = analyze_workspace(workspace, changed_files_for_pr(args.repo, args.pr))
-    delta_from_sha, carried = read_fast_advisory_state(args.repo, args.pr)
-    # Only treat the stored SHA as a delta base when it is a real, different
-    # ancestor of the current head; otherwise fall back to a full review.
-    if delta_from_sha:
-        ancestor = run_command(
-            ["git", "merge-base", "--is-ancestor", delta_from_sha, "HEAD"], cwd=workspace
-        )
-        if delta_from_sha == args.sha or ancestor.returncode != 0:
-            delta_from_sha, carried = None, ()
-    result = run_codex_review(
-        workspace,
-        review_prompt,
-        repo=args.repo,
-        pr_number=args.pr,
-        sha=args.sha,
-        base_ref=args.base_ref,
-        mode="fast",
-        delta_from_sha=delta_from_sha,
-        carried_findings=carried,
-    )
-    # Deterministic preflight blockers (committed secrets, merge-conflict markers)
-    # are always major in fast mode. Normalize their severity to P0 so the P0/P1
-    # filter surfaces them and the advisory status reflects them; a fast pass must
-    # never report "no major findings" while a secret or conflict marker is staged.
-    promoted_blocking = tuple(
-        Finding("P0", f.code, f.title, f.detail, f.files) for f in preflight.blocking
-    )
-    if promoted_blocking or preflight.warnings:
-        result = ReviewResult(
-            result.backend,
-            summary=result.summary,
-            warnings=(*preflight.warnings, *result.warnings),
-            blocking=(*promoted_blocking, *result.blocking),
-            raw_review=result.raw_review,
-        )
-    major = [
-        f for f in (*result.blocking, *result.warnings) if f.severity in FAST_ADVISORY_SEVERITIES
-    ]
-    # If Codex did not produce a valid review, do NOT advance the checkpoint:
-    # keep the prior successfully-reviewed SHA (None on the first round -> the
-    # next run does a full review) so the failed round's diff is never skipped.
-    review_failed = any(f.code in REVIEW_FAILURE_CODES for f in result.blocking)
-    checkpoint_sha = delta_from_sha if review_failed else args.sha
-    # Carry forward the re-verification list. A failed round produced no valid
-    # findings, so it preserves the PRIOR round's carried list; a successful round
-    # carries its own current major findings (minus the backend-failure markers).
-    if review_failed:
-        carried_forward = carried
-    else:
-        carried_forward = tuple(
-            f.title for f in major if f.code not in REVIEW_FAILURE_CODES
-        )
-    print(
-        f"Fast advisory review complete: {len(major)} major (P0/P1) finding(s)."
-        + (" Review did not complete; checkpoint not advanced." if review_failed else "")
-    )
-    if args.post_comment:
-        post_or_update_fast_comment(
-            args.repo,
-            args.pr,
-            build_fast_comment(
-                result,
-                sha=args.sha,
-                run_url=args.run_url,
-                pr_number=args.pr,
-                delta_from_sha=delta_from_sha,
-                checkpoint_sha=checkpoint_sha,
-                carried_forward=carried_forward,
-            ),
-        )
-    if args.post_status:
-        # Distinct, NON-required context. Never touches the "Review Gate" context
-        # the merge gate owns. state=failure only signals P0/P1 to the author; a
-        # non-required context cannot block merge.
-        post_commit_status(
-            args.repo,
-            args.sha,
-            "failure" if major else "success",
-            f"Fast advisory: {len(major)} major finding(s) - not a merge gate"
-            if major
-            else "Fast advisory: no major findings - run thorough gate before merge",
-            args.run_url,
-            context=STATUS_CONTEXT_FAST,
-        )
-    # Returns normally; the run_fast_advisory wrapper performs the sys.exit(0) so
-    # both the success and the operational-failure paths exit 0 identically.
-
 
 def main() -> None:
     parser = argparse.ArgumentParser()
@@ -1121,22 +1073,9 @@ def main() -> None:
     parser.add_argument("--submit-approval", action="store_true")
     parser.add_argument("--run-url", default="")
     parser.add_argument("--base-ref", default=os.environ.get("REVIEW_GATE_BASE_REF", "main"))
-    parser.add_argument(
-        "--mode",
-        choices=("thorough", "fast"),
-        default=os.environ.get("REVIEW_GATE_MODE", "thorough"),
-        help="thorough = merge-authority full-diff review (default); "
-        "fast = non-blocking advisory pass (delta re-review, P0/P1 only).",
-    )
     args = parser.parse_args()
 
     review_prompt = os.environ.get("REVIEW_GATE_PROMPT", "").strip() or DEFAULT_REVIEW_PROMPT
-
-    if args.mode == "fast":
-        # Advisory lane: separate comment marker + status context, no approval,
-        # always exits 0. Cannot touch the thorough merge-authority surface.
-        run_fast_advisory(args, review_prompt, workspace=Path(args.workspace).resolve())
-        return
 
     preflight = analyze_workspace(
         Path(args.workspace).resolve(),
@@ -1145,7 +1084,7 @@ def main() -> None:
     if preflight.blocking:
         result = preflight
     else:
-        result = run_codex_review(
+        result = run_routed_codex_review(
             Path(args.workspace).resolve(),
             review_prompt,
             repo=args.repo,
@@ -1160,6 +1099,7 @@ def main() -> None:
                 warnings=(*preflight.warnings, *result.warnings),
                 blocking=result.blocking,
                 raw_review=result.raw_review,
+                profile=result.profile,
             )
     print(render_structured_summary(result, review_prompt))
 
@@ -1181,6 +1121,7 @@ def main() -> None:
         approved = submit_pr_approval(
             args.repo,
             args.pr,
+            args.sha,
             f"Codex review passed for {args.sha[:8]}. {status_description(result)}",
         )
         if not approved:

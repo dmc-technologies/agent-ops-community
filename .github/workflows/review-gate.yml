@@ -2,7 +2,7 @@ name: Review Gate Dispatcher
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, labeled]
+    types: [labeled]
   workflow_dispatch:
     inputs:
       pr_number:
@@ -21,10 +21,7 @@ jobs:
     name: Review Gate
     if: >-
       github.event_name == 'pull_request' &&
-      (
-        (github.event.action == 'labeled' && github.event.label.name == 'ai review') ||
-        github.event.action != 'labeled'
-      )
+      github.event.label.name == 'ai review'
     permissions:
       contents: read
       issues: write
