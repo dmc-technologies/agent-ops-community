@@ -34,7 +34,6 @@ jobs:
       head_repo: ${{ github.event.pull_request.head.repo.full_name }}
       head_sha: ${{ github.event.pull_request.head.sha }}
       base_ref: ${{ github.event.pull_request.base.ref }}
-      codex_model: ${{ vars.REVIEW_GATE_CODEX_MODEL || '' }}
     secrets: inherit
 
   resolve-dispatch-pr:
@@ -80,5 +79,4 @@ jobs:
       head_repo: ${{ needs.resolve-dispatch-pr.outputs.head_repo }}
       head_sha: ${{ needs.resolve-dispatch-pr.outputs.head_sha }}
       base_ref: ${{ needs.resolve-dispatch-pr.outputs.base_ref }}
-      codex_model: ${{ vars.REVIEW_GATE_CODEX_MODEL || '' }}
     secrets: inherit

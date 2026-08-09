@@ -65,7 +65,8 @@ def test_ai_review_label_triggers_review_and_approval() -> None:
     assert "head_repo: ${{ github.event.pull_request.head.repo.full_name }}" in workflow
     assert "head_sha: ${{ github.event.pull_request.head.sha }}" in workflow
     assert "base_ref: ${{ github.event.pull_request.base.ref }}" in workflow
-    assert "codex_model: ${{ vars.REVIEW_GATE_CODEX_MODEL || '' }}" in workflow
+    assert "codex_model:" not in workflow
+    assert "REVIEW_GATE_CODEX_MODEL" not in workflow
     assert "Resolve PR" in workflow
     assert "github.event.label.name == 'ai review'" in workflow
     assert "github.event.action != 'labeled'" not in workflow
@@ -75,7 +76,7 @@ def test_ai_review_label_triggers_review_and_approval() -> None:
     assert "python review-gate-main/.github/scripts/review_gate.py" not in workflow
 
     assert "workflow_call:" in reusable
-    assert "codex_model:" in reusable
+    assert "codex_model:" not in reusable
     assert f"repository: {org_name}/agent-ops-community" in reusable
     assert "caller-main/.github/review-gate-prompt.md" in reusable
     assert concurrency_group in reusable
@@ -89,7 +90,7 @@ def test_ai_review_label_triggers_review_and_approval() -> None:
     assert "OPENAI_API_KEY" not in run_gate_block
     assert "--submit-approval" in reusable
     assert "REVIEW_GATE_BASE_REF" in reusable
-    assert "REVIEW_GATE_CODEX_MODEL: ${{ inputs.codex_model }}" in reusable
+    assert "REVIEW_GATE_CODEX_MODEL" not in reusable
     assert "--base-ref" not in reusable
     assert "ref: ${{ github.sha }}" not in workflow
     assert "ref: ${{ github.ref_name }}" not in workflow
@@ -196,7 +197,9 @@ def test_codex_review_invokes_codex_exec_and_parses_findings(monkeypatch, tmp_pa
     assert result.blocking[0].title == "Fix the unsafe workflow"
 
 
-def test_codex_review_uses_configured_model(monkeypatch, tmp_path: Path) -> None:
+def test_codex_review_ignores_model_override_environment(
+    monkeypatch, tmp_path: Path
+) -> None:
     review_gate = load_review_gate()
     calls = []
 
@@ -224,16 +227,14 @@ def test_codex_review_uses_configured_model(monkeypatch, tmp_path: Path) -> None
 
     codex_args, codex_env = next(call for call in calls if call[0][:2] == ["codex", "exec"])
     assert result.passed
-    assert codex_args[codex_args.index("--model") + 1] == "gpt-5.4-test"
+    assert codex_args[codex_args.index("--model") + 1] == "gpt-5.6-sol"
     assert codex_env is not None
-    assert codex_env["REVIEW_GATE_CODEX_MODEL"] == "gpt-5.4-test"
+    assert "REVIEW_GATE_CODEX_MODEL" not in codex_env
 
 
-def test_review_gate_defaults_to_sol_and_explicit_reasoning_effort(monkeypatch) -> None:
+def test_review_gate_uses_sol_and_explicit_reasoning_effort() -> None:
     review_gate = load_review_gate()
-    monkeypatch.delenv("REVIEW_GATE_CODEX_MODEL", raising=False)
 
-    assert review_gate.resolve_codex_model() == "gpt-5.6-sol"
     assert review_gate.codex_model_args(effort="xhigh") == [
         "--model",
         "gpt-5.6-sol",

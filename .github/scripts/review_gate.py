@@ -124,7 +124,6 @@ def codex_child_env() -> dict[str, str]:
         "CODEX_HOME",
         "HOME",
         "PATH",
-        "REVIEW_GATE_CODEX_MODEL",
         "TEMP",
         "TMPDIR",
         "USER",
@@ -132,15 +131,15 @@ def codex_child_env() -> dict[str, str]:
     return {key: value for key, value in os.environ.items() if key in allowed}
 
 
-def resolve_codex_model() -> str:
-    return os.environ.get("REVIEW_GATE_CODEX_MODEL", "").strip() or DEFAULT_CODEX_MODEL
-
-
 def codex_model_args(*, effort: str = "medium") -> list[str]:
     if effort not in REVIEW_EFFORTS:
         effort = "xhigh"
-    model = resolve_codex_model()
-    return ["--model", model, "-c", f'model_reasoning_effort="{effort}"']
+    return [
+        "--model",
+        DEFAULT_CODEX_MODEL,
+        "-c",
+        f'model_reasoning_effort="{effort}"',
+    ]
 
 
 def iter_text_files(workspace: Path, changed_files: list[str] | None = None) -> list[Path]:
@@ -826,7 +825,7 @@ def render_structured_summary(result: ReviewResult, review_prompt: str = "") -> 
         lines.append("")
     if result.profile:
         lines.append("## Review profile")
-        lines.append(f"- Model: {resolve_codex_model()}")
+        lines.append(f"- Model: {DEFAULT_CODEX_MODEL}")
         lines.append(f"- Reasoning effort: {result.profile.effort}")
         lines.append(f"- Classifier confidence: {result.profile.confidence}")
         domains = ", ".join(result.profile.risk_domains) or "none identified"
