@@ -92,6 +92,23 @@ class OpenCodeAdapter(FrameworkAdapter):
         )
 
 
+class PrimeAgentAdapter(FrameworkAdapter):
+    framework = Framework.PRIME_AGENT
+    executable = "prime-agent"
+
+    def build_command(self, job: AgentJob, context_pack: ContextPack, cwd: Path) -> AdapterCommand:
+        prompt = context_pack.to_markdown()
+        return AdapterCommand(
+            framework=self.framework,
+            command=["prime-agent", "--print", "--cwd", str(cwd), "--", prompt],
+            cwd=str(cwd),
+            notes=[
+                "Uses Prime Agent print mode for a non-interactive context-pack handoff.",
+                "Skills and bootstrap install into ${PRIME_AGENT_HOME:-~/.prime/agent}.",
+            ],
+        )
+
+
 class OpenClawAdapter(FrameworkAdapter):
     framework = Framework.OPENCLAW
     executable = "openclaw"
@@ -114,6 +131,7 @@ ADAPTERS: dict[Framework, FrameworkAdapter] = {
     Framework.CODEX: CodexAdapter(),
     Framework.CURSOR: CursorAdapter(),
     Framework.OPENCODE: OpenCodeAdapter(),
+    Framework.PRIME_AGENT: PrimeAgentAdapter(),
     Framework.OPENCLAW: OpenClawAdapter(),
 }
 

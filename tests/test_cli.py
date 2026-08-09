@@ -82,6 +82,7 @@ def test_bootstrap_writes_public_agentops_file(tmp_path: Path) -> None:
     assert (tmp_path / "codex/AGENTOPS.md").exists()
     assert (tmp_path / "claude-code/AGENTOPS.md").exists()
     assert (tmp_path / "cursor/AGENTOPS.md").exists()
+    assert (tmp_path / "prime-agent/AGENTOPS.md").exists()
     text = (tmp_path / "codex/AGENTOPS.md").read_text(encoding="utf-8")
     assert "Agent Ops Bootstrap: codex" in text
     assert "agent-knowledge" in text
@@ -167,3 +168,42 @@ verification:
     command = json.loads(command_result.output)
     assert command["framework"] == "codex"
     assert command["command"][0] == "codex"
+
+
+def test_prime_agent_cli_handoff_and_skill_install_dry_run(tmp_path: Path) -> None:
+    job = tmp_path / "job.yaml"
+    job.write_text(
+        """
+id: prime-cli
+title: Prime CLI
+mode: verify-only
+verification:
+  - name: ok
+    command: "true"
+""",
+        encoding="utf-8",
+    )
+
+    command_result = runner.invoke(
+        app,
+        ["frameworks", "command", str(job), "--framework", "prime-agent", "--json"],
+    )
+    install_result = runner.invoke(
+        app,
+        [
+            "skills",
+            "install",
+            "prime-agent",
+            "--home",
+            str(tmp_path / "prime-home"),
+            "--dry-run",
+        ],
+    )
+
+    assert command_result.exit_code == 0
+    command = json.loads(command_result.output)
+    assert command["framework"] == "prime-agent"
+    assert command["command"][:4] == ["prime-agent", "--print", "--cwd", str(Path.cwd())]
+    assert install_result.exit_code == 0
+    assert "gstack ->" in install_result.output
+    assert "superpowers ->" in install_result.output

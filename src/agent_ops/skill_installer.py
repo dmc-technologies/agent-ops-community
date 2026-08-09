@@ -26,6 +26,8 @@ def default_framework_home(framework: Framework) -> Path:
             return Path("~/.claude").expanduser()
         case Framework.OPENCODE:
             return Path("~/.agents").expanduser()
+        case Framework.PRIME_AGENT:
+            return Path("~/.prime/agent").expanduser()
         case Framework.CURSOR:
             return Path("~/.cursor").expanduser()
         case Framework.OPENCLAW:

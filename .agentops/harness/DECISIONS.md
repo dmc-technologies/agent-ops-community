@@ -4,6 +4,13 @@ Repository: `agent-ops-community`
 
 Record durable architecture, workflow, and harness decisions here.
 
+### 2026-08-09: Prime Agent uses its native print-mode and home conventions
+
+- Decision: register Prime Agent as `prime-agent`; hand context packs to `prime-agent --print --cwd <repo> -- <prompt>`; default installs to `${PRIME_AGENT_HOME:-~/.prime/agent}`; install pinned gstack at `skills/gstack` and merge pinned Superpowers skills into `skills/`.
+- Rationale: these are the public CLI and resource conventions exposed by Prime Agent, and they provide the same bootstrap, context, handoff, and pinned-skill experience as other first-class frameworks without a runner plugin.
+- Applies to: framework and registry models, adapters, bootstrap generation, skill dependency installation, public data registries, documentation, and tests.
+- Revisit when: Prime Agent changes its public CLI handoff flags or resource discovery home.
+
 ### 2026-08-08: AI review runs once on the final head with risk-routed Sol effort
 
 - Decision: a person applies `ai review` once when a pull request's final head is ready. A low-effort `gpt-5.6-sol` classifier evaluates the complete diff and routes the full review to the same model at low, medium, high, or xhigh effort. Low confidence and critical authority domains route to xhigh. Auto-labeling and fast advisory mode are removed.

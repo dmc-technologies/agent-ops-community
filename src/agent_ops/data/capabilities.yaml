@@ -5,6 +5,7 @@
   - claude-code
   - codex
   - opencode
+  - prime-agent
   - local
   requires:
   - git
@@ -47,6 +48,7 @@
   - codex
   - cursor
   - opencode
+  - prime-agent
   - openclaw
   - local
   requires:

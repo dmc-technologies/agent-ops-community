@@ -26,6 +26,7 @@
   - codex
   - claude-code
   - opencode
+  - prime-agent
   - openclaw
   - local
   env:
@@ -48,4 +49,13 @@
   kind: local-command
   frameworks:
   - codex
+  requires: []
+- id: prime-agent-cli
+  name: Prime Agent CLI
+  description: Prime Agent command line interface with print-mode context handoff.
+  kind: local-command
+  frameworks:
+  - prime-agent
+  config_paths:
+  - ${PRIME_AGENT_HOME:-~/.prime/agent}
   requires: []

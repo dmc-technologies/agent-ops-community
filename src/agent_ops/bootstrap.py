@@ -10,6 +10,7 @@ SUPPORTED_BOOTSTRAPS = [
     Framework.CURSOR,
     Framework.OPENCLAW,
     Framework.OPENCODE,
+    Framework.PRIME_AGENT,
     Framework.LOCAL,
 ]
 
@@ -22,6 +23,7 @@ SKILL_INSTALL_BOOTSTRAPS = {
     Framework.CODEX,
     Framework.CLAUDE_CODE,
     Framework.OPENCODE,
+    Framework.PRIME_AGENT,
 }
 
 
@@ -48,6 +50,7 @@ export CLAUDE_HOME="${{CLAUDE_HOME:-~/.claude}}"
 export CURSOR_HOME="${{CURSOR_HOME:-~/.cursor}}"
 export OPENCLAW_HOME="${{OPENCLAW_HOME:-~/.openclaw}}"
 export OPENCODE_HOME="${{OPENCODE_HOME:-~/.agents}}"
+export PRIME_AGENT_HOME="${{PRIME_AGENT_HOME:-~/.prime/agent}}"
 export AGENT_OPS_LOCAL_HOME="${{AGENT_OPS_LOCAL_HOME:-~/.agentops}}"
 export KNOWLEDGE_MEMORY_DIR="${{KNOWLEDGE_MEMORY_DIR:-$AGENT_KNOWLEDGE_HOME}}"
 {KNOWLEDGE_GIT_EXPORT}

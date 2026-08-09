@@ -22,6 +22,9 @@
   - framework: opencode
     invocation: Read as the portable skill definition; install with agentops skills
       install opencode.
+  - framework: prime-agent
+    invocation: Use the installed Agent Knowledge skill when available; fall back to
+      the configured git/file memory store.
 - id: doc-migration
   name: Doc Migration
   description: Additive migration of external document exports into Google Drive as
@@ -49,6 +52,9 @@
   - framework: opencode
     invocation: Read as the portable skill definition; install with agentops skills
       install opencode.
+  - framework: prime-agent
+    invocation: Load the portable migration procedure as a Prime Agent skill or include
+      it in the context pack.
 - id: superpowers
   name: Superpowers Skill Bundle
   description: Skill bundle for disciplined planning, execution, TDD, debugging, and
@@ -73,6 +79,9 @@
   - framework: opencode
     invocation: Read as the portable skill definition; install with agentops skills
       install opencode.
+  - framework: prime-agent
+    invocation: Use matching installed Prime Agent skills when present.
+    install_hint: agentops skills install prime-agent
 - id: gstack
   name: GStack Skill Bundle
   description: Reusable operating skills for review, planning, safety guardrails,
@@ -98,6 +107,9 @@
   - framework: opencode
     invocation: Read as the portable skill definition; install with agentops skills
       install opencode.
+  - framework: prime-agent
+    invocation: Use the installed gstack bundle from the Prime Agent skills directory.
+    install_hint: agentops skills install prime-agent
 - id: steinberger-review
   name: Steinberger Review
   description: Peter Steinberger-inspired review persona for terminal-first agent
@@ -119,6 +131,9 @@
   - framework: opencode
     invocation: Read as the portable skill definition; install with agentops skills
       install opencode.
+  - framework: prime-agent
+    invocation: Include the Steinberger review lens in the context pack or load it as
+      a Prime Agent skill.
 - id: verification-before-completion
   name: Verification Before Completion
   description: Require evidence from tests/checks before claiming work is complete.
@@ -134,6 +149,9 @@
   - framework: opencode
     invocation: Read as the portable skill definition; install with agentops skills
       install opencode.
+  - framework: prime-agent
+    invocation: Use the installed verification skill before final status.
+    install_hint: agentops skills install prime-agent
 - id: repo-ci-checks
   name: Repo CI Checks
   description: Prefer repository-provided CI, harness, and verification commands before
@@ -152,6 +170,8 @@
     invocation: Run repo-provided CI-safe checks before final status.
   - framework: opencode
     invocation: Run repo-provided CI-safe checks before final status.
+  - framework: prime-agent
+    invocation: Run repo-provided CI-safe checks before final status.
 - id: test-driven-development
   name: Test Driven Development
   description: Write or identify failing tests before implementation where practical.
@@ -167,6 +187,9 @@
   - framework: opencode
     invocation: Read as the portable skill definition; install with agentops skills
       install opencode.
+  - framework: prime-agent
+    invocation: Use the installed test-driven development skill.
+    install_hint: agentops skills install prime-agent
 - id: cursor-agent-bundle
   name: Cursor Agent Bundle
   description: Cursor-native agents bundled from the portable agent-ops source tree.
@@ -184,6 +207,8 @@
     invocation: Read as portable agent role definitions.
   - framework: opencode
     invocation: Read as the portable agent definition.
+  - framework: prime-agent
+    invocation: Include selected portable agent roles in the context pack when useful.
 - id: claude-command-bundle
   name: Claude Command Bundle
   description: Claude Code command helpers bundled from the portable agent-ops source
@@ -198,3 +223,5 @@
     invocation: Read as portable command workflow references.
   - framework: opencode
     invocation: Read as the portable command definition.
+  - framework: prime-agent
+    invocation: Read command workflows as portable references when useful.

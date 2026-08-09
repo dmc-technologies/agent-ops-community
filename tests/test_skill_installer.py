@@ -3,8 +3,9 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+from agent_ops.registries import load_skill_dependencies
 from agent_ops.registries.models import Framework, SkillDependency, SkillDependencyInstall
-from agent_ops.skill_installer import install_skill_dependencies
+from agent_ops.skill_installer import default_framework_home, install_skill_dependencies
 
 
 def _git_repo(path: Path) -> str:
@@ -309,3 +310,55 @@ def test_install_skill_dependencies_fails_on_unsupported_explicit_dependency(
         assert "not supported for opencode: gstack" in str(exc)
     else:
         raise AssertionError("expected unsupported explicit dependency to fail")
+
+
+def test_prime_agent_uses_native_home_and_pinned_bundle_mappings(tmp_path: Path) -> None:
+    registered = {dependency.id: dependency for dependency in load_skill_dependencies()}
+    assert all(
+        len(registered[dependency_id].ref) == 40
+        and set(registered[dependency_id].ref) <= set("0123456789abcdef")
+        for dependency_id in ("gstack", "superpowers")
+    )
+    assert registered["gstack"].install["prime-agent"].destination == "skills/gstack"
+    assert registered["superpowers"].install["prime-agent"].destination == "skills"
+
+    dependencies = [
+        SkillDependency(
+            id="gstack",
+            name="GStack",
+            repo="https://example.invalid/gstack.git",
+            ref="a" * 40,
+            install={
+                "prime-agent": SkillDependencyInstall(
+                    strategy="gstack",
+                    destination="skills/gstack",
+                )
+            },
+        ),
+        SkillDependency(
+            id="superpowers",
+            name="Superpowers",
+            repo="https://example.invalid/superpowers.git",
+            ref="b" * 40,
+            install={
+                "prime-agent": SkillDependencyInstall(
+                    strategy="copy-skills",
+                    source="skills",
+                    destination="skills",
+                )
+            },
+        ),
+    ]
+
+    rows = install_skill_dependencies(
+        framework=Framework.PRIME_AGENT,
+        dependencies=dependencies,
+        home=tmp_path / "prime-home",
+        dry_run=True,
+    )
+
+    assert default_framework_home(Framework.PRIME_AGENT) == Path("~/.prime/agent").expanduser()
+    assert [row.destination.relative_to(tmp_path / "prime-home").as_posix() for row in rows] == [
+        "skills/gstack",
+        "skills",
+    ]

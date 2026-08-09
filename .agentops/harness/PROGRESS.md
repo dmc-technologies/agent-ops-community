@@ -4,18 +4,20 @@ Repository: `agent-ops-community`
 
 ## Current State
 
-- Branch: `agent/review-gate-risk-routing`
-- Latest commit: `origin/main` at branch creation.
-- Verification: full tests, lint, source-tree harness check, whitespace validation, and historical shadow evaluation pass.
+- Branch: `feat/prime-agent-first-class`
+- Latest commit before current work: `origin/main` (`bcada9b`).
+- Verification: full tests, lint, source-tree harness check, and whitespace validation pass.
 
 ## Current Work
 
-- Goal: preserve material AI review findings while reducing repeated review cost and non-material review cycles.
-- Active task: publish the final-label risk router and materiality contract for review.
-- Files in play: Review Gate workflows, script, prompt, tests, and evaluation evidence.
+- Goal: make Prime Agent a first-class supported framework.
+- Active task: complete; implementation, documentation, and tests are recorded on this branch.
+- Files in play: framework registry and adapter, bootstrap, skill registries and installer, documentation, and tests.
 - Blockers: none
 
 ## Session Log
+
+- 2026-08-09: Added Prime Agent framework registration, `prime-agent --print --cwd` context handoff, generated bootstrap support, the native `~/.prime/agent` home, pinned gstack and Superpowers install mappings, registry metadata, documentation, and tests.
 
 - 2026-08-08: Changed Review Gate to run only when a person applies `ai review` to the final pull-request head. Removed auto-labeling and all fast advisory code, inputs, state, tests, and documentation.
 - 2026-08-08: Added a low-effort `gpt-5.6-sol` classifier that routes the complete review to Sol at low, medium, high, or xhigh effort based on consequence and review difficulty. Low confidence and critical authority domains route to xhigh.
@@ -36,6 +38,8 @@ Repository: `agent-ops-community`
 
 ## Verification Log
 
+- 2026-08-09: `uv run --extra dev pytest tests/test_frameworks.py tests/test_skill_installer.py tests/test_cli.py -q` passed (`21 passed`); `uv run --extra dev agentops frameworks command examples/local-smoke.yaml --framework prime-agent --json` produced the expected print-mode handoff; `.venv/bin/ruff check .` passed; `.venv/bin/pytest -q` passed (`60 passed`); `.venv/bin/agentops harness check .` passed; `git diff --check` passed.
+
 - 2026-08-08: `.venv/bin/python -m pytest -q` passed (`57 passed`); `.venv/bin/ruff check .` passed; `.venv/bin/agentops harness check .` passed; `git diff --check` passed.
 - 2026-08-08: Exact-head materiality rerun passed with zero blockers in 564.8 seconds at xhigh for a former test-only finding; exact-head recall rerun returned one material root-cause blocker in 1,031.9 seconds at xhigh for a current false-verification path.
 - 2026-08-03: `PYTHONPATH=src python -m pytest tests/test_harness.py
@@ -53,5 +57,4 @@ Repository: `agent-ops-community`
 
 ## Next Actions
 
-1. Commit, push, open the pull request, and wait for exact-head hosted CI.
-2. After approval and merge, update downstream callers to the final-label-only workflow.
+1. Open a pull request when requested; do not push from this task.

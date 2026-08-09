@@ -25,6 +25,7 @@ Install common skill bundles for your agent framework:
 ```bash
 agentops skills install codex
 agentops skills install opencode
+agentops skills install prime-agent
 ```
 
 By default, supported frameworks install all configured skill dependency
@@ -54,6 +55,7 @@ Generate bootstrap instructions:
 ```bash
 agentops bootstrap all
 agentops bootstrap codex
+agentops bootstrap prime-agent
 ```
 
 Build framework context packs and handoff commands:
@@ -61,7 +63,10 @@ Build framework context packs and handoff commands:
 ```bash
 agentops context build examples/local-smoke.yaml --framework codex
 agentops frameworks command examples/local-smoke.yaml --framework codex --json
+agentops frameworks command examples/local-smoke.yaml --framework prime-agent --json
 ```
+
+Prime Agent handoff uses its non-interactive `--print` mode and passes the job context with an explicit `--cwd`. Prime Agent skill bundles install under `${PRIME_AGENT_HOME:-~/.prime/agent}/skills`. See [Prime Agent support](docs/prime-agent.md) for the complete setup and command contract.
 
 ## Extension Model
 
