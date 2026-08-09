@@ -23,11 +23,6 @@ on:
         description: "PR base branch/ref"
         required: true
         type: string
-      codex_model:
-        description: "Optional Codex model override; defaults to gpt-5.6-sol"
-        required: false
-        type: string
-        default: ""
     secrets:
       OPENAI_API_KEY:
         required: true
@@ -112,18 +107,12 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Show selected Codex model
-        run: |
-          if [ -n "${{ inputs.codex_model }}" ]; then
-            echo "Review Gate Codex model: ${{ inputs.codex_model }}"
-          else
-            echo "Review Gate Codex model: gpt-5.6-sol"
-          fi
+        run: echo "Review Gate Codex model: gpt-5.6-sol"
 
       - name: Run review gate
         env:
           GH_TOKEN: ${{ secrets.REVIEW_GATE_APPROVAL_TOKEN || github.token }}
           REVIEW_GATE_BASE_REF: ${{ inputs.base_ref }}
-          REVIEW_GATE_CODEX_MODEL: ${{ inputs.codex_model }}
         run: |
           RUN_URL="${{ github.server_url }}/${{ inputs.repo }}/actions/runs/${{ github.run_id }}"
           python review-gate-main/.github/scripts/review_gate.py \
