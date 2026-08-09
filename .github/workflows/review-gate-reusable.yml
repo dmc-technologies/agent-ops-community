@@ -107,7 +107,8 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Show selected Codex model
-        run: echo "Review Gate Codex model: gpt-5.6-sol"
+        run: |
+          echo "Review Gate Codex model: gpt-5.6-sol"
 
       - name: Run review gate
         env:
