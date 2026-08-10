@@ -6,6 +6,7 @@ from pathlib import Path
 from agent_ops.registries import load_skill_dependencies
 from agent_ops.registries.models import Framework, SkillDependency, SkillDependencyInstall
 from agent_ops.skill_installer import default_framework_home, install_skill_dependencies
+from agent_ops.superpowers_adapter import OWNERSHIP_MANIFEST_RELATIVE, SUPERPOWERS_SKILLS
 
 
 def _git_repo(path: Path) -> str:
@@ -323,6 +324,7 @@ def test_prime_agent_uses_native_home_and_pinned_bundle_mappings(
     )
     assert registered["gstack"].install["prime-agent"].destination == "skills/gstack"
     assert registered["superpowers"].install["prime-agent"].destination == "skills"
+    assert registered["superpowers"].install["prime-agent"].strategy == "prime-superpowers"
 
     dependencies = [
         SkillDependency(
@@ -344,7 +346,7 @@ def test_prime_agent_uses_native_home_and_pinned_bundle_mappings(
             ref="b" * 40,
             install={
                 "prime-agent": SkillDependencyInstall(
-                    strategy="copy-skills",
+                    strategy="prime-superpowers",
                     source="skills",
                     destination="skills",
                 )
@@ -374,3 +376,45 @@ def test_prime_agent_home_honors_native_environment_variable(
     monkeypatch.setenv("PRIME_AGENT_CODING_AGENT_DIR", str(configured_home))
 
     assert default_framework_home(Framework.PRIME_AGENT) == configured_home
+
+
+def test_prime_superpowers_strategy_installs_adapted_namespaced_skills(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    source = tmp_path / "superpowers-src"
+    for name in SUPERPOWERS_SKILLS:
+        directory = source / "skills" / name
+        directory.mkdir(parents=True)
+        (directory / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: test\n---\nUse superpowers:writing-plans.\n",
+            encoding="utf-8",
+        )
+    dependency = SkillDependency(
+        id="superpowers",
+        name="Superpowers",
+        repo="https://example.invalid/superpowers.git",
+        ref="f2cbfbefebbfef77321e4c9abc9e949826bea9d7",
+        install={
+            "prime-agent": SkillDependencyInstall(
+                strategy="prime-superpowers", source="skills", destination="skills"
+            )
+        },
+    )
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
+    )
+
+    install_skill_dependencies(
+        framework=Framework.PRIME_AGENT,
+        dependencies=[dependency],
+        home=tmp_path / "home",
+        cache_dir=tmp_path / "cache",
+    )
+
+    installed = tmp_path / "home" / "skills"
+    assert (installed.parent / OWNERSHIP_MANIFEST_RELATIVE).is_file()
+    assert not (installed / ".agentops-superpowers-manifest.json").exists()
+    assert not (installed / "writing-plans").exists()
+    skill = installed / "agentops-superpowers-writing-plans" / "SKILL.md"
+    assert "name: agentops-superpowers-writing-plans" in skill.read_text()
+    assert "agentops-superpowers-writing-plans" in skill.read_text()

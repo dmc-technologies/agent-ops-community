@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from agent_ops.registries.models import Framework, SkillDependency, SkillDependencyInstall
+from agent_ops.superpowers_adapter import install_prime_superpowers
 
 
 @dataclass(frozen=True)
@@ -141,6 +142,11 @@ def _install_dependency(
 ) -> None:
     if install.strategy in {"gstack", "copy-repo"}:
         _replace_tree(source, destination)
+        return
+    if install.strategy == "prime-superpowers":
+        if dependency_id != "superpowers":
+            raise ValueError("prime-superpowers strategy is only valid for Superpowers")
+        install_prime_superpowers(source, destination)
         return
     if install.strategy == "copy-skills":
         if install.source is None:

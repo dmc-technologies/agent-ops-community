@@ -40,7 +40,7 @@
       source: skills
       destination: skills
     prime-agent:
-      strategy: copy-skills
+      strategy: prime-superpowers
       source: skills
       destination: skills
     portable:
