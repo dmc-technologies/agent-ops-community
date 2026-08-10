@@ -144,6 +144,7 @@ const prime: HostConfig = {{
       'careful', 'freeze', 'guard', 'unfreeze',
       'benchmark-models', 'pair-agent', 'autoplan', 'office-hours',
       'open-gstack-browser', 'connect-chrome', 'ship', 'skillify',
+      'document-release', 'land-and-deploy',
     ],
   }},
   pathRewrites: [
@@ -397,226 +398,6 @@ context."""
             "Prerequisite Skill Offer",
             design_source_fallback,
         )
-    if installed_name == "agentops-gstack-land-and-deploy":
-        content = content.replace(
-            '**If the platform detected above is GitLab or unknown:** STOP with: "GitLab '
-            'support for /land-and-deploy is not yet implemented. Run `/ship` to create the '
-            'MR, then merge manually via the GitLab web UI." Do not proceed.',
-            '**If the platform detected above is GitLab:** STOP. If no merge request exists, '
-            'create it with `glab mr create` when available or the GitLab UI. Then locate an '
-            'explicit repository-owned GitLab merge and deployment procedure. If none exists, '
-            'ask the user for that procedure and STOP; do not improvise and do not rerun this '
-            'workflow.\n\n**If the platform is unknown:** STOP, report the detected origin '
-            'remote, and ask the user to identify the provider and its repository-owned merge '
-            'and deployment procedure. Do not issue GitHub or GitLab commands.',
-        )
-        content = content.replace(
-            'Run `/ship` to create the MR, then merge manually via the GitLab web UI.',
-            "Create the merge request with `glab mr create` when available or the GitLab web "
-            "UI, then locate an explicit repository-owned GitLab merge/deploy procedure. If "
-            "none exists, STOP and ask the user; do not improvise and do not rerun this "
-            "workflow.",
-        )
-        content = content.replace(
-            'Run `/ship` first to create a PR, then come back here to land and deploy it.',
-            "Create the pull request manually with `gh pr create` or the GitHub web UI, then "
-            "rerun this workflow.",
-        )
-        content = content.replace(
-            """   Rerun /ship from the feature branch to reconcile. /ship's ALREADY_BUMPED
-   branch will detect the drift and rewrite VERSION + CHANGELOG header + PR title
-   atomically. Do NOT merge from here — the landed PR would overwrite the other
-   branch's CHANGELOG entry or land with a duplicate version header.""",
-            """   Reconcile the feature branch manually: update VERSION, package metadata,
-   the CHANGELOG header, and the pull-request title to v<NEXT_SLOT>; commit and push
-   those changes. Do NOT merge from here — the landed PR would overwrite the other
-   branch's CHANGELOG entry or land with a duplicate version header. Rerun this
-   land-and-deploy workflow only after the updated pull request is visible.""",
-        )
-        content = content.replace(
-            "Exit non-zero. Do NOT auto-bump from `/land-and-deploy` — rerunning `/ship` is "
-            "the clean path (it already handles VERSION + package.json + CHANGELOG header + "
-            "PR title atomically via Step 12 ALREADY_BUMPED detection).",
-            "Exit non-zero. Do NOT auto-bump from `/land-and-deploy`; require the manual "
-            "VERSION, package metadata, CHANGELOG header, and pull-request title update "
-            "described above before rerunning this workflow.",
-        )
-    if installed_name == "agentops-gstack-land-and-deploy":
-        release_gate = f"""## Step 3.3: Prime release-artifact gate
-
-The upstream ship workflow is excluded from Prime, so verify its former artifacts rather than
-assuming they exist.
-Run this gate before VERSION drift detection or any merge action:
-
-```bash
-BASE_BRANCH=$(gh pr view --json baseRefName -q .baseRefName 2>/dev/null || echo main)
-BRANCH_VERSION=$(tr -d '\\r\\n[:space:]' < VERSION 2>/dev/null || true)
-PR_TITLE=$(gh pr view --json title -q .title 2>/dev/null || true)
-REVIEW_LOG=$({runtime}/bin/gstack-review-read 2>/dev/null || echo NO_REVIEWS)
-NON_DOC_CHANGES=$(git diff --name-only "origin/$BASE_BRANCH...HEAD" 2>/dev/null |
-  grep -Ev '\\.(md|rst|txt)$' || true)
-git rev-parse --verify "origin/$BASE_BRANCH" >/dev/null 2>&1 || exit 19
-case "$REVIEW_LOG" in NO_REVIEWS*) exit 20 ;; esac
-printf 'VERSION=%s\\nTITLE=%s\\nNON_DOC=%s\\n' "$BRANCH_VERSION" "$PR_TITLE" "$NON_DOC_CHANGES"
-
-if [ -n "$NON_DOC_CHANGES" ] && [ -f VERSION ]; then
-  CHANGED=$(git diff --name-only "origin/$BASE_BRANCH...HEAD")
-  echo "$CHANGED" | grep -qx VERSION || exit 21
-  echo "$CHANGED" | grep -qx CHANGELOG.md || exit 22
-  grep -E '^#{{1,6}} ' CHANGELOG.md | grep -F "$BRANCH_VERSION" >/dev/null || exit 23
-  case "$PR_TITLE" in "v$BRANCH_VERSION"*) ;; *) exit 24 ;; esac
-fi
-
-python3 - "$BRANCH_VERSION" <<'PY'
-import json
-import pathlib
-import sys
-import tomllib
-
-expected = sys.argv[1]
-mismatches = []
-if expected and pathlib.Path("package.json").is_file():
-    value = json.loads(pathlib.Path("package.json").read_text()).get("version")
-    if value is not None and str(value) != expected:
-        mismatches.append(("package.json", value))
-for filename, table in (("pyproject.toml", "project"), ("Cargo.toml", "package")):
-    path = pathlib.Path(filename)
-    if expected and path.is_file():
-        value = tomllib.loads(path.read_text()).get(table, {{}}).get("version")
-        if value is not None and str(value) != expected:
-            mismatches.append((filename, value))
-for filename, value in mismatches:
-    print("version mismatch: %s=%s expected=%s" % (filename, value, expected))
-raise SystemExit(25 if mismatches else 0)
-PY
-```
-
-- Any non-zero exit, including codes 19-25, is a **BLOCKER**. Do not merge after any
-  non-zero result.
-- If `REVIEW_LOG` starts with `NO_REVIEWS`, mark review provenance as a **BLOCKER**. Step 3.5
-  may clear it only by completing a current retained review or recording the user's explicit
-  decision to skip; never infer review completion.
-- If `NON_DOC_CHANGES` is non-empty and the repository has `VERSION`, require both `VERSION`
-  and `CHANGELOG.md` in `git diff --name-only origin/$BASE_BRANCH...HEAD`. Otherwise **STOP**
-  and run `/skill:agentops-gstack-document-release` before continuing.
-- When `BRANCH_VERSION` is non-empty, require a CHANGELOG heading containing that exact version
-  and require `PR_TITLE` to begin with `v<BRANCH_VERSION>`. A missing or mismatched value is a
-  **BLOCKER**; run document-release and rerun this workflow.
-- Check root package metadata that exists. `package.json`'s `.version`, `pyproject.toml`'s
-  `project.version`, and `Cargo.toml`'s package `version` must equal `BRANCH_VERSION`. Use the
-  project's documented version-update command to correct a mismatch; if none exists, **STOP**
-  and ask the user for the repository-owned update procedure. Do not improvise a partial bump.
-
-Do not proceed to Step 3.4 while any blocker remains."""
-        content = content.replace(
-            "## Step 3.4: VERSION drift detection (workspace-aware ship)",
-            release_gate + "\n\n## Step 3.4: VERSION drift detection (workspace-aware ship)",
-        )
-    if installed_name == "agentops-gstack-document-release":
-        content = content.replace(
-            "You are running the `/document-release` workflow. This runs **after `/ship`** "
-            "(code committed, PR\nexists or about to exist) but **before the PR merges**.",
-            "You are running the `/document-release` workflow after a provider-aware pull or "
-            "merge request exists and before it merges. This workflow is responsible for "
-            "verifying and preparing release artifacts in Prime; do not assume another "
-            "workflow created them.",
-        )
-        content = content.replace(
-            "Never regenerate a CHANGELOG entry from scratch. The entry was written by `/ship` "
-            "from the\n   actual diff and commit history. It is the source of truth. You are "
-            "polishing prose, not\n   rewriting history.",
-            "If the current VERSION entry exists, preserve its content and polish wording only. "
-            "If it is missing for release-bearing changes, Step 8.5 must draft it from the exact "
-            "diff and commit history, obtain user approval, and insert it without replacing "
-            "another entry.",
-        )
-        content = content.replace(
-            "This is a second pass that complements `/ship`'s Step 5.5.",
-            "This pass performs the required TODO reconciliation.",
-        )
-        content = content.replace(
-            "same rule as `/ship`",
-            "required release-title rule",
-        )
-        content = content.replace(
-            "after `/ship` had already created the PR",
-            "after the pull or merge request was created",
-        )
-        content = content.replace(
-            "same one `/ship` uses",
-            "repository-shipped shared helper",
-        )
-        content = content.replace(
-            "Already bumped — version was set by /ship",
-            "Already bumped — version was set earlier on this branch",
-        )
-        content = content.replace(
-            'If the edit command fails: warn "Could not update PR/MR title — documentation '
-            'changes are still in the commit." and continue. Do not block on title sync failure.',
-            'If the title edit fails, **STOP** and report the provider command failure. The '
-            'documentation commit remains valid, but Prime release preparation is incomplete '
-            'until the request title begins with `v<VERSION>`.',
-        )
-        document_release_gate = f"""## Step 0.5: Prime release-preparation authority
-
-The upstream ship workflow is excluded from Prime. Before documentation edits, confirm that a
-pull or merge request exists through the provider-aware route and run
-`{runtime}/bin/gstack-review-read`. If it reports
-`NO_REVIEWS`, **STOP** and run `/skill:agentops-gstack-review`; do not claim review provenance.
-This workflow, not an unnamed manual step, owns the VERSION, package-metadata, CHANGELOG, and
-request-title checks below."""
-        content = content.replace(
-            "## Step 1: Pre-flight & Diff Analysis",
-            document_release_gate + "\n\n## Step 1: Pre-flight & Diff Analysis",
-        )
-        release_artifacts = f"""## Step 8.5: Prime release-artifact completion
-
-After the Step 8 version decision, compute the base branch and inspect the exact branch diff and
-commit history. For release-bearing changes in a repository with `VERSION`, run the pinned
-allocator with the bump level approved in Step 8 (or derive the already-applied level from the
-base and branch VERSION values, then confirm it with the user):
-
-```bash
-ORIGIN_URL=$(git remote get-url origin 2>/dev/null || true)
-case "$ORIGIN_URL" in
-  *github.com*) BASE_BRANCH=$(gh pr view --json baseRefName -q .baseRefName) || exit 30 ;;
-  *gitlab*) BASE_BRANCH=$(glab mr view -F json 2>/dev/null |
-    jq -r '.target_branch // .targetBranch // empty') || exit 30 ;;
-  *) echo "unknown repository provider: $ORIGIN_URL" >&2; exit 30 ;;
-esac
-[ -n "$BASE_BRANCH" ] || exit 30
-BASE_VERSION=$(git show "origin/$BASE_BRANCH:VERSION" 2>/dev/null | tr -d '\\r\\n[:space:]')
-BUMP="${{BUMP:?set BUMP to the approved patch, minor, or major level}}"
-QUEUE_JSON=$(bun run {runtime}/bin/gstack-next-version --base "$BASE_BRANCH" \
-  --bump "$BUMP" --current-version "$BASE_VERSION") || exit 31
-OFFLINE=$(echo "$QUEUE_JSON" | jq -r '.offline // false')
-NEXT_SLOT=$(echo "$QUEUE_JSON" | jq -r '.version // empty')
-[ "$OFFLINE" = false ] && [ -n "$NEXT_SLOT" ] || exit 32
-[ "$(tr -d '\\r\\n[:space:]' < VERSION)" = "$NEXT_SLOT" ] || exit 33
-```
-
-Exit 30 means provider or request discovery failed; exits 31-33 mean allocation failed. Every
-non-zero result is a **BLOCKER**. Do not guess a provider, base branch, or version.
-
-1. Require `VERSION` to be modified on the branch. If it is not, **STOP** and return to the Step 8
-   decision; do not create a request that silently reuses a release number.
-2. Require root package metadata that declares a version (`package.json`, `pyproject.toml`, or
-   `Cargo.toml`) to equal `VERSION`. Use only the project's documented version-update command.
-   If no such procedure exists, **STOP** and ask the user rather than applying a partial bump.
-3. If CHANGELOG lacks a heading for the exact VERSION, draft one from `git log <base>..HEAD` and
-   `git diff <base>...HEAD`, show the complete draft to the user, and ask for approval. Insert the
-   approved entry with an exact edit; never overwrite, reorder, or regenerate another entry. If
-   the user does not approve the source-backed draft, **STOP**.
-4. Continue to the existing title-sync step and require the pull or merge request title to begin
-   with `v<VERSION>`. A failed title update is a **BLOCKER** for release preparation, not a warning.
-
-Report VERSION, every checked metadata file, CHANGELOG heading, current review evidence, and
-request title as explicit pass/fail rows. Do not call the Prime release-preparation sequence
-complete until every applicable row passes."""
-        content = content.replace(
-            "## Step 9: Commit & Output",
-            release_artifacts + "\n\n## Step 9: Commit & Output",
-        )
     if installed_name == "agentops-gstack-scrape":
         content = _replace_level_two_section(
             content,
@@ -636,10 +417,8 @@ manual copy has been installed or benchmarked.""",
         "Ship/deploy/PR → invoke /ship or /land-and-deploy",
         "Pull-request creation → inspect the origin remote: on GitHub use `gh pr create` or "
         "the GitHub UI; on GitLab use `glab mr create` when available or the GitLab UI; for "
-        "an unknown provider STOP. For release-bearing changes run /document-release before "
-        "merge. Merge and deploy an existing GitHub pull request → invoke "
-        "/land-and-deploy; on GitLab locate an explicit repository-owned GitLab merge/deploy "
-        "procedure, and if none exists STOP and ask the user; do not improvise",
+        "an unknown provider STOP. Merge and deploy an existing GitHub pull request → invoke "
+        "/land-and-deploy; on GitLab use the repository's approved GitLab path",
     )
     content = content.replace(
         "Full review pipeline → invoke /autoplan",
@@ -654,9 +433,8 @@ manual copy has been installed or benchmarked.""",
     content = content.replace(
         "User asks to merge + deploy + verify as one flow → invoke `/land-and-deploy`",
         "User asks to merge, deploy, and verify → inspect the origin remote: on GitHub invoke "
-        "`/land-and-deploy` for an existing pull request; on GitLab locate an explicit "
-        "repository-owned GitLab merge/deploy procedure, and if none exists STOP "
-        "and ask the user; for an unknown provider STOP without issuing provider commands",
+        "`/land-and-deploy` for an existing pull request; on GitLab use the repository's "
+        "approved GitLab merge and deployment path; for an unknown provider STOP",
     )
     content = content.replace(
         "User asks for safety mode, careful mode → invoke `/careful` or `/guard`",
@@ -688,6 +466,8 @@ manual copy has been installed or benchmarked.""",
         "open-gstack-browser",
         "ship",
         "skillify",
+        "document-release",
+        "land-and-deploy",
         "codex",
         "claude",
     )
@@ -703,6 +483,12 @@ manual copy has been installed or benchmarked.""",
         "open-gstack-browser": "the retained headless browser",
         "ship": "manual pull-request and release preparation",
         "skillify": "manual script preservation",
+        "document-release": (
+            "a source-backed manual release procedure (STOP if none is supplied)"
+        ),
+        "land-and-deploy": (
+            "a repository-owned merge and deployment procedure (STOP if none is supplied)"
+        ),
         "codex": "an external review that is not run by Prime",
         "claude": "an external review that is not run by Prime",
     }
@@ -724,8 +510,7 @@ manual copy has been installed or benchmarked.""",
         "Ship/deploy/PR → invoke manual pull-request and release preparation or ",
         "Pull-request creation → inspect the origin remote: on GitHub use `gh pr create` or "
         "the GitHub UI; on GitLab use `glab mr create` when available or the GitLab UI; for "
-        "an unknown provider STOP. For release-bearing changes run /document-release before "
-        "merge. Merge and deploy an existing GitHub pull request → invoke ",
+        "an unknown provider STOP. Merge and deploy an existing GitHub pull request → invoke ",
     )
     content = content.replace(
         "suggest manual script preservation so the",
@@ -760,11 +545,8 @@ manual copy has been installed or benchmarked.""",
         "`manual pull-request and release preparation`",
         "asks to create a pull or merge request → inspect the origin remote: use `gh pr "
         "create` or the GitHub UI on GitHub, use `glab mr create` when available or the "
-        "GitLab UI on GitLab, and STOP for an unknown provider. For release-bearing changes "
-        "run `/skill:agentops-gstack-document-release` before merge; asks to deploy → use "
-        "`/skill:agentops-gstack-land-and-deploy` only for an existing GitHub pull request "
-        "and on GitLab locate an explicit repository-owned GitLab merge/deploy procedure; "
-        "if none exists STOP and ask the user; do not improvise",
+        "GitLab UI on GitLab, and STOP for an unknown provider; asks to merge or deploy → "
+        "use an explicit repository-owned procedure and STOP to ask the user if none is supplied",
     )
     content = content.replace(
         "asks for a second opinion, codex review → invoke "
@@ -780,8 +562,8 @@ manual copy has been installed or benchmarked.""",
         "→ invoke `manual pull-request and release preparation`",
         "→ inspect the origin remote; on GitHub use `gh pr create` or the GitHub UI, on "
         "GitLab use `glab mr create` when available or the GitLab UI, and for an unknown "
-        "provider STOP; use the retained land-and-deploy workflow only for an existing "
-        "GitHub pull request",
+        "provider STOP; for merge or deployment use an explicit repository-owned procedure "
+        "and STOP to ask the user if none is supplied",
     )
     content = content.replace(
         "→ invoke `an external review that is not run by Prime`",
@@ -825,52 +607,16 @@ manual copy has been installed or benchmarked.""",
     )
     content = content.replace(
         "manual pull-request and release preparation",
-        "the Prime release-preparation sequence",
+        "user-approved manual pull-request and release steps",
     )
     for prose_fallback in route_fallbacks.values():
         content = content.replace(f"`{prose_fallback}`", prose_fallback)
-    manual_steps = "the Prime release-preparation sequence"
+    manual_steps = "user-approved manual pull-request and release steps"
     content = content.replace(f"`{manual_steps}`", manual_steps)
     content = content.replace(f"\\`{manual_steps}\\`", manual_steps)
     content = content.replace(f"{manual_steps} squashes", f"{manual_steps} may squash")
+    content = content.replace(f"{manual_steps} creates", f"{manual_steps} create")
     content = content.replace(f"{manual_steps}'s", manual_steps)
-    content = content.replace(
-        f"{manual_steps} may squash WIP commits into clean commits",
-        "WIP squashing is not part of release preparation; require explicit user approval "
-        "before manual Git cleanup",
-    )
-    content = content.replace(
-        f". {manual_steps} creates the PR.",
-        ". The provider-aware creation step creates the pull or merge request.",
-    )
-    content = content.replace(
-        f"Next {manual_steps} will claim",
-        "The next release-preparation run will claim",
-    )
-    content = content.replace(
-        f"since last {manual_steps}",
-        "since the last release-preparation run",
-    )
-    content = content.replace(
-        f"what slot {manual_steps} would pick next",
-        "what next slot the current release queue reports",
-    )
-    content = content.replace(
-        f"{manual_steps} would land in",
-        "the branch would land in after release preparation",
-    )
-    content = content.replace(
-        f"utility {manual_steps} uses",
-        "utility used for this read-only calculation",
-    )
-    content = content.replace(
-        f"If you ran {manual_steps} right now, you'd claim:",
-        "The current release-queue calculation reports:",
-    )
-    content = content.replace(
-        f"from {manual_steps} runs this period",
-        "from retained review runs this period",
-    )
     for name in sorted(skill_names, key=len, reverse=True):
         base = name.removeprefix("gstack-")
         pattern = rf"(?<![\w./-])/(?:gstack-)?{re.escape(base)}\b"
@@ -884,12 +630,6 @@ manual copy has been installed or benchmarked.""",
         "> **Prime Agent tool contract:** Use IPython for shell commands and file operations "
         "(`%%bash` for project commands and Python for file work). Spawn child agents with "
         "RLM and receive replies through `agent_message`. Ask the user an ordinary question.\n\n"
-        "> **Prime release-preparation sequence:** Run "
-        "`/skill:agentops-gstack-review`, create the pull or merge request through the "
-        "provider-aware route, then run `/skill:agentops-gstack-document-release`. Do not "
-        "claim that review evidence, VERSION, package metadata, CHANGELOG, or the request title "
-        "is prepared until the responsible step confirms it. Use land-and-deploy only for an "
-        "existing GitHub pull request after this sequence completes.\n\n"
     )
     body = content.find("\n---", 3)
     if body >= 0:
@@ -1021,6 +761,8 @@ def _validate_reference_closure(files: dict[str, bytes], profile_root: Path) -> 
         "open-gstack-browser",
         "ship",
         "skillify",
+        "document-release",
+        "land-and-deploy",
         "careful",
         "freeze",
         "guard",
