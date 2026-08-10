@@ -5,9 +5,9 @@ Repository: `agent-ops-community`
 ## Current State
 
 - Branch: `feat/prime-agent-first-class`
-- Current head before this handoff update: `2dfc55f`.
+- Current head before this handoff update: `7a8291a`.
 - Current handoff: all four public pull request 11 Review Gate findings are corrected locally. Prime now uses its native profile variable and an explicit repository path, while gstack and Superpowers install through namespaced Prime adapters with fingerprint ownership and safe legacy migration.
-- Verification: Ruff, 85 tests, the source-tree harness check, whitespace validation, real pinned Superpowers adaptation, and a real pinned gstack generation/runtime build pass. The generated gstack browser executable loads and prints its help; starting Chromium reaches the host sandbox restriction rather than a missing runtime dependency.
+- Verification: Ruff, 85 tests, the source-tree harness check, whitespace validation, real pinned Superpowers adaptation, and a real pinned gstack generation/runtime build pass. The generated gstack browser executable navigates and captures screenshots with sandboxed Chromium on the integration host; no browser sandbox setting was weakened.
 
 ## Current Work
 
@@ -48,7 +48,10 @@ Repository: `agent-ops-community`
 
 ## Verification Log
 
+- 2026-08-10: `uv run --extra dev ruff check .`, `uv run --extra dev pytest -q` (`85 passed`), `uv run --extra dev agentops harness check .`, and `git diff --check` passed for the final public branch. The staged gstack `browse` command navigated to `https://example.com`, returned HTTP 200, reported the expected URL, and captured a 1280×720 screenshot with Chromium sandboxing enabled.
 - 2026-08-09: `uv run --extra dev ruff check .`, `uv run --extra dev pytest -q` (`85 passed`), `uv run --extra dev agentops harness check .`, and `git diff --check` passed after the Prime adapter changes. Real pinned Superpowers adaptation produced 14 unique namespaced skills with no raw provider path or unavailable-tool requirement. Real pinned gstack generation produced 42 unique namespaced skills and 726 managed files; required browser, design, and PDF executables were built, and `browse --help` ran from the staged runtime.
+- 2026-08-09: `uv run --extra dev agentops skills install prime-agent --home <disposable-profile> --cache-dir <pinned-cache>` migrated the actual prior raw gstack and Superpowers installation in a disposable profile. It removed only the exact legacy bundle paths, preserved an unrelated skill byte-for-byte, produced 42 gstack and 14 Superpowers namespaced skills, wrote both ownership manifests, and ran the migrated `browse --help` executable.
+- 2026-08-09: Two clean `prime-agent --print --no-session --offline` runs against the disposable migrated profile discovered and loaded `agentops-superpowers-verification-before-completion` and `agentops-gstack-careful`. The upstream Superpowers acceptance prompt `Let’s make a react todo list` automatically entered the adapted brainstorming workflow and asked its first visual-companion question without writing a file. The temporary profile referenced the existing auth file by symlink; its inode, size, and modification time remained unchanged.
 - 2026-08-09: `uv run --extra dev pytest tests/test_frameworks.py tests/test_skill_installer.py tests/test_cli.py tests/test_readme_smoke.py -q` passed (`25 passed`); final `uv run --extra dev pytest -q` passed (`62 passed`); final `uv run --extra dev ruff check .` and `uv run --extra dev agentops harness check .` passed; `git diff --check` and the obsolete-variable scan passed.
 - 2026-08-09: `uv run --extra dev pytest tests/test_frameworks.py tests/test_skill_installer.py tests/test_cli.py -q` passed (`21 passed`); `uv run --extra dev agentops frameworks command examples/local-smoke.yaml --framework prime-agent --json` produced the expected print-mode handoff; `.venv/bin/ruff check .` passed; `.venv/bin/pytest -q` passed (`60 passed`); `.venv/bin/agentops harness check .` passed; `git diff --check` passed.
 
