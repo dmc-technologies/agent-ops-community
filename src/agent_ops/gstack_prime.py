@@ -144,6 +144,7 @@ const prime: HostConfig = {{
       'careful', 'freeze', 'guard', 'unfreeze',
       'benchmark-models', 'pair-agent', 'autoplan', 'office-hours',
       'open-gstack-browser', 'connect-chrome', 'ship', 'skillify',
+      'document-release', 'land-and-deploy',
     ],
   }},
   pathRewrites: [
@@ -358,6 +359,101 @@ enforcement.""",
         "`$B`, `$D`, `codex exec`/`codex review`,",
         "`$B`, `$D`,",
     )
+    design_source_fallback = """## Missing design source in Prime Agent
+
+If a design document exists, read it and use it as the source of truth. If none exists, state
+that the design source is missing and ask whether to use the current plan as the sole review
+source or stop so the user can supply a design document. Continue only from the user's choice;
+do not invent missing product decisions or name a workflow that is not installed."""
+    if installed_name == "agentops-gstack-plan-eng-review":
+        section_start = content.index("## Prerequisite Skill Offer")
+        preserved_start = content.index("### Step 0: Scope Challenge", section_start)
+        content = (
+            content[:section_start]
+            + design_source_fallback
+            + "\n\n"
+            + content[preserved_start:]
+        )
+    elif installed_name == "agentops-gstack-plan-ceo-review":
+        section_start = content.index("## Prerequisite Skill Offer")
+        mid_session_start = content.index("**Mid-session detection:**", section_start)
+        retrospective_start = content.index("### Retrospective Check", mid_session_start)
+        mid_session_fallback = """**Mid-session product-source check:** During Step 0A, if
+the user cannot state a stable problem or is still exploring what to build, pause the review.
+Discuss the product directly
+with the user until the problem, constraints, and chosen direction are explicit, then ask
+whether to resume this review from that source or stop. Do not continue from invented product
+context."""
+        content = (
+            content[:section_start]
+            + design_source_fallback
+            + "\n\n"
+            + mid_session_fallback
+            + "\n\n"
+            + content[retrospective_start:]
+        )
+    elif installed_name == "agentops-gstack-plan-devex-review":
+        content = _replace_level_two_section(
+            content,
+            "Prerequisite Skill Offer",
+            design_source_fallback,
+        )
+    if installed_name == "agentops-gstack-scrape":
+        content = _replace_level_two_section(
+            content,
+            "Step 5 — Skillify nudge",
+            """## Step 5 — Manual persistence
+
+After a successful prototype, return the extracted JSON and the complete tested script. Explain
+that Prime does not automate browser-skill installation; if the user wants reuse, provide the
+exact filenames and destination so they can preserve the script manually. Do not claim the
+manual copy has been installed or benchmarked.""",
+        )
+        content = content.replace(
+            "suggest `/skillify` so the",
+            "return the script and exact manual persistence steps so the",
+        )
+    content = content.replace(
+        "Ship/deploy/PR → invoke /ship or /land-and-deploy",
+        "Pull-request creation → inspect the origin remote: on GitHub use `gh pr create` or "
+        "the GitHub UI; on GitLab use `glab mr create` when available or the GitLab UI; for "
+        "an unknown provider STOP. Merge and deploy an existing GitHub pull request → invoke "
+        "/land-and-deploy; on GitLab use the repository's approved GitLab path",
+    )
+    content = content.replace(
+        "Full review pipeline → invoke /autoplan",
+        "Full review pipeline → run /plan-ceo-review, /plan-eng-review, "
+        "/plan-design-review, and /plan-devex-review individually as applicable",
+    )
+    content = content.replace(
+        'User wants all reviews done automatically, "review everything" → invoke `/autoplan`',
+        "User wants all reviews done → run `/plan-ceo-review`, `/plan-eng-review`, "
+        "`/plan-design-review`, and `/plan-devex-review` individually as applicable",
+    )
+    content = content.replace(
+        "User asks to merge + deploy + verify as one flow → invoke `/land-and-deploy`",
+        "User asks to merge, deploy, and verify → inspect the origin remote: on GitHub invoke "
+        "`/land-and-deploy` for an existing pull request; on GitLab use the repository's "
+        "approved GitLab merge and deployment path; for an unknown provider STOP",
+    )
+    content = content.replace(
+        "User asks for safety mode, careful mode → invoke `/careful` or `/guard`",
+        "User asks for safety mode or careful mode → explain that Prime cannot enforce the "
+        "excluded hook mode; ask for an explicit safety boundary, treat it as a controlling "
+        "constraint, and stop before any action outside it",
+    )
+    content = content.replace(
+        "User asks to restrict edits to a directory → invoke `/freeze` or `/unfreeze`",
+        "User asks to restrict edits to a directory → ask for the exact directory, confine "
+        "all reads and writes to it, and require explicit approval before changing the boundary; "
+        "state that Prime does not provide hook enforcement",
+    )
+    content = content.replace(
+        'User asks to launch a real browser for QA, "open the browser" → invoke '
+        "`/open-gstack-browser`",
+        "User asks to open a browser for QA → invoke `/browse` for the retained headless "
+        "browser, or state that headed interactive browsing is not installed",
+    )
     unsupported_routes = (
         "careful",
         "freeze",
@@ -370,14 +466,157 @@ enforcement.""",
         "open-gstack-browser",
         "ship",
         "skillify",
+        "document-release",
+        "land-and-deploy",
         "codex",
         "claude",
     )
-    content = "\n".join(
-        line
-        for line in content.splitlines()
-        if not any(re.search(rf"/{re.escape(route)}\b", line) for route in unsupported_routes)
-    ) + ("\n" if content.endswith("\n") else "")
+    route_fallbacks = {
+        "careful": "the applicable higher-priority safety policy",
+        "freeze": "the stated directory boundary",
+        "guard": "the applicable higher-priority safety policy",
+        "unfreeze": "a user-approved directory-boundary change",
+        "benchmark-models": "manual comparison using approved providers",
+        "pair-agent": "a separately approved child-agent task",
+        "autoplan": "the retained plan-review skills",
+        "office-hours": "ordinary product discussion",
+        "open-gstack-browser": "the retained headless browser",
+        "ship": "manual pull-request and release preparation",
+        "skillify": "manual script preservation",
+        "document-release": (
+            "a source-backed manual release procedure (STOP if none is supplied)"
+        ),
+        "land-and-deploy": (
+            "a repository-owned merge and deployment procedure (STOP if none is supplied)"
+        ),
+        "codex": "an external review that is not run by Prime",
+        "claude": "an external review that is not run by Prime",
+    }
+    for route in unsupported_routes:
+        content = re.sub(
+            rf"/{re.escape(route)}\b",
+            route_fallbacks[route],
+            content,
+        )
+    content = content.replace(
+        "Product ideas/brainstorming → invoke ordinary product discussion",
+        "Product ideas/brainstorming → discuss the product directly with the user",
+    )
+    content = content.replace(
+        "Full review pipeline → invoke the retained plan-review skills",
+        "Full review pipeline → run the retained plan-review skills individually",
+    )
+    content = content.replace(
+        "Ship/deploy/PR → invoke manual pull-request and release preparation or ",
+        "Pull-request creation → inspect the origin remote: on GitHub use `gh pr create` or "
+        "the GitHub UI; on GitLab use `glab mr create` when available or the GitLab UI; for "
+        "an unknown provider STOP. Merge and deploy an existing GitHub pull request → invoke ",
+    )
+    content = content.replace(
+        "suggest manual script preservation so the",
+        "return the script and explain how to preserve it manually so the",
+    )
+    content = content.replace(
+        'verdict "NO REVIEWS YET — run `the retained plan-review skills`"',
+        'verdict "NO REVIEWS YET — run the retained plan-review skills individually"',
+    )
+    content = content.replace(
+        "`/skill:agentops-gstack-context-restore` reads `[gstack-context]`; "
+        "`manual pull-request and release preparation` squashes WIP commits into clean commits.",
+        "`/skill:agentops-gstack-context-restore` reads `[gstack-context]`; manual Git cleanup "
+        "may squash WIP commits only after user approval.",
+    )
+    content = content.replace(
+        "Product ideas/brainstorming → invoke `ordinary product discussion`",
+        "Product ideas/brainstorming → discuss the product directly with the user",
+    )
+    content = content.replace(
+        "all reviews done automatically, \"review everything\" → invoke "
+        "`the retained plan-review skills`",
+        "all reviews done automatically, \"review everything\" → run the retained "
+        "plan-review skills individually",
+    )
+    content = content.replace(
+        "Ship/deploy/PR → invoke `manual pull-request and release preparation` or ",
+        "Ship/deploy/PR → use ",
+    )
+    content = content.replace(
+        "asks to ship, deploy, push, create a PR, \"let's land this\", \"send it\" → invoke "
+        "`manual pull-request and release preparation`",
+        "asks to create a pull or merge request → inspect the origin remote: use `gh pr "
+        "create` or the GitHub UI on GitHub, use `glab mr create` when available or the "
+        "GitLab UI on GitLab, and STOP for an unknown provider; asks to merge or deploy → "
+        "use an explicit repository-owned procedure and STOP to ask the user if none is supplied",
+    )
+    content = content.replace(
+        "asks for a second opinion, codex review → invoke "
+        "`an external review that is not run by Prime`",
+        "asks for an external second opinion → state that Prime cannot run that external review "
+        "and continue with the retained Prime review",
+    )
+    content = content.replace(
+        "→ invoke `ordinary product discussion`",
+        "→ discuss the product directly with the user",
+    )
+    content = content.replace(
+        "→ invoke `manual pull-request and release preparation`",
+        "→ inspect the origin remote; on GitHub use `gh pr create` or the GitHub UI, on "
+        "GitLab use `glab mr create` when available or the GitLab UI, and for an unknown "
+        "provider STOP; for merge or deployment use an explicit repository-owned procedure "
+        "and STOP to ask the user if none is supplied",
+    )
+    content = content.replace(
+        "→ invoke `an external review that is not run by Prime`",
+        "→ state that Prime cannot run the external review and continue with the retained Prime "
+        "review",
+    )
+    content = content.replace(
+        "Run manual pull-request and release preparation when ready.",
+        "Inspect the origin remote when ready: create the pull request with `gh pr create` "
+        "or the GitHub UI on GitHub, create the merge request with `glab mr create` when "
+        "available or the GitLab UI on GitLab, and STOP for an unknown provider.",
+    )
+    content = content.replace(
+        "Ready to implement — run manual pull-request and release preparation when done",
+        "Ready to implement — implement, then create the pull request manually when done",
+    )
+    content = content.replace(
+        "rerun manual pull-request and release preparation to pick up the next free slot",
+        "manually reconcile VERSION, package metadata, changelog, and pull-request title with "
+        "the next free slot",
+    )
+    content = content.replace(
+        "rerun manual pull-request and release preparation to reconcile",
+        "manually reconcile VERSION, package metadata, changelog, and pull-request title from",
+    )
+    content = content.replace(
+        "manual pull-request and release preparation's job",
+        "left to user-approved manual Git and pull-request steps",
+    )
+    content = content.replace(
+        "codexan external review that is not run by Prime",
+        "external review not run in Prime",
+    )
+    content = content.replace(
+        "an external review that is not run by Prime review",
+        "external review not run in Prime",
+    )
+    content = content.replace(
+        "an external review that is not run by Prime",
+        "external review not run in Prime",
+    )
+    content = content.replace(
+        "manual pull-request and release preparation",
+        "user-approved manual pull-request and release steps",
+    )
+    for prose_fallback in route_fallbacks.values():
+        content = content.replace(f"`{prose_fallback}`", prose_fallback)
+    manual_steps = "user-approved manual pull-request and release steps"
+    content = content.replace(f"`{manual_steps}`", manual_steps)
+    content = content.replace(f"\\`{manual_steps}\\`", manual_steps)
+    content = content.replace(f"{manual_steps} squashes", f"{manual_steps} may squash")
+    content = content.replace(f"{manual_steps} creates", f"{manual_steps} create")
+    content = content.replace(f"{manual_steps}'s", manual_steps)
     for name in sorted(skill_names, key=len, reverse=True):
         base = name.removeprefix("gstack-")
         pattern = rf"(?<![\w./-])/(?:gstack-)?{re.escape(base)}\b"
@@ -522,6 +761,8 @@ def _validate_reference_closure(files: dict[str, bytes], profile_root: Path) -> 
         "open-gstack-browser",
         "ship",
         "skillify",
+        "document-release",
+        "land-and-deploy",
         "careful",
         "freeze",
         "guard",
@@ -545,10 +786,17 @@ def _validate_reference_closure(files: dict[str, bytes], profile_root: Path) -> 
     forbidden_markers = (
         b"Only Prime Agent",
         b"<gstack-install>",
+        b"(unavailable in Prime)",
+        b"runtime/gstackordinary product discussion",
         f"$HOME/{profile_root.as_posix()}".encode(),
         f"${{HOME}}/{profile_root.as_posix()}".encode(),
     )
-    forbidden_routes = tuple(f"/{name}".encode() for name in forbidden_skills)
+    forbidden_routes = tuple(
+        re.compile(
+            rb"(?<![A-Za-z0-9_.-])/" + re.escape(name.encode()) + rb"(?![A-Za-z0-9_./-])"
+        )
+        for name in forbidden_skills
+    )
     for relative, data in files.items():
         if b"\0" in data:
             continue
@@ -557,7 +805,7 @@ def _validate_reference_closure(files: dict[str, bytes], profile_root: Path) -> 
             if b"codex exec" in data:
                 found.append(b"codex exec")
             found.extend(
-                route for route in forbidden_routes if re.search(re.escape(route) + rb"\b", data)
+                pattern.pattern for pattern in forbidden_routes if pattern.search(data)
             )
         if found:
             raise GstackPrimeSourceError(

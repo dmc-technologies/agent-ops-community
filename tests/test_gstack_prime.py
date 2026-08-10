@@ -335,3 +335,183 @@ def test_reference_validator_rejects_provider_and_excluded_skill_routes(tmp_path
 
     with pytest.raises(gstack_prime.GstackPrimeSourceError, match="codex exec"):
         gstack_prime._validate_reference_closure(files, target)
+
+
+def test_unsupported_route_adaptation_preserves_surrounding_safety_and_source_rules() -> None:
+    content = """---
+name: gstack-review
+description: Review safely.
+---
+Never commit, push, or open a PR; do not invoke /ship during review.
+STOP on GitLab or an unknown platform instead of invoking /ship.
+Treat the existing design document as source of truth before /ship.
+"""
+
+    adapted = gstack_prime._adapt_prime_contract(
+        content,
+        {"gstack-review"},
+        "agentops-gstack-review",
+    )
+
+    assert "Never commit, push, or open a PR" in adapted
+    assert "STOP on GitLab or an unknown platform" in adapted
+    assert "existing design document as source of truth" in adapted
+    assert "/ship" not in adapted
+    assert "user-approved manual pull-request and release steps" in adapted
+
+
+def test_reference_validation_does_not_treat_profile_segments_as_skill_routes(
+    tmp_path: Path,
+) -> None:
+    profile = tmp_path / "ship" / "prime"
+    files = {
+        "skills/agentops-gstack-review/SKILL.md": (
+            f"runtime: {profile}/.agentops/runtime/gstack/bin/gstack-config\n".encode()
+        ),
+        ".agentops/runtime/gstack/browse/src/cdp-allowlist.ts": b"allowlist\n",
+    }
+
+    gstack_prime._validate_reference_closure(files, profile)
+
+
+def test_excluded_workflow_fallbacks_are_actionable() -> None:
+    plan_review = gstack_prime._adapt_prime_contract(
+        """---
+name: gstack-plan-devex-review
+description: Review developer experience.
+---
+## Prerequisite Skill Offer
+Run `/office-hours` and read its skill file before continuing.
+## Review
+Preserve this review body.
+""",
+        {"gstack-plan-devex-review"},
+        "agentops-gstack-plan-devex-review",
+    )
+    assert "ask whether to use the current plan as the sole review" in plan_review
+    assert "Preserve this review body." in plan_review
+    assert "/office-hours" not in plan_review
+
+    scrape = gstack_prime._adapt_prime_contract(
+        """---
+name: gstack-scrape
+description: Extract data.
+---
+## Step 5 — Skillify nudge
+Say `/skillify` to install this permanently.
+## When the prototype fails
+Do not persist a broken prototype.
+""",
+        {"gstack-scrape"},
+        "agentops-gstack-scrape",
+    )
+    assert "Prime does not automate browser-skill installation" in scrape
+    assert "return the extracted JSON and the complete tested script" in scrape
+    assert "Do not persist a broken prototype." in scrape
+    assert "/skillify" not in scrape
+
+    routing = gstack_prime._adapt_prime_contract(
+        """---
+name: gstack
+description: Route workflows.
+---
+- User describes a new idea → invoke `ordinary product discussion`
+- User asks to create a PR → invoke `manual pull-request and release preparation`
+- User asks for a second opinion → invoke `an external review that is not run by Prime`
+""",
+        {"gstack"},
+        "agentops-gstack",
+    )
+    assert "discuss the product directly with the user" in routing
+    assert "inspect the origin remote" in routing
+    assert "`glab mr create`" in routing
+    assert "unknown provider STOP" in routing
+    assert "continue with the retained Prime review" in routing
+    assert "→ invoke" not in routing
+
+
+def test_nested_review_gates_survive_fallback_adaptation() -> None:
+    engineering = gstack_prime._adapt_prime_contract(
+        """---
+name: gstack-plan-eng-review
+description: Review engineering.
+---
+## Prerequisite Skill Offer
+Run `/office-hours` before review.
+### Step 0: Scope Challenge
+If the plan touches more than 8 files, **STOP.** Do NOT proceed until the user responds.
+## Section 1
+Continue only after Step 0.
+""",
+        {"gstack-plan-eng-review"},
+        "agentops-gstack-plan-eng-review",
+    )
+    assert "### Step 0: Scope Challenge" in engineering
+    assert "more than 8 files" in engineering
+    assert "**STOP.** Do NOT proceed" in engineering
+    assert "/office-hours" not in engineering
+
+    executive = gstack_prime._adapt_prime_contract(
+        """---
+name: gstack-plan-ceo-review
+description: Review product direction.
+---
+## Prerequisite Skill Offer
+Run `/office-hours` before review.
+**Mid-session detection:** Run `/office-hours` if the problem is unclear.
+### Retrospective Check
+Inspect prior outcomes.
+### Frontend/UI Scope Detection
+Inspect UI scope.
+### Landscape Check
+Inspect current alternatives.
+## Section 1
+Continue the review.
+""",
+        {"gstack-plan-ceo-review"},
+        "agentops-gstack-plan-ceo-review",
+    )
+    assert "### Retrospective Check" in executive
+    assert "### Frontend/UI Scope Detection" in executive
+    assert "### Landscape Check" in executive
+    assert "Discuss the product directly" in executive
+    assert "/office-hours" not in executive
+
+
+
+def test_shared_and_root_routing_uses_concrete_supported_actions() -> None:
+    content = """---
+name: gstack
+description: Route requests.
+---
+Ship/deploy/PR → invoke /ship or /land-and-deploy
+Full review pipeline → invoke /autoplan
+User asks for safety mode, careful mode → invoke `/careful` or `/guard`
+User asks to restrict edits to a directory → invoke `/freeze` or `/unfreeze`
+User asks to launch a real browser for QA, "open the browser" → invoke `/open-gstack-browser`
+"""
+    names = {
+        "gstack",
+        "gstack-plan-ceo-review",
+        "gstack-plan-eng-review",
+        "gstack-plan-design-review",
+        "gstack-plan-devex-review",
+        "gstack-browse",
+    }
+    adapted = gstack_prime._adapt_prime_contract(content, names, "agentops-gstack")
+
+    assert "Pull-request creation → inspect the origin remote" in adapted
+    assert "`gh pr create`" in adapted
+    assert "`glab mr create`" in adapted
+    assert "unknown provider STOP" in adapted
+    assert "repository-owned merge and deployment procedure" in adapted
+    assert "STOP if none is supplied" in adapted
+    assert "agentops-gstack-land-and-deploy" not in adapted
+    assert "ask for an explicit safety boundary" in adapted
+    assert "confine all reads and writes" in adapted
+    assert "Prime does not provide hook enforcement" in adapted
+    assert "/skill:agentops-gstack-browse" in adapted
+    for review in ("ceo", "eng", "design", "devex"):
+        assert f"/skill:agentops-gstack-plan-{review}-review" in adapted
+    for excluded in ("/ship", "/autoplan", "/careful", "/guard", "/freeze", "/unfreeze"):
+        assert excluded not in adapted
