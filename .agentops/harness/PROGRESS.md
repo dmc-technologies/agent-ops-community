@@ -6,23 +6,24 @@ Repository: `agent-ops-community`
 
 - Branch: `feat/prime-agent-first-class`
 - Latest commit before current work: `origin/main` (`bcada9b`).
-- Current handoff: pull request 11 is pending external finalization. CI passed on the implementation head; CI and Review Gate must pass on the final clock-out head before merge. No Plane work item applies because Dan directly requested this framework integration.
-- Verification: full tests, lint, source-tree harness check, real temporary-home dependency installation, and whitespace validation pass.
+- Current handoff: the two Review Gate corrections are implemented on `feat/prime-core-review-fixes`; the final commit and hosted checks remain. No Plane work item applies because Dan directly requested this framework integration.
+- Verification: targeted tests, full tests (`62 passed`), Ruff, the source-tree harness check, whitespace validation, and the obsolete-variable scan pass.
 
 ## Current Work
 
 - Goal: make Prime Agent a first-class supported framework.
-- Active task: finish pull request 11 on the final clock-out head, then merge it before opening the dependent private Agent Ops pull request.
+- Active task: commit the Prime 0.7.1 environment-variable and explicit framework-command working-directory corrections for pull request 11.
 - Files in play: framework registry and adapter, bootstrap, skill registries and installer, documentation, tests, and this repository handoff.
-- Blockers: Review Gate must pass on the unchanged final head before merge.
+- Blockers: hosted CI and Review Gate must pass on the final head before merge.
 
 ## Next Actions
 
-- Require CI and Review Gate to pass on the final pull-request head with no unresolved review conversation.
+- Push the correction commit, then require CI and Review Gate to pass on the final pull-request head with no unresolved review conversation.
 - Merge pull request 11, then rebase and open the coordinated private Agent Ops pull request.
 
 ## Session Log
 
+- 2026-08-09: Replaced the obsolete Prime home variable with Prime 0.7.1’s `PRIME_AGENT_CODING_AGENT_DIR`, made default skill installation honor it, and required a validated explicit `--cwd` for framework command handoffs without changing gstack or Superpowers install mappings.
 - 2026-08-09: Clock-out recorded pull request 11 as pending external finalization after the public Prime implementation and real dependency installation passed locally. The dependent private pull request must follow this public merge.
 - 2026-08-09: Added Prime Agent framework registration, `prime-agent --print --cwd` context handoff, generated bootstrap support, the native `~/.prime/agent` home, pinned gstack and Superpowers install mappings, registry metadata, documentation, and tests.
 
@@ -45,6 +46,7 @@ Repository: `agent-ops-community`
 
 ## Verification Log
 
+- 2026-08-09: `uv run --extra dev pytest tests/test_frameworks.py tests/test_skill_installer.py tests/test_cli.py tests/test_readme_smoke.py -q` passed (`25 passed`); final `uv run --extra dev pytest -q` passed (`62 passed`); final `uv run --extra dev ruff check .` and `uv run --extra dev agentops harness check .` passed; `git diff --check` and the obsolete-variable scan passed.
 - 2026-08-09: `uv run --extra dev pytest tests/test_frameworks.py tests/test_skill_installer.py tests/test_cli.py -q` passed (`21 passed`); `uv run --extra dev agentops frameworks command examples/local-smoke.yaml --framework prime-agent --json` produced the expected print-mode handoff; `.venv/bin/ruff check .` passed; `.venv/bin/pytest -q` passed (`60 passed`); `.venv/bin/agentops harness check .` passed; `git diff --check` passed.
 
 - 2026-08-08: `.venv/bin/python -m pytest -q` passed (`57 passed`); `.venv/bin/ruff check .` passed; `.venv/bin/agentops harness check .` passed; `git diff --check` passed.

@@ -6,8 +6,8 @@ Record durable architecture, workflow, and harness decisions here.
 
 ### 2026-08-09: Prime Agent uses its native print-mode and home conventions
 
-- Decision: register Prime Agent as `prime-agent`; hand context packs to `prime-agent --print --cwd <repo> -- <prompt>`; default installs to `${PRIME_AGENT_HOME:-~/.prime/agent}`; install pinned gstack at `skills/gstack` and merge pinned Superpowers skills into `skills/`.
-- Rationale: these are the public CLI and resource conventions exposed by Prime Agent, and they provide the same bootstrap, context, handoff, and pinned-skill experience as other first-class frameworks without a runner plugin.
+- Decision: register Prime Agent as `prime-agent`; require every framework command handoff to receive an existing directory through `--cwd`; hand context packs to `prime-agent --print --cwd <repo> -- <prompt>` using that same directory; default installs to `${PRIME_AGENT_CODING_AGENT_DIR:-~/.prime/agent}`; install pinned gstack at `skills/gstack` and merge pinned Superpowers skills into `skills/`.
+- Rationale: Prime Agent 0.7.1 discovers coding-agent resources through `PRIME_AGENT_CODING_AGENT_DIR`, and an explicit validated repository directory prevents the reported adapter working directory from diverging from Prime Agent’s `--cwd`. These conventions provide the same bootstrap, context, handoff, and pinned-skill experience as other first-class frameworks without a runner plugin.
 - Applies to: framework and registry models, adapters, bootstrap generation, skill dependency installation, public data registries, documentation, and tests.
 - Revisit when: Prime Agent changes its public CLI handoff flags or resource discovery home.
 

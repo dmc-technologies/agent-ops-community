@@ -49,7 +49,11 @@ def test_public_bootstrap_only_advertises_supported_skill_installs() -> None:
     assert "agentops skills install opencode" in bootstrap_text(Framework.OPENCODE)
     prime_bootstrap = bootstrap_text(Framework.PRIME_AGENT)
     assert "agentops skills install prime-agent" in prime_bootstrap
-    assert 'export PRIME_AGENT_HOME="${PRIME_AGENT_HOME:-~/.prime/agent}"' in prime_bootstrap
+    assert (
+        'export PRIME_AGENT_CODING_AGENT_DIR='
+        '"${PRIME_AGENT_CODING_AGENT_DIR:-~/.prime/agent}"'
+        in prime_bootstrap
+    )
     assert "agentops skills install cursor" not in bootstrap_text(Framework.CURSOR)
     assert "agentops skills install local" not in bootstrap_text(Framework.LOCAL)
 

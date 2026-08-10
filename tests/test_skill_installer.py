@@ -312,7 +312,9 @@ def test_install_skill_dependencies_fails_on_unsupported_explicit_dependency(
         raise AssertionError("expected unsupported explicit dependency to fail")
 
 
-def test_prime_agent_uses_native_home_and_pinned_bundle_mappings(tmp_path: Path) -> None:
+def test_prime_agent_uses_native_home_and_pinned_bundle_mappings(
+    tmp_path: Path, monkeypatch,
+) -> None:
     registered = {dependency.id: dependency for dependency in load_skill_dependencies()}
     assert all(
         len(registered[dependency_id].ref) == 40
@@ -357,8 +359,18 @@ def test_prime_agent_uses_native_home_and_pinned_bundle_mappings(tmp_path: Path)
         dry_run=True,
     )
 
+    monkeypatch.delenv("PRIME_AGENT_CODING_AGENT_DIR", raising=False)
     assert default_framework_home(Framework.PRIME_AGENT) == Path("~/.prime/agent").expanduser()
     assert [row.destination.relative_to(tmp_path / "prime-home").as_posix() for row in rows] == [
         "skills/gstack",
         "skills",
     ]
+
+
+def test_prime_agent_home_honors_native_environment_variable(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    configured_home = tmp_path / "configured-prime-home"
+    monkeypatch.setenv("PRIME_AGENT_CODING_AGENT_DIR", str(configured_home))
+
+    assert default_framework_home(Framework.PRIME_AGENT) == configured_home

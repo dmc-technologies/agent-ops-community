@@ -50,7 +50,7 @@ export CLAUDE_HOME="${{CLAUDE_HOME:-~/.claude}}"
 export CURSOR_HOME="${{CURSOR_HOME:-~/.cursor}}"
 export OPENCLAW_HOME="${{OPENCLAW_HOME:-~/.openclaw}}"
 export OPENCODE_HOME="${{OPENCODE_HOME:-~/.agents}}"
-export PRIME_AGENT_HOME="${{PRIME_AGENT_HOME:-~/.prime/agent}}"
+export PRIME_AGENT_CODING_AGENT_DIR="${{PRIME_AGENT_CODING_AGENT_DIR:-~/.prime/agent}}"
 export AGENT_OPS_LOCAL_HOME="${{AGENT_OPS_LOCAL_HOME:-~/.agentops}}"
 export KNOWLEDGE_MEMORY_DIR="${{KNOWLEDGE_MEMORY_DIR:-$AGENT_KNOWLEDGE_HOME}}"
 {KNOWLEDGE_GIT_EXPORT}
@@ -108,7 +108,7 @@ rg -n "<project|repo|workflow keyword>" "$AGENT_KNOWLEDGE_HOME"
 3. Use framework command handoff when useful:
 
    ```bash
-   agentops frameworks command <job.yaml> --framework {framework.value} --json
+   agentops frameworks command <job.yaml> --framework {framework.value} --cwd <repo> --json
    ```
 
 4. Run installed plugin-backed execution paths when a runner plugin is present:

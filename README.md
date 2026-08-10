@@ -62,11 +62,11 @@ Build framework context packs and handoff commands:
 
 ```bash
 agentops context build examples/local-smoke.yaml --framework codex
-agentops frameworks command examples/local-smoke.yaml --framework codex --json
-agentops frameworks command examples/local-smoke.yaml --framework prime-agent --json
+agentops frameworks command examples/local-smoke.yaml --framework codex --cwd /tmp/agentops-example --json
+agentops frameworks command examples/local-smoke.yaml --framework prime-agent --cwd /tmp/agentops-example --json
 ```
 
-Prime Agent handoff uses its non-interactive `--print` mode and passes the job context with an explicit `--cwd`. Prime Agent skill bundles install under `${PRIME_AGENT_HOME:-~/.prime/agent}/skills`. See [Prime Agent support](docs/prime-agent.md) for the complete setup and command contract.
+Prime Agent handoff uses its non-interactive `--print` mode and passes the job context with an explicit `--cwd`. Prime Agent skill bundles install under `${PRIME_AGENT_CODING_AGENT_DIR:-~/.prime/agent}/skills`. See [Prime Agent support](docs/prime-agent.md) for the complete setup and command contract.
 
 ## Extension Model
 

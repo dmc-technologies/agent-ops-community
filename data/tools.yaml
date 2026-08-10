@@ -57,5 +57,5 @@
   frameworks:
   - prime-agent
   config_paths:
-  - ${PRIME_AGENT_HOME:-~/.prime/agent}
+  - ${PRIME_AGENT_CODING_AGENT_DIR:-~/.prime/agent}
   requires: []

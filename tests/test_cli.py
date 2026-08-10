@@ -161,7 +161,16 @@ verification:
 
     command_result = runner.invoke(
         app,
-        ["frameworks", "command", str(job), "--framework", "codex", "--json"],
+        [
+            "frameworks",
+            "command",
+            str(job),
+            "--framework",
+            "codex",
+            "--cwd",
+            str(tmp_path),
+            "--json",
+        ],
     )
 
     assert command_result.exit_code == 0
@@ -186,7 +195,16 @@ verification:
 
     command_result = runner.invoke(
         app,
-        ["frameworks", "command", str(job), "--framework", "prime-agent", "--json"],
+        [
+            "frameworks",
+            "command",
+            str(job),
+            "--framework",
+            "prime-agent",
+            "--cwd",
+            str(tmp_path),
+            "--json",
+        ],
     )
     install_result = runner.invoke(
         app,
@@ -203,7 +221,39 @@ verification:
     assert command_result.exit_code == 0
     command = json.loads(command_result.output)
     assert command["framework"] == "prime-agent"
-    assert command["command"][:4] == ["prime-agent", "--print", "--cwd", str(Path.cwd())]
+    assert command["command"][:4] == ["prime-agent", "--print", "--cwd", str(tmp_path)]
+    assert command["cwd"] == str(tmp_path)
     assert install_result.exit_code == 0
     assert "gstack ->" in install_result.output
     assert "superpowers ->" in install_result.output
+
+
+def test_framework_command_requires_explicit_existing_directory(tmp_path: Path) -> None:
+    job = tmp_path / "job.yaml"
+    job.write_text(
+        "id: explicit-cwd\ntitle: Explicit CWD\nmode: verify-only\n",
+        encoding="utf-8",
+    )
+
+    missing_result = runner.invoke(
+        app,
+        ["frameworks", "command", str(job), "--framework", "codex", "--json"],
+    )
+    file_result = runner.invoke(
+        app,
+        [
+            "frameworks",
+            "command",
+            str(job),
+            "--framework",
+            "codex",
+            "--cwd",
+            str(job),
+            "--json",
+        ],
+    )
+
+    assert missing_result.exit_code != 0
+    assert "Missing option" in missing_result.output
+    assert file_result.exit_code != 0
+    assert "Directory" in file_result.output

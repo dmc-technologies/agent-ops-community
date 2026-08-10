@@ -104,7 +104,8 @@ class PrimeAgentAdapter(FrameworkAdapter):
             cwd=str(cwd),
             notes=[
                 "Uses Prime Agent print mode for a non-interactive context-pack handoff.",
-                "Skills and bootstrap install into ${PRIME_AGENT_HOME:-~/.prime/agent}.",
+                "Skills and bootstrap install into "
+                "${PRIME_AGENT_CODING_AGENT_DIR:-~/.prime/agent}.",
             ],
         )
 

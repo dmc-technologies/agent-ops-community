@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -27,7 +28,9 @@ def default_framework_home(framework: Framework) -> Path:
         case Framework.OPENCODE:
             return Path("~/.agents").expanduser()
         case Framework.PRIME_AGENT:
-            return Path("~/.prime/agent").expanduser()
+            return Path(
+                os.environ.get("PRIME_AGENT_CODING_AGENT_DIR", "~/.prime/agent")
+            ).expanduser()
         case Framework.CURSOR:
             return Path("~/.cursor").expanduser()
         case Framework.OPENCLAW:

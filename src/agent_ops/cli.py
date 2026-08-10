@@ -318,12 +318,23 @@ def list_frameworks(json_output: Annotated[bool, typer.Option("--json")] = False
 def framework_command(
     job_file: Annotated[Path, typer.Argument(exists=True, dir_okay=False)],
     framework: Annotated[Framework, typer.Option("--framework", "-f")],
+    cwd: Annotated[
+        Path,
+        typer.Option(
+            "--cwd",
+            exists=True,
+            file_okay=False,
+            dir_okay=True,
+            resolve_path=True,
+            help="Existing job repository directory.",
+        ),
+    ],
     json_output: Annotated[bool, typer.Option("--json")] = False,
 ) -> None:
     job = load_job(job_file)
     context_pack = build_context_pack(job, framework)
     adapter = get_adapter(framework)
-    command = adapter.build_command(job, context_pack, Path.cwd())
+    command = adapter.build_command(job, context_pack, cwd)
     if json_output:
         typer.echo(command.model_dump_json(indent=2))
     else:
