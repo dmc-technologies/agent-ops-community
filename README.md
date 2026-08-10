@@ -63,7 +63,7 @@ agentops frameworks command examples/local-smoke.yaml --framework codex --cwd /t
 agentops frameworks command examples/local-smoke.yaml --framework prime-agent --cwd /tmp/agentops-example --json
 ```
 
-Prime Agent handoff uses its non-interactive `--print` mode and passes the job context with an explicit `--cwd`. Prime Agent skill bundles install namespaced skills under `${PRIME_AGENT_CODING_AGENT_DIR:-~/.prime/agent}/skills` and keep ownership records outside the shared skill namespace. See [Prime Agent support](docs/prime-agent.md) for the complete setup, collision contract, and command contract.
+Prime Agent handoff uses its non-interactive `--print` mode and passes the job context with an explicit `--cwd`. Prime Agent skill bundles install namespaced skills under `${PRIME_AGENT_CODING_AGENT_DIR:-$HOME/.prime/agent}/skills` and keep ownership records outside the shared skill namespace. See [Prime Agent support](docs/prime-agent.md) for the complete setup, collision contract, and command contract.
 
 ## Extension Model
 

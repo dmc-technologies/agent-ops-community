@@ -146,6 +146,7 @@ def install_prime_superpowers(
         for skill_name in SUPERPOWERS_SKILLS:
             _adapt_skill(upstream_root / "skills" / skill_name, staging, skill_name)
         _validate_reference_closure(staging)
+        _bind_profile_root(staging, destination.parent.resolve())
         manifest = _build_manifest(staging)
         _install_staged(staging, destination, manifest, source_fingerprints)
     return manifest
@@ -176,6 +177,25 @@ def _validate_input(upstream_root: Path, upstream_ref: str) -> None:
         if actual_ref != upstream_ref:
             raise ValueError(
                 f"pinned Superpowers checkout is at {actual_ref}, expected {upstream_ref}"
+            )
+        checkout_status = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(upstream_root),
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--ignored=matching",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        if checkout_status.stdout:
+            raise ValueError(
+                "pinned Superpowers checkout contains tracked modifications, "
+                "untracked files, or ignored files"
             )
 
 
@@ -317,6 +337,21 @@ def _validate_reference_closure(staging: Path) -> None:
                         f"unresolved Superpowers path {token!r} "
                         f"at {relative}:{line_number}"
                     )
+
+
+def _bind_profile_root(staging: Path, profile_root: Path) -> None:
+    marker = "${PRIME_AGENT_CODING_AGENT_DIR}"
+    text_suffixes = {".md", ".txt", ".dot", ".ts", ".js", ".sh"}
+    replacement = profile_root.as_posix()
+    for path in sorted(item for item in staging.rglob("*") if item.is_file()):
+        if path.suffix.lower() not in text_suffixes:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        if marker in text:
+            path.write_text(text.replace(marker, replacement), encoding="utf-8", newline="\n")
 
 
 def _split_frontmatter(text: str) -> tuple[str, str]:

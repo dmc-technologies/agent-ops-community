@@ -4,11 +4,13 @@ import hashlib
 import json
 import re
 import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
 import yaml
 
+import agent_ops.superpowers_adapter as superpowers_adapter
 from agent_ops.superpowers_adapter import (
     OWNERSHIP_MANIFEST_RELATIVE,
     PINNED_SUPERPOWERS_REF,
@@ -110,6 +112,7 @@ def test_internal_references_and_claude_tools_are_prime_native(tmp_path: Path) -
     assert "ordinary conversation" in all_markdown
     assert "~/.claude" not in all_markdown
     assert "Claude Code" not in all_markdown
+    assert "PRIME_AGENT_CODING_AGENT_DIR" not in all_markdown
     assert 'handle = await rlm("<complete bounded task prompt>")' in all_markdown
     assert "await agent_message.send" in all_markdown
     assert 'await agent_message.send(message, receiver_role="parent")' in all_markdown
@@ -118,7 +121,7 @@ def test_internal_references_and_claude_tools_are_prime_native(tmp_path: Path) -
     assert "ordinary agent message" in all_markdown
     assert "receive results with" not in all_markdown
     assert "system, developer, and project policy" in all_markdown
-    profile_skills = "${PRIME_AGENT_CODING_AGENT_DIR}/skills"
+    profile_skills = f"{destination.parent.resolve().as_posix()}/skills"
     visual_companion = (
         f"{profile_skills}/agentops-superpowers-brainstorming/visual-companion.md"
     )
@@ -140,6 +143,49 @@ def test_internal_references_and_claude_tools_are_prime_native(tmp_path: Path) -
     )
     for claude_requirement in claude_only_requirements:
         assert claude_requirement not in all_markdown
+
+
+@pytest.mark.parametrize("mutation", ["tracked", "untracked", "ignored"])
+def test_dirty_pinned_checkout_is_rejected_before_install(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str
+) -> None:
+    upstream = _write_upstream(tmp_path / "upstream")
+    upstream.joinpath(".gitignore").write_text("*.local\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-q"], cwd=upstream, check=True)
+    subprocess.run(["git", "add", "."], cwd=upstream, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+        cwd=upstream,
+        check=True,
+    )
+    ref = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=upstream,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if mutation == "tracked":
+        upstream.joinpath("skills/writing-plans/SKILL.md").write_text("modified\n")
+    elif mutation == "untracked":
+        upstream.joinpath("skills/writing-plans/injected.md").write_text("untracked\n")
+    else:
+        upstream.joinpath("skills/writing-plans/injected.local").write_text("ignored\n")
+    monkeypatch.setattr(superpowers_adapter, "PINNED_SUPERPOWERS_REF", ref)
+    destination = tmp_path / "prime/skills"
+
+    with pytest.raises(ValueError, match="tracked modifications|untracked files"):
+        install_prime_superpowers(upstream, destination, upstream_ref=ref)
+    assert not destination.exists()
 
 
 def test_reference_closure_rejects_missing_profile_asset(tmp_path: Path) -> None:
@@ -206,16 +252,14 @@ def test_modified_managed_skill_fails_without_changing_any_destination_bytes(
 def test_manifest_is_deterministic_and_records_collision_fingerprints(tmp_path: Path) -> None:
     upstream = _write_upstream(tmp_path / "upstream")
     first = tmp_path / "first" / "skills"
-    second = tmp_path / "second" / "skills"
 
     result_one = install_prime_superpowers(upstream, first)
-    result_two = install_prime_superpowers(upstream, second)
+    manifest_bytes = (first.parent / OWNERSHIP_MANIFEST_RELATIVE).read_bytes()
+    result_two = install_prime_superpowers(upstream, first)
 
     assert result_one == result_two
-    assert (first.parent / OWNERSHIP_MANIFEST_RELATIVE).read_bytes() == (
-        second.parent / OWNERSHIP_MANIFEST_RELATIVE
-    ).read_bytes()
-    disk = json.loads((first.parent / OWNERSHIP_MANIFEST_RELATIVE).read_text())
+    assert (first.parent / OWNERSHIP_MANIFEST_RELATIVE).read_bytes() == manifest_bytes
+    disk = json.loads(manifest_bytes)
     assert all(len(entry["fingerprint"]) == 64 for entry in disk["skills"].values())
 
 

@@ -21,6 +21,8 @@ _RUNTIME_TREES = (
     "design/dist",
     "make-pdf/dist",
     "review",
+    "design-html/vendor",
+    "extension",
     "qa/templates",
     "qa/references",
     "gstack-upgrade/migrations",
@@ -29,7 +31,7 @@ _RUNTIME_TREES = (
     "node_modules/diff",
     "node_modules/@ngrok",
 )
-_RUNTIME_FILES = ("ETHOS.md",)
+_RUNTIME_FILES = ("ETHOS.md", "plan-devex-review/dx-hall-of-fame.md")
 _REQUIRED_EXECUTABLES = (
     "browse/dist/browse",
     "browse/dist/find-browse",
@@ -123,9 +125,14 @@ const prime: HostConfig = {{
   frontmatter: {{ mode: 'allowlist', keepFields: ['name', 'description'], descriptionLimit: null }},
   generation: {{
     generateMetadata: false,
-    skipSkills: ['codex', 'claude', 'gstack-upgrade', 'setup-gbrain', 'sync-gbrain'],
+    skipSkills: [
+      'codex', 'claude', 'gstack-upgrade', 'setup-gbrain', 'sync-gbrain',
+      'careful', 'freeze', 'guard', 'unfreeze',
+    ],
   }},
   pathRewrites: [
+    {{ from: '~/.claude/skills/review', to: '{runtime}/review' }},
+    {{ from: '.claude/skills/review', to: '{runtime}/review' }},
     {{ from: '~/.claude/skills/gstack', to: '{runtime}' }},
     {{ from: '.claude/skills/gstack', to: '{runtime}' }},
     {{ from: '~/.claude/skills', to: '${{PRIME_AGENT_CODING_AGENT_DIR}}/skills' }},
@@ -238,8 +245,22 @@ Present the decision, why it matters, and concise options in an ordinary assista
 one direct question and stop for the user's reply. Do not dispatch a child agent or call an MCP
 tool to ask the user. Continue from the answer on the next turn.""",
         )
+    if installed_name == "agentops-gstack-investigate":
+        content = _replace_level_two_section(
+            content,
+            "Scope Lock",
+            """## Scope boundary in Prime Agent
+
+Prime Agent does not provide gstack's provider-specific edit hook. Identify and state the narrowest
+directory containing the affected files before editing. Do not edit outside that directory unless
+the user approves the expanded scope. This is an explicit workflow constraint, not automated
+enforcement.""",
+        )
     runtime = "${PRIME_AGENT_CODING_AGENT_DIR}/.agentops/runtime/gstack"
     replacements = (
+        ("$HOME/.claude/skills/review", f"{runtime}/review"),
+        ("~/.claude/skills/review", f"{runtime}/review"),
+        (".claude/skills/review", f"{runtime}/review"),
         ("$HOME/.claude/skills/gstack", runtime),
         ("$_ROOT/.claude/skills/gstack", runtime),
         ("$HOME/.prime/agent/.agentops/runtime/gstack", runtime),
@@ -286,6 +307,18 @@ tool to ask the user. Continue from the answer on the next turn.""",
     )
     for old, new in replacements:
         content = content.replace(old, new)
+    for name in skill_names:
+        installed_skill_path = (
+            f"${{PRIME_AGENT_CODING_AGENT_DIR}}/skills/agentops-{name}/SKILL.md"
+        )
+        content = content.replace(f"{runtime}/{name}/SKILL.md", installed_skill_path)
+        content = content.replace(
+            f"${{CLAUDE_SKILL_DIR}}/../{name}/SKILL.md", installed_skill_path
+        )
+        base = name.removeprefix("gstack-")
+        content = content.replace(
+            f"${{CLAUDE_SKILL_DIR}}/../{base}/SKILL.md", installed_skill_path
+        )
     content = content.replace(f"$HOME{runtime}", runtime)
     content = content.replace(f"$_ROOT/{runtime}", runtime)
     for name in sorted(skill_names, key=len, reverse=True):
@@ -323,6 +356,7 @@ tool to ask the user. Continue from the answer on the next turn.""",
         "ExitPlanMode",
         "$HOME${PRIME_AGENT_CODING_AGENT_DIR}",
         "$_ROOT/${PRIME_AGENT_CODING_AGENT_DIR}",
+        "CLAUDE_SKILL_DIR",
     )
     found = [token for token in forbidden if token in content]
     if found:
@@ -344,7 +378,8 @@ def _adapt_runtime_asset(item: Path) -> bytes:
         text = data.decode("utf-8")
     except UnicodeDecodeError:
         return data
-    runtime = "${PRIME_AGENT_CODING_AGENT_DIR:-$HOME/.prime/agent}/.agentops/runtime/gstack"
+    profile = "${PRIME_AGENT_CODING_AGENT_DIR}"
+    runtime = f"{profile}/.agentops/runtime/gstack"
     replacements = (
         ("$HOME/.claude/skills/gstack", runtime),
         ("$_ROOT/.claude/skills/gstack", runtime),
@@ -352,9 +387,9 @@ def _adapt_runtime_asset(item: Path) -> bytes:
         ("$HOME${PRIME_AGENT_CODING_AGENT_DIR}/.agentops/runtime/gstack", runtime),
         ("$_ROOT/${PRIME_AGENT_CODING_AGENT_DIR}/.agentops/runtime/gstack", runtime),
         ("~/.claude/skills/gstack", runtime),
-        (".claude/skills/gstack", ".prime/agent/.agentops/runtime/gstack"),
-        ("$HOME/.claude/plans", "${PRIME_AGENT_CODING_AGENT_DIR:-$HOME/.prime/agent}/plans"),
-        (".claude/plans", ".prime/agent/plans"),
+        (".claude/skills/gstack", runtime),
+        ("$HOME/.claude/plans", f"{profile}/plans"),
+        (".claude/plans", f"{profile}/plans"),
         ("CLAUDE.md", "AGENTS.md"),
     )
     for old, new in replacements:
@@ -405,6 +440,14 @@ def _collect_files(source: Path) -> tuple[dict[str, bytes], dict[str, int]]:
     return files, modes
 
 
+def _bind_profile_root(files: dict[str, bytes], profile_root: Path) -> None:
+    marker = b"${PRIME_AGENT_CODING_AGENT_DIR}"
+    replacement = profile_root.as_posix().encode("utf-8")
+    for relative, data in list(files.items()):
+        if b"\0" not in data and marker in data:
+            files[relative] = data.replace(marker, replacement)
+
+
 def _load_manifest(target: Path) -> dict[str, object] | None:
     path = target / MANIFEST_NAME
     if not path.exists():
@@ -428,7 +471,10 @@ def _load_manifest(target: Path) -> dict[str, object] | None:
         allowed = (
             pure.parts[:1] == ("skills",)
             and len(pure.parts) >= 3
-            and pure.parts[1].startswith("agentops-gstack-")
+            and (
+                pure.parts[1] == "agentops-gstack"
+                or pure.parts[1].startswith("agentops-gstack-")
+            )
         ) or pure.parts[:3] == (".agentops", "runtime", "gstack")
         if (
             not isinstance(relative, str)
@@ -680,6 +726,7 @@ def install_prime_gstack(
                     f"gstack build produced a non-executable runtime: {relative}"
                 )
         new_files, modes = _collect_files(source)
+        _bind_profile_root(new_files, target)
 
         manifest = _load_manifest(target)
         migrate_legacy = _preflight(target, new_files, manifest, legacy_expected)

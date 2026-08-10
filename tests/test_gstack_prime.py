@@ -58,6 +58,7 @@ Use /gstack-qa and /qa. Use ~/.claude/skills/gstack/bin/gstack-config.
 Use the Bash tool and the Read tool. Use AskUserQuestion for decisions.
 Use the Agent tool with subagent_type for parallel review.
 Use $HOME/.claude/skills/gstack/bin/gstack-config too.
+Read ~/.claude/skills/review/checklist.md before review.
 ## Skill Invocation During Plan Mode
 Use mcp__host__AskUserQuestion, then call ExitPlanMode.
 ## AskUserQuestion Format
@@ -128,14 +129,16 @@ def test_install_generates_namespaced_prime_skills_and_built_runtime(
     assert "name: agentops-gstack-review" in content
     assert "name: agentops-gstack-qa" in (target / "skills/agentops-gstack-qa/SKILL.md").read_text()
     assert "/skill:agentops-gstack-qa" in content
-    assert "${PRIME_AGENT_CODING_AGENT_DIR}/.agentops/runtime/gstack/bin/gstack-config" in content
+    runtime = f"{target.resolve().as_posix()}/.agentops/runtime/gstack"
+    assert f"{runtime}/bin/gstack-config" in content
+    assert f"{runtime}/review/checklist.md" in content
     assert "IPython" in content
     assert "RLM" in content and "agent_message" in content
     assert "ordinary question" in content
     assert "Claude" not in content and ".claude" not in content
     assert "Model-Specific Behavioral Patch" not in content
     assert "mcp__" not in content and "ExitPlanMode" not in content
-    assert "$HOME${PRIME_AGENT_CODING_AGENT_DIR}" not in content
+    assert "PRIME_AGENT_CODING_AGENT_DIR" not in content
     assert "ordinary assistant response" in content
     for executable in (
         "browse/dist/browse",
@@ -149,7 +152,8 @@ def test_install_generates_namespaced_prime_skills_and_built_runtime(
     assert (target / ".agentops/runtime/gstack/qa/templates/report.md").exists()
     runtime_config = (target / ".agentops/runtime/gstack/bin/gstack-config").read_text()
     assert ".claude/skills/gstack" not in runtime_config
-    assert "PRIME_AGENT_CODING_AGENT_DIR" in runtime_config
+    assert "PRIME_AGENT_CODING_AGENT_DIR" not in runtime_config
+    assert target.resolve().as_posix() in runtime_config
     commands = (tmp_path / "bun-commands.log").read_text()
     assert "install --frozen-lockfile" in commands
     assert "run build" in commands
