@@ -37,7 +37,16 @@ def test_readme_quick_start_commands_work(tmp_path: Path) -> None:
             "--output-dir",
             str(tmp_path / "context"),
         ],
-        ["frameworks", "command", str(job), "--framework", "codex", "--json"],
+        [
+            "frameworks",
+            "command",
+            str(job),
+            "--framework",
+            "codex",
+            "--cwd",
+            str(sample_repo),
+            "--json",
+        ],
     ]
 
     for command in commands:
@@ -46,7 +55,16 @@ def test_readme_quick_start_commands_work(tmp_path: Path) -> None:
 
     command_result = runner.invoke(
         app,
-        ["frameworks", "command", str(job), "--framework", "codex", "--json"],
+        [
+            "frameworks",
+            "command",
+            str(job),
+            "--framework",
+            "codex",
+            "--cwd",
+            str(sample_repo),
+            "--json",
+        ],
     )
     assert json.loads(command_result.output)["framework"] == "codex"
 

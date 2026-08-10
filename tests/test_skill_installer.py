@@ -3,8 +3,10 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+from agent_ops.registries import load_skill_dependencies
 from agent_ops.registries.models import Framework, SkillDependency, SkillDependencyInstall
-from agent_ops.skill_installer import install_skill_dependencies
+from agent_ops.skill_installer import default_framework_home, install_skill_dependencies
+from agent_ops.superpowers_adapter import OWNERSHIP_MANIFEST_RELATIVE, SUPERPOWERS_SKILLS
 
 
 def _git_repo(path: Path) -> str:
@@ -70,9 +72,7 @@ def test_install_gstack_dependency_copies_full_bundle(tmp_path: Path) -> None:
         name="GStack",
         repo=repo_url,
         ref=ref,
-        install={
-            "codex": SkillDependencyInstall(strategy="gstack", destination="skills/gstack")
-        },
+        install={"codex": SkillDependencyInstall(strategy="gstack", destination="skills/gstack")},
     )
 
     assert not (tmp_path / "home" / "skills").exists()
@@ -128,9 +128,7 @@ def test_install_copy_skills_dependency_merges_skill_directories(tmp_path: Path)
     )
 
     assert (tmp_path / "home" / "skills" / "writing-plans" / "SKILL.md").exists()
-    assert (
-        tmp_path / "home" / "skills" / "verification-before-completion" / "SKILL.md"
-    ).exists()
+    assert (tmp_path / "home" / "skills" / "verification-before-completion" / "SKILL.md").exists()
 
 
 def test_install_copy_skills_dependency_supports_opencode(tmp_path: Path) -> None:
@@ -170,9 +168,7 @@ def test_install_copy_skills_dependency_supports_opencode(tmp_path: Path) -> Non
     )
 
     assert (tmp_path / "home" / "skills" / "writing-plans" / "SKILL.md").exists()
-    assert (
-        tmp_path / "home" / "skills" / "verification-before-completion" / "SKILL.md"
-    ).exists()
+    assert (tmp_path / "home" / "skills" / "verification-before-completion" / "SKILL.md").exists()
 
 
 def test_copy_skills_dependency_removes_stale_manifest_entries(tmp_path: Path) -> None:
@@ -238,9 +234,7 @@ def test_install_skill_dependencies_dry_run_does_not_clone(tmp_path: Path) -> No
         name="GStack",
         repo="https://example.invalid/gstack.git",
         ref="abc123",
-        install={
-            "codex": SkillDependencyInstall(strategy="gstack", destination="skills/gstack")
-        },
+        install={"codex": SkillDependencyInstall(strategy="gstack", destination="skills/gstack")},
     )
 
     rows = install_skill_dependencies(
@@ -264,9 +258,7 @@ def test_install_skill_dependencies_fails_when_framework_has_no_default_support(
         name="GStack",
         repo="https://example.invalid/gstack.git",
         ref="abc123",
-        install={
-            "codex": SkillDependencyInstall(strategy="gstack", destination="skills/gstack")
-        },
+        install={"codex": SkillDependencyInstall(strategy="gstack", destination="skills/gstack")},
     )
 
     try:
@@ -291,9 +283,7 @@ def test_install_skill_dependencies_fails_on_unsupported_explicit_dependency(
         name="GStack",
         repo="https://example.invalid/gstack.git",
         ref="abc123",
-        install={
-            "codex": SkillDependencyInstall(strategy="gstack", destination="skills/gstack")
-        },
+        install={"codex": SkillDependencyInstall(strategy="gstack", destination="skills/gstack")},
     )
 
     try:
@@ -309,3 +299,156 @@ def test_install_skill_dependencies_fails_on_unsupported_explicit_dependency(
         assert "not supported for opencode: gstack" in str(exc)
     else:
         raise AssertionError("expected unsupported explicit dependency to fail")
+
+
+def test_prime_agent_uses_native_home_and_pinned_bundle_mappings(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    registered = {dependency.id: dependency for dependency in load_skill_dependencies()}
+    assert all(
+        len(registered[dependency_id].ref) == 40
+        and set(registered[dependency_id].ref) <= set("0123456789abcdef")
+        for dependency_id in ("gstack", "superpowers")
+    )
+    assert registered["gstack"].version == "1.32.0.0"
+    assert registered["gstack"].install["prime-agent"].destination == "."
+    assert registered["gstack"].install["prime-agent"].strategy == "prime-gstack"
+    assert registered["superpowers"].install["prime-agent"].destination == "skills"
+    assert registered["superpowers"].install["prime-agent"].strategy == "prime-superpowers"
+
+    dependencies = [
+        SkillDependency(
+            id="gstack",
+            name="GStack",
+            repo="https://example.invalid/gstack.git",
+            ref="a" * 40,
+            install={
+                "prime-agent": SkillDependencyInstall(
+                    strategy="prime-gstack",
+                    destination=".",
+                )
+            },
+        ),
+        SkillDependency(
+            id="superpowers",
+            name="Superpowers",
+            repo="https://example.invalid/superpowers.git",
+            ref="b" * 40,
+            install={
+                "prime-agent": SkillDependencyInstall(
+                    strategy="prime-superpowers",
+                    source="skills",
+                    destination="skills",
+                )
+            },
+        ),
+    ]
+
+    rows = install_skill_dependencies(
+        framework=Framework.PRIME_AGENT,
+        dependencies=dependencies,
+        home=tmp_path / "prime-home",
+        dry_run=True,
+    )
+
+    monkeypatch.delenv("PRIME_AGENT_CODING_AGENT_DIR", raising=False)
+    assert default_framework_home(Framework.PRIME_AGENT) == Path("~/.prime/agent").expanduser()
+    assert [row.destination.relative_to(tmp_path / "prime-home").as_posix() for row in rows] == [
+        ".",
+        "skills",
+    ]
+
+
+def test_prime_agent_home_treats_empty_native_environment_variable_as_unset(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("PRIME_AGENT_CODING_AGENT_DIR", "")
+
+    assert default_framework_home(Framework.PRIME_AGENT) == Path("~/.prime/agent").expanduser()
+
+
+def test_prime_agent_home_honors_native_environment_variable(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    configured_home = tmp_path / "configured-prime-home"
+    monkeypatch.setenv("PRIME_AGENT_CODING_AGENT_DIR", str(configured_home))
+
+    assert default_framework_home(Framework.PRIME_AGENT) == configured_home
+
+
+def test_prime_superpowers_strategy_installs_adapted_namespaced_skills(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = tmp_path / "superpowers-src"
+    for name in SUPERPOWERS_SKILLS:
+        directory = source / "skills" / name
+        directory.mkdir(parents=True)
+        (directory / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: test\n---\nUse superpowers:writing-plans.\n",
+            encoding="utf-8",
+        )
+    dependency = SkillDependency(
+        id="superpowers",
+        name="Superpowers",
+        repo="https://example.invalid/superpowers.git",
+        ref="f2cbfbefebbfef77321e4c9abc9e949826bea9d7",
+        install={
+            "prime-agent": SkillDependencyInstall(
+                strategy="prime-superpowers", source="skills", destination="skills"
+            )
+        },
+    )
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
+    )
+
+    install_skill_dependencies(
+        framework=Framework.PRIME_AGENT,
+        dependencies=[dependency],
+        home=tmp_path / "home",
+        cache_dir=tmp_path / "cache",
+    )
+
+    installed = tmp_path / "home" / "skills"
+    assert (installed.parent / OWNERSHIP_MANIFEST_RELATIVE).is_file()
+    assert not (installed / ".agentops-superpowers-manifest.json").exists()
+    assert not (installed / "writing-plans").exists()
+    skill = installed / "agentops-superpowers-writing-plans" / "SKILL.md"
+    assert "name: agentops-superpowers-writing-plans" in skill.read_text()
+    assert "agentops-superpowers-writing-plans" in skill.read_text()
+
+
+def test_prime_gstack_strategy_receives_the_profile_root(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = tmp_path / "gstack-src"
+    source.mkdir()
+    dependency = SkillDependency(
+        id="gstack",
+        name="GStack",
+        repo="https://example.invalid/gstack.git",
+        ref="74895062fb8a3acbf9f66cd088a83359aaaa56cd",
+        install={"prime-agent": SkillDependencyInstall(strategy="prime-gstack", destination=".")},
+    )
+    calls: list[tuple[Path, Path]] = []
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency",
+        lambda dependency, cache: source,
+    )
+    monkeypatch.setattr(
+        "agent_ops.skill_installer.install_prime_gstack",
+        lambda checkout, coding_agent_dir: calls.append((checkout, coding_agent_dir)),
+    )
+
+    install_skill_dependencies(
+        framework=Framework.PRIME_AGENT,
+        dependencies=[dependency],
+        home=tmp_path / "home",
+        cache_dir=tmp_path / "cache",
+    )
+
+    assert calls == [(source, tmp_path / "home")]

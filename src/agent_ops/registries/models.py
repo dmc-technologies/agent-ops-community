@@ -12,6 +12,7 @@ class Framework(StrEnum):
     CURSOR = "cursor"
     OPENCLAW = "openclaw"
     OPENCODE = "opencode"
+    PRIME_AGENT = "prime-agent"
     LOCAL = "local"
 
 

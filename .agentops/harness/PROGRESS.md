@@ -4,18 +4,30 @@ Repository: `agent-ops-community`
 
 ## Current State
 
-- Branch: `agent/review-gate-risk-routing`
-- Latest commit: `origin/main` at branch creation.
-- Verification: full tests, lint, source-tree harness check, whitespace validation, and historical shadow evaluation pass.
+- Branch: `feat/prime-agent-first-class`
+- Current head before this handoff update: `7a8291a`.
+- Current handoff: all current public pull request 11 Review Gate findings are corrected locally. Prime now uses its native profile variable and an explicit repository path, while gstack and Superpowers install through namespaced Prime adapters with fingerprint ownership and safe legacy migration.
+- Verification: Ruff, 91 tests, the source-tree harness check, whitespace validation, real pinned Superpowers adaptation, and a real pinned gstack generation/runtime build pass. The generated gstack browser executable navigates and captures screenshots with sandboxed Chromium on the integration host; no browser sandbox setting was weakened.
 
 ## Current Work
 
-- Goal: preserve material AI review findings while reducing repeated review cost and non-material review cycles.
-- Active task: publish the final-label risk router and materiality contract for review.
-- Files in play: Review Gate workflows, script, prompt, tests, and evaluation evidence.
-- Blockers: none
+- Goal: make Prime Agent a first-class supported framework without overwriting user-authored skills.
+- Active task: update pull request 11, rerun hosted CI and Review Gate, then merge the public dependency before the private Prime support pull request.
+- Files in play: Prime framework handoff, bootstrap, skill registries, gstack and Superpowers adapters, documentation, tests, and this repository handoff.
+- Blockers: hosted CI and Review Gate must pass on the final public head before merge.
+
+## Next Actions
+
+- Commit and push the final public corrections, then require CI and Review Gate to pass with no unresolved material finding.
+- Merge pull request 11, update the coordinated private Agent Ops branch against public main, rerun its full verification, and merge it.
+- Reinstall from both canonical main branches, restart Prime sessions, and complete the approved Agent Knowledge write with immediate readback during clock-out.
 
 ## Session Log
+
+- 2026-08-09: Replaced raw Prime bundle copies with namespaced adapters. gstack now uses the pinned upstream generator, a Prime host/tool contract, compiled runtime assets, `agentops-gstack-*` names, and fingerprint rollback; Superpowers uses all 14 pinned skills under `agentops-superpowers-*` names with a Prime startup/tool contract and the same collision protections. Exact unmodified legacy copies migrate; changed or logically colliding skills are preserved and refused.
+- 2026-08-09: Replaced the obsolete Prime home variable with Prime 0.7.1’s `PRIME_AGENT_CODING_AGENT_DIR`, made default skill installation honor it, and required a validated explicit `--cwd` for framework command handoffs without changing gstack or Superpowers install mappings.
+- 2026-08-09: Clock-out recorded pull request 11 as pending external finalization after the public Prime implementation and real dependency installation passed locally. The dependent private pull request must follow this public merge.
+- 2026-08-09: Added Prime Agent framework registration, `prime-agent --print --cwd` context handoff, generated bootstrap support, the native `~/.prime/agent` home, pinned gstack and Superpowers install mappings, registry metadata, documentation, and tests.
 
 - 2026-08-08: Changed Review Gate to run only when a person applies `ai review` to the final pull-request head. Removed auto-labeling and all fast advisory code, inputs, state, tests, and documentation.
 - 2026-08-08: Added a low-effort `gpt-5.6-sol` classifier that routes the complete review to Sol at low, medium, high, or xhigh effort based on consequence and review difficulty. Low confidence and critical authority domains route to xhigh.
@@ -36,6 +48,15 @@ Repository: `agent-ops-community`
 
 ## Verification Log
 
+- 2026-08-10: The latest Review Gate corrections bind every generated path to the selected Prime profile, exclude four hook-enforced gstack workflows that Prime cannot safely preserve, adapt investigate to a truthful manual scope boundary, package the required review, plan-review, design, and extension assets, and reject dirty Superpowers source checkouts. A real pinned install produced 38 gstack and 14 Superpowers skills in a custom disposable profile with no unresolved provider/profile markers; required runtime assets and review paths resolved. `uv run --extra dev ruff check .`, `uv run --extra dev pytest -q` (`91 passed`), `uv run --extra dev agentops harness check .`, and `git diff --check` passed.
+- 2026-08-10: After the final Review Gate run, the Prime Superpowers adapter now proves closure for namespaced skill transitions and managed file references, states the child-to-parent reply contract correctly, and treats an empty native Prime profile override as unset. `uv run --extra dev ruff check .`, `uv run --extra dev pytest -q` (`88 passed`), `uv run --extra dev agentops harness check .`, and `git diff --check` passed; adapting the exact pinned Superpowers checkout produced all 14 skills with reference validation enabled.
+- 2026-08-10: `uv run --extra dev ruff check .`, `uv run --extra dev pytest -q` (`85 passed`), `uv run --extra dev agentops harness check .`, and `git diff --check` passed for the final public branch. The staged gstack `browse` command navigated to `https://example.com`, returned HTTP 200, reported the expected URL, and captured a 1280×720 screenshot with Chromium sandboxing enabled.
+- 2026-08-09: `uv run --extra dev ruff check .`, `uv run --extra dev pytest -q` (`85 passed`), `uv run --extra dev agentops harness check .`, and `git diff --check` passed after the Prime adapter changes. Real pinned Superpowers adaptation produced 14 unique namespaced skills with no raw provider path or unavailable-tool requirement. Real pinned gstack generation produced 42 unique namespaced skills and 726 managed files; required browser, design, and PDF executables were built, and `browse --help` ran from the staged runtime.
+- 2026-08-09: `uv run --extra dev agentops skills install prime-agent --home <disposable-profile> --cache-dir <pinned-cache>` migrated the actual prior raw gstack and Superpowers installation in a disposable profile. It removed only the exact legacy bundle paths, preserved an unrelated skill byte-for-byte, produced 42 gstack and 14 Superpowers namespaced skills, wrote both ownership manifests, and ran the migrated `browse --help` executable.
+- 2026-08-09: Two clean `prime-agent --print --no-session --offline` runs against the disposable migrated profile discovered and loaded `agentops-superpowers-verification-before-completion` and `agentops-gstack-careful`. The upstream Superpowers acceptance prompt `Let’s make a react todo list` automatically entered the adapted brainstorming workflow and asked its first visual-companion question without writing a file. The temporary profile referenced the existing auth file by symlink; its inode, size, and modification time remained unchanged.
+- 2026-08-09: `uv run --extra dev pytest tests/test_frameworks.py tests/test_skill_installer.py tests/test_cli.py tests/test_readme_smoke.py -q` passed (`25 passed`); final `uv run --extra dev pytest -q` passed (`62 passed`); final `uv run --extra dev ruff check .` and `uv run --extra dev agentops harness check .` passed; `git diff --check` and the obsolete-variable scan passed.
+- 2026-08-09: `uv run --extra dev pytest tests/test_frameworks.py tests/test_skill_installer.py tests/test_cli.py -q` passed (`21 passed`); `uv run --extra dev agentops frameworks command examples/local-smoke.yaml --framework prime-agent --json` produced the expected print-mode handoff; `.venv/bin/ruff check .` passed; `.venv/bin/pytest -q` passed (`60 passed`); `.venv/bin/agentops harness check .` passed; `git diff --check` passed.
+
 - 2026-08-08: `.venv/bin/python -m pytest -q` passed (`57 passed`); `.venv/bin/ruff check .` passed; `.venv/bin/agentops harness check .` passed; `git diff --check` passed.
 - 2026-08-08: Exact-head materiality rerun passed with zero blockers in 564.8 seconds at xhigh for a former test-only finding; exact-head recall rerun returned one material root-cause blocker in 1,031.9 seconds at xhigh for a current false-verification path.
 - 2026-08-03: `PYTHONPATH=src python -m pytest tests/test_harness.py
@@ -50,8 +71,3 @@ Repository: `agent-ops-community`
 - 2026-06-19: hardening validation passed: `python -m pytest tests/test_review_gate.py tests/test_public_safety.py -q`,
   `ruff check .github/scripts/review_gate.py tests/test_review_gate.py`,
   `git diff --check`, and `agentops harness check .`.
-
-## Next Actions
-
-1. Commit, push, open the pull request, and wait for exact-head hosted CI.
-2. After approval and merge, update downstream callers to the final-label-only workflow.
