@@ -400,8 +400,9 @@ context."""
     if installed_name == "agentops-gstack-land-and-deploy":
         content = content.replace(
             'Run `/ship` to create the MR, then merge manually via the GitLab web UI.',
-            "Create the merge request manually with the GitLab CLI or web UI, then rerun this "
-            "workflow.",
+            "Create the merge request with `glab mr create` when available or the GitLab web "
+            "UI, then use the repository's approved GitLab merge and deployment path. Do not "
+            "rerun this workflow because it does not support GitLab.",
         )
         content = content.replace(
             'Run `/ship` first to create a PR, then come back here to land and deploy it.',
@@ -444,8 +445,10 @@ manual copy has been installed or benchmarked.""",
         )
     content = content.replace(
         "Ship/deploy/PR → invoke /ship or /land-and-deploy",
-        "Pull-request creation → use user-approved manual GitHub steps; merge and deploy an "
-        "existing pull request → invoke /land-and-deploy",
+        "Pull-request creation → inspect the origin remote: on GitHub use `gh pr create` or "
+        "the GitHub UI; on GitLab use `glab mr create` when available or the GitLab UI; for "
+        "an unknown provider STOP. Merge and deploy an existing GitHub pull request → invoke "
+        "/land-and-deploy; on GitLab use the repository's approved GitLab path",
     )
     content = content.replace(
         "Full review pipeline → invoke /autoplan",
@@ -456,6 +459,12 @@ manual copy has been installed or benchmarked.""",
         'User wants all reviews done automatically, "review everything" → invoke `/autoplan`',
         "User wants all reviews done → run `/plan-ceo-review`, `/plan-eng-review`, "
         "`/plan-design-review`, and `/plan-devex-review` individually as applicable",
+    )
+    content = content.replace(
+        "User asks to merge + deploy + verify as one flow → invoke `/land-and-deploy`",
+        "User asks to merge, deploy, and verify → inspect the origin remote: on GitHub invoke "
+        "`/land-and-deploy` for an existing pull request; on GitLab use the repository's "
+        "approved GitLab merge and deployment path; for an unknown provider STOP",
     )
     content = content.replace(
         "User asks for safety mode, careful mode → invoke `/careful` or `/guard`",
@@ -521,8 +530,9 @@ manual copy has been installed or benchmarked.""",
     )
     content = content.replace(
         "Ship/deploy/PR → invoke manual pull-request and release preparation or ",
-        "Pull-request creation → use user-approved manual GitHub steps; merge and deploy an "
-        "existing pull request → invoke ",
+        "Pull-request creation → inspect the origin remote: on GitHub use `gh pr create` or "
+        "the GitHub UI; on GitLab use `glab mr create` when available or the GitLab UI; for "
+        "an unknown provider STOP. Merge and deploy an existing GitHub pull request → invoke ",
     )
     content = content.replace(
         "suggest manual script preservation so the",
@@ -555,8 +565,11 @@ manual copy has been installed or benchmarked.""",
     content = content.replace(
         "asks to ship, deploy, push, create a PR, \"let's land this\", \"send it\" → invoke "
         "`manual pull-request and release preparation`",
-        "asks to create a PR → provide `gh pr create` or GitHub web steps; asks to deploy → "
-        "use `/skill:agentops-gstack-land-and-deploy` only after a PR exists",
+        "asks to create a pull or merge request → inspect the origin remote: use `gh pr "
+        "create` or the GitHub UI on GitHub, use `glab mr create` when available or the "
+        "GitLab UI on GitLab, and STOP for an unknown provider; asks to deploy → use "
+        "`/skill:agentops-gstack-land-and-deploy` only for an existing GitHub pull request "
+        "and use the repository's approved GitLab path on GitLab",
     )
     content = content.replace(
         "asks for a second opinion, codex review → invoke "
@@ -570,8 +583,10 @@ manual copy has been installed or benchmarked.""",
     )
     content = content.replace(
         "→ invoke `manual pull-request and release preparation`",
-        "→ provide `gh pr create` or GitHub web steps for pull requests and use the retained "
-        "land-and-deploy workflow only after a pull request exists",
+        "→ inspect the origin remote; on GitHub use `gh pr create` or the GitHub UI, on "
+        "GitLab use `glab mr create` when available or the GitLab UI, and for an unknown "
+        "provider STOP; use the retained land-and-deploy workflow only for an existing "
+        "GitHub pull request",
     )
     content = content.replace(
         "→ invoke `an external review that is not run by Prime`",
@@ -580,7 +595,9 @@ manual copy has been installed or benchmarked.""",
     )
     content = content.replace(
         "Run manual pull-request and release preparation when ready.",
-        "Create the pull request manually with `gh pr create` or the GitHub web UI when ready.",
+        "Inspect the origin remote when ready: create the pull request with `gh pr create` "
+        "or the GitHub UI on GitHub, create the merge request with `glab mr create` when "
+        "available or the GitLab UI on GitLab, and STOP for an unknown provider.",
     )
     content = content.replace(
         "Ready to implement — run manual pull-request and release preparation when done",

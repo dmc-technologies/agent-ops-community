@@ -423,7 +423,9 @@ description: Route workflows.
         "agentops-gstack",
     )
     assert "discuss the product directly with the user" in routing
-    assert "provide `gh pr create` or GitHub web steps" in routing
+    assert "inspect the origin remote" in routing
+    assert "`glab mr create`" in routing
+    assert "unknown provider STOP" in routing
     assert "continue with the retained Prime review" in routing
     assert "→ invoke" not in routing
 
@@ -480,6 +482,7 @@ Continue the review.
 name: gstack-land-and-deploy
 description: Land safely.
 ---
+Run `/ship` to create the MR, then merge manually via the GitLab web UI.
 ## Step 3.4: VERSION drift detection (workspace-aware ship)
 ```bash
 BRANCH_VERSION=$(git show HEAD:VERSION)
@@ -505,6 +508,8 @@ Continue only without drift.
     assert "If `OFFLINE=true`" in deployment
     assert "If drift is detected: **STOP**" in deployment
     assert "Reconcile the feature branch manually" in deployment
+    assert "`glab mr create`" in deployment
+    assert "Do not rerun this workflow because it does not support GitLab" in deployment
     assert "Exit non-zero" in deployment
     assert "/ship" not in deployment
 
@@ -531,8 +536,11 @@ User asks to launch a real browser for QA, "open the browser" → invoke `/open-
     }
     adapted = gstack_prime._adapt_prime_contract(content, names, "agentops-gstack")
 
-    assert "Pull-request creation → use user-approved manual GitHub steps" in adapted
-    assert "merge and deploy an existing pull request" in adapted
+    assert "Pull-request creation → inspect the origin remote" in adapted
+    assert "`gh pr create`" in adapted
+    assert "`glab mr create`" in adapted
+    assert "unknown provider STOP" in adapted
+    assert "existing GitHub pull request" in adapted
     assert "/skill:agentops-gstack-land-and-deploy" in adapted
     assert "ask for an explicit safety boundary" in adapted
     assert "confine all reads and writes" in adapted
