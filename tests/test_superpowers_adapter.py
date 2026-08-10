@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from agent_ops.superpowers_adapter import (
     PINNED_SUPERPOWERS_REF,
     SUPERPOWERS_SKILLS,
     SuperpowersCollisionError,
+    _validate_reference_closure,
     install_prime_superpowers,
 )
 
@@ -33,6 +35,13 @@ Use Task tool (general-purpose) for subagents.
 Call Task("bounded work") when needed.
 Use AskUserQuestion for unresolved questions.
 Read files and run Bash commands when useful.
+Invoke writing-plans skill after approval.
+Open skills/brainstorming/visual-companion.md when visuals are accepted.
+Use the template at requesting-code-review/code-reviewer.md.
+Compare skills/debugging/systematic-debugging and skills/testing/test-driven-development.
+Render ../subagent-driven-development when documenting the workflow.
+See skills/meta/testing-skills-with-subagents and skill-creation/SKILL.md.
+Replace the archived skills/using-skills reference.
 Prime portability check originally named Claude Code and ~/.claude/skills.
 """
         (directory / "SKILL.md").write_text(body, encoding="utf-8")
@@ -40,6 +49,15 @@ Prime portability check originally named Claude Code and ~/.claude/skills.
             "Task tool (general-purpose): follow superpowers:verification-before-completion.\n",
             encoding="utf-8",
         )
+    (skills / "brainstorming/visual-companion.md").write_text(
+        "visual companion\n", encoding="utf-8"
+    )
+    (skills / "requesting-code-review/code-reviewer.md").write_text(
+        "reviewer prompt\n", encoding="utf-8"
+    )
+    (skills / "writing-skills/testing-skills-with-subagents.md").write_text(
+        "testing guide\n", encoding="utf-8"
+    )
     return root
 
 
@@ -94,7 +112,26 @@ def test_internal_references_and_claude_tools_are_prime_native(tmp_path: Path) -
     assert "Claude Code" not in all_markdown
     assert 'handle = await rlm("<complete bounded task prompt>")' in all_markdown
     assert "await agent_message.send" in all_markdown
+    assert 'await agent_message.send(message, receiver_role="parent")' in all_markdown
+    assert 'receiver_role="child"' in all_markdown
+    assert "receiver_name=handle.name" in all_markdown
+    assert "ordinary agent message" in all_markdown
+    assert "receive results with" not in all_markdown
     assert "system, developer, and project policy" in all_markdown
+    profile_skills = "${PRIME_AGENT_CODING_AGENT_DIR}/skills"
+    visual_companion = (
+        f"{profile_skills}/agentops-superpowers-brainstorming/visual-companion.md"
+    )
+    reviewer_prompt = (
+        f"{profile_skills}/agentops-superpowers-requesting-code-review/code-reviewer.md"
+    )
+    assert visual_companion in all_markdown
+    assert reviewer_prompt in all_markdown
+    assert re.search(r"(?<![\w/-])code-reviewer\.md", all_markdown) is None
+    for name in SUPERPOWERS_SKILLS:
+        assert re.search(
+            rf"(?<!agentops-superpowers-)\b{re.escape(name)}\b", all_markdown
+        ) is None
     claude_only_requirements = (
         "Use the Skill tool",
         "create TodoWrite",
@@ -103,6 +140,32 @@ def test_internal_references_and_claude_tools_are_prime_native(tmp_path: Path) -
     )
     for claude_requirement in claude_only_requirements:
         assert claude_requirement not in all_markdown
+
+
+def test_reference_closure_rejects_missing_profile_asset(tmp_path: Path) -> None:
+    staging = tmp_path / "staging"
+    skill = staging / "agentops-superpowers-brainstorming"
+    skill.mkdir(parents=True)
+    skill.joinpath("SKILL.md").write_text(
+        "${PRIME_AGENT_CODING_AGENT_DIR}/skills/"
+        "agentops-superpowers-brainstorming/missing.md\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=r"missing\.md.*SKILL\.md:1"):
+        _validate_reference_closure(staging)
+
+
+def test_reference_closure_rejects_unknown_installed_skill(tmp_path: Path) -> None:
+    staging = tmp_path / "staging"
+    skill = staging / "agentops-superpowers-brainstorming"
+    skill.mkdir(parents=True)
+    skill.joinpath("SKILL.md").write_text(
+        "Invoke agentops-superpowers-not-installed.\n", encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match=r"not-installed.*SKILL\.md:1"):
+        _validate_reference_closure(staging)
 
 
 def test_existing_user_skill_collision_preserves_bytes(tmp_path: Path) -> None:

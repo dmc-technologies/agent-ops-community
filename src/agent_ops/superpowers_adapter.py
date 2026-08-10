@@ -41,8 +41,11 @@ _PRIME_PREAMBLE = """\
 > **Prime Agent mapping:** Global system, developer, and project policy, plus direct user
 > instructions, outrank this skill. Use IPython for shell commands and file work
 > (`%%bash` for project commands). Dispatch with
-> `handle = await rlm("<complete bounded task prompt>")`; receive results with
-> `await agent_message.send(...)`. Track checklists and ask questions in ordinary conversation.
+> `handle = await rlm("<complete bounded task prompt>")`. A child sends its result with
+> `await agent_message.send(message, receiver_role="parent")`; that reply arrives to the parent
+> as an ordinary agent message. Retain the child handle and use `agent_message.send` with
+> `receiver_role="child"` and `receiver_name=handle.name` only for parent follow-ups. Track
+> checklists and ask questions in ordinary conversation.
 > Discover and load skills through Prime's session skill inventory; do not assume
 > Claude-only tools exist.
 
@@ -68,9 +71,11 @@ may skip this startup skill and follow the task it received.
 - Use IPython for filesystem inspection, edits, Python work, and shell commands. Run project shell
   commands in an IPython `%%bash` cell so the project's own environment remains authoritative.
 - The upstream `Task` concept maps to Prime-native RLM subagent dispatch:
-  `handle = await rlm("<complete bounded task prompt>")`. Results return through
-  `await agent_message.send(...)`; admission metadata is not a result. Keep dependent work
-  sequential.
+  `handle = await rlm("<complete bounded task prompt>")`. A child explicitly replies with
+  `await agent_message.send(message, receiver_role="parent")`; the parent receives that result
+  as an ordinary agent message. Retain the child handle and send parent follow-ups with
+  `receiver_role="child"` and `receiver_name=handle.name`. Admission metadata is not a result.
+  Keep dependent work sequential.
 - The upstream `TodoWrite` concept maps to a checklist maintained in ordinary conversation or the
   repository's approved progress file.
 - The upstream `Skill` concept maps to Prime's session skill inventory and loading the selected
@@ -140,6 +145,7 @@ def install_prime_superpowers(
         }
         for skill_name in SUPERPOWERS_SKILLS:
             _adapt_skill(upstream_root / "skills" / skill_name, staging, skill_name)
+        _validate_reference_closure(staging)
         manifest = _build_manifest(staging)
         _install_staged(staging, destination, manifest, source_fingerprints)
     return manifest
@@ -207,15 +213,110 @@ def _rewrite_internal_references(text: str) -> str:
     )
     for old, new in platform_replacements:
         text = text.replace(old, new)
+    profile_skills = "${PRIME_AGENT_CODING_AGENT_DIR}/skills"
+    legacy_paths = {
+        "skills/meta/testing-skills-with-subagents": (
+            f"{profile_skills}/{SKILL_PREFIX}writing-skills/"
+            "testing-skills-with-subagents.md"
+        ),
+        "skill-creation/SKILL.md": (
+            f"{profile_skills}/{SKILL_PREFIX}writing-skills/SKILL.md"
+        ),
+        "skills/using-skills": f"{profile_skills}/{SKILL_PREFIX}using-superpowers",
+    }
+    for old, new in legacy_paths.items():
+        text = text.replace(old, new)
     for name in SUPERPOWERS_SKILLS:
-        text = text.replace(f"superpowers:{name}", f"{SKILL_PREFIX}{name}")
-        text = text.replace(f"skills/{name}", f"skills/{SKILL_PREFIX}{name}")
+        installed_name = f"{SKILL_PREFIX}{name}"
+        installed_path = f"{profile_skills}/{installed_name}"
+        text = text.replace(f"superpowers:{name}", installed_name)
+        text = text.replace(f"{profile_skills}/{name}", installed_path)
+        text = re.sub(
+            rf"(?<![\w$/-])(?:\.\./)?skills/(?:[a-z0-9-]+/)*{re.escape(name)}",
+            installed_path,
+            text,
+        )
+        text = re.sub(
+            rf"(?<![\w$/-])(?:\.\./)?{re.escape(name)}/",
+            f"{installed_path}/",
+            text,
+        )
+        text = re.sub(
+            rf"(?<!{re.escape(SKILL_PREFIX)})\b{re.escape(name)}\b",
+            installed_name,
+            text,
+        )
+    reviewer_path = f"{profile_skills}/{SKILL_PREFIX}requesting-code-review/code-reviewer.md"
+    text = re.sub(r"(?<![\w/-])code-reviewer\.md", reviewer_path, text)
     for agent_name in ("implementer", "spec-reviewer", "code-reviewer", "code-quality-reviewer"):
         text = text.replace(f"superpowers:{agent_name}", f"bundled {agent_name} prompt template")
     text = re.sub(r'\bTask\("([^"]*)"\)', r'await rlm("\1")', text)
     for old, new in _TOOL_REPLACEMENTS:
         text = text.replace(old, new)
     return text
+
+
+def _validate_reference_closure(staging: Path) -> None:
+    text_suffixes = {".md", ".txt", ".dot", ".ts", ".js", ".sh"}
+    expected_names = {f"{SKILL_PREFIX}{name}" for name in SUPERPOWERS_SKILLS}
+    profile_reference = re.compile(
+        r"\$\{PRIME_AGENT_CODING_AGENT_DIR\}/skills/"
+        r"(?P<skill>agentops-superpowers-[a-z0-9-]+)"
+        r"(?P<suffix>(?:/[A-Za-z0-9_.-]+)*)"
+    )
+    installed_reference = re.compile(r"\bagentops-superpowers-[a-z0-9-]+\b")
+    legacy_paths = (
+        "skills/meta/testing-skills-with-subagents",
+        "skill-creation/SKILL.md",
+        "skills/using-skills",
+    )
+    for path in sorted(item for item in staging.rglob("*") if item.is_file()):
+        if path.suffix.lower() not in text_suffixes:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        for line_number, line in enumerate(text.splitlines(), start=1):
+            unresolved: str | None = None
+            if "superpowers:" in line:
+                unresolved = "superpowers:"
+            if unresolved is None:
+                for name in SUPERPOWERS_SKILLS:
+                    match = re.search(
+                        rf"(?<!{re.escape(SKILL_PREFIX)})\b{re.escape(name)}\b",
+                        line,
+                    )
+                    if match:
+                        unresolved = match.group(0)
+                        break
+            if unresolved is None:
+                unresolved = next((value for value in legacy_paths if value in line), None)
+            if unresolved is not None:
+                relative = path.relative_to(staging).as_posix()
+                raise ValueError(
+                    f"unresolved Superpowers reference {unresolved!r} "
+                    f"at {relative}:{line_number}"
+                )
+            for match in installed_reference.finditer(line):
+                if match.group(0) not in expected_names:
+                    relative = path.relative_to(staging).as_posix()
+                    raise ValueError(
+                        f"unresolved Superpowers skill {match.group(0)!r} "
+                        f"at {relative}:{line_number}"
+                    )
+            for match in profile_reference.finditer(line):
+                suffix = match.group("suffix").rstrip(".,;:")
+                target = staging / match.group("skill")
+                if suffix:
+                    target = target.joinpath(*suffix.lstrip("/").split("/"))
+                if not target.exists():
+                    relative = path.relative_to(staging).as_posix()
+                    token = match.group(0).rstrip(".,;:")
+                    raise ValueError(
+                        f"unresolved Superpowers path {token!r} "
+                        f"at {relative}:{line_number}"
+                    )
 
 
 def _split_frontmatter(text: str) -> tuple[str, str]:

@@ -360,6 +360,14 @@ def test_prime_agent_uses_native_home_and_pinned_bundle_mappings(
     ]
 
 
+def test_prime_agent_home_treats_empty_native_environment_variable_as_unset(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("PRIME_AGENT_CODING_AGENT_DIR", "")
+
+    assert default_framework_home(Framework.PRIME_AGENT) == Path("~/.prime/agent").expanduser()
+
+
 def test_prime_agent_home_honors_native_environment_variable(
     tmp_path: Path,
     monkeypatch,

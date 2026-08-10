@@ -31,7 +31,7 @@ def default_framework_home(framework: Framework) -> Path:
             return Path("~/.agents").expanduser()
         case Framework.PRIME_AGENT:
             return Path(
-                os.environ.get("PRIME_AGENT_CODING_AGENT_DIR", "~/.prime/agent")
+                os.environ.get("PRIME_AGENT_CODING_AGENT_DIR") or "~/.prime/agent"
             ).expanduser()
         case Framework.CURSOR:
             return Path("~/.cursor").expanduser()
