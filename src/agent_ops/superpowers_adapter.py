@@ -86,6 +86,32 @@ may skip this startup skill and follow the task it received.
 When another adapted skill names `agentops-superpowers-<name>`, select that exact namespaced skill.
 """
 
+def _validate_confined_destination(destination: Path) -> tuple[Path, Path]:
+    raw_destination = destination.expanduser().absolute()
+    profile_root = raw_destination.parent.resolve()
+    confined_destination = profile_root / raw_destination.name
+    ownership_parent = profile_root / OWNERSHIP_MANIFEST_RELATIVE.parent
+    for path in (confined_destination, ownership_parent):
+        cursor = profile_root
+        try:
+            relative = path.relative_to(profile_root)
+        except ValueError as exc:
+            raise SuperpowersCollisionError(
+                f"Superpowers write path escapes the selected profile: {path}"
+            ) from exc
+        for part in relative.parts:
+            cursor /= part
+            if cursor.is_symlink():
+                raise SuperpowersCollisionError(
+                    f"symbolic link blocks confined Superpowers installation: {cursor}"
+                )
+            if cursor.exists() and not cursor.is_dir():
+                raise SuperpowersCollisionError(
+                    f"non-directory blocks confined Superpowers installation: {cursor}"
+                )
+    return confined_destination, profile_root
+
+
 _TOOL_REPLACEMENTS = (
     (
         "Task tool (general-purpose):",
@@ -129,7 +155,7 @@ def install_prime_superpowers(
     """
 
     upstream_root = Path(upstream_root)
-    destination = Path(destination)
+    destination, profile_root = _validate_confined_destination(Path(destination))
     _validate_input(upstream_root, upstream_ref)
     destination_parent = destination.parent
     destination_parent.mkdir(parents=True, exist_ok=True)
@@ -146,7 +172,7 @@ def install_prime_superpowers(
         for skill_name in SUPERPOWERS_SKILLS:
             _adapt_skill(upstream_root / "skills" / skill_name, staging, skill_name)
         _validate_reference_closure(staging)
-        _bind_profile_root(staging, destination.parent.resolve())
+        _bind_profile_root(staging, profile_root)
         manifest = _build_manifest(staging)
         _install_staged(staging, destination, manifest, source_fingerprints)
     return manifest
@@ -583,6 +609,9 @@ def _install_staged(
     manifest: dict[str, Any],
     source_fingerprints: dict[str, str],
 ) -> None:
+    validated_destination, _ = _validate_confined_destination(destination)
+    if validated_destination != destination:
+        raise SuperpowersCollisionError("Superpowers destination changed during installation")
     managed, legacy_names, old_manifest_path = _preflight(
         destination, manifest, source_fingerprints
     )
@@ -607,6 +636,9 @@ def _install_staged(
                 os.replace(staged, target)
                 installed.append(name)
 
+        validated_destination, _ = _validate_confined_destination(destination)
+        if validated_destination != destination:
+            raise SuperpowersCollisionError("Superpowers destination changed during installation")
         ownership_path.parent.mkdir(parents=True, exist_ok=True)
         manifest_temporary = staging.parent / "ownership-manifest.tmp"
         manifest_temporary.write_text(

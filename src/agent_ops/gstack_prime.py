@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import tarfile
@@ -31,7 +32,11 @@ _RUNTIME_TREES = (
     "node_modules/diff",
     "node_modules/@ngrok",
 )
-_RUNTIME_FILES = ("ETHOS.md", "plan-devex-review/dx-hall-of-fame.md")
+_RUNTIME_FILES = (
+    "ETHOS.md",
+    "plan-devex-review/dx-hall-of-fame.md",
+    "browse/src/cdp-allowlist.ts",
+)
 _REQUIRED_EXECUTABLES = (
     "browse/dist/browse",
     "browse/dist/find-browse",
@@ -51,6 +56,15 @@ class GstackPrimeSourceError(GstackPrimeError):
 
 class GstackPrimeCollisionError(GstackPrimeError):
     """Installation would overwrite a file the manifest does not safely own."""
+
+
+def _validate_shell_safe_profile_root(profile_root: Path) -> None:
+    value = profile_root.as_posix()
+    if not profile_root.is_absolute() or shlex.quote(value) != value:
+        raise GstackPrimeSourceError(
+            "Prime gstack requires an absolute profile path that is safe as an "
+            "unquoted POSIX shell word"
+        )
 
 
 @dataclass(frozen=True)
@@ -128,6 +142,8 @@ const prime: HostConfig = {{
     skipSkills: [
       'codex', 'claude', 'gstack-upgrade', 'setup-gbrain', 'sync-gbrain',
       'careful', 'freeze', 'guard', 'unfreeze',
+      'benchmark-models', 'pair-agent', 'autoplan', 'office-hours',
+      'open-gstack-browser', 'connect-chrome', 'ship', 'skillify',
     ],
   }},
   pathRewrites: [
@@ -265,7 +281,12 @@ enforcement.""",
         ("$_ROOT/.claude/skills/gstack", runtime),
         ("$HOME/.prime/agent/.agentops/runtime/gstack", runtime),
         ("$HOME${PRIME_AGENT_CODING_AGENT_DIR}/.agentops/runtime/gstack", runtime),
+        ("$HOME/${PRIME_AGENT_CODING_AGENT_DIR}/.agentops/runtime/gstack", runtime),
+        ("${HOME}/${PRIME_AGENT_CODING_AGENT_DIR}/.agentops/runtime/gstack", runtime),
         ("$_ROOT/${PRIME_AGENT_CODING_AGENT_DIR}/.agentops/runtime/gstack", runtime),
+        ("$HOME/${PRIME_AGENT_CODING_AGENT_DIR}", "${PRIME_AGENT_CODING_AGENT_DIR}"),
+        ("${HOME}/${PRIME_AGENT_CODING_AGENT_DIR}", "${PRIME_AGENT_CODING_AGENT_DIR}"),
+        ("$_ROOT/${PRIME_AGENT_CODING_AGENT_DIR}", "${PRIME_AGENT_CODING_AGENT_DIR}"),
         ("~/.claude/skills/gstack", runtime),
         (".claude/skills/gstack", runtime),
         ("~/.claude/skills", "${PRIME_AGENT_CODING_AGENT_DIR}/skills"),
@@ -284,7 +305,6 @@ enforcement.""",
         ("CLAUDE.md", "AGENTS.md"),
         ("Claude-only", "Prime-native"),
         ("Claude Code", "Prime Agent"),
-        ("Claude", "Prime Agent"),
         ("ExitPlanMode", "continue after the user confirms the plan"),
         ("AskUserQuestion", "an ordinary question to the user"),
         ("the Agent tool", "RLM plus `agent_message`"),
@@ -312,15 +332,52 @@ enforcement.""",
             f"${{PRIME_AGENT_CODING_AGENT_DIR}}/skills/agentops-{name}/SKILL.md"
         )
         content = content.replace(f"{runtime}/{name}/SKILL.md", installed_skill_path)
+        base = name.removeprefix("gstack-")
+        content = content.replace(f"{runtime}/{base}/SKILL.md", installed_skill_path)
+        content = re.sub(
+            rf"(?<!agentops-)(?<!gstack-){re.escape(base)}/SKILL\.md",
+            installed_skill_path,
+            content,
+        )
         content = content.replace(
             f"${{CLAUDE_SKILL_DIR}}/../{name}/SKILL.md", installed_skill_path
         )
-        base = name.removeprefix("gstack-")
         content = content.replace(
             f"${{CLAUDE_SKILL_DIR}}/../{base}/SKILL.md", installed_skill_path
         )
     content = content.replace(f"$HOME{runtime}", runtime)
+    content = content.replace(f"$HOME/{runtime}", runtime)
+    content = content.replace(f"${{HOME}}/{runtime}", runtime)
     content = content.replace(f"$_ROOT/{runtime}", runtime)
+    content = re.sub(
+        r"(?<!/)browse/src/cdp-allowlist\.ts",
+        f"{runtime}/browse/src/cdp-allowlist.ts",
+        content,
+    )
+    content = content.replace(
+        "`$B`, `$D`, `codex exec`/`codex review`,",
+        "`$B`, `$D`,",
+    )
+    unsupported_routes = (
+        "careful",
+        "freeze",
+        "guard",
+        "unfreeze",
+        "benchmark-models",
+        "pair-agent",
+        "autoplan",
+        "office-hours",
+        "open-gstack-browser",
+        "ship",
+        "skillify",
+        "codex",
+        "claude",
+    )
+    content = "\n".join(
+        line
+        for line in content.splitlines()
+        if not any(re.search(rf"/{re.escape(route)}\b", line) for route in unsupported_routes)
+    ) + ("\n" if content.endswith("\n") else "")
     for name in sorted(skill_names, key=len, reverse=True):
         base = name.removeprefix("gstack-")
         pattern = rf"(?<![\w./-])/(?:gstack-)?{re.escape(base)}\b"
@@ -385,7 +442,12 @@ def _adapt_runtime_asset(item: Path) -> bytes:
         ("$_ROOT/.claude/skills/gstack", runtime),
         ("$HOME/.prime/agent/.agentops/runtime/gstack", runtime),
         ("$HOME${PRIME_AGENT_CODING_AGENT_DIR}/.agentops/runtime/gstack", runtime),
+        ("$HOME/${PRIME_AGENT_CODING_AGENT_DIR}/.agentops/runtime/gstack", runtime),
+        ("${HOME}/${PRIME_AGENT_CODING_AGENT_DIR}/.agentops/runtime/gstack", runtime),
         ("$_ROOT/${PRIME_AGENT_CODING_AGENT_DIR}/.agentops/runtime/gstack", runtime),
+        ("$HOME/${PRIME_AGENT_CODING_AGENT_DIR}", "${PRIME_AGENT_CODING_AGENT_DIR}"),
+        ("${HOME}/${PRIME_AGENT_CODING_AGENT_DIR}", "${PRIME_AGENT_CODING_AGENT_DIR}"),
+        ("$_ROOT/${PRIME_AGENT_CODING_AGENT_DIR}", "${PRIME_AGENT_CODING_AGENT_DIR}"),
         ("~/.claude/skills/gstack", runtime),
         (".claude/skills/gstack", runtime),
         ("$HOME/.claude/plans", f"{profile}/plans"),
@@ -394,6 +456,9 @@ def _adapt_runtime_asset(item: Path) -> bytes:
     )
     for old, new in replacements:
         text = text.replace(old, new)
+    text = text.replace(f"$HOME/{runtime}", runtime)
+    text = text.replace(f"${{HOME}}/{runtime}", runtime)
+    text = text.replace(f"$_ROOT/{runtime}", runtime)
     forbidden_paths = ("~/.claude/skills/gstack", ".claude/skills/gstack", "$HOME/.claude/plans")
     if any(token in text for token in forbidden_paths):
         raise GstackPrimeSourceError(f"runtime asset retains a Claude-only path: {item}")
@@ -447,6 +512,58 @@ def _bind_profile_root(files: dict[str, bytes], profile_root: Path) -> None:
         if b"\0" not in data and marker in data:
             files[relative] = data.replace(marker, replacement)
 
+
+def _validate_reference_closure(files: dict[str, bytes], profile_root: Path) -> None:
+    forbidden_skills = (
+        "benchmark-models",
+        "pair-agent",
+        "autoplan",
+        "office-hours",
+        "open-gstack-browser",
+        "ship",
+        "skillify",
+        "careful",
+        "freeze",
+        "guard",
+        "unfreeze",
+    )
+    for name in forbidden_skills:
+        if f"skills/agentops-gstack-{name}/SKILL.md" in files:
+            raise GstackPrimeSourceError(f"unsupported Prime gstack skill was generated: {name}")
+    cdp_allowlist = ".agentops/runtime/gstack/browse/src/cdp-allowlist.ts"
+    if cdp_allowlist not in files:
+        raise GstackPrimeSourceError(
+            f"generated bundle is missing required dependency: {cdp_allowlist}"
+        )
+    cdp_reference = f"{profile_root.as_posix()}/{cdp_allowlist}".encode()
+    for skill in ("skills/agentops-gstack/SKILL.md", "skills/agentops-gstack-browse/SKILL.md"):
+        content = files.get(skill)
+        if content is not None and cdp_reference not in content:
+            raise GstackPrimeSourceError(
+                f"generated skill {skill} does not reference packaged dependency: {cdp_allowlist}"
+            )
+    forbidden_markers = (
+        b"Only Prime Agent",
+        b"<gstack-install>",
+        f"$HOME/{profile_root.as_posix()}".encode(),
+        f"${{HOME}}/{profile_root.as_posix()}".encode(),
+    )
+    forbidden_routes = tuple(f"/{name}".encode() for name in forbidden_skills)
+    for relative, data in files.items():
+        if b"\0" in data:
+            continue
+        found = [marker for marker in forbidden_markers if marker in data]
+        if relative.startswith("skills/"):
+            if b"codex exec" in data:
+                found.append(b"codex exec")
+            found.extend(
+                route for route in forbidden_routes if re.search(re.escape(route) + rb"\b", data)
+            )
+        if found:
+            raise GstackPrimeSourceError(
+                f"generated Prime file {relative} retains an invalid runtime reference: "
+                f"{found[0].decode(errors='replace')}"
+            )
 
 def _load_manifest(target: Path) -> dict[str, object] | None:
     path = target / MANIFEST_NAME
@@ -677,6 +794,7 @@ def install_prime_gstack(
             raise GstackPrimeSourceError("PRIME_AGENT_CODING_AGENT_DIR is required")
         coding_agent_dir = Path(configured)
     target = coding_agent_dir.expanduser().resolve()
+    _validate_shell_safe_profile_root(target)
 
     checkout = Path(checkout).resolve()
     with tempfile.TemporaryDirectory(
@@ -727,6 +845,7 @@ def install_prime_gstack(
                 )
         new_files, modes = _collect_files(source)
         _bind_profile_root(new_files, target)
+        _validate_reference_closure(new_files, target)
 
         manifest = _load_manifest(target)
         migrate_legacy = _preflight(target, new_files, manifest, legacy_expected)

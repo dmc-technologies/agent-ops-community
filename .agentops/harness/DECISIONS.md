@@ -53,6 +53,13 @@ Record durable architecture, workflow, and harness decisions here.
 - Applies to: `.github/workflows/review-gate.yml`, `.github/review-gate-prompt.md`, `tests/test_review_gate.py`.
 - Revisit when the review backend can enforce these principles with richer inline review APIs or repository-specific policy packs.
 
+### 2026-08-10: Prime excludes workflows whose provider and runtime contracts cannot be preserved
+
+- Decision: The Prime gstack adapter excludes model benchmarking, paired external agents, automated multi-model planning, multi-model office hours, the provider-specific headed browser, automated shipping, and browser-skill authoring. It also rejects custom gstack profile paths that are unsafe as unquoted shell words. Superpowers resolves the selected profile once and rejects symlinked skills or ownership-metadata write paths.
+- Rationale: Exclusion is the smallest safe correction when text substitution would mislabel an external provider or a retained workflow would require omitted or provider-specific runtime behavior. Failing before writes preserves profile confinement and prevents commands from splitting an absolute path.
+- Applies to: Prime gstack generation, Superpowers installation, focused adapter tests, and Prime support documentation.
+- Revisit when: a workflow has an explicit Prime-native provider operation and complete packaged runtime, or generated gstack commands gain context-aware path serialization.
+
 ## Template
 
 ### YYYY-MM-DD: Decision title
