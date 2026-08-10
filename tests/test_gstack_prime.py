@@ -601,6 +601,9 @@ Commit only verified documentation.
     assert "root package metadata" in adapted
     assert "draft one from `git log <base>..HEAD`" in adapted
     assert "gstack-next-version" in adapted
+    assert "*github.com*)" in adapted
+    assert "*gitlab*)" in adapted
+    assert "exit 30" in adapted
     assert "exit 31" in adapted
     assert "A failed title update is a **BLOCKER**" in adapted
     assert "If the title edit fails, **STOP**" in adapted

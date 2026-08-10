@@ -577,8 +577,14 @@ allocator with the bump level approved in Step 8 (or derive the already-applied 
 base and branch VERSION values, then confirm it with the user):
 
 ```bash
-BASE_BRANCH=$(git branch --show-current >/dev/null 2>&1 &&
-gh pr view --json baseRefName -q .baseRefName 2>/dev/null || echo main)
+ORIGIN_URL=$(git remote get-url origin 2>/dev/null || true)
+case "$ORIGIN_URL" in
+  *github.com*) BASE_BRANCH=$(gh pr view --json baseRefName -q .baseRefName) || exit 30 ;;
+  *gitlab*) BASE_BRANCH=$(glab mr view -F json 2>/dev/null |
+    jq -r '.target_branch // .targetBranch // empty') || exit 30 ;;
+  *) echo "unknown repository provider: $ORIGIN_URL" >&2; exit 30 ;;
+esac
+[ -n "$BASE_BRANCH" ] || exit 30
 BASE_VERSION=$(git show "origin/$BASE_BRANCH:VERSION" 2>/dev/null | tr -d '\\r\\n[:space:]')
 BUMP="${{BUMP:?set BUMP to the approved patch, minor, or major level}}"
 QUEUE_JSON=$(bun run {runtime}/bin/gstack-next-version --base "$BASE_BRANCH" \
@@ -589,7 +595,8 @@ NEXT_SLOT=$(echo "$QUEUE_JSON" | jq -r '.version // empty')
 [ "$(tr -d '\\r\\n[:space:]' < VERSION)" = "$NEXT_SLOT" ] || exit 33
 ```
 
-A non-zero allocator result is a **BLOCKER**; do not guess or reuse a version.
+Exit 30 means provider or request discovery failed; exits 31-33 mean allocation failed. Every
+non-zero result is a **BLOCKER**. Do not guess a provider, base branch, or version.
 
 1. Require `VERSION` to be modified on the branch. If it is not, **STOP** and return to the Step 8
    decision; do not create a request that silently reuses a release number.
