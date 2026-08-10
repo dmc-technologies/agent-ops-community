@@ -4,12 +4,12 @@ Repository: `agent-ops-community`
 
 Record durable architecture, workflow, and harness decisions here.
 
-### 2026-08-09: Prime Agent uses its native print-mode and home conventions
+### 2026-08-09: Prime Agent uses native handoff and namespaced owned bundles
 
-- Decision: register Prime Agent as `prime-agent`; require every framework command handoff to receive an existing directory through `--cwd`; hand context packs to `prime-agent --print --cwd <repo> -- <prompt>` using that same directory; default installs to `${PRIME_AGENT_CODING_AGENT_DIR:-~/.prime/agent}`; install pinned gstack at `skills/gstack` and merge pinned Superpowers skills into `skills/`.
-- Rationale: Prime Agent 0.7.1 discovers coding-agent resources through `PRIME_AGENT_CODING_AGENT_DIR`, and an explicit validated repository directory prevents the reported adapter working directory from diverging from Prime Agent’s `--cwd`. These conventions provide the same bootstrap, context, handoff, and pinned-skill experience as other first-class frameworks without a runner plugin.
-- Applies to: framework and registry models, adapters, bootstrap generation, skill dependency installation, public data registries, documentation, and tests.
-- Revisit when: Prime Agent changes its public CLI handoff flags or resource discovery home.
+- Decision: register Prime Agent as `prime-agent`; require every framework command handoff to receive an existing directory through `--cwd`; hand context packs to `prime-agent --print --cwd <repo> -- <prompt>` using that same directory; default installs to `${PRIME_AGENT_CODING_AGENT_DIR:-~/.prime/agent}`; and generate namespaced `agentops-gstack-*` and `agentops-superpowers-*` skills with fingerprint ownership manifests outside the shared skill namespace.
+- Rationale: Prime Agent 0.7.1 discovers coding-agent resources through `PRIME_AGENT_CODING_AGENT_DIR`, while the upstream pinned bundles contain provider-specific paths and tool contracts. Explicit Prime generation plus collision preflight preserves frequently used workflows without overwriting a person’s skills or exposing raw Claude instructions. A validated repository directory also prevents the reported adapter working directory from diverging from Prime Agent’s `--cwd`.
+- Applies to: framework and registry models, adapters, bootstrap generation, Prime bundle adapters, skill dependency installation, public data registries, documentation, and tests.
+- Revisit when: Prime Agent changes its CLI or skill discovery contract, or either upstream project publishes and tests an equivalent Prime host package.
 
 ### 2026-08-08: AI review runs once on the final head with risk-routed Sol effort
 

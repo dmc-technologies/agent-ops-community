@@ -28,10 +28,7 @@ agentops skills install opencode
 agentops skills install prime-agent
 ```
 
-By default, supported frameworks install all configured skill dependency
-bundles. The pinned gstack repository is installed as a complete bundle under
-`skills/gstack`; Superpowers installs every skill from its pinned `skills/`
-tree.
+By default, supported frameworks install all configured skill dependency bundles. Codex, Claude Code, and OpenCode retain their existing upstream layouts. Prime Agent receives generated Prime-native variants: gstack skills use `agentops-gstack-*` names with their built runtime under `.agentops/runtime/gstack`, and Superpowers skills use `agentops-superpowers-*` names. Fingerprint manifests prevent either bundle from overwriting an unowned or locally modified skill.
 
 ## Quick Start
 
@@ -66,7 +63,7 @@ agentops frameworks command examples/local-smoke.yaml --framework codex --cwd /t
 agentops frameworks command examples/local-smoke.yaml --framework prime-agent --cwd /tmp/agentops-example --json
 ```
 
-Prime Agent handoff uses its non-interactive `--print` mode and passes the job context with an explicit `--cwd`. Prime Agent skill bundles install under `${PRIME_AGENT_CODING_AGENT_DIR:-~/.prime/agent}/skills`. See [Prime Agent support](docs/prime-agent.md) for the complete setup and command contract.
+Prime Agent handoff uses its non-interactive `--print` mode and passes the job context with an explicit `--cwd`. Prime Agent skill bundles install namespaced skills under `${PRIME_AGENT_CODING_AGENT_DIR:-~/.prime/agent}/skills` and keep ownership records outside the shared skill namespace. See [Prime Agent support](docs/prime-agent.md) for the complete setup, collision contract, and command contract.
 
 ## Extension Model
 
@@ -105,8 +102,9 @@ agentops harness check .
 - Use Python 3.11 or newer.
 - Run commands from an activated virtual environment, or prefix them with
   `.venv/bin/`.
-- If `agentops` is not found, rerun `python -m pip install -e ".[dev]"` from
-  the repository root.
+- If `agentops` is not found, rerun `python -m pip install -e ".[dev]"` from the repository root.
+- Prime gstack generation requires Bun. Agent Ops uses the pinned upstream lockfile and stops without changing the Prime profile if generation or the required runtime build fails.
+- The Prime gstack runtime contains compiled browser, design, and PDF executables and currently uses about 600 MB on Linux.
 
 ## Agent Harness
 

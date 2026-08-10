@@ -5,24 +5,26 @@ Repository: `agent-ops-community`
 ## Current State
 
 - Branch: `feat/prime-agent-first-class`
-- Latest commit before current work: `origin/main` (`bcada9b`).
-- Current handoff: the two Review Gate corrections are implemented on `feat/prime-core-review-fixes`; the final commit and hosted checks remain. No Plane work item applies because Dan directly requested this framework integration.
-- Verification: targeted tests, full tests (`62 passed`), Ruff, the source-tree harness check, whitespace validation, and the obsolete-variable scan pass.
+- Current head before this handoff update: `2dfc55f`.
+- Current handoff: all four public pull request 11 Review Gate findings are corrected locally. Prime now uses its native profile variable and an explicit repository path, while gstack and Superpowers install through namespaced Prime adapters with fingerprint ownership and safe legacy migration.
+- Verification: Ruff, 85 tests, the source-tree harness check, whitespace validation, real pinned Superpowers adaptation, and a real pinned gstack generation/runtime build pass. The generated gstack browser executable loads and prints its help; starting Chromium reaches the host sandbox restriction rather than a missing runtime dependency.
 
 ## Current Work
 
-- Goal: make Prime Agent a first-class supported framework.
-- Active task: commit the Prime 0.7.1 environment-variable and explicit framework-command working-directory corrections for pull request 11.
-- Files in play: framework registry and adapter, bootstrap, skill registries and installer, documentation, tests, and this repository handoff.
-- Blockers: hosted CI and Review Gate must pass on the final head before merge.
+- Goal: make Prime Agent a first-class supported framework without overwriting user-authored skills.
+- Active task: update pull request 11, rerun hosted CI and Review Gate, then merge the public dependency before the private Prime support pull request.
+- Files in play: Prime framework handoff, bootstrap, skill registries, gstack and Superpowers adapters, documentation, tests, and this repository handoff.
+- Blockers: hosted CI and Review Gate must pass on the final public head before merge.
 
 ## Next Actions
 
-- Push the correction commit, then require CI and Review Gate to pass on the final pull-request head with no unresolved review conversation.
-- Merge pull request 11, then rebase and open the coordinated private Agent Ops pull request.
+- Commit and push the final public corrections, then require CI and Review Gate to pass with no unresolved material finding.
+- Merge pull request 11, update the coordinated private Agent Ops branch against public main, rerun its full verification, and merge it.
+- Reinstall from both canonical main branches, restart Prime sessions, and complete the approved Agent Knowledge write with immediate readback during clock-out.
 
 ## Session Log
 
+- 2026-08-09: Replaced raw Prime bundle copies with namespaced adapters. gstack now uses the pinned upstream generator, a Prime host/tool contract, compiled runtime assets, `agentops-gstack-*` names, and fingerprint rollback; Superpowers uses all 14 pinned skills under `agentops-superpowers-*` names with a Prime startup/tool contract and the same collision protections. Exact unmodified legacy copies migrate; changed or logically colliding skills are preserved and refused.
 - 2026-08-09: Replaced the obsolete Prime home variable with Prime 0.7.1’s `PRIME_AGENT_CODING_AGENT_DIR`, made default skill installation honor it, and required a validated explicit `--cwd` for framework command handoffs without changing gstack or Superpowers install mappings.
 - 2026-08-09: Clock-out recorded pull request 11 as pending external finalization after the public Prime implementation and real dependency installation passed locally. The dependent private pull request must follow this public merge.
 - 2026-08-09: Added Prime Agent framework registration, `prime-agent --print --cwd` context handoff, generated bootstrap support, the native `~/.prime/agent` home, pinned gstack and Superpowers install mappings, registry metadata, documentation, and tests.
@@ -46,6 +48,7 @@ Repository: `agent-ops-community`
 
 ## Verification Log
 
+- 2026-08-09: `uv run --extra dev ruff check .`, `uv run --extra dev pytest -q` (`85 passed`), `uv run --extra dev agentops harness check .`, and `git diff --check` passed after the Prime adapter changes. Real pinned Superpowers adaptation produced 14 unique namespaced skills with no raw provider path or unavailable-tool requirement. Real pinned gstack generation produced 42 unique namespaced skills and 726 managed files; required browser, design, and PDF executables were built, and `browse --help` ran from the staged runtime.
 - 2026-08-09: `uv run --extra dev pytest tests/test_frameworks.py tests/test_skill_installer.py tests/test_cli.py tests/test_readme_smoke.py -q` passed (`25 passed`); final `uv run --extra dev pytest -q` passed (`62 passed`); final `uv run --extra dev ruff check .` and `uv run --extra dev agentops harness check .` passed; `git diff --check` and the obsolete-variable scan passed.
 - 2026-08-09: `uv run --extra dev pytest tests/test_frameworks.py tests/test_skill_installer.py tests/test_cli.py -q` passed (`21 passed`); `uv run --extra dev agentops frameworks command examples/local-smoke.yaml --framework prime-agent --json` produced the expected print-mode handoff; `.venv/bin/ruff check .` passed; `.venv/bin/pytest -q` passed (`60 passed`); `.venv/bin/agentops harness check .` passed; `git diff --check` passed.
 
@@ -63,7 +66,3 @@ Repository: `agent-ops-community`
 - 2026-06-19: hardening validation passed: `python -m pytest tests/test_review_gate.py tests/test_public_safety.py -q`,
   `ruff check .github/scripts/review_gate.py tests/test_review_gate.py`,
   `git diff --check`, and `agentops harness check .`.
-
-## Next Actions
-
-1. Open a pull request when requested; do not push from this task.
