@@ -6,17 +6,24 @@ Repository: `agent-ops-community`
 
 - Branch: `feat/prime-agent-first-class`
 - Latest commit before current work: `origin/main` (`bcada9b`).
-- Verification: full tests, lint, source-tree harness check, and whitespace validation pass.
+- Current handoff: pull request 11 is pending external finalization. CI passed on the implementation head; CI and Review Gate must pass on the final clock-out head before merge. No Plane work item applies because Dan directly requested this framework integration.
+- Verification: full tests, lint, source-tree harness check, real temporary-home dependency installation, and whitespace validation pass.
 
 ## Current Work
 
 - Goal: make Prime Agent a first-class supported framework.
-- Active task: complete; implementation, documentation, and tests are recorded on this branch.
-- Files in play: framework registry and adapter, bootstrap, skill registries and installer, documentation, and tests.
-- Blockers: none
+- Active task: finish pull request 11 on the final clock-out head, then merge it before opening the dependent private Agent Ops pull request.
+- Files in play: framework registry and adapter, bootstrap, skill registries and installer, documentation, tests, and this repository handoff.
+- Blockers: Review Gate must pass on the unchanged final head before merge.
+
+## Next Actions
+
+- Require CI and Review Gate to pass on the final pull-request head with no unresolved review conversation.
+- Merge pull request 11, then rebase and open the coordinated private Agent Ops pull request.
 
 ## Session Log
 
+- 2026-08-09: Clock-out recorded pull request 11 as pending external finalization after the public Prime implementation and real dependency installation passed locally. The dependent private pull request must follow this public merge.
 - 2026-08-09: Added Prime Agent framework registration, `prime-agent --print --cwd` context handoff, generated bootstrap support, the native `~/.prime/agent` home, pinned gstack and Superpowers install mappings, registry metadata, documentation, and tests.
 
 - 2026-08-08: Changed Review Gate to run only when a person applies `ai review` to the final pull-request head. Removed auto-labeling and all fast advisory code, inputs, state, tests, and documentation.
