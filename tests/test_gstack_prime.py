@@ -357,7 +357,7 @@ Treat the existing design document as source of truth before /ship.
     assert "STOP on GitLab or an unknown platform" in adapted
     assert "existing design document as source of truth" in adapted
     assert "/ship" not in adapted
-    assert "user-approved manual pull-request and release steps" in adapted
+    assert "the Prime release-preparation sequence" in adapted
 
 
 def test_reference_validation_does_not_treat_profile_segments_as_skill_routes(
@@ -477,12 +477,17 @@ Continue the review.
     assert "Discuss the product directly" in executive
     assert "/office-hours" not in executive
 
+    platform_stop = (
+        '**If the platform detected above is GitLab or unknown:** STOP with: "GitLab '
+        'support for /land-and-deploy is not yet implemented. Run `/ship` to create the MR, '
+        'then merge manually via the GitLab web UI." Do not proceed.'
+    )
     deployment = gstack_prime._adapt_prime_contract(
-        """---
+        f"""---
 name: gstack-land-and-deploy
 description: Land safely.
 ---
-Run `/ship` to create the MR, then merge manually via the GitLab web UI.
+{platform_stop}
 ## Step 3.4: VERSION drift detection (workspace-aware ship)
 ```bash
 BRANCH_VERSION=$(git show HEAD:VERSION)
@@ -509,7 +514,19 @@ Continue only without drift.
     assert "If drift is detected: **STOP**" in deployment
     assert "Reconcile the feature branch manually" in deployment
     assert "`glab mr create`" in deployment
-    assert "Do not rerun this workflow because it does not support GitLab" in deployment
+    assert "**If the platform is unknown:** STOP" in deployment
+    unknown_provider = deployment.split("**If the platform is unknown:**", 1)[1].split(
+        "## Step 3.3", 1
+    )[0]
+    assert "`glab" not in unknown_provider
+    assert "`gh" not in unknown_provider
+    assert "explicit repository-owned GitLab merge and deployment procedure" in deployment
+    assert "## Step 3.3: Prime release-artifact gate" in deployment
+    assert "exit 19" in deployment
+    assert "exit 20" in deployment
+    assert "SystemExit(25" in deployment
+    assert "/skill:agentops-gstack-document-release" in deployment
+    assert "If none exists, ask the user for that procedure and STOP" in deployment
     assert "Exit non-zero" in deployment
     assert "/ship" not in deployment
 
@@ -542,6 +559,7 @@ User asks to launch a real browser for QA, "open the browser" → invoke `/open-
     assert "unknown provider STOP" in adapted
     assert "existing GitHub pull request" in adapted
     assert "/skill:agentops-gstack-land-and-deploy" in adapted
+    assert "/skill:agentops-gstack-document-release" in adapted
     assert "ask for an explicit safety boundary" in adapted
     assert "confine all reads and writes" in adapted
     assert "Prime does not provide hook enforcement" in adapted
@@ -550,3 +568,40 @@ User asks to launch a real browser for QA, "open the browser" → invoke `/open-
         assert f"/skill:agentops-gstack-plan-{review}-review" in adapted
     for excluded in ("/ship", "/autoplan", "/careful", "/guard", "/freeze", "/unfreeze"):
         assert excluded not in adapted
+
+
+def test_document_release_owns_prime_release_artifacts() -> None:
+    title_failure = (
+        '5. If the edit command fails: warn "Could not update PR/MR title — documentation '
+        'changes are still in the commit." and continue. Do not block on title sync failure.'
+    )
+    content = f"""---
+name: gstack-document-release
+description: Prepare release documentation.
+---
+# Document Release
+## Step 1: Pre-flight & Diff Analysis
+Inspect the branch.
+## Step 8: VERSION Bump Question
+Ask before changing VERSION.
+## Step 9: Commit & Output
+Commit only verified documentation.
+{title_failure}
+"""
+    adapted = gstack_prime._adapt_prime_contract(
+        content,
+        {"gstack-document-release", "gstack-review"},
+        "agentops-gstack-document-release",
+    )
+
+    assert "## Step 0.5: Prime release-preparation authority" in adapted
+    assert "/skill:agentops-gstack-review" in adapted
+    assert "## Step 8.5: Prime release-artifact completion" in adapted
+    assert "Require `VERSION` to be modified" in adapted
+    assert "root package metadata" in adapted
+    assert "draft one from `git log <base>..HEAD`" in adapted
+    assert "gstack-next-version" in adapted
+    assert "exit 31" in adapted
+    assert "A failed title update is a **BLOCKER**" in adapted
+    assert "If the title edit fails, **STOP**" in adapted
+    assert "Do not block on title sync failure" not in adapted
