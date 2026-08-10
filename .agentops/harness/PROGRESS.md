@@ -6,15 +6,15 @@ Repository: `agent-ops-community`
 
 - Branch: `fix/prime-runtime-contracts`
 - Main baseline: the merged first Prime integration and its first public correction.
-- Current handoff: the initial public rollout merged while final reviews were pending. The first public correction fixed provider, runtime, symlink, and profile-path defects. Its completed review found that route removal also deleted surrounding safety clauses, profile segments could be mistaken for commands, and this public handoff included private rollout metadata. This follow-up preserves the safety clauses, parses route tokens contextually, and keeps the handoff public-safe.
-- Verification: Ruff, 99 tests, the source-tree harness check, and whitespace validation pass. A real pinned update removed the unsupported skills, retained 31 gstack and 14 Superpowers skills, rejected both reproduced symlink escapes and an unsafe profile path before writes, and preserved sandboxed headless browser navigation and screenshot capture.
+- Current handoff: public pull request 13 preserves safety clauses, parses route tokens contextually, and keeps the handoff public-safe. Its late Review Gate found that generic excluded-workflow substitutions could still produce malformed or non-actionable retained instructions. The correction now replaces affected prerequisite and routing sections with direct discussion, individual retained reviews, manual pull-request and release steps, manual script preservation, and a retained Prime review path.
+- Verification: Ruff, 100 tests, the source-tree harness check, and whitespace validation pass. A real pinned update retained 31 gstack and 14 Superpowers skills with no excluded command routes, unavailable-route markers, malformed runtime paths, or code-styled fallback workflow names.
 
 ## Current Work
 
 - Goal: make Prime Agent a first-class supported framework without overwriting user-authored skills.
 - Active task: complete and merge one narrow post-merge correction, then resume the paused canonical reinstall.
 - Files in play: only the gstack adapter, Superpowers destination confinement, focused tests, Prime documentation, and this handoff.
-- Blockers: full local verification and hosted review of the corrective pull request.
+- Blockers: hosted deterministic checks and Review Gate on the updated corrective pull request.
 
 ## Next Actions
 
@@ -24,6 +24,7 @@ Repository: `agent-ops-community`
 
 ## Session Log
 
+- 2026-08-10: Pull request 13's late Review Gate showed that generic excluded-route substitutions could leave malformed provider labels and retained instructions that still appeared to invoke nonexistent workflows. The adapter now replaces the affected review prerequisites, release drift handling, scrape persistence, and root routing with explicit actions; it removes command styling from prose fallbacks and rejects residual unavailable or malformed markers. `uv run --extra dev ruff check .`, `uv run --extra dev pytest -q` (`100 passed`), `uv run --extra dev agentops harness check .`, and `git diff --check` passed. A real pinned install retained 31 gstack skills with no excluded route tokens or malformed fallback markers.
 - 2026-08-10: Review of the first public correction found three defects: whole-line removal discarded retained safety and source-authority clauses, path segments could be mistaken for excluded commands, and the public handoff exposed private rollout metadata. The follow-up replaces only invocation tokens, uses filesystem-aware route matching, and removes private identifiers from this public record.
 - 2026-08-10: The narrow corrective implementation passed `uv run --extra dev ruff check .`, `uv run --extra dev pytest -q` (`97 passed`), `uv run --extra dev agentops harness check .`, and `git diff --check`. Exact pinned installation retained 31 gstack and 14 Superpowers skills; unsupported provider/runtime workflows were removed on update, every required retained reference resolved (the absent `VERSION` and `.git` paths are guarded optional update probes), unsafe profile paths and both symlink escapes failed before writes, and the retained headless browser navigated to `https://example.com/` and captured `/tmp/prime-gstack-hotfix.png` at 1280×720 with sandboxing preserved.
 - 2026-08-10: The initial public rollout merged while final reviews were pending. The late public review found four reproducible runtime and confinement defects, so canonical reinstall was paused and one narrow correction was authorized.

@@ -358,6 +358,58 @@ enforcement.""",
         "`$B`, `$D`, `codex exec`/`codex review`,",
         "`$B`, `$D`,",
     )
+    if installed_name in {
+        "agentops-gstack-plan-ceo-review",
+        "agentops-gstack-plan-eng-review",
+        "agentops-gstack-plan-devex-review",
+    }:
+        content = _replace_level_two_section(
+            content,
+            "Prerequisite Skill Offer",
+            """## Missing design source in Prime Agent
+
+If a design document exists, read it and use it as the source of truth. If none exists, state
+that the design source is missing and ask whether to use the current plan as the sole review
+source or stop so the user can supply a design document. Continue only from the user's choice;
+do not invent missing product decisions or name a workflow that is not installed.""",
+        )
+    if installed_name == "agentops-gstack-land-and-deploy":
+        content = _replace_level_two_section(
+            content,
+            "Step 3.4: VERSION drift detection (workspace-aware ship)",
+            """## Step 3.4: VERSION drift detection
+
+Run the retained next-version utility and compare the branch version with the next available
+slot. If the queue moved, STOP before merge or deployment. Report the branch version, next slot,
+and the VERSION, package metadata, changelog header, and pull-request title that require manual
+reconciliation. Resume this workflow only after the user confirms those files and the pull
+request were updated.""",
+        )
+        content = content.replace(
+            'Run `/ship` to create the MR, then merge manually via the GitLab web UI.',
+            "Create the merge request manually with the GitLab CLI or web UI, then rerun this "
+            "workflow.",
+        )
+        content = content.replace(
+            'Run `/ship` first to create a PR, then come back here to land and deploy it.',
+            "Create the pull request manually with `gh pr create` or the GitHub web UI, then "
+            "rerun this workflow.",
+        )
+    if installed_name == "agentops-gstack-scrape":
+        content = _replace_level_two_section(
+            content,
+            "Step 5 — Skillify nudge",
+            """## Step 5 — Manual persistence
+
+After a successful prototype, return the extracted JSON and the complete tested script. Explain
+that Prime does not automate browser-skill installation; if the user wants reuse, provide the
+exact filenames and destination so they can preserve the script manually. Do not claim the
+manual copy has been installed or benchmarked.""",
+        )
+        content = content.replace(
+            "suggest `/skillify` so the",
+            "return the script and exact manual persistence steps so the",
+        )
     unsupported_routes = (
         "careful",
         "freeze",
@@ -373,12 +425,138 @@ enforcement.""",
         "codex",
         "claude",
     )
+    route_fallbacks = {
+        "careful": "the applicable higher-priority safety policy",
+        "freeze": "the stated directory boundary",
+        "guard": "the applicable higher-priority safety policy",
+        "unfreeze": "a user-approved directory-boundary change",
+        "benchmark-models": "manual comparison using approved providers",
+        "pair-agent": "a separately approved child-agent task",
+        "autoplan": "the retained plan-review skills",
+        "office-hours": "ordinary product discussion",
+        "open-gstack-browser": "the retained headless browser",
+        "ship": "manual pull-request and release preparation",
+        "skillify": "manual script preservation",
+        "codex": "an external review that is not run by Prime",
+        "claude": "an external review that is not run by Prime",
+    }
     for route in unsupported_routes:
         content = re.sub(
             rf"/{re.escape(route)}\b",
-            f"{route} (unavailable in Prime)",
+            route_fallbacks[route],
             content,
         )
+    content = content.replace(
+        "Product ideas/brainstorming → invoke ordinary product discussion",
+        "Product ideas/brainstorming → discuss the product directly with the user",
+    )
+    content = content.replace(
+        "Full review pipeline → invoke the retained plan-review skills",
+        "Full review pipeline → run the retained plan-review skills individually",
+    )
+    content = content.replace(
+        "Ship/deploy/PR → invoke manual pull-request and release preparation or ",
+        "Ship/deploy/PR → use ",
+    )
+    content = content.replace(
+        "suggest manual script preservation so the",
+        "return the script and explain how to preserve it manually so the",
+    )
+    content = content.replace(
+        'verdict "NO REVIEWS YET — run `the retained plan-review skills`"',
+        'verdict "NO REVIEWS YET — run the retained plan-review skills individually"',
+    )
+    content = content.replace(
+        "`/skill:agentops-gstack-context-restore` reads `[gstack-context]`; "
+        "`manual pull-request and release preparation` squashes WIP commits into clean commits.",
+        "`/skill:agentops-gstack-context-restore` reads `[gstack-context]`; manual Git cleanup "
+        "may squash WIP commits only after user approval.",
+    )
+    content = content.replace(
+        "Product ideas/brainstorming → invoke `ordinary product discussion`",
+        "Product ideas/brainstorming → discuss the product directly with the user",
+    )
+    content = content.replace(
+        "all reviews done automatically, \"review everything\" → invoke "
+        "`the retained plan-review skills`",
+        "all reviews done automatically, \"review everything\" → run the retained "
+        "plan-review skills individually",
+    )
+    content = content.replace(
+        "Ship/deploy/PR → invoke `manual pull-request and release preparation` or ",
+        "Ship/deploy/PR → use ",
+    )
+    content = content.replace(
+        "asks to ship, deploy, push, create a PR, \"let's land this\", \"send it\" → invoke "
+        "`manual pull-request and release preparation`",
+        "asks to create a PR → provide `gh pr create` or GitHub web steps; asks to deploy → "
+        "use `/skill:agentops-gstack-land-and-deploy` only after a PR exists",
+    )
+    content = content.replace(
+        "asks for a second opinion, codex review → invoke "
+        "`an external review that is not run by Prime`",
+        "asks for an external second opinion → state that Prime cannot run that external review "
+        "and continue with the retained Prime review",
+    )
+    content = content.replace(
+        "→ invoke `ordinary product discussion`",
+        "→ discuss the product directly with the user",
+    )
+    content = content.replace(
+        "→ invoke `manual pull-request and release preparation`",
+        "→ provide `gh pr create` or GitHub web steps for pull requests and use the retained "
+        "land-and-deploy workflow only after a pull request exists",
+    )
+    content = content.replace(
+        "→ invoke `an external review that is not run by Prime`",
+        "→ state that Prime cannot run the external review and continue with the retained Prime "
+        "review",
+    )
+    content = content.replace(
+        "Run manual pull-request and release preparation when ready.",
+        "Create the pull request manually with `gh pr create` or the GitHub web UI when ready.",
+    )
+    content = content.replace(
+        "Ready to implement — run manual pull-request and release preparation when done",
+        "Ready to implement — implement, then create the pull request manually when done",
+    )
+    content = content.replace(
+        "rerun manual pull-request and release preparation to pick up the next free slot",
+        "manually reconcile VERSION, package metadata, changelog, and pull-request title with "
+        "the next free slot",
+    )
+    content = content.replace(
+        "rerun manual pull-request and release preparation to reconcile",
+        "manually reconcile VERSION, package metadata, changelog, and pull-request title from",
+    )
+    content = content.replace(
+        "manual pull-request and release preparation's job",
+        "left to user-approved manual Git and pull-request steps",
+    )
+    content = content.replace(
+        "codexan external review that is not run by Prime",
+        "external review not run in Prime",
+    )
+    content = content.replace(
+        "an external review that is not run by Prime review",
+        "external review not run in Prime",
+    )
+    content = content.replace(
+        "an external review that is not run by Prime",
+        "external review not run in Prime",
+    )
+    content = content.replace(
+        "manual pull-request and release preparation",
+        "user-approved manual pull-request and release steps",
+    )
+    for prose_fallback in route_fallbacks.values():
+        content = content.replace(f"`{prose_fallback}`", prose_fallback)
+    manual_steps = "user-approved manual pull-request and release steps"
+    content = content.replace(f"`{manual_steps}`", manual_steps)
+    content = content.replace(f"\\`{manual_steps}\\`", manual_steps)
+    content = content.replace(f"{manual_steps} squashes", f"{manual_steps} may squash")
+    content = content.replace(f"{manual_steps} creates", f"{manual_steps} create")
+    content = content.replace(f"{manual_steps}'s", manual_steps)
     for name in sorted(skill_names, key=len, reverse=True):
         base = name.removeprefix("gstack-")
         pattern = rf"(?<![\w./-])/(?:gstack-)?{re.escape(base)}\b"
@@ -546,6 +724,8 @@ def _validate_reference_closure(files: dict[str, bytes], profile_root: Path) -> 
     forbidden_markers = (
         b"Only Prime Agent",
         b"<gstack-install>",
+        b"(unavailable in Prime)",
+        b"runtime/gstackordinary product discussion",
         f"$HOME/{profile_root.as_posix()}".encode(),
         f"${{HOME}}/{profile_root.as_posix()}".encode(),
     )

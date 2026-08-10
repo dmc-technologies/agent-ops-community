@@ -357,7 +357,7 @@ Treat the existing design document as source of truth before /ship.
     assert "STOP on GitLab or an unknown platform" in adapted
     assert "existing design document as source of truth" in adapted
     assert "/ship" not in adapted
-    assert "ship (unavailable in Prime)" in adapted
+    assert "user-approved manual pull-request and release steps" in adapted
 
 
 def test_reference_validation_does_not_treat_profile_segments_as_skill_routes(
@@ -372,3 +372,57 @@ def test_reference_validation_does_not_treat_profile_segments_as_skill_routes(
     }
 
     gstack_prime._validate_reference_closure(files, profile)
+
+
+def test_excluded_workflow_fallbacks_are_actionable() -> None:
+    plan_review = gstack_prime._adapt_prime_contract(
+        """---
+name: gstack-plan-devex-review
+description: Review developer experience.
+---
+## Prerequisite Skill Offer
+Run `/office-hours` and read its skill file before continuing.
+## Review
+Preserve this review body.
+""",
+        {"gstack-plan-devex-review"},
+        "agentops-gstack-plan-devex-review",
+    )
+    assert "ask whether to use the current plan as the sole review" in plan_review
+    assert "Preserve this review body." in plan_review
+    assert "/office-hours" not in plan_review
+
+    scrape = gstack_prime._adapt_prime_contract(
+        """---
+name: gstack-scrape
+description: Extract data.
+---
+## Step 5 — Skillify nudge
+Say `/skillify` to install this permanently.
+## When the prototype fails
+Do not persist a broken prototype.
+""",
+        {"gstack-scrape"},
+        "agentops-gstack-scrape",
+    )
+    assert "Prime does not automate browser-skill installation" in scrape
+    assert "return the extracted JSON and the complete tested script" in scrape
+    assert "Do not persist a broken prototype." in scrape
+    assert "/skillify" not in scrape
+
+    routing = gstack_prime._adapt_prime_contract(
+        """---
+name: gstack
+description: Route workflows.
+---
+- User describes a new idea → invoke `ordinary product discussion`
+- User asks to create a PR → invoke `manual pull-request and release preparation`
+- User asks for a second opinion → invoke `an external review that is not run by Prime`
+""",
+        {"gstack"},
+        "agentops-gstack",
+    )
+    assert "discuss the product directly with the user" in routing
+    assert "provide `gh pr create` or GitHub web steps" in routing
+    assert "continue with the retained Prime review" in routing
+    assert "→ invoke" not in routing
