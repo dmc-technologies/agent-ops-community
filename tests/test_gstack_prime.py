@@ -335,3 +335,40 @@ def test_reference_validator_rejects_provider_and_excluded_skill_routes(tmp_path
 
     with pytest.raises(gstack_prime.GstackPrimeSourceError, match="codex exec"):
         gstack_prime._validate_reference_closure(files, target)
+
+
+def test_unsupported_route_adaptation_preserves_surrounding_safety_and_source_rules() -> None:
+    content = """---
+name: gstack-review
+description: Review safely.
+---
+Never commit, push, or open a PR; do not invoke /ship during review.
+STOP on GitLab or an unknown platform instead of invoking /ship.
+Treat the existing design document as source of truth before /ship.
+"""
+
+    adapted = gstack_prime._adapt_prime_contract(
+        content,
+        {"gstack-review"},
+        "agentops-gstack-review",
+    )
+
+    assert "Never commit, push, or open a PR" in adapted
+    assert "STOP on GitLab or an unknown platform" in adapted
+    assert "existing design document as source of truth" in adapted
+    assert "/ship" not in adapted
+    assert "ship (unavailable in Prime)" in adapted
+
+
+def test_reference_validation_does_not_treat_profile_segments_as_skill_routes(
+    tmp_path: Path,
+) -> None:
+    profile = tmp_path / "ship" / "prime"
+    files = {
+        "skills/agentops-gstack-review/SKILL.md": (
+            f"runtime: {profile}/.agentops/runtime/gstack/bin/gstack-config\n".encode()
+        ),
+        ".agentops/runtime/gstack/browse/src/cdp-allowlist.ts": b"allowlist\n",
+    }
+
+    gstack_prime._validate_reference_closure(files, profile)

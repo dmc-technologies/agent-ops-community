@@ -373,11 +373,12 @@ enforcement.""",
         "codex",
         "claude",
     )
-    content = "\n".join(
-        line
-        for line in content.splitlines()
-        if not any(re.search(rf"/{re.escape(route)}\b", line) for route in unsupported_routes)
-    ) + ("\n" if content.endswith("\n") else "")
+    for route in unsupported_routes:
+        content = re.sub(
+            rf"/{re.escape(route)}\b",
+            f"{route} (unavailable in Prime)",
+            content,
+        )
     for name in sorted(skill_names, key=len, reverse=True):
         base = name.removeprefix("gstack-")
         pattern = rf"(?<![\w./-])/(?:gstack-)?{re.escape(base)}\b"
@@ -548,7 +549,12 @@ def _validate_reference_closure(files: dict[str, bytes], profile_root: Path) -> 
         f"$HOME/{profile_root.as_posix()}".encode(),
         f"${{HOME}}/{profile_root.as_posix()}".encode(),
     )
-    forbidden_routes = tuple(f"/{name}".encode() for name in forbidden_skills)
+    forbidden_routes = tuple(
+        re.compile(
+            rb"(?<![A-Za-z0-9_.-])/" + re.escape(name.encode()) + rb"(?![A-Za-z0-9_./-])"
+        )
+        for name in forbidden_skills
+    )
     for relative, data in files.items():
         if b"\0" in data:
             continue
@@ -557,7 +563,7 @@ def _validate_reference_closure(files: dict[str, bytes], profile_root: Path) -> 
             if b"codex exec" in data:
                 found.append(b"codex exec")
             found.extend(
-                route for route in forbidden_routes if re.search(re.escape(route) + rb"\b", data)
+                pattern.pattern for pattern in forbidden_routes if pattern.search(data)
             )
         if found:
             raise GstackPrimeSourceError(

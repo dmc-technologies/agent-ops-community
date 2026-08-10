@@ -5,9 +5,9 @@ Repository: `agent-ops-community`
 ## Current State
 
 - Branch: `fix/prime-runtime-contracts`
-- Main baseline: `cfde2439cf7879e8470c1e2c017669566ab19eee`.
-- Current handoff: pull request 11 and dependent private pull request 92 merged under Dan's explicit instruction while final Review Gate runs were pending. The completed public gate then identified incorrect external-provider labels, incomplete generated workflows, a Superpowers symlink escape, and unsafe custom-profile shell paths. This narrow correction excludes the unsupported workflows and fails closed on both path classes.
-- Verification: Ruff, 97 tests, the source-tree harness check, and whitespace validation pass. A real pinned update removed the unsupported skills, retained 31 gstack and 14 Superpowers skills, rejected both reproduced symlink escapes and an unsafe profile path before writes, and preserved sandboxed headless browser navigation and screenshot capture.
+- Main baseline: the merged first Prime integration and its first public correction.
+- Current handoff: the initial public rollout merged while final reviews were pending. The first public correction fixed provider, runtime, symlink, and profile-path defects. Its completed review found that route removal also deleted surrounding safety clauses, profile segments could be mistaken for commands, and this public handoff included private rollout metadata. This follow-up preserves the safety clauses, parses route tokens contextually, and keeps the handoff public-safe.
+- Verification: Ruff, 99 tests, the source-tree harness check, and whitespace validation pass. A real pinned update removed the unsupported skills, retained 31 gstack and 14 Superpowers skills, rejected both reproduced symlink escapes and an unsafe profile path before writes, and preserved sandboxed headless browser navigation and screenshot capture.
 
 ## Current Work
 
@@ -24,8 +24,9 @@ Repository: `agent-ops-community`
 
 ## Session Log
 
+- 2026-08-10: Review of the first public correction found three defects: whole-line removal discarded retained safety and source-authority clauses, path segments could be mistaken for excluded commands, and the public handoff exposed private rollout metadata. The follow-up replaces only invocation tokens, uses filesystem-aware route matching, and removes private identifiers from this public record.
 - 2026-08-10: The narrow corrective implementation passed `uv run --extra dev ruff check .`, `uv run --extra dev pytest -q` (`97 passed`), `uv run --extra dev agentops harness check .`, and `git diff --check`. Exact pinned installation retained 31 gstack and 14 Superpowers skills; unsupported provider/runtime workflows were removed on update, every required retained reference resolved (the absent `VERSION` and `.git` paths are guarded optional update probes), unsafe profile paths and both symlink escapes failed before writes, and the retained headless browser navigated to `https://example.com/` and captured `/tmp/prime-gstack-hotfix.png` at 1280×720 with sandboxing preserved.
-- 2026-08-10: Public pull request 11 merged as `cfde2439cf7879e8470c1e2c017669566ab19eee` and private pull request 92 merged as `9bd562ce3cb895bbd60586be53d41043b6c92211`. The late public Review Gate failed with four reproducible runtime and confinement defects, so canonical reinstall was paused. Dan approved one narrow correction.
+- 2026-08-10: The initial public rollout merged while final reviews were pending. The late public review found four reproducible runtime and confinement defects, so canonical reinstall was paused and one narrow correction was authorized.
 - 2026-08-09: Replaced raw Prime bundle copies with namespaced adapters. gstack now uses the pinned upstream generator, a Prime host/tool contract, compiled runtime assets, `agentops-gstack-*` names, and fingerprint rollback; Superpowers uses all 14 pinned skills under `agentops-superpowers-*` names with a Prime startup/tool contract and the same collision protections. Exact unmodified legacy copies migrate; changed or logically colliding skills are preserved and refused.
 - 2026-08-09: Replaced the obsolete Prime home variable with Prime 0.7.1’s `PRIME_AGENT_CODING_AGENT_DIR`, made default skill installation honor it, and required a validated explicit `--cwd` for framework command handoffs without changing gstack or Superpowers install mappings.
 - 2026-08-09: Clock-out recorded pull request 11 as pending external finalization after the public Prime implementation and real dependency installation passed locally. The dependent private pull request must follow this public merge.
