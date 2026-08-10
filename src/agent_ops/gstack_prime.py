@@ -358,33 +358,46 @@ enforcement.""",
         "`$B`, `$D`, `codex exec`/`codex review`,",
         "`$B`, `$D`,",
     )
-    if installed_name in {
-        "agentops-gstack-plan-ceo-review",
-        "agentops-gstack-plan-eng-review",
-        "agentops-gstack-plan-devex-review",
-    }:
-        content = _replace_level_two_section(
-            content,
-            "Prerequisite Skill Offer",
-            """## Missing design source in Prime Agent
+    design_source_fallback = """## Missing design source in Prime Agent
 
 If a design document exists, read it and use it as the source of truth. If none exists, state
 that the design source is missing and ask whether to use the current plan as the sole review
 source or stop so the user can supply a design document. Continue only from the user's choice;
-do not invent missing product decisions or name a workflow that is not installed.""",
+do not invent missing product decisions or name a workflow that is not installed."""
+    if installed_name == "agentops-gstack-plan-eng-review":
+        section_start = content.index("## Prerequisite Skill Offer")
+        preserved_start = content.index("### Step 0: Scope Challenge", section_start)
+        content = (
+            content[:section_start]
+            + design_source_fallback
+            + "\n\n"
+            + content[preserved_start:]
         )
-    if installed_name == "agentops-gstack-land-and-deploy":
+    elif installed_name == "agentops-gstack-plan-ceo-review":
+        section_start = content.index("## Prerequisite Skill Offer")
+        mid_session_start = content.index("**Mid-session detection:**", section_start)
+        retrospective_start = content.index("### Retrospective Check", mid_session_start)
+        mid_session_fallback = """**Mid-session product-source check:** During Step 0A, if
+the user cannot state a stable problem or is still exploring what to build, pause the review.
+Discuss the product directly
+with the user until the problem, constraints, and chosen direction are explicit, then ask
+whether to resume this review from that source or stop. Do not continue from invented product
+context."""
+        content = (
+            content[:section_start]
+            + design_source_fallback
+            + "\n\n"
+            + mid_session_fallback
+            + "\n\n"
+            + content[retrospective_start:]
+        )
+    elif installed_name == "agentops-gstack-plan-devex-review":
         content = _replace_level_two_section(
             content,
-            "Step 3.4: VERSION drift detection (workspace-aware ship)",
-            """## Step 3.4: VERSION drift detection
-
-Run the retained next-version utility and compare the branch version with the next available
-slot. If the queue moved, STOP before merge or deployment. Report the branch version, next slot,
-and the VERSION, package metadata, changelog header, and pull-request title that require manual
-reconciliation. Resume this workflow only after the user confirms those files and the pull
-request were updated.""",
+            "Prerequisite Skill Offer",
+            design_source_fallback,
         )
+    if installed_name == "agentops-gstack-land-and-deploy":
         content = content.replace(
             'Run `/ship` to create the MR, then merge manually via the GitLab web UI.',
             "Create the merge request manually with the GitLab CLI or web UI, then rerun this "
@@ -394,6 +407,25 @@ request were updated.""",
             'Run `/ship` first to create a PR, then come back here to land and deploy it.',
             "Create the pull request manually with `gh pr create` or the GitHub web UI, then "
             "rerun this workflow.",
+        )
+        content = content.replace(
+            """   Rerun /ship from the feature branch to reconcile. /ship's ALREADY_BUMPED
+   branch will detect the drift and rewrite VERSION + CHANGELOG header + PR title
+   atomically. Do NOT merge from here — the landed PR would overwrite the other
+   branch's CHANGELOG entry or land with a duplicate version header.""",
+            """   Reconcile the feature branch manually: update VERSION, package metadata,
+   the CHANGELOG header, and the pull-request title to v<NEXT_SLOT>; commit and push
+   those changes. Do NOT merge from here — the landed PR would overwrite the other
+   branch's CHANGELOG entry or land with a duplicate version header. Rerun this
+   land-and-deploy workflow only after the updated pull request is visible.""",
+        )
+        content = content.replace(
+            "Exit non-zero. Do NOT auto-bump from `/land-and-deploy` — rerunning `/ship` is "
+            "the clean path (it already handles VERSION + package.json + CHANGELOG header + "
+            "PR title atomically via Step 12 ALREADY_BUMPED detection).",
+            "Exit non-zero. Do NOT auto-bump from `/land-and-deploy`; require the manual "
+            "VERSION, package metadata, CHANGELOG header, and pull-request title update "
+            "described above before rerunning this workflow.",
         )
     if installed_name == "agentops-gstack-scrape":
         content = _replace_level_two_section(
@@ -410,6 +442,39 @@ manual copy has been installed or benchmarked.""",
             "suggest `/skillify` so the",
             "return the script and exact manual persistence steps so the",
         )
+    content = content.replace(
+        "Ship/deploy/PR → invoke /ship or /land-and-deploy",
+        "Pull-request creation → use user-approved manual GitHub steps; merge and deploy an "
+        "existing pull request → invoke /land-and-deploy",
+    )
+    content = content.replace(
+        "Full review pipeline → invoke /autoplan",
+        "Full review pipeline → run /plan-ceo-review, /plan-eng-review, "
+        "/plan-design-review, and /plan-devex-review individually as applicable",
+    )
+    content = content.replace(
+        'User wants all reviews done automatically, "review everything" → invoke `/autoplan`',
+        "User wants all reviews done → run `/plan-ceo-review`, `/plan-eng-review`, "
+        "`/plan-design-review`, and `/plan-devex-review` individually as applicable",
+    )
+    content = content.replace(
+        "User asks for safety mode, careful mode → invoke `/careful` or `/guard`",
+        "User asks for safety mode or careful mode → explain that Prime cannot enforce the "
+        "excluded hook mode; ask for an explicit safety boundary, treat it as a controlling "
+        "constraint, and stop before any action outside it",
+    )
+    content = content.replace(
+        "User asks to restrict edits to a directory → invoke `/freeze` or `/unfreeze`",
+        "User asks to restrict edits to a directory → ask for the exact directory, confine "
+        "all reads and writes to it, and require explicit approval before changing the boundary; "
+        "state that Prime does not provide hook enforcement",
+    )
+    content = content.replace(
+        'User asks to launch a real browser for QA, "open the browser" → invoke '
+        "`/open-gstack-browser`",
+        "User asks to open a browser for QA → invoke `/browse` for the retained headless "
+        "browser, or state that headed interactive browsing is not installed",
+    )
     unsupported_routes = (
         "careful",
         "freeze",
@@ -456,7 +521,8 @@ manual copy has been installed or benchmarked.""",
     )
     content = content.replace(
         "Ship/deploy/PR → invoke manual pull-request and release preparation or ",
-        "Ship/deploy/PR → use ",
+        "Pull-request creation → use user-approved manual GitHub steps; merge and deploy an "
+        "existing pull request → invoke ",
     )
     content = content.replace(
         "suggest manual script preservation so the",

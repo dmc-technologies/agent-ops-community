@@ -426,3 +426,119 @@ description: Route workflows.
     assert "provide `gh pr create` or GitHub web steps" in routing
     assert "continue with the retained Prime review" in routing
     assert "→ invoke" not in routing
+
+
+def test_nested_review_and_version_gates_survive_fallback_adaptation() -> None:
+    engineering = gstack_prime._adapt_prime_contract(
+        """---
+name: gstack-plan-eng-review
+description: Review engineering.
+---
+## Prerequisite Skill Offer
+Run `/office-hours` before review.
+### Step 0: Scope Challenge
+If the plan touches more than 8 files, **STOP.** Do NOT proceed until the user responds.
+## Section 1
+Continue only after Step 0.
+""",
+        {"gstack-plan-eng-review"},
+        "agentops-gstack-plan-eng-review",
+    )
+    assert "### Step 0: Scope Challenge" in engineering
+    assert "more than 8 files" in engineering
+    assert "**STOP.** Do NOT proceed" in engineering
+    assert "/office-hours" not in engineering
+
+    executive = gstack_prime._adapt_prime_contract(
+        """---
+name: gstack-plan-ceo-review
+description: Review product direction.
+---
+## Prerequisite Skill Offer
+Run `/office-hours` before review.
+**Mid-session detection:** Run `/office-hours` if the problem is unclear.
+### Retrospective Check
+Inspect prior outcomes.
+### Frontend/UI Scope Detection
+Inspect UI scope.
+### Landscape Check
+Inspect current alternatives.
+## Section 1
+Continue the review.
+""",
+        {"gstack-plan-ceo-review"},
+        "agentops-gstack-plan-ceo-review",
+    )
+    assert "### Retrospective Check" in executive
+    assert "### Frontend/UI Scope Detection" in executive
+    assert "### Landscape Check" in executive
+    assert "Discuss the product directly" in executive
+    assert "/office-hours" not in executive
+
+    deployment = gstack_prime._adapt_prime_contract(
+        """---
+name: gstack-land-and-deploy
+description: Land safely.
+---
+## Step 3.4: VERSION drift detection (workspace-aware ship)
+```bash
+BRANCH_VERSION=$(git show HEAD:VERSION)
+QUEUE_JSON=$(bun run bin/gstack-next-version --base main --bump patch)
+NEXT_SLOT=$(echo "$QUEUE_JSON" | jq -r '.version // empty')
+OFFLINE=$(echo "$QUEUE_JSON" | jq -r '.offline // false')
+```
+If `OFFLINE=true`, continue with CI as the backstop.
+If drift is detected: **STOP** and print:
+   Rerun /ship from the feature branch to reconcile. /ship's ALREADY_BUMPED
+   branch will detect the drift and rewrite VERSION + CHANGELOG header + PR title
+   atomically. Do NOT merge from here — the landed PR would overwrite the other
+   branch's CHANGELOG entry or land with a duplicate version header.
+Exit non-zero. Do NOT merge until manual reconciliation is complete.
+## Step 3.5
+Continue only without drift.
+""",
+        {"gstack-land-and-deploy"},
+        "agentops-gstack-land-and-deploy",
+    )
+    assert "BRANCH_VERSION=$(git show HEAD:VERSION)" in deployment
+    assert "QUEUE_JSON=$(bun run bin/gstack-next-version" in deployment
+    assert "If `OFFLINE=true`" in deployment
+    assert "If drift is detected: **STOP**" in deployment
+    assert "Reconcile the feature branch manually" in deployment
+    assert "Exit non-zero" in deployment
+    assert "/ship" not in deployment
+
+
+def test_shared_and_root_routing_uses_concrete_supported_actions() -> None:
+    content = """---
+name: gstack
+description: Route requests.
+---
+Ship/deploy/PR → invoke /ship or /land-and-deploy
+Full review pipeline → invoke /autoplan
+User asks for safety mode, careful mode → invoke `/careful` or `/guard`
+User asks to restrict edits to a directory → invoke `/freeze` or `/unfreeze`
+User asks to launch a real browser for QA, "open the browser" → invoke `/open-gstack-browser`
+"""
+    names = {
+        "gstack",
+        "gstack-land-and-deploy",
+        "gstack-plan-ceo-review",
+        "gstack-plan-eng-review",
+        "gstack-plan-design-review",
+        "gstack-plan-devex-review",
+        "gstack-browse",
+    }
+    adapted = gstack_prime._adapt_prime_contract(content, names, "agentops-gstack")
+
+    assert "Pull-request creation → use user-approved manual GitHub steps" in adapted
+    assert "merge and deploy an existing pull request" in adapted
+    assert "/skill:agentops-gstack-land-and-deploy" in adapted
+    assert "ask for an explicit safety boundary" in adapted
+    assert "confine all reads and writes" in adapted
+    assert "Prime does not provide hook enforcement" in adapted
+    assert "/skill:agentops-gstack-browse" in adapted
+    for review in ("ceo", "eng", "design", "devex"):
+        assert f"/skill:agentops-gstack-plan-{review}-review" in adapted
+    for excluded in ("/ship", "/autoplan", "/careful", "/guard", "/freeze", "/unfreeze"):
+        assert excluded not in adapted
