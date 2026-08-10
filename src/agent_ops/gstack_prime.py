@@ -638,8 +638,10 @@ def install_prime_gstack(
     ) as temporary:
         temporary_root = Path(temporary)
         pristine = temporary_root / "pristine"
+        legacy_expected = temporary_root / "legacy-expected"
         source = temporary_root / "source"
         _extract_pinned_checkout(checkout, pristine)
+        shutil.copytree(pristine, legacy_expected)
         shutil.copytree(pristine, source)
         _add_prime_host(source)
         _patch_browse_runtime(source)
@@ -680,7 +682,7 @@ def install_prime_gstack(
         new_files, modes = _collect_files(source)
 
         manifest = _load_manifest(target)
-        migrate_legacy = _preflight(target, new_files, manifest, pristine)
+        migrate_legacy = _preflight(target, new_files, manifest, legacy_expected)
         old_files = manifest["files"] if manifest else {}
         assert isinstance(old_files, dict)
         fingerprints = {relative: _sha256(data) for relative, data in sorted(new_files.items())}

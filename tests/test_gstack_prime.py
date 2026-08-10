@@ -33,6 +33,7 @@ def _upstream_repo(path: Path) -> tuple[Path, Path, str]:
     (path / "ETHOS.md").write_text("runtime ethos\n")
     (path / "review/checklist.md").write_text("review checklist\n")
     (path / "qa/templates/report.md").write_text("qa report\n")
+    (path / "review-link").symlink_to("review", target_is_directory=True)
     bun = path.parent / "fake-bun"
     bun.write_text(
         """#!/usr/bin/env python3
