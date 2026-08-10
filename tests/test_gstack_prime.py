@@ -27,6 +27,7 @@ def _upstream_repo(path: Path) -> tuple[Path, Path, str]:
         "});\n"
     )
     (path / "browse/src/server.ts").write_text("console.log('server')\n")
+    (path / "browse/src/cdp-allowlist.ts").write_text("export const CDP_ALLOWLIST = {}\n")
     (path / "package.json").write_text('{"scripts":{"build":"fixture"}}\n')
     (path / "bun.lock").write_text("frozen lock\n")
     (path / "bin/gstack-config").write_text("#!/bin/sh\necho ~/.claude/skills/gstack\n")
@@ -309,3 +310,28 @@ def test_logical_namespaced_skill_collision_is_preserved(
     ):
         gstack_prime.install_prime_gstack(upstream, target, bun=bun)
     assert collision.read_bytes() == before
+
+
+def test_install_rejects_profile_path_unsafe_for_generated_shell_commands(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    upstream, bun, ref = _upstream_repo(tmp_path / "upstream")
+    monkeypatch.setattr(gstack_prime, "PINNED_GSTACK_REF", ref)
+    target = tmp_path / "Prime Agent"
+
+    with pytest.raises(gstack_prime.GstackPrimeSourceError, match="unquoted POSIX shell word"):
+        gstack_prime.install_prime_gstack(upstream, target, bun=bun)
+
+    assert not target.exists()
+    assert not (tmp_path / "bun-commands.log").exists()
+
+
+def test_reference_validator_rejects_provider_and_excluded_skill_routes(tmp_path: Path) -> None:
+    target = tmp_path / "prime"
+    files = {
+        "skills/agentops-gstack-review/SKILL.md": b"Run codex exec and then /ship.\n",
+        ".agentops/runtime/gstack/browse/src/cdp-allowlist.ts": b"allowlist\n",
+    }
+
+    with pytest.raises(gstack_prime.GstackPrimeSourceError, match="codex exec"):
+        gstack_prime._validate_reference_closure(files, target)

@@ -379,3 +379,41 @@ def test_logical_namespaced_frontmatter_collision_is_preserved(tmp_path: Path) -
     assert _tree_fingerprint(destination) == before
     assert "person-owned" in collision.read_text()
     assert not (destination.parent / OWNERSHIP_MANIFEST_RELATIVE).exists()
+
+
+@pytest.mark.parametrize("escape", ["skills", ".agentops", ".agentops/skill-dependencies"])
+def test_install_rejects_symlinked_profile_write_paths(
+    tmp_path: Path, escape: str
+) -> None:
+    upstream = _write_upstream(tmp_path / "upstream")
+    profile = tmp_path / "prime"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "sentinel.txt"
+    sentinel.write_text("person-owned\n", encoding="utf-8")
+    link = profile / escape
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(SuperpowersCollisionError, match="symbolic link"):
+        install_prime_superpowers(upstream, profile / "skills")
+
+    assert sentinel.read_text(encoding="utf-8") == "person-owned\n"
+    assert sorted(path.relative_to(outside).as_posix() for path in outside.rglob("*")) == [
+        "sentinel.txt"
+    ]
+    assert not (profile / OWNERSHIP_MANIFEST_RELATIVE).is_file()
+
+
+def test_install_rejects_dangling_skills_symlink(tmp_path: Path) -> None:
+    upstream = _write_upstream(tmp_path / "upstream")
+    profile = tmp_path / "prime"
+    profile.mkdir()
+    destination = profile / "skills"
+    destination.symlink_to(tmp_path / "missing-skills", target_is_directory=True)
+
+    with pytest.raises(SuperpowersCollisionError, match="symbolic link"):
+        install_prime_superpowers(upstream, destination)
+
+    assert destination.is_symlink()
+    assert not (profile / OWNERSHIP_MANIFEST_RELATIVE).exists()
