@@ -7,6 +7,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from agent_ops.gstack_prime import install_prime_gstack
 from agent_ops.registries.models import Framework, SkillDependency, SkillDependencyInstall
 from agent_ops.superpowers_adapter import install_prime_superpowers
 
@@ -140,6 +141,11 @@ def _install_dependency(
     destination: Path,
     install: SkillDependencyInstall,
 ) -> None:
+    if install.strategy == "prime-gstack":
+        if dependency_id != "gstack":
+            raise ValueError("prime-gstack strategy is only valid for gstack")
+        install_prime_gstack(source, destination)
+        return
     if install.strategy in {"gstack", "copy-repo"}:
         _replace_tree(source, destination)
         return

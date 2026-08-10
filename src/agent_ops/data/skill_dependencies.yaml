@@ -2,7 +2,7 @@
   name: GStack
   repo: https://github.com/garrytan/gstack.git
   ref: 74895062fb8a3acbf9f66cd088a83359aaaa56cd
-  version: "0.13.3.0"
+  version: "1.32.0.0"
   license: MIT
   install:
     codex:
@@ -15,8 +15,8 @@
       strategy: gstack
       destination: skills/gstack
     prime-agent:
-      strategy: gstack
-      destination: skills/gstack
+      strategy: prime-gstack
+      destination: .
     portable:
       strategy: copy-repo
       destination: dependencies/gstack
