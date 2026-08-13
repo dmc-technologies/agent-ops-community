@@ -542,16 +542,6 @@ def _reject_opencode_collisions(root: Path, *, allowed_fingerprint: str) -> None
     root_skill = root / "SKILL.md"
     if root_skill.is_file():
         _reject_candidate_skill(root_skill, allowed_fingerprint=allowed_fingerprint)
-    for flat_file in root.iterdir():
-        if flat_file.is_file() and flat_file.suffix.lower() == ".md":
-            if flat_file.name.lower() == f"{SKILL_NAME}.md":
-                raise ShowMeCollisionError(
-                    f"logical skill-path collision for {SKILL_NAME} at {flat_file}"
-                )
-            if _host_visible_skill_name(flat_file) == SKILL_NAME:
-                raise ShowMeCollisionError(
-                    f"logical skill-name collision for {SKILL_NAME} at {flat_file}"
-                )
     visit(root)
 
 

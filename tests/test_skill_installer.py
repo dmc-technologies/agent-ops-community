@@ -682,16 +682,16 @@ def test_openclaw_home_matches_operator_home_precedence(
     )
 
 
-def test_opencode_refuses_other_global_root_and_flat_markdown_collisions(
+def test_opencode_ignores_flat_markdown_in_other_global_root(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
     source = _show_me_source(tmp_path / "source")
     os_home = tmp_path / "os-home"
     target = os_home / ".agents"
-    collision = os_home / ".config" / "opencode" / "skills" / "show-me.md"
-    collision.parent.mkdir(parents=True)
-    collision.write_text("---\ndescription: old copy\n---\n", encoding="utf-8")
+    unrelated = os_home / ".config" / "opencode" / "skills" / "show-me.md"
+    unrelated.parent.mkdir(parents=True)
+    unrelated.write_text("---\ndescription: not a loadable skill\n---\n", encoding="utf-8")
     monkeypatch.setenv("HOME", str(os_home))
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     monkeypatch.delenv("OPENCODE_CONFIG_DIR", raising=False)
@@ -699,19 +699,13 @@ def test_opencode_refuses_other_global_root_and_flat_markdown_collisions(
         "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
     )
 
-    try:
-        install_skill_dependencies(
-            framework=Framework.OPENCODE,
-            dependencies=[_show_me_dependency(Framework.OPENCODE)],
-            home=target,
-        )
-    except ShowMeCollisionError as exc:
-        assert "logical skill-path collision" in str(exc)
-        assert "show-me.md" in str(exc)
-    else:
-        raise AssertionError("expected other OpenCode global root collision to fail")
+    install_skill_dependencies(
+        framework=Framework.OPENCODE,
+        dependencies=[_show_me_dependency(Framework.OPENCODE)],
+        home=target,
+    )
 
-    assert not (target / "skills" / "show-me").exists()
+    assert (target / "skills" / "show-me" / "SKILL.md").is_file()
 
 
 def test_openclaw_default_state_refuses_personal_agent_skill_collision(
