@@ -751,7 +751,7 @@ def test_openclaw_default_state_refuses_personal_agent_skill_collision(
     assert not (os_home / ".openclaw" / "skills" / "show-me").exists()
 
 
-def test_openclaw_custom_state_excludes_personal_agent_skill_root(
+def test_openclaw_custom_state_at_default_path_checks_personal_agent_skill_root(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -763,7 +763,7 @@ def test_openclaw_custom_state_excludes_personal_agent_skill_root(
         "---\nname: show-me\ndescription: default only\n---\n",
         encoding="utf-8",
     )
-    custom_state = tmp_path / "custom-state"
+    custom_state = os_home / ".openclaw"
     monkeypatch.setenv("HOME", str(os_home))
     monkeypatch.setenv("OPENCLAW_STATE_DIR", str(custom_state))
     monkeypatch.delenv("OPENCLAW_HOME", raising=False)
@@ -772,12 +772,17 @@ def test_openclaw_custom_state_excludes_personal_agent_skill_root(
         "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
     )
 
-    install_skill_dependencies(
-        framework=Framework.OPENCLAW,
-        dependencies=[_show_me_dependency(Framework.OPENCLAW)],
-    )
+    try:
+        install_skill_dependencies(
+            framework=Framework.OPENCLAW,
+            dependencies=[_show_me_dependency(Framework.OPENCLAW)],
+        )
+    except ShowMeCollisionError as exc:
+        assert "logical skill-path collision" in str(exc)
+    else:
+        raise AssertionError("expected default-path personal OpenClaw collision to fail")
 
-    assert (custom_state / "skills" / "show-me" / "SKILL.md").is_file()
+    assert not (custom_state / "skills" / "show-me").exists()
 
 
 def test_openclaw_config_path_selects_managed_skill_root(
@@ -1012,6 +1017,133 @@ def test_openclaw_legacy_state_does_not_relocate_managed_skills(
 
     assert (os_home / ".openclaw" / "skills" / "show-me" / "SKILL.md").is_file()
     assert not (os_home / ".clawdbot" / "skills" / "show-me").exists()
+
+
+def test_openclaw_config_path_at_default_root_checks_personal_agent_skill(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = _show_me_source(tmp_path / "source")
+    os_home = tmp_path / "os-home"
+    personal = os_home / ".agents" / "skills" / "show-me"
+    personal.mkdir(parents=True)
+    (personal / "SKILL.md").write_text(
+        "---\nname: show-me\ndescription: personal\n---\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(os_home))
+    monkeypatch.setenv(
+        "OPENCLAW_CONFIG_PATH",
+        str(os_home / ".openclaw" / "openclaw.json"),
+    )
+    monkeypatch.delenv("OPENCLAW_HOME", raising=False)
+    monkeypatch.delenv("OPENCLAW_STATE_DIR", raising=False)
+    monkeypatch.delenv("OPENCLAW_PROFILE", raising=False)
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
+    )
+
+    try:
+        install_skill_dependencies(
+            framework=Framework.OPENCLAW,
+            dependencies=[_show_me_dependency(Framework.OPENCLAW)],
+        )
+    except ShowMeCollisionError as exc:
+        assert "logical skill-path collision" in str(exc)
+    else:
+        raise AssertionError("expected config-only personal collision to fail")
+
+
+def test_codex_and_cursor_check_all_global_compatibility_roots(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = _show_me_source(tmp_path / "source")
+    os_home = tmp_path / "os-home"
+    monkeypatch.setenv("HOME", str(os_home))
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
+    )
+
+    for framework, root in (
+        (Framework.CODEX, os_home / ".agents"),
+        (Framework.CURSOR, os_home / ".codex"),
+        (Framework.CURSOR, os_home / ".claude"),
+        (Framework.CURSOR, os_home / ".agents"),
+    ):
+        collision = root / "skills" / "show-me"
+        collision.mkdir(parents=True)
+        (collision / "SKILL.md").write_text(
+            "---\nname: show-me\ndescription: existing\n---\n",
+            encoding="utf-8",
+        )
+        try:
+            install_skill_dependencies(
+                framework=framework,
+                dependencies=[_show_me_dependency(framework)],
+                home=os_home / f"target-{framework.value}-{root.name}",
+            )
+        except ShowMeCollisionError as exc:
+            assert "logical skill-path collision" in str(exc)
+        else:
+            raise AssertionError(f"expected {framework.value} compatibility collision")
+        shutil.rmtree(root)
+
+
+def test_opencode_external_disable_uses_native_config_skill_root(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = _show_me_source(tmp_path / "source")
+    os_home = tmp_path / "os-home"
+    xdg = tmp_path / "xdg"
+    monkeypatch.setenv("HOME", str(os_home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    monkeypatch.setenv("OPENCODE_DISABLE_EXTERNAL_SKILLS", "1")
+    monkeypatch.delenv("OPENCODE_CONFIG_DIR", raising=False)
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
+    )
+
+    assert default_framework_home(Framework.OPENCODE) == xdg / "opencode"
+    install_skill_dependencies(
+        framework=Framework.OPENCODE,
+        dependencies=[_show_me_dependency(Framework.OPENCODE)],
+    )
+
+    assert (xdg / "opencode" / "skills" / "show-me" / "SKILL.md").is_file()
+    assert not (os_home / ".agents" / "skills" / "show-me").exists()
+
+
+def test_opencode_collision_scans_singular_and_plural_config_roots(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = _show_me_source(tmp_path / "source")
+    os_home = tmp_path / "os-home"
+    config = tmp_path / "config"
+    monkeypatch.setenv("HOME", str(os_home))
+    monkeypatch.setenv("OPENCODE_CONFIG_DIR", str(config))
+    monkeypatch.setenv("OPENCODE_DISABLE_EXTERNAL_SKILLS", "true")
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
+    )
+
+    collision = config / "skill" / "show-me"
+    collision.mkdir(parents=True)
+    (collision / "SKILL.md").write_text(
+        "---\nname: show-me\ndescription: singular\n---\n",
+        encoding="utf-8",
+    )
+    try:
+        install_skill_dependencies(
+            framework=Framework.OPENCODE,
+            dependencies=[_show_me_dependency(Framework.OPENCODE)],
+        )
+    except ShowMeCollisionError as exc:
+        assert "logical skill-path collision" in str(exc)
+    else:
+        raise AssertionError("expected singular OpenCode collision")
 
 
 def test_openclaw_home_rejects_unsafe_profile_name(

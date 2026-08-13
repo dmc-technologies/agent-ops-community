@@ -34,15 +34,35 @@ def default_framework_home(framework: Framework) -> Path:
     }
     fixed_defaults = {
         Framework.CURSOR: "~/.cursor",
-        Framework.OPENCODE: "~/.agents",
         Framework.LOCAL: "~/.agentops",
     }
     if framework is Framework.OPENCLAW:
         return _default_openclaw_home()
+    if framework is Framework.OPENCODE:
+        return _default_opencode_home()
     if framework in fixed_defaults:
         return Path(fixed_defaults[framework]).expanduser()
     variable, default = environment_defaults[framework]
     return Path(os.environ.get(variable) or default).expanduser()
+
+
+def _environment_truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true"}
+
+
+def _opencode_config_home() -> Path:
+    configured = _normalize_home_value(os.environ.get("OPENCODE_CONFIG_DIR"))
+    if configured is not None:
+        return Path(configured).expanduser().resolve()
+    xdg_config = _normalize_home_value(os.environ.get("XDG_CONFIG_HOME"))
+    base = Path(xdg_config).expanduser() if xdg_config is not None else Path.home() / ".config"
+    return (base / "opencode").resolve()
+
+
+def _default_opencode_home() -> Path:
+    if _environment_truthy("OPENCODE_DISABLE_EXTERNAL_SKILLS"):
+        return _opencode_config_home()
+    return Path("~/.agents").expanduser()
 
 
 def _normalize_home_value(value: str | None) -> str | None:
@@ -129,29 +149,28 @@ def _openclaw_uses_default_state(target_home: Path) -> bool:
         if configured_home is not None
         else os_home
     )
-    state_override = _normalize_home_value(os.environ.get("OPENCLAW_STATE_DIR"))
-    config_path = _normalize_home_value(os.environ.get("OPENCLAW_CONFIG_PATH"))
-    profile = _normalize_home_value(os.environ.get("OPENCLAW_PROFILE"))
-    if state_override is not None or config_path is not None:
-        return False
-    if profile is not None and profile.lower() != "default":
-        return False
     return target_home.resolve() == (effective_home / ".openclaw").resolve()
+
 
 def _show_me_collision_roots(framework: Framework, target_home: Path) -> tuple[Path, ...]:
     os_home = _openclaw_os_home()
-    if framework is Framework.OPENCODE:
-        xdg_config = _normalize_home_value(os.environ.get("XDG_CONFIG_HOME"))
-        default_config = (
-            Path(xdg_config).resolve() if xdg_config is not None else os_home / ".config"
-        ) / "opencode"
-        configured = _normalize_home_value(os.environ.get("OPENCODE_CONFIG_DIR"))
+    if framework is Framework.CODEX:
+        roots = [os_home / ".agents" / "skills"]
+    elif framework is Framework.CURSOR:
         roots = [
-            default_config / "skills",
-            *([Path(configured).resolve() / "skills"] if configured is not None else []),
-            os_home / ".claude" / "skills",
             os_home / ".agents" / "skills",
+            os_home / ".claude" / "skills",
+            os_home / ".codex" / "skills",
         ]
+    elif framework is Framework.OPENCODE:
+        roots = [_opencode_config_home() / "skill", _opencode_config_home() / "skills"]
+        if not _environment_truthy("OPENCODE_DISABLE_EXTERNAL_SKILLS"):
+            roots.append(os_home / ".agents" / "skills")
+            if not (
+                _environment_truthy("OPENCODE_DISABLE_CLAUDE_CODE")
+                or _environment_truthy("OPENCODE_DISABLE_CLAUDE_CODE_SKILLS")
+            ):
+                roots.append(os_home / ".claude" / "skills")
     elif framework is Framework.OPENCLAW and _openclaw_uses_default_state(target_home):
         roots = [os_home / ".agents" / "skills"]
     else:
