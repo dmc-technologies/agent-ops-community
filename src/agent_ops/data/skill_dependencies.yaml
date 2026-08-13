@@ -46,3 +46,35 @@
     portable:
       strategy: copy-repo
       destination: dependencies/superpowers
+
+- id: humanlayer-show-me
+  name: HumanLayer Show Me
+  repo: https://github.com/humanlayer/skills.git
+  ref: 4d8d644ca747517973f58d7953f58d7cd07520cd
+  version: "1.0.0"
+  license: MIT
+  install:
+    codex:
+      strategy: humanlayer-show-me
+      source: plugins/show-me/skills
+      destination: skills
+    claude-code:
+      strategy: humanlayer-show-me
+      source: plugins/show-me/skills
+      destination: skills
+    cursor:
+      strategy: humanlayer-show-me
+      source: plugins/show-me/skills
+      destination: skills
+    openclaw:
+      strategy: humanlayer-show-me
+      source: plugins/show-me/skills
+      destination: skills
+    opencode:
+      strategy: humanlayer-show-me
+      source: plugins/show-me/skills
+      destination: skills
+    prime-agent:
+      strategy: humanlayer-show-me
+      source: plugins/show-me/skills
+      destination: skills

@@ -15,7 +15,7 @@
   - KNOWLEDGE_GIT_URL
   config_paths:
   - ${CODEX_HOME:-~/.codex}/config.toml
-  - ${CLAUDE_HOME:-~/.claude}
+  - ${CLAUDE_CONFIG_DIR:-~/.claude}
   - ${AGENT_KNOWLEDGE_HOME:-~/agent-knowledge}
   requires: []
 - id: github

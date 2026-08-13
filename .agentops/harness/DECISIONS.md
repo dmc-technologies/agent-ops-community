@@ -4,6 +4,13 @@ Repository: `agent-ops-community`
 
 Record durable architecture, workflow, and harness decisions here.
 
+### 2026-08-13: HumanLayer show-me stays an exact pinned dependency
+
+- Decision: install only `plugins/show-me/skills/show-me` from `humanlayer/skills` version 1.0.0 at commit `4d8d644ca747517973f58d7953f58d7cd07520cd` through a fingerprint-owned transactional adapter for all six managed agent hosts. Keep the upstream skill identity and core instructions, but replace its host-specific HTML opener with a portable artifact-preview fallback.
+- Rationale: one exact upstream commit makes harness installation reproducible while preserving the requested skill identity, excluding the repository's four unrelated skills, refusing user-owned collisions, and keeping the HTML artifact path usable across agent hosts.
+- Applies to: the source and packaged skill-dependency registries, framework skill installation, and Prime Agent setup documentation.
+- Revisit when: HumanLayer publishes a required correction, the skill gains executable resources, or a supported framework needs a host-specific adaptation.
+
 ### 2026-08-09: Prime Agent uses native handoff and namespaced owned bundles
 
 - Decision: register Prime Agent as `prime-agent`; require every framework command handoff to receive an existing directory through `--cwd`; hand context packs to `prime-agent --print --cwd <repo> -- <prompt>` using that same directory; default installs to `${PRIME_AGENT_CODING_AGENT_DIR:-$HOME/.prime/agent}`; and generate namespaced `agentops-gstack-*` and `agentops-superpowers-*` skills with fingerprint ownership manifests outside the shared skill namespace.
@@ -59,6 +66,13 @@ Record durable architecture, workflow, and harness decisions here.
 - Rationale: Exclusion is the smallest safe correction when text substitution would mislabel an external provider or a retained workflow would require omitted or provider-specific runtime behavior. Failing before writes preserves profile confinement and prevents commands from splitting an absolute path.
 - Applies to: Prime gstack generation, Superpowers installation, focused adapter tests, and Prime support documentation.
 - Revisit when: a workflow has an explicit Prime-native provider operation and complete packaged runtime, or generated gstack commands gain context-aware path serialization.
+
+### 2026-08-13: Adapted show-me installation follows each host's active profile and filesystem capabilities
+
+- Decision: HumanLayer `show-me` installs through a dedicated ownership transaction. POSIX hosts use no-follow directory descriptors and `/dev/fd`; Windows uses reparse-point checks, `msvcrt` locking, same-volume atomic renames, and the same fingerprint recovery rules. Collision discovery recursively checks nested host-visible skill definitions, OpenCode root Markdown definitions, and every documented global compatibility or configured root for Codex, Cursor, OpenCode, and OpenClaw; it refuses linked definitions it cannot confine and permits an alternate-root copy only when its exact bytes match the adapted installation. OpenClaw profile selection follows `OPENCLAW_STATE_DIR`, then the parent of `OPENCLAW_CONFIG_PATH`, then a validated `OPENCLAW_PROFILE`, then normalized `OPENCLAW_HOME`, `HOME`, `USERPROFILE`, Termux, and native account-home precedence. Legacy `.clawdbot` state discovery does not relocate the managed config-directory skill root.
+- Rationale: The managed installer must neither overwrite user-authored skills nor write into a host's inactive profile, and its safety contract must work on macOS and Windows rather than depending on Linux procfs or locking APIs.
+- Applies to: `src/agent_ops/show_me_adapter.py`, `src/agent_ops/skill_installer.py`, generated bootstraps, and skill-installer tests.
+- Revisit when: a supported host changes global skill discovery, OpenClaw changes state/config precedence, or Python exposes a stronger Windows directory-relative filesystem API.
 
 ## Template
 

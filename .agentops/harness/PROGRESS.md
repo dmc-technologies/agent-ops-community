@@ -4,25 +4,73 @@ Repository: `agent-ops-community`
 
 ## Current State
 
-- Branch: `fix/prime-runtime-contracts`
-- Main baseline: the merged first Prime integration and its first public correction.
-- Current handoff: public pull request 13 now excludes `document-release` and `land-and-deploy` because Prime cannot safely reproduce their provider, release-artifact, and merge-head guarantees. The correction retains 29 verified gstack skills, preserves nested review and safety gates, and routes request creation by provider while requiring an explicit repository-owned procedure for merge, deployment, and release work.
-- Verification: Ruff, 102 tests, the source-tree harness check, and whitespace validation pass. A real pinned update installed 29 gstack and 14 Superpowers skills; neither excluded release workflow nor any route to it exists in generated Prime skills.
+- Branch: `feat/humanlayer-show-me-skill`
+- Main baseline: `4eda2a8`, the merge of public pull request 13.
+- Current handoff: public `agent-ops-community` pull request 14 pins HumanLayer's `show-me` skill at upstream commit `4d8d644ca747517973f58d7953f58d7cd07520cd` and configures it for all six Agent Ops agent hosts without importing the repository's four unrelated skills. Three Review Gate cycles exposed unsafe replacement, incomplete discovery, non-durable recovery, Linux-only filesystem assumptions, incomplete nested collision detection, and incorrect OpenClaw profile resolution. The corrected adapter now refuses unowned or modified targets, owns updates by fingerprint, locks and recovers durable transactions on POSIX and Windows, preserves changed crash-recovery content, scans flat and nested skill identities through confined no-follow operations, resolves OpenClaw's active state precedence, and uses a portable artifact-preview fallback. Replacement hosted acceptance, merge, and the post-merge package refresh remain pending external finalization. No external tracker applies to this public package change.
+- Verification: the registry contract test failed before the dependency was added and now passes. Complete Ruff, all 173 tests, the source-tree harness check, whitespace validation, focused installer/framework tests, six exact pinned disposable installs, POSIX and Windows-path transaction tests, interruption recovery, changed-target preservation, recursive collision, and no-follow profile-confinement checks pass.
 
 ## Current Work
 
-- Goal: make Prime Agent a first-class supported framework without overwriting user-authored skills.
-- Active task: complete and merge one narrow post-merge correction, then resume the paused canonical reinstall.
-- Files in play: only the gstack adapter, Superpowers destination confinement, focused tests, Prime documentation, and this handoff.
-- Blockers: hosted deterministic checks and Review Gate on the updated corrective pull request.
+- Goal: make the requested visual-explanation skill available through both machine-global discovery and reproducible Agent Ops harness installation.
+- Active task: publish the verified public dependency change and obtain hosted CI and Review Gate on the final pull-request head.
+- Files in play: the source and packaged dependency registries, installation contract test, public setup documentation, and harness handoff records.
+- Blockers: no product or implementation blocker. Hosted acceptance and merge remain external.
 
 ## Next Actions
 
-- Run the full public verification set and exact four-finding acceptance reproductions.
-- Open and merge the narrow corrective pull request after hosted CI and Review Gate pass.
-- Reinstall from both canonical main branches, restart Prime sessions, and complete the approved Agent Knowledge write with immediate readback during clock-out.
+- Obtain hosted CI and Review Gate on the unchanged final head of public `agent-ops-community` pull request 14.
+- Merge public `agent-ops-community` pull request 14 only after the required checks pass.
+- After merge, refresh the installed Agent Ops package from public `main`; the machine-global and Prime Agent copies are already installed.
 
 ## Session Log
+
+- 2026-08-13: Review Gate run `31703138089` found missing higher-precedence OpenClaw roots. Collision discovery now includes the personal compatibility root whenever the selected state is the default regardless of config location, plus default and configured agent workspace `skills` and `.agents/skills` roots.
+
+- 2026-08-13: Review Gate run `31701642780` found a POSIX target-replacement race and OpenClaw target-context mismatch. POSIX updates now pin the exact managed target identity, verify the renamed backup before promoting the stage, and restore a concurrent replacement on mismatch. OpenClaw discovery now carries the selected target state through config, limits, compatibility roots, and plugin scanning, including separate config and state paths.
+
+- 2026-08-13: Review Gate run `31699523095` found three configuration-source mismatches after Windows CI passed. The installer now honors exact `OPENCODE_DB` selection and active organization state, keeps explicit isolated OpenClaw state independent from the default profile, and fails closed before checkout when active OpenClaw plugin sources make the skill inventory unreproducible.
+
+- 2026-08-13: Review Gate run `31695523335` found a Windows time-of-check/time-of-use race and mapped-drive rejection. Windows transactions now pin verified directory and exact child identities with native no-follow handles, perform tree renames and state-file deletion through those handles, use atomic handle-renamed state writes, compare volume/file identities rather than drive spellings, and preserve quarantined transaction trees instead of unsafe recursive deletion. CI now includes a native Windows job for sharing, mapped-drive, and Win32 ABI coverage.
+
+- 2026-08-13: Review Gate run `31694353828` found that adapted installed copies omitted HumanLayer's MIT notice. Every staged copy now includes the pinned repository's exact `LICENSE`; the installed-tree ownership fingerprint covers it, so later modification or omission fails verification.
+
+- 2026-08-13: Review Gate run `31692930249` found two additional OpenCode global sources: enterprise-managed configuration and remote skill catalogs. The installer now merges the platform system-managed files and macOS managed preferences at runtime precedence, rejects configured `skills.urls` before checkout because remote catalog contents are not reproducible, and tests both behaviors.
+
+- 2026-08-13: Review Gate run `31690383803` found that configured collision roots were scanned more broadly than their hosts load. Collision discovery now matches each active host: OpenClaw applies ignored directories, bounded candidates, depth, file-size limits, terminal skill roots, and symlink containment/allowlists; OpenCode applies its recursive visible-path scan; Codex applies its hidden-directory, depth, entry, response-size, and symlink rules. Frontmatter identity checks use string-preserving YAML scalar semantics so unrelated names such as unquoted `on` are not rejected.
+
+- 2026-08-13: Review Gate run `31688053732` found that OpenClaw profile projection still happened after config-path selection in one combination. Profile projection now occurs first: an explicit state override wins, otherwise a named profile selects its isolated state and managed skills even when an explicit config path remains in the environment; the personal-agent compatibility root is excluded for that isolated state.
+
+- 2026-08-13: An independent configured-root review found two OpenClaw edge cases before final acceptance. Named-profile config discovery now uses the same profile state as the install target when projected state/config overrides are absent, and relative `OPENCLAW_INCLUDE_ROOTS` values are rejected before path resolution exactly as the host requires.
+
+- 2026-08-13: Review Gate run `31684393102` found three configured global sources still outside collision checks. Codex now checks the machine-admin skill root (`/etc/codex/skills` or Windows ProgramData). OpenCode parses its global JSON/JSONC layers, inline override, environment/file substitutions, and absolute or home-relative `skills.paths`; workspace-relative roots fail closed because no global installation can enumerate every workspace. OpenClaw parses the active JSON5 config, bounded `$include` chain, environment substitution, and `skills.load.extraDirs` using effective-home, state, config, and legacy candidate precedence.
+
+- 2026-08-13: Review Gate run `31683131861` found two remaining loader-precedence cases. OpenCode now retains its XDG native root alongside `OPENCODE_CONFIG_DIR`, including singular and plural skill directories. OpenClaw now classifies personal-agent visibility from state semantics: a custom config path still uses personal skills when no state override exists, while an explicit non-default state path does not.
+
+- 2026-08-13: Review Gate run `31681219551` identified unmodeled host-visible roots. The installer now checks Codex's personal-agent root; Cursor's personal-agent, Claude, and Codex compatibility roots; OpenCode's singular and plural native config roots plus enabled compatibility roots; and OpenClaw's personal-agent root whenever the resolved managed path is the default. With `OPENCODE_DISABLE_EXTERNAL_SKILLS=1`, OpenCode now installs under its XDG/config native root rather than the disabled personal-agent root.
+
+- 2026-08-13: Review Gate run `31679772525` separated OpenClaw's current managed config-directory skill root from its legacy state fallback. A legacy `~/.clawdbot` no longer relocates installation away from `~/.openclaw`, and a named profile is classified as isolated so a default personal-agent skill does not block it.
+
+- 2026-08-13: The Windows lock-handle check now declares the pointer-sized Win32 signature before calling `GetFinalPathNameByHandleW` and normalizes both drive and UNC device paths. This prevents 64-bit handle truncation from making native Windows installation fail closed for every profile while retaining link-escape detection.
+
+- 2026-08-13: A Windows confinement probe found that safe directory creation validated a missing parent chain but could skip an already-existing linked ancestor. Directory creation now validates every ancestor up to the filesystem root before any mutation, and the regression proves that no directory is created through the link.
+
+- 2026-08-13: A final confinement probe found POSIX profile creation still used recursive path creation before opening the root without following links. The installer now creates each missing profile component relative to an already-open parent descriptor and rejects a linked ancestor before it can create any external directory; the strengthened regression asserts that no external profile path is created.
+
+- 2026-08-13: Hosted CI run `31677787673` exposed a test-environment dependency: the compatibility-root test inherited the runner's `XDG_CONFIG_HOME`, so it no longer exercised OpenCode's default `~/.config/opencode` root. The test now clears both native OpenCode override variables before asserting default-root behavior and passes with a simulated predefined runner XDG root.
+
+- 2026-08-13: Review Gate run `31676414787` identified four final safety and public-package defects. The correction now resolves OpenClaw's configured file parent and OpenCode's XDG/config override roots, parses YAML frontmatter instead of approximating it with a regular expression, stages only below non-discoverable Agent Ops state, uses atomic re-entrant recovery followed by retryable garbage cleanup, validates Windows descendant paths and the opened lock handle, and removes the organization-specific requester sentence from the public handoff.
+
+- 2026-08-13: The machine installation now uses independent Agent Ops-owned adapted copies for OpenCode, Claude Code, Codex, Cursor, OpenClaw, and Prime Agent. All six ownership manifests match the same installed fingerprint `92cb6335fe2b`; none of the six skill roots is a symbolic link, and all contain the portable artifact-preview instruction. The collision reader follows linked skill directories and files through read-only anchored handles so unrelated linked bundles remain compatible while a linked `show-me` identity still blocks installation.
+
+- 2026-08-13: Review Gate run `31674693066` found two remaining cross-host discovery defects: OpenClaw home resolution did not normalize `HOME`, `USERPROFILE`, Termux, and the native account home exactly; and OpenCode/OpenClaw could load a conflicting higher-priority global skill outside the selected managed root. The correction mirrors OpenClaw's operator-home precedence and checks OpenCode's config, Claude-compatibility, and agent-compatibility global roots plus OpenClaw's default-state personal agent root. It recognizes root Markdown skill definitions, refuses unresolved linked or duplicate identities, and permits only a byte-identical adapted copy in an alternate compatibility root.
+
+- 2026-08-13: Review Gate run `31672591768` found four remaining defects: Linux-only descriptor paths and locking, deletion of a changed post-crash target, immediate-child-only collision scanning, and incorrect OpenClaw profile selection. The correction uses `/dev/fd` on POSIX plus a Windows reparse-point and `msvcrt` transaction path, verifies every transaction tree before deletion, scans flat and arbitrarily nested skill definitions without following links, and mirrors OpenClaw state, profile, home, and legacy-state precedence while intentionally leaving config-file selection independent. `uv run ruff check .`, `uv run pytest -q` (`148 passed`), `uv run agentops harness check .`, `git diff --check`, and real pinned disposable installs for all six supported agent hosts passed before the final commit.
+
+- 2026-08-13: Replacement Review Gate run `31671457517` verified four remaining ownership and discovery defects: exact upstream bytes did not prove Agent Ops ownership; symlinked skill identities could evade collision detection; several aliases were not native discovery roots and the local pseudo-framework has no skill loader; and path validation plus in-memory rollback could not survive parent swaps or process termination. The correction now requires an existing ownership manifest for updates, inspects symlinked definitions read-only, uses native Claude Code and OpenClaw variables while keeping fixed Cursor and OpenCode roots, excludes local installation, and performs locked directory-handle-anchored transactions with durable recovery state.
+
+- 2026-08-13: Pull request 14 Review Gate run `31670668602` failed with three verified defects. The correction replaces generic `copy-skills` installation with a HumanLayer-specific transactional adapter, completes generated installs and configured home-variable resolution for all six agent hosts, and replaces the non-portable `Bash(open ...)` instruction with an artifact-preview fallback. Focused Ruff and 24 adjacent installer/framework tests pass; exact pinned disposable installs produced the same adapted owned skill in all six homes. The live Prime Agent copy was moved to the adapted owned form; the local pseudo-framework has no skill loader and is excluded.
+
+- 2026-08-13: Added HumanLayer `show-me` 1.0.0 as one exact pinned dependency for six managed agent hosts. The registry selects only `plugins/show-me/skills`; its transactional adapter refuses user-owned changes and corrects the host-specific HTML opener. Disposable installs for Claude Code, Codex, Cursor, OpenClaw, OpenCode, and Prime Agent produced the same adapted `SKILL.md` file. The requested global `npx skills` installation also completed for its supported agents; an explicit managed copy covers Prime Agent, which the upstream installer does not target.
 
 - 2026-08-10: To close the rollout without merging known release-safety defects, Prime now explicitly excludes `document-release` and `land-and-deploy`. This removes the incomplete release subsystem rather than expanding it. Provider-aware pull or merge request creation remains supported; release preparation, merge, and deployment require a supplied repository-owned procedure and stop when none exists. Exact pinned generation retained 29 gstack skills and contained no excluded workflow or route references.
 - 2026-08-10: Final provider review of the release sequence made document-release's allocator base-branch discovery provider-aware as well: GitHub uses `gh pr view`, GitLab uses `glab mr view`, and unknown or missing request/provider data exits 30 before version allocation. The focused adapter suite and exact pinned generation passed after this correction.

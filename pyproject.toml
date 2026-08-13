@@ -9,6 +9,7 @@ description = "Community core for agent operations harnesses, contracts, plugins
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "json5>=0.9",
     "markdown-it-py>=3.0",
     "pydantic>=2.7",
     "pyyaml>=6.0",

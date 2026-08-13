@@ -28,7 +28,7 @@ agentops skills install opencode
 agentops skills install prime-agent
 ```
 
-By default, supported frameworks install all configured skill dependency bundles. Codex, Claude Code, and OpenCode retain their existing upstream layouts. Prime Agent receives generated Prime-native variants: gstack skills use `agentops-gstack-*` names with their built runtime under `.agentops/runtime/gstack`, and Superpowers skills use `agentops-superpowers-*` names. Fingerprint manifests prevent either bundle from overwriting an unowned or locally modified skill.
+By default, supported frameworks install all configured skill dependency bundles. Codex, Claude Code, and OpenCode retain the existing upstream layouts for gstack and Superpowers, while all six supported agent hosts receive HumanLayer's pinned `show-me` skill through a collision-safe adapter with a portable HTML artifact opener. Prime Agent receives generated Prime-native variants of the two larger bundles: gstack skills use `agentops-gstack-*` names with their built runtime under `.agentops/runtime/gstack`, and Superpowers skills use `agentops-superpowers-*` names. Fingerprint manifests prevent every adapted bundle from overwriting an unowned or locally modified skill.
 
 ## Quick Start
 
