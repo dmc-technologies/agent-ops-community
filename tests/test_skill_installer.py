@@ -2106,6 +2106,7 @@ def test_opencode_remote_skill_url_fails_before_checkout(
         encoding="utf-8",
     )
     monkeypatch.setenv("HOME", str(os_home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     monkeypatch.setenv("OPENCODE_TEST_MANAGED_CONFIG_DIR", str(tmp_path / "managed"))
     checkout_called = False
 
