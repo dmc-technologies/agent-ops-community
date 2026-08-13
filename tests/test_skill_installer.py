@@ -586,7 +586,10 @@ def test_posix_update_restores_concurrently_replaced_target(
 
     assert (destination / "SKILL.md").read_text(encoding="utf-8") == "personal replacement\n"
     assert displaced.is_dir()
-    assert not (profile / ".agentops" / "skill-dependencies" / ".transaction.json").exists()
+    dependencies = profile / ".agentops" / "skill-dependencies"
+    assert not (dependencies / show_me_adapter._TRANSACTION_NAME).exists()
+    assert not list(dependencies.glob(f"{show_me_adapter._BACKUP_PREFIX}*"))
+    assert not list(dependencies.glob(f"{show_me_adapter._STAGE_PREFIX}*"))
 
 
 def test_humanlayer_show_me_refuses_symlinked_profile_ancestor(
@@ -1392,7 +1395,7 @@ def test_openclaw_extra_root_expands_effective_home_and_environment(
         raise AssertionError("expected expanded OpenClaw extra-root collision")
 
 
-def test_openclaw_custom_config_does_not_inherit_default_state_personal_root(
+def test_openclaw_custom_config_still_checks_default_state_personal_root(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -1416,13 +1419,11 @@ def test_openclaw_custom_config_does_not_inherit_default_state_personal_root(
         "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
     )
 
-    installed = install_skill_dependencies(
-        framework=Framework.OPENCLAW,
-        dependencies=[_show_me_dependency(Framework.OPENCLAW)],
-    )
-
-    assert len(installed) == 1
-    assert (tmp_path / "configured" / "skills" / "show-me" / "SKILL.md").is_file()
+    with pytest.raises(ShowMeCollisionError, match="logical skill-path collision"):
+        install_skill_dependencies(
+            framework=Framework.OPENCLAW,
+            dependencies=[_show_me_dependency(Framework.OPENCLAW)],
+        )
 
 
 def test_opencode_xdg_and_config_override_roots_are_checked(
@@ -2673,4 +2674,34 @@ def test_openclaw_distinct_config_scans_selected_state_plugins(
             framework=Framework.OPENCLAW,
             dependencies=[_show_me_dependency(Framework.OPENCLAW)],
             home=target,
+        )
+
+
+def test_openclaw_configured_agent_workspace_collision_is_checked(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = _show_me_source(tmp_path / "source")
+    state = tmp_path / "state"
+    workspace = tmp_path / "agent-workspace"
+    collision = workspace / ".agents" / "skills" / "visual"
+    collision.mkdir(parents=True)
+    (collision / "SKILL.md").write_text(
+        "---\nname: show-me\ndescription: workspace\n---\n", encoding="utf-8"
+    )
+    state.mkdir()
+    (state / "openclaw.json").write_text(
+        json.dumps({"agents": {"list": [{"id": "research", "workspace": str(workspace)}]}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("OPENCLAW_STATE_DIR", str(state))
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
+    )
+
+    with pytest.raises(ShowMeCollisionError, match="logical skill-name collision"):
+        install_skill_dependencies(
+            framework=Framework.OPENCLAW,
+            dependencies=[_show_me_dependency(Framework.OPENCLAW)],
         )

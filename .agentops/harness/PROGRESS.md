@@ -7,7 +7,7 @@ Repository: `agent-ops-community`
 - Branch: `feat/humanlayer-show-me-skill`
 - Main baseline: `4eda2a8`, the merge of public pull request 13.
 - Current handoff: public `agent-ops-community` pull request 14 pins HumanLayer's `show-me` skill at upstream commit `4d8d644ca747517973f58d7953f58d7cd07520cd` and configures it for all six Agent Ops agent hosts without importing the repository's four unrelated skills. Three Review Gate cycles exposed unsafe replacement, incomplete discovery, non-durable recovery, Linux-only filesystem assumptions, incomplete nested collision detection, and incorrect OpenClaw profile resolution. The corrected adapter now refuses unowned or modified targets, owns updates by fingerprint, locks and recovers durable transactions on POSIX and Windows, preserves changed crash-recovery content, scans flat and nested skill identities through confined no-follow operations, resolves OpenClaw's active state precedence, and uses a portable artifact-preview fallback. Replacement hosted acceptance, merge, and the post-merge package refresh remain pending external finalization. No external tracker applies to this public package change.
-- Verification: the registry contract test failed before the dependency was added and now passes. Complete Ruff, all 172 tests, the source-tree harness check, whitespace validation, focused installer/framework tests, six exact pinned disposable installs, POSIX and Windows-path transaction tests, interruption recovery, changed-target preservation, recursive collision, and no-follow profile-confinement checks pass.
+- Verification: the registry contract test failed before the dependency was added and now passes. Complete Ruff, all 173 tests, the source-tree harness check, whitespace validation, focused installer/framework tests, six exact pinned disposable installs, POSIX and Windows-path transaction tests, interruption recovery, changed-target preservation, recursive collision, and no-follow profile-confinement checks pass.
 
 ## Current Work
 
@@ -23,6 +23,8 @@ Repository: `agent-ops-community`
 - After merge, refresh the installed Agent Ops package from public `main`; the machine-global and Prime Agent copies are already installed.
 
 ## Session Log
+
+- 2026-08-13: Review Gate run `31703138089` found missing higher-precedence OpenClaw roots. Collision discovery now includes the personal compatibility root whenever the selected state is the default regardless of config location, plus default and configured agent workspace `skills` and `.agents/skills` roots.
 
 - 2026-08-13: Review Gate run `31701642780` found a POSIX target-replacement race and OpenClaw target-context mismatch. POSIX updates now pin the exact managed target identity, verify the renamed backup before promoting the stage, and restore a concurrent replacement on mismatch. OpenClaw discovery now carries the selected target state through config, limits, compatibility roots, and plugin scanning, including separate config and state paths.
 

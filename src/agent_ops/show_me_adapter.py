@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import json
 import os
@@ -1875,6 +1876,54 @@ def _frontmatter_skill_name(text: str, location: str) -> str | None:
     return name.strip()
 
 
+def _rename_directory_no_replace(
+    source_fd: int,
+    source_name: str,
+    destination_fd: int,
+    destination_name: str,
+) -> None:
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is not None:
+        renameat2.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        renameat2.restype = ctypes.c_int
+        if (
+            renameat2(
+                source_fd,
+                os.fsencode(source_name),
+                destination_fd,
+                os.fsencode(destination_name),
+                1,
+            )
+            == 0
+        ):
+            return
+        error = ctypes.get_errno()
+        if error == errno.EEXIST:
+            raise ShowMeCollisionError(
+                "concurrent show-me target appeared; preserving transaction data"
+            )
+        raise OSError(error, os.strerror(error))
+    if _entry_stat(destination_fd, destination_name) is not None:
+        raise ShowMeCollisionError(
+            "concurrent show-me target appeared; preserving transaction data"
+        )
+    os.rename(
+        source_name,
+        destination_name,
+        src_dir_fd=source_fd,
+        dst_dir_fd=destination_fd,
+    )
+
+
 def _install_transaction(
     skills_fd: int,
     dependencies_fd: int,
@@ -1905,20 +1954,25 @@ def _install_transaction(
             )
             backup_stat = _entry_stat(dependencies_fd, backup_name)
             pinned_stat = os.fstat(target_fd) if target_fd is not None else None
+            backup_fingerprint = (
+                _tree_fingerprint(_fd_path(target_fd)) if target_fd is not None else None
+            )
             if (
                 backup_stat is None
                 or pinned_stat is None
                 or (backup_stat.st_dev, backup_stat.st_ino)
                 != (pinned_stat.st_dev, pinned_stat.st_ino)
+                or backup_fingerprint != current["installed_fingerprint"]
             ):
-                os.rename(
+                _rename_directory_no_replace(
+                    dependencies_fd,
                     backup_name,
+                    skills_fd,
                     SKILL_NAME,
-                    src_dir_fd=dependencies_fd,
-                    dst_dir_fd=skills_fd,
                 )
-                _unlink_if_present(dependencies_fd, _TRANSACTION_NAME)
                 os.fsync(skills_fd)
+                os.fsync(dependencies_fd)
+                _unlink_if_present(dependencies_fd, _TRANSACTION_NAME)
                 os.fsync(dependencies_fd)
                 raise ShowMeCollisionError(
                     "managed show-me target changed before replacement; restored replacement"

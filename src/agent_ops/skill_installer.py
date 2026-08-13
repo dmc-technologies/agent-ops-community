@@ -706,8 +706,62 @@ def _codex_system_skill_root() -> Path:
 
 
 def _openclaw_uses_default_state(target_state: Path) -> bool:
+    del target_state
+    state_override = _normalize_home_value(os.environ.get("OPENCLAW_STATE_DIR"))
+    if _openclaw_profile() is not None:
+        return False
+    if state_override is None:
+        return True
+    selected = _expand_openclaw_path(state_override, _openclaw_effective_home())
+    return selected.resolve() == (_openclaw_effective_home() / ".openclaw").resolve()
+
+
+def _openclaw_workspace_roots(target_state: Path) -> tuple[Path, ...]:
+    config = _load_openclaw_config(_openclaw_active_config_path(target_state))
     effective_home = _openclaw_effective_home()
-    return target_state.resolve() == (effective_home / ".openclaw").resolve()
+    configured_default = None
+    agents = config.get("agents")
+    if isinstance(agents, dict):
+        defaults = agents.get("defaults")
+        if isinstance(defaults, dict) and isinstance(defaults.get("workspace"), str):
+            configured_default = _expand_openclaw_path(
+                _expand_openclaw_config_environment(defaults["workspace"], config),
+                effective_home,
+            )
+        agent_list = agents.get("list")
+    else:
+        agent_list = None
+    workspaces: list[Path] = []
+    if isinstance(agent_list, list) and agent_list:
+        for agent in agent_list:
+            if not isinstance(agent, dict):
+                raise ValueError("cannot inspect configured OpenClaw agent workspace")
+            agent_id = agent.get("id")
+            authored = agent.get("workspace")
+            if isinstance(authored, str):
+                workspace = _expand_openclaw_path(
+                    _expand_openclaw_config_environment(authored, config),
+                    effective_home,
+                )
+            elif configured_default is not None and isinstance(agent_id, str):
+                workspace = configured_default / agent_id
+            elif isinstance(agent_id, str):
+                workspace = target_state / f"workspace-{agent_id}"
+            else:
+                raise ValueError("cannot inspect configured OpenClaw agent workspace")
+            workspaces.append(workspace)
+    else:
+        authored = _normalize_home_value(os.environ.get("OPENCLAW_WORKSPACE_DIR"))
+        if authored is not None:
+            workspaces.append(_expand_openclaw_path(authored, effective_home))
+        elif configured_default is not None:
+            workspaces.append(configured_default)
+        else:
+            workspaces.append(_openclaw_os_home() / ".openclaw" / "workspace")
+    roots = []
+    for workspace in workspaces:
+        roots.extend([workspace / "skills", workspace / ".agents" / "skills"])
+    return tuple(roots)
 
 
 def _show_me_collision_roots(framework: Framework, target_home: Path) -> tuple[Path, ...]:
@@ -733,6 +787,7 @@ def _show_me_collision_roots(framework: Framework, target_home: Path) -> tuple[P
                 roots.append(os_home / ".claude" / "skills")
     elif framework is Framework.OPENCLAW:
         roots = list(_openclaw_configured_skill_roots(target_home))
+        roots.extend(_openclaw_workspace_roots(target_home))
         if _openclaw_uses_default_state(target_home):
             roots.append(os_home / ".agents" / "skills")
     else:
