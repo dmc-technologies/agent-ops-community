@@ -12,6 +12,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 try:
     import fcntl
 except ImportError:  # pragma: no cover - exercised on Windows
@@ -82,8 +84,8 @@ def install_show_me(
         )
         _lock_file(lock_fd)
         _recover_transaction(skills_fd, dependencies_fd)
-        _stage_skill(source, skills_fd, stage_name)
-        staged = _fd_path(skills_fd, stage_name)
+        _stage_skill(source, dependencies_fd, stage_name)
+        staged = _fd_path(dependencies_fd, stage_name)
         _adapt_instructions(staged / "SKILL.md")
         manifest = {
             "schema_version": 1,
@@ -108,7 +110,7 @@ def install_show_me(
         return manifest
     finally:
         if skills_fd is not None and dependencies_fd is not None:
-            _remove_unreferenced_stage(skills_fd, dependencies_fd, stage_name)
+            _remove_unreferenced_stage(dependencies_fd, dependencies_fd, stage_name)
         if lock_fd is not None:
             os.close(lock_fd)
         if dependencies_fd is not None:
@@ -140,16 +142,19 @@ def _install_show_me_windows(
     collision_roots: tuple[Path, ...] = (),
     flat_markdown: bool = False,
 ) -> dict[str, Any]:
-    _validate_windows_profile(profile_root)
+    _ensure_windows_directory(profile_root)
     skills_root = profile_root / "skills"
+    agentops_root = profile_root / ".agentops"
     dependencies_root = profile_root / OWNERSHIP_MANIFEST_RELATIVE.parent
-    skills_root.mkdir(parents=True, exist_ok=True)
-    dependencies_root.mkdir(parents=True, exist_ok=True)
+    _ensure_windows_directory(skills_root)
+    _ensure_windows_directory(agentops_root)
+    _ensure_windows_directory(dependencies_root)
     lock_path = dependencies_root / _LOCK_NAME
-    with lock_path.open("a+b") as lock_stream:
+    lock_fd = _open_windows_lock(lock_path)
+    with os.fdopen(lock_fd, "a+b") as lock_stream:
         _lock_file(lock_stream.fileno())
         _recover_windows_transaction(skills_root, dependencies_root)
-        stage = skills_root / f"{_STAGE_PREFIX}{uuid.uuid4().hex}"
+        stage = dependencies_root / f"{_STAGE_PREFIX}{uuid.uuid4().hex}"
         try:
             shutil.copytree(source, stage)
             _adapt_instructions(stage / "SKILL.md")
@@ -193,6 +198,58 @@ def _is_windows_reparse_point(path: Path) -> bool:
         return False
     reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
     return bool(attributes & reparse_flag)
+
+
+def _ensure_windows_directory(path: Path) -> None:
+    parent = path.parent
+    if parent != path and not parent.exists():
+        _ensure_windows_directory(parent)
+    if path.is_symlink() or _is_windows_reparse_point(path):
+        raise ShowMeCollisionError(
+            f"selected profile path contains a symbolic link or junction: {path}"
+        )
+    if path.exists():
+        if not path.is_dir():
+            raise ShowMeCollisionError(
+                f"selected profile path contains a non-directory: {path}"
+            )
+        return
+    path.mkdir()
+    if path.is_symlink() or _is_windows_reparse_point(path) or not path.is_dir():
+        raise ShowMeCollisionError(f"could not create confined profile directory: {path}")
+
+
+def _open_windows_lock(path: Path) -> int:
+    expected_path = os.path.abspath(path)
+    if path.is_symlink() or _is_windows_reparse_point(path):
+        raise ShowMeCollisionError(f"unsafe show-me lock path: {path}")
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_BINARY", 0)
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ShowMeCollisionError(f"unsafe show-me lock path: {path}")
+        if os.name == "nt":  # pragma: no cover - exercised on Windows
+            import ctypes
+
+            handle = msvcrt.get_osfhandle(descriptor)
+            buffer = ctypes.create_unicode_buffer(32768)
+            length = ctypes.windll.kernel32.GetFinalPathNameByHandleW(
+                handle,
+                buffer,
+                len(buffer),
+                0,
+            )
+            if length == 0 or length >= len(buffer):
+                raise ShowMeCollisionError(f"cannot verify show-me lock path: {path}")
+            resolved = buffer.value.removeprefix("\\\\?\\")
+            if os.path.normcase(os.path.abspath(resolved)) != os.path.normcase(
+                expected_path
+            ):
+                raise ShowMeCollisionError(f"show-me lock escaped profile: {path}")
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
 
 
 def _validate_windows_profile(profile_root: Path) -> None:
@@ -323,8 +380,7 @@ def _reject_show_me_frontmatter_path(skill_file: Path, relative: Path) -> None:
         raise ShowMeCollisionError(
             f"cannot verify skill identity at {_skill_location(relative)}"
         ) from exc
-    match = re.search(r'(?m)^name\s*:\s*[\'\"]?([^\'\"\s]+)', text)
-    if match and match.group(1) == SKILL_NAME:
+    if _frontmatter_skill_name(text, _skill_location(relative)) == SKILL_NAME:
         raise ShowMeCollisionError(
             f"logical skill-name collision for {SKILL_NAME} "
             f"at {_skill_location(relative)}"
@@ -339,7 +395,7 @@ def _install_windows_transaction(
     manifest: dict[str, Any],
     current: dict[str, Any] | None,
 ) -> None:
-    backup = skills_root / f"{_BACKUP_PREFIX}{uuid.uuid4().hex}"
+    backup = dependencies_root / f"{_BACKUP_PREFIX}{uuid.uuid4().hex}"
     state = {
         "schema_version": 1,
         "phase": "prepared",
@@ -352,7 +408,8 @@ def _install_windows_transaction(
     transaction = dependencies_root / _TRANSACTION_NAME
     _write_json_path(transaction, state)
     try:
-        _validate_windows_profile(skills_root.parent)
+        _validate_windows_profile(skills_root)
+        _validate_windows_profile(dependencies_root)
         if current is not None:
             os.replace(destination, backup)
         os.replace(stage, destination)
@@ -374,13 +431,17 @@ def _recover_windows_transaction(skills_root: Path, dependencies_root: Path) -> 
     transaction = dependencies_root / _TRANSACTION_NAME
     state = _read_json_path(transaction)
     if state is None:
+        _cleanup_windows_dependency_garbage(dependencies_root)
         return
     _validate_transaction_state(state)
     destination = skills_root / SKILL_NAME
-    stage = skills_root / state["stage"]
-    backup = skills_root / state["backup"]
+    stage = dependencies_root / state["stage"]
+    backup = dependencies_root / state["backup"]
     old_manifest = state["old_manifest"]
+    new_fingerprint = state["new_manifest"]["installed_fingerprint"]
 
+    if _windows_entry_exists(stage):
+        _verify_windows_transaction_tree(stage, new_fingerprint, "recovery stage")
     if _windows_entry_exists(backup):
         if not state["had_destination"] or old_manifest is None:
             raise ShowMeCollisionError("unexpected show-me recovery backup")
@@ -393,63 +454,53 @@ def _recover_windows_transaction(skills_root: Path, dependencies_root: Path) -> 
     if state["phase"] == "committed":
         _verify_windows_transaction_tree(
             destination,
-            state["new_manifest"]["installed_fingerprint"],
+            new_fingerprint,
             "committed transaction target",
         )
-        _remove_verified_windows_tree(
-            backup,
-            old_manifest["installed_fingerprint"] if old_manifest else None,
-            "committed recovery backup",
-        )
-        _remove_verified_windows_tree(
-            stage,
-            state["new_manifest"]["installed_fingerprint"],
-            "committed recovery stage",
-        )
         transaction.unlink()
+        _cleanup_windows_dependency_garbage(dependencies_root)
         return
 
-    if _windows_entry_exists(backup):
-        if _windows_entry_exists(destination):
-            _verify_windows_transaction_tree(
-                destination,
-                state["new_manifest"]["installed_fingerprint"],
-                "uncommitted transaction target",
+    if _windows_entry_exists(destination):
+        _verify_windows_transaction_tree_shape(destination, "uncommitted transaction target")
+        target_fingerprint = _tree_fingerprint(destination)
+        old_fingerprint = old_manifest["installed_fingerprint"] if old_manifest else None
+        if target_fingerprint == new_fingerprint:
+            if _windows_entry_exists(stage):
+                raise ShowMeCollisionError(
+                    "duplicate uncommitted show-me target; preserving transaction data"
+                )
+            os.replace(destination, stage)
+        elif old_fingerprint is None or target_fingerprint != old_fingerprint:
+            raise ShowMeCollisionError(
+                "uncommitted transaction target changed; preserving transaction data"
             )
-            shutil.rmtree(destination)
-        os.replace(backup, destination)
-    elif not state["had_destination"] and _windows_entry_exists(destination):
-        _verify_windows_transaction_tree(
-            destination,
-            state["new_manifest"]["installed_fingerprint"],
-            "uncommitted transaction target",
-        )
-        shutil.rmtree(destination)
-    elif state["had_destination"] and not _windows_entry_exists(destination):
-        raise ShowMeCollisionError("show-me transaction cannot recover its prior skill")
 
-    _remove_verified_windows_tree(
-        stage,
-        state["new_manifest"]["installed_fingerprint"],
-        "uncommitted recovery stage",
-    )
-    manifest_path = dependencies_root / OWNERSHIP_MANIFEST_RELATIVE.name
-    if old_manifest is None:
-        manifest_path.unlink(missing_ok=True)
+    if state["had_destination"]:
+        if old_manifest is None:
+            raise ShowMeCollisionError("transaction is missing its prior manifest")
+        if not _windows_entry_exists(destination):
+            if not _windows_entry_exists(backup):
+                raise ShowMeCollisionError("show-me transaction cannot recover its prior skill")
+            os.replace(backup, destination)
+        _write_json_path(
+            dependencies_root / OWNERSHIP_MANIFEST_RELATIVE.name,
+            old_manifest,
+        )
     else:
-        _write_json_path(manifest_path, old_manifest)
+        if _windows_entry_exists(destination):
+            raise ShowMeCollisionError("fresh show-me transaction has an unexpected target")
+        (dependencies_root / OWNERSHIP_MANIFEST_RELATIVE.name).unlink(missing_ok=True)
+
     transaction.unlink()
+    _cleanup_windows_dependency_garbage(dependencies_root)
 
 
 def _windows_entry_exists(path: Path) -> bool:
     return path.exists() or path.is_symlink() or _is_windows_reparse_point(path)
 
 
-def _verify_windows_transaction_tree(
-    path: Path,
-    expected_fingerprint: str,
-    label: str,
-) -> None:
+def _verify_windows_transaction_tree_shape(path: Path, label: str) -> None:
     if (
         not _windows_entry_exists(path)
         or path.is_symlink()
@@ -457,21 +508,25 @@ def _verify_windows_transaction_tree(
         or not path.is_dir()
     ):
         raise ShowMeCollisionError(f"{label} is missing or not a regular directory")
+
+
+def _verify_windows_transaction_tree(
+    path: Path,
+    expected_fingerprint: str,
+    label: str,
+) -> None:
+    _verify_windows_transaction_tree_shape(path, label)
     if _tree_fingerprint(path) != expected_fingerprint:
         raise ShowMeCollisionError(f"{label} changed; preserving transaction data")
 
 
-def _remove_verified_windows_tree(
-    path: Path,
-    expected_fingerprint: str | None,
-    label: str,
-) -> None:
-    if not _windows_entry_exists(path):
+def _cleanup_windows_dependency_garbage(dependencies_root: Path) -> None:
+    if _windows_entry_exists(dependencies_root / _TRANSACTION_NAME):
         return
-    if expected_fingerprint is None:
-        raise ShowMeCollisionError(f"unexpected {label}; preserving transaction data")
-    _verify_windows_transaction_tree(path, expected_fingerprint, label)
-    shutil.rmtree(path)
+    for path in sorted(dependencies_root.iterdir(), key=lambda candidate: candidate.name):
+        if path.name.startswith(_STAGE_PREFIX) or path.name.startswith(_BACKUP_PREFIX):
+            _verify_windows_transaction_tree_shape(path, "show-me transaction garbage")
+            shutil.rmtree(path)
 
 
 def _remove_unreferenced_windows_stage(stage: Path, dependencies_root: Path) -> None:
@@ -482,8 +537,7 @@ def _remove_unreferenced_windows_stage(stage: Path, dependencies_root: Path) -> 
     if isinstance(state, dict) and state.get("stage") == stage.name:
         return
     if _windows_entry_exists(stage):
-        if stage.is_symlink() or _is_windows_reparse_point(stage) or not stage.is_dir():
-            return
+        _verify_windows_transaction_tree_shape(stage, "unreferenced installation stage")
         shutil.rmtree(stage)
 
 
@@ -803,11 +857,31 @@ def _reject_show_me_file_at(
             text = stream.read()
     except (OSError, UnicodeDecodeError) as exc:
         raise ShowMeCollisionError(f"cannot verify skill identity at {location}") from exc
-    match = re.search(r'(?m)^name\s*:\s*[\'\"]?([^\'\"\s]+)', text)
-    if match and match.group(1) == SKILL_NAME:
+    if _frontmatter_skill_name(text, location) == SKILL_NAME:
         raise ShowMeCollisionError(
             f"logical skill-name collision for {SKILL_NAME} at {location}"
         )
+
+
+def _frontmatter_skill_name(text: str, location: str) -> str | None:
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return None
+    try:
+        closing = next(index for index, line in enumerate(lines[1:], 1) if line.strip() == "---")
+        value = yaml.safe_load("\n".join(lines[1:closing]))
+    except (StopIteration, yaml.YAMLError) as exc:
+        raise ShowMeCollisionError(f"cannot parse skill frontmatter at {location}") from exc
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ShowMeCollisionError(f"cannot parse skill frontmatter at {location}")
+    name = value.get("name")
+    if name is None:
+        return None
+    if not isinstance(name, str):
+        raise ShowMeCollisionError(f"cannot parse skill name at {location}")
+    return name.strip()
 
 
 def _install_transaction(
@@ -828,13 +902,24 @@ def _install_transaction(
         "new_manifest": manifest,
     }
     _write_json_at(dependencies_fd, _TRANSACTION_NAME, state)
-    os.fsync(dependencies_fd)
     try:
         if current is not None:
-            os.rename(SKILL_NAME, backup_name, src_dir_fd=skills_fd, dst_dir_fd=skills_fd)
+            os.rename(
+                SKILL_NAME,
+                backup_name,
+                src_dir_fd=skills_fd,
+                dst_dir_fd=dependencies_fd,
+            )
             os.fsync(skills_fd)
-        os.rename(stage_name, SKILL_NAME, src_dir_fd=skills_fd, dst_dir_fd=skills_fd)
+            os.fsync(dependencies_fd)
+        os.rename(
+            stage_name,
+            SKILL_NAME,
+            src_dir_fd=dependencies_fd,
+            dst_dir_fd=skills_fd,
+        )
         os.fsync(skills_fd)
+        os.fsync(dependencies_fd)
         _write_json_at(
             dependencies_fd,
             OWNERSHIP_MANIFEST_RELATIVE.name,
@@ -851,19 +936,29 @@ def _install_transaction(
 def _recover_transaction(skills_fd: int, dependencies_fd: int) -> None:
     state = _read_json_at(dependencies_fd, _TRANSACTION_NAME)
     if state is None:
+        _cleanup_dependency_garbage(dependencies_fd)
         return
     _validate_transaction_state(state)
     stage = state["stage"]
     backup = state["backup"]
     target_stat = _entry_stat(skills_fd, SKILL_NAME)
-    backup_stat = _entry_stat(skills_fd, backup)
+    stage_stat = _entry_stat(dependencies_fd, stage)
+    backup_stat = _entry_stat(dependencies_fd, backup)
     old_manifest = state["old_manifest"]
+    new_fingerprint = state["new_manifest"]["installed_fingerprint"]
 
+    if stage_stat is not None:
+        _verify_transaction_tree(
+            dependencies_fd,
+            stage,
+            new_fingerprint,
+            "recovery stage",
+        )
     if backup_stat is not None:
         if not state["had_destination"] or old_manifest is None:
             raise ShowMeCollisionError("unexpected show-me recovery backup")
         _verify_transaction_tree(
-            skills_fd,
+            dependencies_fd,
             backup,
             old_manifest["installed_fingerprint"],
             "recovery backup",
@@ -873,96 +968,97 @@ def _recover_transaction(skills_fd: int, dependencies_fd: int) -> None:
         _verify_transaction_tree(
             skills_fd,
             SKILL_NAME,
-            state["new_manifest"]["installed_fingerprint"],
+            new_fingerprint,
             "committed transaction target",
         )
-        _remove_verified_transaction_tree(
-            skills_fd,
-            backup,
-            old_manifest["installed_fingerprint"] if old_manifest else None,
-            "committed recovery backup",
-        )
-        _remove_verified_transaction_tree(
-            skills_fd,
-            stage,
-            state["new_manifest"]["installed_fingerprint"],
-            "committed recovery stage",
-        )
         _unlink_if_present(dependencies_fd, _TRANSACTION_NAME)
-        os.fsync(skills_fd)
         os.fsync(dependencies_fd)
+        _cleanup_dependency_garbage(dependencies_fd)
         return
 
-    if backup_stat is not None:
-        if target_stat is not None:
-            _verify_transaction_tree(
-                skills_fd,
-                SKILL_NAME,
-                state["new_manifest"]["installed_fingerprint"],
-                "uncommitted transaction target",
+    if target_stat is not None:
+        if not stat.S_ISDIR(target_stat.st_mode):
+            raise ShowMeCollisionError(
+                "uncommitted transaction target is not a regular directory"
             )
-            _remove_directory_if_present(skills_fd, SKILL_NAME)
-        os.rename(backup, SKILL_NAME, src_dir_fd=skills_fd, dst_dir_fd=skills_fd)
-    elif not state["had_destination"] and target_stat is not None:
-        _verify_transaction_tree(
-            skills_fd,
-            SKILL_NAME,
-            state["new_manifest"]["installed_fingerprint"],
-            "uncommitted transaction target",
-        )
-        _remove_directory_if_present(skills_fd, SKILL_NAME)
-    elif state["had_destination"] and target_stat is None:
-        raise ShowMeCollisionError("show-me transaction cannot recover its prior skill")
+        target_fingerprint = _tree_fingerprint(_fd_path(skills_fd, SKILL_NAME))
+        old_fingerprint = old_manifest["installed_fingerprint"] if old_manifest else None
+        if target_fingerprint == new_fingerprint:
+            if stage_stat is not None:
+                raise ShowMeCollisionError(
+                    "duplicate uncommitted show-me target; preserving transaction data"
+                )
+            os.rename(
+                SKILL_NAME,
+                stage,
+                src_dir_fd=skills_fd,
+                dst_dir_fd=dependencies_fd,
+            )
+            os.fsync(skills_fd)
+            os.fsync(dependencies_fd)
+            target_stat = None
+            stage_stat = _entry_stat(dependencies_fd, stage)
+        elif old_fingerprint is None or target_fingerprint != old_fingerprint:
+            raise ShowMeCollisionError(
+                "uncommitted transaction target changed; preserving transaction data"
+            )
 
-    _remove_verified_transaction_tree(
-        skills_fd,
-        stage,
-        state["new_manifest"]["installed_fingerprint"],
-        "uncommitted recovery stage",
-    )
-    if old_manifest is None:
-        _unlink_if_present(dependencies_fd, OWNERSHIP_MANIFEST_RELATIVE.name)
-    else:
+    if state["had_destination"]:
+        if old_manifest is None:
+            raise ShowMeCollisionError("transaction is missing its prior manifest")
+        if target_stat is None:
+            if backup_stat is None:
+                raise ShowMeCollisionError("show-me transaction cannot recover its prior skill")
+            os.rename(
+                backup,
+                SKILL_NAME,
+                src_dir_fd=dependencies_fd,
+                dst_dir_fd=skills_fd,
+            )
+            os.fsync(skills_fd)
+            os.fsync(dependencies_fd)
         _write_json_at(
             dependencies_fd,
             OWNERSHIP_MANIFEST_RELATIVE.name,
             old_manifest,
         )
+    else:
+        if target_stat is not None:
+            raise ShowMeCollisionError(
+                "fresh show-me transaction has an unexpected target"
+            )
+        _unlink_if_present(dependencies_fd, OWNERSHIP_MANIFEST_RELATIVE.name)
+
     _unlink_if_present(dependencies_fd, _TRANSACTION_NAME)
-    os.fsync(skills_fd)
     os.fsync(dependencies_fd)
+    _cleanup_dependency_garbage(dependencies_fd)
 
 
 def _verify_transaction_tree(
-    skills_fd: int,
+    directory_fd: int,
     name: str,
     expected_fingerprint: str,
     label: str,
 ) -> None:
-    entry = _entry_stat(skills_fd, name)
+    entry = _entry_stat(directory_fd, name)
     if entry is None or not stat.S_ISDIR(entry.st_mode):
         raise ShowMeCollisionError(f"{label} is missing or not a regular directory")
-    actual = _tree_fingerprint(_fd_path(skills_fd, name))
+    actual = _tree_fingerprint(_fd_path(directory_fd, name))
     if actual != expected_fingerprint:
         raise ShowMeCollisionError(f"{label} changed; preserving transaction data")
 
 
-def _remove_verified_transaction_tree(
-    skills_fd: int,
-    name: str,
-    expected_fingerprint: str | None,
-    label: str,
-) -> None:
-    if _entry_stat(skills_fd, name) is None:
+def _cleanup_dependency_garbage(dependencies_fd: int) -> None:
+    if _entry_stat(dependencies_fd, _TRANSACTION_NAME) is not None:
         return
-    if expected_fingerprint is None:
-        raise ShowMeCollisionError(f"unexpected {label}; preserving transaction data")
-    _verify_transaction_tree(skills_fd, name, expected_fingerprint, label)
-    _remove_directory_if_present(skills_fd, name)
+    for name in sorted(os.listdir(dependencies_fd)):
+        if name.startswith(_STAGE_PREFIX) or name.startswith(_BACKUP_PREFIX):
+            _remove_directory_if_present(dependencies_fd, name)
+    os.fsync(dependencies_fd)
 
 
 def _remove_unreferenced_stage(
-    skills_fd: int,
+    stage_fd: int,
     dependencies_fd: int,
     stage_name: str,
 ) -> None:
@@ -972,7 +1068,7 @@ def _remove_unreferenced_stage(
         return
     if isinstance(state, dict) and state.get("stage") == stage_name:
         return
-    _remove_directory_if_present(skills_fd, stage_name)
+    _remove_directory_if_present(stage_fd, stage_name)
 
 
 def _validate_manifest(value: Any) -> None:

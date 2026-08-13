@@ -95,6 +95,9 @@ def _default_openclaw_home() -> Path:
     state_override = _normalize_home_value(os.environ.get("OPENCLAW_STATE_DIR"))
     if state_override is not None:
         return _expand_openclaw_path(state_override, base_home)
+    config_path = _normalize_home_value(os.environ.get("OPENCLAW_CONFIG_PATH"))
+    if config_path is not None:
+        return _expand_openclaw_path(config_path, base_home).parent
     profile = _normalize_home_value(os.environ.get("OPENCLAW_PROFILE"))
     if profile and profile.lower() != "default":
         if not profile[0].isalnum() or len(profile) > 64 or any(
@@ -131,9 +134,6 @@ def _openclaw_uses_default_state(target_home: Path) -> bool:
         else os_home
     )
     state_override = _normalize_home_value(os.environ.get("OPENCLAW_STATE_DIR"))
-    profile = _normalize_home_value(os.environ.get("OPENCLAW_PROFILE"))
-    if profile and profile.lower() != "default":
-        return False
     canonical = effective_home / ".openclaw"
     if state_override is None:
         return target_home.resolve() == _default_openclaw_home().resolve()
@@ -147,8 +147,14 @@ def _openclaw_uses_default_state(target_home: Path) -> bool:
 def _show_me_collision_roots(framework: Framework, target_home: Path) -> tuple[Path, ...]:
     os_home = _openclaw_os_home()
     if framework is Framework.OPENCODE:
+        xdg_config = _normalize_home_value(os.environ.get("XDG_CONFIG_HOME"))
+        default_config = (
+            Path(xdg_config).resolve() if xdg_config is not None else os_home / ".config"
+        ) / "opencode"
+        configured = _normalize_home_value(os.environ.get("OPENCODE_CONFIG_DIR"))
         roots = [
-            os_home / ".config" / "opencode" / "skills",
+            default_config / "skills",
+            *([Path(configured).resolve() / "skills"] if configured is not None else []),
             os_home / ".claude" / "skills",
             os_home / ".agents" / "skills",
         ]

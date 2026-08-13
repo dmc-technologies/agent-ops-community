@@ -508,7 +508,7 @@ def test_humanlayer_show_me_preserves_changed_crash_recovery_target(
     destination = home / "skills" / "show-me"
     manifest_path = home / SHOW_ME_OWNERSHIP_MANIFEST_RELATIVE
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    backup = home / "skills" / ".humanlayer-show-me-backup-crash"
+    backup = manifest_path.parent / ".humanlayer-show-me-backup-crash"
     shutil.copytree(destination, backup)
     (destination / "SKILL.md").write_text(
         (destination / "SKILL.md").read_text(encoding="utf-8") + "user edit\n",
@@ -633,7 +633,8 @@ def test_openclaw_home_resolves_active_state_precedence(
     monkeypatch.delenv("OPENCLAW_STATE_DIR", raising=False)
     monkeypatch.delenv("OPENCLAW_PROFILE", raising=False)
     monkeypatch.setenv("OPENCLAW_CONFIG_PATH", str(tmp_path / "other" / "config.json"))
-    assert default_framework_home(Framework.OPENCLAW) == base_home / ".openclaw"
+    assert default_framework_home(Framework.OPENCLAW) == tmp_path / "other"
+    monkeypatch.delenv("OPENCLAW_CONFIG_PATH")
     (base_home / ".clawdbot").mkdir(parents=True)
     assert default_framework_home(Framework.OPENCLAW) == base_home / ".clawdbot"
     (base_home / ".openclaw").mkdir()
@@ -775,6 +776,169 @@ def test_openclaw_custom_state_excludes_personal_agent_skill_root(
     )
 
     assert (custom_state / "skills" / "show-me" / "SKILL.md").is_file()
+
+
+def test_openclaw_config_path_selects_managed_skill_root(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("OPENCLAW_HOME", raising=False)
+    monkeypatch.delenv("OPENCLAW_STATE_DIR", raising=False)
+    monkeypatch.delenv("OPENCLAW_PROFILE", raising=False)
+    monkeypatch.setenv(
+        "OPENCLAW_CONFIG_PATH",
+        str(tmp_path / "configured" / "openclaw.json"),
+    )
+
+    assert default_framework_home(Framework.OPENCLAW) == tmp_path / "configured"
+
+
+def test_opencode_xdg_and_config_override_roots_are_checked(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = _show_me_source(tmp_path / "source")
+    os_home = tmp_path / "os-home"
+    xdg = tmp_path / "xdg"
+    override = tmp_path / "override"
+    collision = override / "skills" / "visual-helper"
+    collision.mkdir(parents=True)
+    (collision / "SKILL.md").write_text(
+        "---\nname: 'show-me'\ndescription: override\n---\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(os_home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+    monkeypatch.setenv("OPENCODE_CONFIG_DIR", str(override))
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
+    )
+
+    try:
+        install_skill_dependencies(
+            framework=Framework.OPENCODE,
+            dependencies=[_show_me_dependency(Framework.OPENCODE)],
+            home=os_home / ".agents",
+        )
+    except ShowMeCollisionError as exc:
+        assert "logical skill-name collision" in str(exc)
+    else:
+        raise AssertionError("expected configured OpenCode root collision to fail")
+
+
+def test_show_me_yaml_frontmatter_collision_handles_folded_name(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = _show_me_source(tmp_path / "source")
+    collision = tmp_path / "home" / "skills" / "visual-helper"
+    collision.mkdir(parents=True)
+    (collision / "SKILL.md").write_text(
+        "---\nname: >-\n  show-me\ndescription: folded\n---\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
+    )
+
+    try:
+        install_skill_dependencies(
+            framework=Framework.PRIME_AGENT,
+            dependencies=[_show_me_dependency()],
+            home=tmp_path / "home",
+        )
+    except ShowMeCollisionError as exc:
+        assert "logical skill-name collision" in str(exc)
+    else:
+        raise AssertionError("expected YAML-equivalent collision to fail")
+
+
+def test_show_me_stage_is_outside_host_discovery_root(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = _show_me_source(tmp_path / "source")
+    os_home = tmp_path / "os-home"
+    home = os_home / ".agents"
+    monkeypatch.setenv("HOME", str(os_home))
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
+    )
+
+    def inspect_stage(skills_fd, dependencies_fd, stage_name, manifest, current) -> None:
+        assert not (show_me_adapter._fd_path(skills_fd) / stage_name).exists()
+        assert (show_me_adapter._fd_path(dependencies_fd) / stage_name).is_dir()
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(show_me_adapter, "_install_transaction", inspect_stage)
+    try:
+        install_skill_dependencies(
+            framework=Framework.OPENCODE,
+            dependencies=[_show_me_dependency(Framework.OPENCODE)],
+            home=home,
+        )
+    except KeyboardInterrupt:
+        pass
+    else:
+        raise AssertionError("expected simulated interruption")
+
+    assert not list((home / "skills").glob(".humanlayer-show-me-stage-*"))
+
+
+def test_show_me_retries_partial_unjournaled_garbage_cleanup(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = _show_me_source(tmp_path / "source")
+    home = tmp_path / "home"
+    garbage = (
+        home
+        / SHOW_ME_OWNERSHIP_MANIFEST_RELATIVE.parent
+        / ".humanlayer-show-me-stage-interrupted"
+    )
+    garbage.mkdir(parents=True)
+    (garbage / "partial").write_text("partial", encoding="utf-8")
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
+    )
+
+    install_skill_dependencies(
+        framework=Framework.PRIME_AGENT,
+        dependencies=[_show_me_dependency()],
+        home=home,
+    )
+
+    assert not garbage.exists()
+    assert (home / "skills" / "show-me" / "SKILL.md").is_file()
+
+
+def test_windows_helpers_refuse_linked_descendant_and_lock(
+    tmp_path: Path,
+) -> None:
+    external = tmp_path / "external"
+    external.mkdir()
+    linked_directory = tmp_path / "profile" / ".agentops"
+    linked_directory.parent.mkdir()
+    linked_directory.symlink_to(external, target_is_directory=True)
+    try:
+        show_me_adapter._ensure_windows_directory(linked_directory)
+    except ShowMeCollisionError as exc:
+        assert "symbolic link or junction" in str(exc)
+    else:
+        raise AssertionError("expected linked Windows descendant to fail")
+
+    target = tmp_path / "user-file"
+    target.write_bytes(b"")
+    linked_lock = tmp_path / "lock"
+    linked_lock.symlink_to(target)
+    try:
+        show_me_adapter._open_windows_lock(linked_lock)
+    except ShowMeCollisionError as exc:
+        assert "unsafe show-me lock path" in str(exc)
+    else:
+        raise AssertionError("expected linked Windows lock to fail")
+    assert target.read_bytes() == b""
 
 
 def test_openclaw_home_rejects_unsafe_profile_name(
