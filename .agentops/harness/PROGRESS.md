@@ -24,6 +24,8 @@ Repository: `agent-ops-community`
 
 ## Session Log
 
+- 2026-08-13: Hosted CI run `31677787673` exposed a test-environment dependency: the compatibility-root test inherited the runner's `XDG_CONFIG_HOME`, so it no longer exercised OpenCode's default `~/.config/opencode` root. The test now clears both native OpenCode override variables before asserting default-root behavior and passes with a simulated predefined runner XDG root.
+
 - 2026-08-13: Review Gate run `31676414787` identified four final safety and public-package defects. The correction now resolves OpenClaw's configured file parent and OpenCode's XDG/config override roots, parses YAML frontmatter instead of approximating it with a regular expression, stages only below non-discoverable Agent Ops state, uses atomic re-entrant recovery followed by retryable garbage cleanup, validates Windows descendant paths and the opened lock handle, and removes the organization-specific requester sentence from the public handoff.
 
 - 2026-08-13: The machine installation now uses independent Agent Ops-owned adapted copies for OpenCode, Claude Code, Codex, Cursor, OpenClaw, and Prime Agent. All six ownership manifests match the same installed fingerprint `92cb6335fe2b`; none of the six skill roots is a symbolic link, and all contain the portable artifact-preview instruction. The collision reader follows linked skill directories and files through read-only anchored handles so unrelated linked bundles remain compatible while a linked `show-me` identity still blocks installation.

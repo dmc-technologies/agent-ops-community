@@ -697,6 +697,8 @@ def test_opencode_refuses_other_global_root_and_flat_markdown_collisions(
     collision.parent.mkdir(parents=True)
     collision.write_text("---\ndescription: old copy\n---\n", encoding="utf-8")
     monkeypatch.setenv("HOME", str(os_home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("OPENCODE_CONFIG_DIR", raising=False)
     monkeypatch.setattr(
         "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
     )
