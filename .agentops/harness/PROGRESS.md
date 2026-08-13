@@ -6,7 +6,7 @@ Repository: `agent-ops-community`
 
 - Branch: `feat/humanlayer-show-me-skill`
 - Main baseline: `4eda2a8`, the merge of public pull request 13.
-- Current handoff: [public pull request 14](https://github.com/dmc-technologies/agent-ops-community/pull/14) pins HumanLayer's `show-me` skill at upstream commit `4d8d644ca747517973f58d7953f58d7cd07520cd` and configures it for all seven Agent Ops frameworks without importing the repository's four unrelated skills. Hosted CI, Review Gate, merge, and the post-merge package refresh remain pending external finalization. No Plane work item applies because Dan directly requested this installation.
+- Current handoff: public `agent-ops-community` pull request 14 pins HumanLayer's `show-me` skill at upstream commit `4d8d644ca747517973f58d7953f58d7cd07520cd` and configures it for all seven Agent Ops frameworks without importing the repository's four unrelated skills. Hosted CI, Review Gate, merge, and the post-merge package refresh remain pending external finalization. No Plane work item applies because Dan directly requested this installation.
 - Verification: the registry contract test failed before the dependency was added and now passes. On implementation commit `b2d5af1`, complete Ruff, all 103 tests, the source-tree harness check, whitespace validation, and exact pinned installation into disposable homes for all seven frameworks pass.
 
 ## Current Work
@@ -18,8 +18,8 @@ Repository: `agent-ops-community`
 
 ## Next Actions
 
-- Obtain hosted CI and Review Gate on the unchanged final head of [public pull request 14](https://github.com/dmc-technologies/agent-ops-community/pull/14).
-- Merge [public pull request 14](https://github.com/dmc-technologies/agent-ops-community/pull/14) only after the required checks pass.
+- Obtain hosted CI and Review Gate on the unchanged final head of public `agent-ops-community` pull request 14.
+- Merge public `agent-ops-community` pull request 14 only after the required checks pass.
 - After merge, refresh the installed Agent Ops package from public `main`; the machine-global, Prime Agent, and local Agent Ops copies are already installed.
 
 ## Session Log
