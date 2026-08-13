@@ -636,7 +636,7 @@ def test_openclaw_home_resolves_active_state_precedence(
     assert default_framework_home(Framework.OPENCLAW) == tmp_path / "other"
     monkeypatch.delenv("OPENCLAW_CONFIG_PATH")
     (base_home / ".clawdbot").mkdir(parents=True)
-    assert default_framework_home(Framework.OPENCLAW) == base_home / ".clawdbot"
+    assert default_framework_home(Framework.OPENCLAW) == base_home / ".openclaw"
     (base_home / ".openclaw").mkdir()
     assert default_framework_home(Framework.OPENCLAW) == base_home / ".openclaw"
 
@@ -958,6 +958,60 @@ def test_windows_helpers_refuse_linked_descendant_and_lock(
     else:
         raise AssertionError("expected linked Windows lock to fail")
     assert target.read_bytes() == b""
+
+
+def test_openclaw_named_profile_excludes_personal_agent_skill_root(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = _show_me_source(tmp_path / "source")
+    os_home = tmp_path / "os-home"
+    personal = os_home / ".agents" / "skills" / "show-me"
+    personal.mkdir(parents=True)
+    (personal / "SKILL.md").write_text(
+        "---\nname: show-me\ndescription: default only\n---\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(os_home))
+    monkeypatch.setenv("OPENCLAW_PROFILE", "customer-a")
+    monkeypatch.delenv("OPENCLAW_HOME", raising=False)
+    monkeypatch.delenv("OPENCLAW_STATE_DIR", raising=False)
+    monkeypatch.delenv("OPENCLAW_CONFIG_PATH", raising=False)
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
+    )
+
+    install_skill_dependencies(
+        framework=Framework.OPENCLAW,
+        dependencies=[_show_me_dependency(Framework.OPENCLAW)],
+    )
+
+    assert (os_home / ".openclaw-customer-a" / "skills" / "show-me" / "SKILL.md").is_file()
+
+
+def test_openclaw_legacy_state_does_not_relocate_managed_skills(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = _show_me_source(tmp_path / "source")
+    os_home = tmp_path / "os-home"
+    (os_home / ".clawdbot").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(os_home))
+    monkeypatch.delenv("OPENCLAW_HOME", raising=False)
+    monkeypatch.delenv("OPENCLAW_STATE_DIR", raising=False)
+    monkeypatch.delenv("OPENCLAW_CONFIG_PATH", raising=False)
+    monkeypatch.delenv("OPENCLAW_PROFILE", raising=False)
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
+    )
+
+    install_skill_dependencies(
+        framework=Framework.OPENCLAW,
+        dependencies=[_show_me_dependency(Framework.OPENCLAW)],
+    )
+
+    assert (os_home / ".openclaw" / "skills" / "show-me" / "SKILL.md").is_file()
+    assert not (os_home / ".clawdbot" / "skills" / "show-me").exists()
 
 
 def test_openclaw_home_rejects_unsafe_profile_name(

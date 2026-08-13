@@ -106,11 +106,7 @@ def _default_openclaw_home() -> Path:
         ):
             raise ValueError("OPENCLAW_PROFILE must use letters, numbers, '_' or '-'")
         return base_home / f".openclaw-{profile}"
-    current_state = base_home / ".openclaw"
-    legacy_state = base_home / ".clawdbot"
-    if not current_state.exists() and legacy_state.exists():
-        return legacy_state
-    return current_state
+    return base_home / ".openclaw"
 
 
 def _expand_openclaw_path(value: str, base_home: Path) -> Path:
@@ -134,15 +130,13 @@ def _openclaw_uses_default_state(target_home: Path) -> bool:
         else os_home
     )
     state_override = _normalize_home_value(os.environ.get("OPENCLAW_STATE_DIR"))
-    canonical = effective_home / ".openclaw"
-    if state_override is None:
-        return target_home.resolve() == _default_openclaw_home().resolve()
-    return (
-        _expand_openclaw_path(state_override, effective_home).resolve()
-        == canonical.resolve()
-        and target_home.resolve() == canonical.resolve()
-    )
-
+    config_path = _normalize_home_value(os.environ.get("OPENCLAW_CONFIG_PATH"))
+    profile = _normalize_home_value(os.environ.get("OPENCLAW_PROFILE"))
+    if state_override is not None or config_path is not None:
+        return False
+    if profile is not None and profile.lower() != "default":
+        return False
+    return target_home.resolve() == (effective_home / ".openclaw").resolve()
 
 def _show_me_collision_roots(framework: Framework, target_home: Path) -> tuple[Path, ...]:
     os_home = _openclaw_os_home()
