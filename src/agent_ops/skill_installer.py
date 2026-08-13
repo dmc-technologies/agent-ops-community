@@ -4,7 +4,9 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -325,6 +327,111 @@ def _expand_opencode_config_value(value: str, *, config_dir: Path) -> str:
     return re.sub(r"\{file:([^}]+)\}", file_replace, expanded)
 
 
+def _opencode_managed_config_dir() -> Path:
+    test_override = _normalize_home_value(os.environ.get("OPENCODE_TEST_MANAGED_CONFIG_DIR"))
+    if test_override is not None:
+        return Path(test_override).expanduser().resolve()
+    if sys.platform == "darwin":
+        return Path("/Library/Application Support/opencode")
+    if os.name == "nt":  # pragma: no cover - exercised on Windows
+        program_data = os.environ.get("PROGRAMDATA") or r"C:\ProgramData"
+        return Path(program_data) / "opencode"
+    return Path("/etc/opencode")
+
+
+def _opencode_managed_preferences() -> dict[str, object]:
+    if sys.platform != "darwin":
+        return {}
+    try:
+        import getpass
+
+        user = getpass.getuser()
+    except (ImportError, OSError):  # pragma: no cover - defensive fallback
+        user = "user"
+    candidates = [
+        Path("/Library/Managed Preferences") / user / "ai.opencode.managed.plist",
+        Path("/Library/Managed Preferences/ai.opencode.managed.plist"),
+    ]
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        result = subprocess.run(
+            ["plutil", "-convert", "json", "-o", "-", str(candidate)],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise ValueError(f"cannot read OpenCode managed preferences {candidate}")
+        try:
+            value = json.loads(result.stdout)
+        except ValueError as exc:
+            raise ValueError(f"cannot parse OpenCode managed preferences {candidate}") from exc
+        if not isinstance(value, dict):
+            raise ValueError(f"OpenCode managed preferences must be an object: {candidate}")
+        for key in (
+            "PayloadDisplayName",
+            "PayloadIdentifier",
+            "PayloadType",
+            "PayloadUUID",
+            "PayloadVersion",
+            "_manualProfile",
+        ):
+            value.pop(key, None)
+        return value
+    return {}
+
+
+def _opencode_data_home() -> Path:
+    configured = _normalize_home_value(os.environ.get("XDG_DATA_HOME"))
+    base = (
+        Path(configured).expanduser()
+        if configured is not None
+        else Path.home() / ".local" / "share"
+    )
+    return (base / "opencode").resolve()
+
+
+def _reject_uninspectable_opencode_remote_config() -> None:
+    auth_path = _opencode_data_home() / "auth.json"
+    if auth_path.is_file():
+        try:
+            auth = json.loads(auth_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise ValueError(
+                f"cannot inspect OpenCode remote configuration state: {auth_path}"
+            ) from exc
+        if isinstance(auth, dict) and any(
+            isinstance(value, dict) and value.get("type") == "wellknown" for value in auth.values()
+        ):
+            raise ValueError(
+                "OpenCode well-known remote configuration cannot be inspected reproducibly "
+                "by the global installer"
+            )
+    for database in _opencode_data_home().glob("opencode*.db"):
+        try:
+            with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as connection:
+                row = connection.execute(
+                    "SELECT active_account_id FROM account_state "
+                    "WHERE active_account_id IS NOT NULL LIMIT 1"
+                ).fetchone()
+        except sqlite3.Error:
+            continue
+        if row:
+            raise ValueError(
+                "OpenCode active-account remote configuration cannot be inspected "
+                "reproducibly by the global installer"
+            )
+
+
+def _reject_uninspectable_opencode_skill_urls(config: dict[str, object]) -> None:
+    urls = _nested_string_list(config, "skills", "urls")
+    if urls:
+        raise ValueError(
+            "OpenCode skills.urls cannot be inspected reproducibly by the global installer; "
+            "remove the remote skill source before global installation"
+        )
+
+
 def _opencode_configured_skill_roots() -> tuple[Path, ...]:
     config: dict[str, object] = {}
     paths_config_dir = _opencode_xdg_home()
@@ -356,6 +463,21 @@ def _opencode_configured_skill_roots() -> tuple[Path, ...]:
         if _nested_string_list(loaded, "skills", "paths"):
             paths_config_dir = Path.cwd()
         config = _deep_merge_host_config(config, loaded)
+    managed_dir = _opencode_managed_config_dir()
+    for config_file in (
+        managed_dir / "opencode.json",
+        managed_dir / "opencode.jsonc",
+    ):
+        loaded = _load_json5_object(config_file)
+        if _nested_string_list(loaded, "skills", "paths"):
+            paths_config_dir = config_file.resolve().parent
+        config = _deep_merge_host_config(config, loaded)
+    managed_preferences = _opencode_managed_preferences()
+    if _nested_string_list(managed_preferences, "skills", "paths"):
+        paths_config_dir = Path("/Library/Managed Preferences")
+    config = _deep_merge_host_config(config, managed_preferences)
+    _reject_uninspectable_opencode_remote_config()
+    _reject_uninspectable_opencode_skill_urls(config)
     roots = []
     for authored in _nested_string_list(config, "skills", "paths"):
         item = _expand_opencode_config_value(authored, config_dir=paths_config_dir)
@@ -579,6 +701,15 @@ def install_skill_dependencies(
     target_home = (home or default_framework_home(framework)).expanduser()
     cache_root = (cache_dir or Path("~/.cache/agentops/skill-dependencies")).expanduser()
     installed: list[InstalledSkillDependency] = []
+
+    show_me_selected = any(
+        dependency.id == "humanlayer-show-me"
+        and (not selected or dependency.id in selected)
+        and framework.value in dependency.install
+        for dependency in dependencies
+    )
+    if show_me_selected and not dry_run:
+        _show_me_collision_roots(framework, target_home)
 
     for dependency in dependencies:
         if selected and dependency.id not in selected:

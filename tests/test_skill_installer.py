@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import sqlite3
 import subprocess
 from pathlib import Path
 
@@ -2060,4 +2061,115 @@ def test_openclaw_configured_root_scans_allowed_symlink_target(
         install_skill_dependencies(
             framework=Framework.OPENCLAW,
             dependencies=[_show_me_dependency(Framework.OPENCLAW)],
+        )
+
+
+def test_opencode_system_managed_skill_path_is_checked(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = _show_me_source(tmp_path / "source")
+    os_home = tmp_path / "os-home"
+    managed = tmp_path / "managed"
+    extra = tmp_path / "enterprise-skills"
+    collision = extra / "show-me-copy"
+    collision.mkdir(parents=True)
+    (collision / "SKILL.md").write_text(
+        "---\nname: show-me\ndescription: managed\n---\n", encoding="utf-8"
+    )
+    managed.mkdir()
+    (managed / "opencode.json").write_text(
+        json.dumps({"skills": {"paths": [str(extra)]}}), encoding="utf-8"
+    )
+    monkeypatch.setenv("HOME", str(os_home))
+    monkeypatch.setenv("OPENCODE_TEST_MANAGED_CONFIG_DIR", str(managed))
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
+    )
+
+    with pytest.raises(ShowMeCollisionError, match="logical skill-name collision"):
+        install_skill_dependencies(
+            framework=Framework.OPENCODE,
+            dependencies=[_show_me_dependency(Framework.OPENCODE)],
+        )
+
+
+def test_opencode_remote_skill_url_fails_before_checkout(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    os_home = tmp_path / "os-home"
+    config = os_home / ".config" / "opencode" / "opencode.json"
+    config.parent.mkdir(parents=True)
+    config.write_text(
+        json.dumps({"skills": {"urls": ["https://example.test/skills/"]}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(os_home))
+    monkeypatch.setenv("OPENCODE_TEST_MANAGED_CONFIG_DIR", str(tmp_path / "managed"))
+    checkout_called = False
+
+    def checkout(dependency, cache):
+        nonlocal checkout_called
+        checkout_called = True
+        raise AssertionError("checkout must not run")
+
+    monkeypatch.setattr("agent_ops.skill_installer._checkout_dependency", checkout)
+
+    with pytest.raises(ValueError, match=r"skills\.urls cannot be inspected reproducibly"):
+        install_skill_dependencies(
+            framework=Framework.OPENCODE,
+            dependencies=[_show_me_dependency(Framework.OPENCODE)],
+        )
+
+    assert not checkout_called
+    assert not (os_home / ".agents" / "skills" / "show-me").exists()
+
+
+def test_opencode_well_known_remote_config_fails_closed(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    os_home = tmp_path / "os-home"
+    data = tmp_path / "data"
+    auth = data / "opencode" / "auth.json"
+    auth.parent.mkdir(parents=True)
+    auth.write_text(
+        json.dumps(
+            {"https://enterprise.test": {"type": "wellknown", "key": "TOKEN", "token": "secret"}}
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(os_home))
+    monkeypatch.setenv("XDG_DATA_HOME", str(data))
+    monkeypatch.setenv("OPENCODE_TEST_MANAGED_CONFIG_DIR", str(tmp_path / "managed"))
+
+    with pytest.raises(ValueError, match="well-known remote configuration"):
+        install_skill_dependencies(
+            framework=Framework.OPENCODE,
+            dependencies=[_show_me_dependency(Framework.OPENCODE)],
+        )
+
+
+def test_opencode_active_organization_remote_config_fails_closed(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    os_home = tmp_path / "os-home"
+    data = tmp_path / "data"
+    database = data / "opencode" / "opencode.db"
+    database.parent.mkdir(parents=True)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TABLE account_state (active_account_id TEXT, active_org_id TEXT)"
+        )
+        connection.execute("INSERT INTO account_state VALUES (?, ?)", ("account", "organization"))
+    monkeypatch.setenv("HOME", str(os_home))
+    monkeypatch.setenv("XDG_DATA_HOME", str(data))
+    monkeypatch.setenv("OPENCODE_TEST_MANAGED_CONFIG_DIR", str(tmp_path / "managed"))
+
+    with pytest.raises(ValueError, match="active-account remote configuration"):
+        install_skill_dependencies(
+            framework=Framework.OPENCODE,
+            dependencies=[_show_me_dependency(Framework.OPENCODE)],
         )
