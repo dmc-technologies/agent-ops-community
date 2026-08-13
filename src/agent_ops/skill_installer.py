@@ -112,9 +112,13 @@ def _openclaw_profile() -> str | None:
     profile = _normalize_home_value(os.environ.get("OPENCLAW_PROFILE"))
     if not profile or profile.lower() == "default":
         return None
-    if not profile[0].isalnum() or len(profile) > 64 or any(
-        character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
-        for character in profile
+    if (
+        not profile[0].isalnum()
+        or len(profile) > 64
+        or any(
+            character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+            for character in profile
+        )
     ):
         raise ValueError("OPENCLAW_PROFILE must use letters, numbers, '_' or '-'")
     return profile
@@ -169,9 +173,7 @@ def _deep_merge_openclaw_config(base: object, override: object) -> object:
         merged = dict(base)
         for key, value in override.items():
             merged[key] = (
-                _deep_merge_openclaw_config(merged[key], value)
-                if key in merged
-                else value
+                _deep_merge_openclaw_config(merged[key], value) if key in merged else value
             )
         return merged
     if isinstance(base, list) and isinstance(override, list):
@@ -211,9 +213,7 @@ def _resolve_openclaw_includes(
 ) -> object:
     if isinstance(value, list):
         return [
-            _resolve_openclaw_includes(
-                item, base_path=base_path, roots=roots, chain=chain
-            )
+            _resolve_openclaw_includes(item, base_path=base_path, roots=roots, chain=chain)
             for item in value
         ]
     if not isinstance(value, dict):
@@ -221,9 +221,7 @@ def _resolve_openclaw_includes(
     include = value.get("$include")
     if include is None:
         return {
-            key: _resolve_openclaw_includes(
-                item, base_path=base_path, roots=roots, chain=chain
-            )
+            key: _resolve_openclaw_includes(item, base_path=base_path, roots=roots, chain=chain)
             for key, item in value.items()
         }
     include_items = [include] if isinstance(include, str) else include
@@ -254,9 +252,7 @@ def _resolve_openclaw_includes(
             ),
         )
     siblings = {
-        key: _resolve_openclaw_includes(
-            item, base_path=base_path, roots=roots, chain=chain
-        )
+        key: _resolve_openclaw_includes(item, base_path=base_path, roots=roots, chain=chain)
         for key, item in value.items()
         if key != "$include"
     }
@@ -340,9 +336,7 @@ def _opencode_configured_skill_roots() -> tuple[Path, ...]:
         xdg_home / "opencode.jsonc",
     ]
     if config_home != xdg_home:
-        config_files.extend(
-            [config_home / "opencode.json", config_home / "opencode.jsonc"]
-        )
+        config_files.extend([config_home / "opencode.json", config_home / "opencode.jsonc"])
     custom = _normalize_home_value(os.environ.get("OPENCODE_CONFIG"))
     if custom is not None:
         config_files.append(Path(custom).expanduser())
@@ -418,20 +412,14 @@ def _openclaw_active_config_path() -> Path:
     return selected_state / "openclaw.json"
 
 
-def _expand_openclaw_config_environment(
-    value: str, config: dict[str, object]
-) -> str:
+def _expand_openclaw_config_environment(value: str, config: dict[str, object]) -> str:
     escaped = "\0AGENTOPS_OPENCLAW_ESCAPED\0"
     value = value.replace("$${", escaped + "{")
     configured_env: dict[str, str] = {}
     raw_env = config.get("env")
     if isinstance(raw_env, dict):
         raw_vars = raw_env.get("vars")
-        candidates = {
-            key: item
-            for key, item in raw_env.items()
-            if key not in {"vars", "shellEnv"}
-        }
+        candidates = {key: item for key, item in raw_env.items() if key not in {"vars", "shellEnv"}}
         if isinstance(raw_vars, dict):
             candidates.update(raw_vars)
         configured_env = {
@@ -460,11 +448,45 @@ def _openclaw_configured_skill_roots() -> tuple[Path, ...]:
     roots = []
     for item in _nested_string_list(config, "skills", "load", "extraDirs"):
         roots.append(
-            _expand_openclaw_path(
-                _expand_openclaw_config_environment(item, config), effective_home
-            )
+            _expand_openclaw_path(_expand_openclaw_config_environment(item, config), effective_home)
         )
     return tuple(root.resolve() for root in roots)
+
+
+def _show_me_collision_policy(framework: Framework) -> str:
+    if framework is Framework.OPENCLAW:
+        return "openclaw"
+    if framework is Framework.OPENCODE:
+        return "opencode"
+    if framework is Framework.CODEX:
+        return "codex"
+    return "generic"
+
+
+def _openclaw_collision_options() -> tuple[dict[str, int], tuple[Path, ...]]:
+    config = _load_openclaw_config(_openclaw_active_config_path())
+    limits: dict[str, int] = {}
+    raw_limits: object = config.get("skills", {})
+    raw_limits = raw_limits.get("limits", {}) if isinstance(raw_limits, dict) else {}
+    defaults = {
+        "maxCandidatesPerRoot": 300,
+        "maxSkillsLoadedPerSource": 200,
+        "maxSkillFileBytes": 256_000,
+    }
+    for key, default in defaults.items():
+        value = raw_limits.get(key, default) if isinstance(raw_limits, dict) else default
+        minimum = 0 if key == "maxSkillFileBytes" else 1
+        if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+            raise ValueError(f"active host configuration skills.limits.{key} is invalid")
+        limits[key] = value
+    effective_home = _openclaw_effective_home()
+    allowed = tuple(
+        _expand_openclaw_path(
+            _expand_openclaw_config_environment(item, config), effective_home
+        ).resolve()
+        for item in _nested_string_list(config, "skills", "load", "allowSymlinkTargets")
+    )
+    return limits, allowed
 
 
 def _codex_system_skill_root() -> Path:
@@ -474,9 +496,7 @@ def _codex_system_skill_root() -> Path:
         buffer = ctypes.create_unicode_buffer(260)
         result = ctypes.windll.shell32.SHGetFolderPathW(None, 35, None, 0, buffer)
         program_data = (
-            Path(buffer.value)
-            if result == 0 and buffer.value
-            else Path(r"C:\ProgramData")
+            Path(buffer.value) if result == 0 and buffer.value else Path(r"C:\ProgramData")
         )
         return program_data / "OpenAI" / "Codex" / "skills"
     return Path("/etc/codex/skills")
@@ -505,11 +525,7 @@ def _show_me_collision_roots(framework: Framework, target_home: Path) -> tuple[P
         ]
     elif framework is Framework.OPENCODE:
         config_roots = {_opencode_xdg_home(), _opencode_config_home()}
-        roots = [
-            child
-            for root in config_roots
-            for child in (root / "skill", root / "skills")
-        ]
+        roots = [child for root in config_roots for child in (root / "skill", root / "skills")]
         roots.extend(_opencode_configured_skill_roots())
         if not _environment_truthy("OPENCODE_DISABLE_EXTERNAL_SKILLS"):
             roots.append(os_home / ".agents" / "skills")
@@ -553,8 +569,7 @@ def install_skill_dependencies(
     )
     if unsupported:
         raise ValueError(
-            f"skill dependency id(s) not supported for {framework.value}: "
-            f"{', '.join(unsupported)}"
+            f"skill dependency id(s) not supported for {framework.value}: {', '.join(unsupported)}"
         )
     if not selected and not any(
         framework.value in dependency.install for dependency in dependencies
@@ -647,14 +662,19 @@ def _install_dependency(
         return
     if install.strategy == "humanlayer-show-me":
         if dependency_id != "humanlayer-show-me":
-            raise ValueError(
-                "humanlayer-show-me strategy is only valid for HumanLayer Show Me"
-            )
+            raise ValueError("humanlayer-show-me strategy is only valid for HumanLayer Show Me")
+        collision_limits: dict[str, int] | None = None
+        collision_allowed_symlink_targets: tuple[Path, ...] = ()
+        if framework is Framework.OPENCLAW:
+            collision_limits, collision_allowed_symlink_targets = _openclaw_collision_options()
         install_show_me(
             source,
             destination / "show-me",
             collision_roots=_show_me_collision_roots(framework, target_home),
             flat_markdown=framework is Framework.OPENCODE,
+            collision_policy=_show_me_collision_policy(framework),
+            collision_limits=collision_limits,
+            collision_allowed_symlink_targets=collision_allowed_symlink_targets,
         )
         return
     if install.strategy == "copy-skills":

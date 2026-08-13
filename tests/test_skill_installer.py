@@ -5,6 +5,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from agent_ops import show_me_adapter
 from agent_ops.registries import load_skill_dependencies
 from agent_ops.registries.models import Framework, SkillDependency, SkillDependencyInstall
@@ -593,9 +595,7 @@ def test_show_me_windows_path_transaction_installs_and_updates(
     assert destination.is_dir()
     assert "supported artifact preview or file-opening capability" in (
         destination / "SKILL.md"
-    ).read_text(
-        encoding="utf-8"
-    )
+    ).read_text(encoding="utf-8")
     assert not list((profile / "skills").glob(".humanlayer-show-me-*-*"))
 
 
@@ -650,9 +650,7 @@ def test_openclaw_home_resolves_active_state_precedence(
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("OPENCLAW_STATE_DIR", "~root/selected-state")
-    assert default_framework_home(Framework.OPENCLAW) == (
-        tmp_path / "~root" / "selected-state"
-    )
+    assert default_framework_home(Framework.OPENCLAW) == (tmp_path / "~root" / "selected-state")
     monkeypatch.delenv("OPENCLAW_STATE_DIR")
     monkeypatch.delenv("OPENCLAW_PROFILE")
     monkeypatch.setenv("OPENCLAW_HOME", "~root/openclaw-home")
@@ -670,14 +668,10 @@ def test_openclaw_home_matches_operator_home_precedence(
     monkeypatch.delenv("OPENCLAW_PROFILE", raising=False)
     monkeypatch.setenv("HOME", "undefined")
     monkeypatch.setenv("USERPROFILE", str(tmp_path / "userprofile"))
-    assert default_framework_home(Framework.OPENCLAW) == (
-        tmp_path / "userprofile" / ".openclaw"
-    )
+    assert default_framework_home(Framework.OPENCLAW) == (tmp_path / "userprofile" / ".openclaw")
 
     monkeypatch.setenv("HOME", str(tmp_path / "home-wins"))
-    assert default_framework_home(Framework.OPENCLAW) == (
-        tmp_path / "home-wins" / ".openclaw"
-    )
+    assert default_framework_home(Framework.OPENCLAW) == (tmp_path / "home-wins" / ".openclaw")
 
     monkeypatch.setenv("HOME", "null")
     monkeypatch.setenv("USERPROFILE", " ")
@@ -813,9 +807,7 @@ def test_codex_system_skill_root_is_checked(tmp_path: Path, monkeypatch) -> None
         encoding="utf-8",
     )
     monkeypatch.setenv("HOME", str(tmp_path / "os-home"))
-    monkeypatch.setattr(
-        "agent_ops.skill_installer._codex_system_skill_root", lambda: system_root
-    )
+    monkeypatch.setattr("agent_ops.skill_installer._codex_system_skill_root", lambda: system_root)
     monkeypatch.setattr(
         "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
     )
@@ -1307,9 +1299,7 @@ def test_show_me_retries_partial_unjournaled_garbage_cleanup(
     source = _show_me_source(tmp_path / "source")
     home = tmp_path / "home"
     garbage = (
-        home
-        / SHOW_ME_OWNERSHIP_MANIFEST_RELATIVE.parent
-        / ".humanlayer-show-me-stage-interrupted"
+        home / SHOW_ME_OWNERSHIP_MANIFEST_RELATIVE.parent / ".humanlayer-show-me-stage-interrupted"
     )
     garbage.mkdir(parents=True)
     (garbage / "partial").write_text("partial", encoding="utf-8")
@@ -1330,12 +1320,14 @@ def test_show_me_retries_partial_unjournaled_garbage_cleanup(
 def test_windows_helpers_refuse_linked_descendant_and_lock(
     tmp_path: Path,
 ) -> None:
-    assert show_me_adapter._normalize_windows_final_path(
-        "\\\\?\\C:\\Users\\agent\\lock"
-    ) == "C:\\Users\\agent\\lock"
-    assert show_me_adapter._normalize_windows_final_path(
-        "\\\\?\\UNC\\server\\share\\lock"
-    ) == "\\\\server\\share\\lock"
+    assert (
+        show_me_adapter._normalize_windows_final_path("\\\\?\\C:\\Users\\agent\\lock")
+        == "C:\\Users\\agent\\lock"
+    )
+    assert (
+        show_me_adapter._normalize_windows_final_path("\\\\?\\UNC\\server\\share\\lock")
+        == "\\\\server\\share\\lock"
+    )
 
     external = tmp_path / "external"
     external.mkdir()
@@ -1931,3 +1923,147 @@ def test_prime_gstack_strategy_receives_the_profile_root(
     )
 
     assert calls == [(source, tmp_path / "home")]
+
+
+def test_openclaw_configured_root_ignores_undiscoverable_entries(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = _show_me_source(tmp_path / "source")
+    os_home = tmp_path / "os-home"
+    extra = tmp_path / "catalog"
+    ignored = extra / "node_modules" / "show-me"
+    ignored.mkdir(parents=True)
+    (ignored / "SKILL.md").write_text(
+        "---\nname: show-me\ndescription: ignored\n---\n", encoding="utf-8"
+    )
+    ordinary = extra / "ordinary"
+    ordinary.mkdir()
+    (ordinary / "SKILL.md").write_text(
+        "---\nname: on\ndescription: unrelated YAML 1.2 name\n---\n", encoding="utf-8"
+    )
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "SKILL.md").write_text(
+        "---\nname: show-me\ndescription: escaped\n---\n", encoding="utf-8"
+    )
+    (extra / "escaped").symlink_to(outside, target_is_directory=True)
+    config = os_home / ".openclaw" / "openclaw.json"
+    config.parent.mkdir(parents=True)
+    config.write_text(
+        json.dumps({"skills": {"load": {"extraDirs": [str(extra)]}}}), encoding="utf-8"
+    )
+    monkeypatch.setenv("HOME", str(os_home))
+    monkeypatch.delenv("OPENCLAW_STATE_DIR", raising=False)
+    monkeypatch.delenv("OPENCLAW_PROFILE", raising=False)
+    monkeypatch.delenv("OPENCLAW_CONFIG_PATH", raising=False)
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
+    )
+
+    install_skill_dependencies(
+        framework=Framework.OPENCLAW,
+        dependencies=[_show_me_dependency(Framework.OPENCLAW)],
+    )
+
+    assert (os_home / ".openclaw" / "skills" / "show-me" / "SKILL.md").is_file()
+
+
+def test_opencode_configured_root_scans_visible_node_modules(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = _show_me_source(tmp_path / "source")
+    os_home = tmp_path / "os-home"
+    extra = tmp_path / "catalog"
+    collision = extra / "node_modules" / "show-me"
+    collision.mkdir(parents=True)
+    (collision / "SKILL.md").write_text(
+        "---\nname: show-me\ndescription: discoverable\n---\n", encoding="utf-8"
+    )
+    config = os_home / ".config" / "opencode" / "opencode.json"
+    config.parent.mkdir(parents=True)
+    config.write_text(json.dumps({"skills": {"paths": [str(extra)]}}), encoding="utf-8")
+    monkeypatch.setenv("HOME", str(os_home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("OPENCODE_CONFIG_DIR", raising=False)
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
+    )
+
+    with pytest.raises(ShowMeCollisionError, match="logical skill-path collision"):
+        install_skill_dependencies(
+            framework=Framework.OPENCODE,
+            dependencies=[_show_me_dependency(Framework.OPENCODE)],
+        )
+
+
+def test_codex_admin_root_ignores_hidden_skill_directory(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = _show_me_source(tmp_path / "source")
+    os_home = tmp_path / "os-home"
+    admin = tmp_path / "admin"
+    hidden = admin / ".fixtures" / "show-me"
+    hidden.mkdir(parents=True)
+    (hidden / "SKILL.md").write_text(
+        "---\nname: show-me\ndescription: hidden\n---\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("HOME", str(os_home))
+    monkeypatch.setattr("agent_ops.skill_installer._codex_system_skill_root", lambda: admin)
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
+    )
+
+    install_skill_dependencies(
+        framework=Framework.CODEX,
+        dependencies=[_show_me_dependency(Framework.CODEX)],
+    )
+
+    assert (os_home / ".codex" / "skills" / "show-me" / "SKILL.md").is_file()
+
+
+def test_openclaw_configured_root_scans_allowed_symlink_target(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = _show_me_source(tmp_path / "source")
+    os_home = tmp_path / "os-home"
+    extra = tmp_path / "catalog"
+    extra.mkdir()
+    allowed = tmp_path / "shared"
+    collision = allowed / "show-me-copy"
+    collision.mkdir(parents=True)
+    (collision / "SKILL.md").write_text(
+        "---\nname: show-me\ndescription: allowed external\n---\n", encoding="utf-8"
+    )
+    (extra / "shared").symlink_to(allowed, target_is_directory=True)
+    config = os_home / ".openclaw" / "openclaw.json"
+    config.parent.mkdir(parents=True)
+    config.write_text(
+        json.dumps(
+            {
+                "skills": {
+                    "load": {
+                        "extraDirs": [str(extra)],
+                        "allowSymlinkTargets": [str(allowed)],
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(os_home))
+    monkeypatch.delenv("OPENCLAW_STATE_DIR", raising=False)
+    monkeypatch.delenv("OPENCLAW_PROFILE", raising=False)
+    monkeypatch.delenv("OPENCLAW_CONFIG_PATH", raising=False)
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
+    )
+
+    with pytest.raises(ShowMeCollisionError, match="logical skill-name collision"):
+        install_skill_dependencies(
+            framework=Framework.OPENCLAW,
+            dependencies=[_show_me_dependency(Framework.OPENCLAW)],
+        )

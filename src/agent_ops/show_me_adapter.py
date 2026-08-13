@@ -28,9 +28,7 @@ PINNED_REPO = "https://github.com/humanlayer/skills.git"
 PINNED_REF = "4d8d644ca747517973f58d7953f58d7cd07520cd"
 SKILL_NAME = "show-me"
 SOURCE_RELATIVE = Path("plugins/show-me/skills/show-me")
-OWNERSHIP_MANIFEST_RELATIVE = Path(
-    ".agentops/skill-dependencies/humanlayer-show-me.json"
-)
+OWNERSHIP_MANIFEST_RELATIVE = Path(".agentops/skill-dependencies/humanlayer-show-me.json")
 _LOCK_NAME = "humanlayer-show-me.lock"
 _TRANSACTION_NAME = "humanlayer-show-me-transaction.json"
 _STAGE_PREFIX = ".humanlayer-show-me-stage-"
@@ -48,6 +46,9 @@ def install_show_me(
     upstream_ref: str = PINNED_REF,
     collision_roots: tuple[Path, ...] = (),
     flat_markdown: bool = False,
+    collision_policy: str = "generic",
+    collision_limits: dict[str, int] | None = None,
+    collision_allowed_symlink_targets: tuple[Path, ...] = (),
 ) -> dict[str, Any]:
     """Adapt and transactionally install the pinned HumanLayer show-me skill."""
 
@@ -63,6 +64,9 @@ def install_show_me(
             upstream_ref,
             collision_roots,
             flat_markdown,
+            collision_policy,
+            collision_limits,
+            collision_allowed_symlink_targets,
         )
 
     root_fd = _ensure_absolute_directory_no_follow(profile_root)
@@ -99,6 +103,9 @@ def install_show_me(
                 collision_root,
                 flat_markdown=flat_markdown,
                 allowed_fingerprint=manifest["installed_fingerprint"],
+                policy=collision_policy,
+                limits=collision_limits,
+                allowed_symlink_targets=collision_allowed_symlink_targets,
             )
         current = _preflight(
             skills_fd,
@@ -140,6 +147,9 @@ def _install_show_me_windows(
     upstream_ref: str,
     collision_roots: tuple[Path, ...] = (),
     flat_markdown: bool = False,
+    collision_policy: str = "generic",
+    collision_limits: dict[str, int] | None = None,
+    collision_allowed_symlink_targets: tuple[Path, ...] = (),
 ) -> dict[str, Any]:
     _ensure_windows_directory(profile_root)
     skills_root = profile_root / "skills"
@@ -170,6 +180,9 @@ def _install_show_me_windows(
                     collision_root,
                     flat_markdown=flat_markdown,
                     allowed_fingerprint=manifest["installed_fingerprint"],
+                    policy=collision_policy,
+                    limits=collision_limits,
+                    allowed_symlink_targets=collision_allowed_symlink_targets,
                 )
             current = _preflight_windows(
                 skills_root,
@@ -209,9 +222,7 @@ def _ensure_windows_directory(path: Path) -> None:
         )
     if path.exists():
         if not path.is_dir():
-            raise ShowMeCollisionError(
-                f"selected profile path contains a non-directory: {path}"
-            )
+            raise ShowMeCollisionError(f"selected profile path contains a non-directory: {path}")
         return
     path.mkdir()
     if path.is_symlink() or _is_windows_reparse_point(path) or not path.is_dir():
@@ -250,9 +261,7 @@ def _open_windows_lock(path: Path) -> int:
             if length == 0 or length >= len(buffer):
                 raise ShowMeCollisionError(f"cannot verify show-me lock path: {path}")
             resolved = _normalize_windows_final_path(buffer.value)
-            if os.path.normcase(os.path.abspath(resolved)) != os.path.normcase(
-                expected_path
-            ):
+            if os.path.normcase(os.path.abspath(resolved)) != os.path.normcase(expected_path):
                 raise ShowMeCollisionError(f"show-me lock escaped profile: {path}")
         return descriptor
     except BaseException:
@@ -279,9 +288,7 @@ def _validate_windows_profile(profile_root: Path) -> None:
                 f"selected profile path contains a symbolic link or junction: {cursor}"
             )
         if cursor.exists() and not cursor.is_dir():
-            raise ShowMeCollisionError(
-                f"selected profile path contains a non-directory: {cursor}"
-            )
+            raise ShowMeCollisionError(f"selected profile path contains a non-directory: {cursor}")
 
 
 def _preflight_windows(
@@ -319,8 +326,21 @@ def _reject_external_collision_root_windows(
     *,
     flat_markdown: bool,
     allowed_fingerprint: str,
+    policy: str = "generic",
+    limits: dict[str, int] | None = None,
+    allowed_symlink_targets: tuple[Path, ...] = (),
 ) -> None:
-    _validate_windows_profile(root)
+    if policy != "generic":
+        if not root.exists():
+            return
+        _reject_host_visible_collisions_path(
+            root,
+            policy=policy,
+            limits=limits,
+            allowed_symlink_targets=allowed_symlink_targets,
+            allowed_fingerprint=allowed_fingerprint,
+        )
+        return
     if not root.exists():
         return
     _reject_logical_collisions_path(
@@ -348,10 +368,14 @@ def _reject_logical_collisions_path(
         visited.add(inode)
         for child in sorted(directory.iterdir(), key=lambda path: path.name):
             child_relative = relative / child.name
-            if not relative.parts and exclude_managed and (
-                child.name == SKILL_NAME
-                or child.name.startswith(_STAGE_PREFIX)
-                or child.name.startswith(_BACKUP_PREFIX)
+            if (
+                not relative.parts
+                and exclude_managed
+                and (
+                    child.name == SKILL_NAME
+                    or child.name.startswith(_STAGE_PREFIX)
+                    or child.name.startswith(_BACKUP_PREFIX)
+                )
             ):
                 continue
             try:
@@ -400,9 +424,257 @@ def _reject_show_me_frontmatter_path(skill_file: Path, relative: Path) -> None:
         ) from exc
     if _frontmatter_skill_name(text, _skill_location(relative)) == SKILL_NAME:
         raise ShowMeCollisionError(
-            f"logical skill-name collision for {SKILL_NAME} "
-            f"at {_skill_location(relative)}"
+            f"logical skill-name collision for {SKILL_NAME} at {_skill_location(relative)}"
         )
+
+
+def _load_frontmatter_mapping(
+    skill_file: Path, *, max_bytes: int | None = None
+) -> dict[str, Any] | None:
+    try:
+        if max_bytes is not None and skill_file.stat().st_size > max_bytes:
+            return None
+        text = skill_file.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    lines = text.removeprefix("\ufeff").splitlines()
+    if not lines or lines[0].strip() != "---":
+        return None
+    try:
+        closing = next(index for index, line in enumerate(lines[1:], 1) if line.strip() == "---")
+        value = yaml.load("\n".join(lines[1:closing]), Loader=yaml.BaseLoader)
+    except (StopIteration, yaml.YAMLError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _host_visible_skill_name(skill_file: Path, *, max_bytes: int | None = None) -> str | None:
+    value = _load_frontmatter_mapping(skill_file, max_bytes=max_bytes)
+    if value is None:
+        return None
+    name = value.get("name")
+    return name.strip() if isinstance(name, str) else None
+
+
+def _is_within(root: Path, candidate: Path) -> bool:
+    try:
+        candidate.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _reject_candidate_skill(
+    skill_file: Path,
+    *,
+    allowed_fingerprint: str,
+    max_bytes: int | None = None,
+) -> bool:
+    """Return whether an immediate SKILL.md made this directory terminal."""
+    if not skill_file.exists():
+        return False
+    if not skill_file.is_file():
+        return True
+    name = _host_visible_skill_name(skill_file, max_bytes=max_bytes)
+    if name == SKILL_NAME:
+        parent = skill_file.parent
+        if parent.name == SKILL_NAME:
+            if _tree_fingerprint(parent) == allowed_fingerprint:
+                return True
+            raise ShowMeCollisionError(f"logical skill-path collision for {SKILL_NAME} at {parent}")
+        raise ShowMeCollisionError(f"logical skill-name collision for {SKILL_NAME} at {skill_file}")
+    return True
+
+
+def _reject_host_visible_collisions_path(
+    root: Path,
+    *,
+    policy: str,
+    limits: dict[str, int] | None,
+    allowed_symlink_targets: tuple[Path, ...],
+    allowed_fingerprint: str,
+) -> None:
+    if policy == "opencode":
+        _reject_opencode_collisions(root, allowed_fingerprint=allowed_fingerprint)
+    elif policy == "codex":
+        _reject_codex_collisions(root, allowed_fingerprint=allowed_fingerprint)
+    elif policy == "openclaw":
+        _reject_openclaw_collisions(
+            root,
+            limits=limits or {},
+            allowed_symlink_targets=allowed_symlink_targets,
+            allowed_fingerprint=allowed_fingerprint,
+        )
+    else:
+        raise ValueError(f"unknown skill collision policy: {policy}")
+
+
+def _reject_opencode_collisions(root: Path, *, allowed_fingerprint: str) -> None:
+    visited: set[tuple[int, int]] = set()
+
+    def visit(directory: Path) -> None:
+        try:
+            identity = directory.stat()
+        except OSError:
+            return
+        inode = (identity.st_dev, identity.st_ino)
+        if inode in visited:
+            return
+        visited.add(inode)
+        try:
+            children = sorted(directory.iterdir(), key=lambda item: item.name)
+        except OSError:
+            return
+        for child in children:
+            if child.name.startswith("."):
+                continue
+            try:
+                if child.is_dir():
+                    visit(child)
+                elif child.name == "SKILL.md" and child.is_file():
+                    _reject_candidate_skill(
+                        child,
+                        allowed_fingerprint=allowed_fingerprint,
+                    )
+            except OSError:
+                continue
+
+    root_skill = root / "SKILL.md"
+    if root_skill.is_file():
+        _reject_candidate_skill(root_skill, allowed_fingerprint=allowed_fingerprint)
+    for flat_file in root.iterdir():
+        if flat_file.is_file() and flat_file.suffix.lower() == ".md":
+            if flat_file.name.lower() == f"{SKILL_NAME}.md":
+                raise ShowMeCollisionError(
+                    f"logical skill-path collision for {SKILL_NAME} at {flat_file}"
+                )
+            if _host_visible_skill_name(flat_file) == SKILL_NAME:
+                raise ShowMeCollisionError(
+                    f"logical skill-name collision for {SKILL_NAME} at {flat_file}"
+                )
+    visit(root)
+
+
+def _reject_codex_collisions(root: Path, *, allowed_fingerprint: str) -> None:
+    root = root.resolve()
+    queue: list[tuple[Path, int]] = [(root, 0)]
+    visited: set[tuple[int, int]] = set()
+    directories = entries = response_bytes = 0
+    while queue and directories < 2_000 and entries < 20_000 and response_bytes < 4 * 1024 * 1024:
+        directory, depth = queue.pop(0)
+        try:
+            identity = directory.stat()
+        except OSError:
+            continue
+        inode = (identity.st_dev, identity.st_ino)
+        if inode in visited:
+            continue
+        visited.add(inode)
+        directories += 1
+        children: list[Path] = []
+        try:
+            with os.scandir(directory) as scanned:
+                for entry in scanned:
+                    entries += 1
+                    child = directory / entry.name
+                    response_bytes += len(os.fsencode(str(child))) + 64
+                    if entries > 20_000 or response_bytes > 4 * 1024 * 1024:
+                        break
+                    children.append(child)
+        except OSError:
+            continue
+        for child in sorted(children, key=lambda item: item.name):
+            try:
+                child_stat = child.lstat()
+                if stat.S_ISDIR(child_stat.st_mode) or stat.S_ISLNK(child_stat.st_mode):
+                    if depth < 6 and not child.name.startswith(".") and child.is_dir():
+                        queue.append((child, depth + 1))
+                elif child.name == "SKILL.md" and stat.S_ISREG(child_stat.st_mode):
+                    _reject_candidate_skill(child, allowed_fingerprint=allowed_fingerprint)
+            except OSError:
+                continue
+
+
+def _reject_openclaw_collisions(
+    root: Path,
+    *,
+    limits: dict[str, int],
+    allowed_symlink_targets: tuple[Path, ...],
+    allowed_fingerprint: str,
+) -> None:
+    root = root.resolve()
+    max_candidates = limits.get("maxCandidatesPerRoot", 300)
+    max_skills = limits.get("maxSkillsLoadedPerSource", 200)
+    max_bytes = limits.get("maxSkillFileBytes", 256_000)
+    allowed = tuple(target.resolve() for target in allowed_symlink_targets if target.exists())
+    loaded = 0
+    visited: set[tuple[int, int]] = set()
+
+    def allowed_directory(directory: Path) -> Path | None:
+        try:
+            resolved = directory.resolve(strict=True)
+        except OSError:
+            return None
+        if _is_within(root, resolved) or any(_is_within(target, resolved) for target in allowed):
+            return resolved
+        return None
+
+    def visit(directory: Path, depth: int, max_depth: int) -> None:
+        nonlocal loaded
+        if loaded >= max_skills:
+            return
+        resolved = allowed_directory(directory)
+        if resolved is None:
+            return
+        try:
+            identity = resolved.stat()
+        except OSError:
+            return
+        inode = (identity.st_dev, identity.st_ino)
+        if inode in visited:
+            return
+        visited.add(inode)
+        skill_file = directory / "SKILL.md"
+        if skill_file.exists():
+            try:
+                skill_real = skill_file.resolve(strict=True)
+            except OSError:
+                return
+            if _is_within(resolved, skill_real):
+                terminal = _reject_candidate_skill(
+                    skill_file,
+                    allowed_fingerprint=allowed_fingerprint,
+                    max_bytes=max_bytes,
+                )
+                if terminal and _host_visible_skill_name(skill_file, max_bytes=max_bytes):
+                    loaded += 1
+            return
+        if depth >= max_depth:
+            return
+        raw_limit = min(10_000, max(1_000, 10 * max_candidates))
+        children: list[Path] = []
+        try:
+            with os.scandir(directory) as entries:
+                for index, entry in enumerate(entries):
+                    if index >= raw_limit:
+                        break
+                    if (
+                        not entry.name.startswith(".")
+                        and entry.name != "node_modules"
+                        and entry.is_dir(follow_symlinks=True)
+                    ):
+                        children.append(directory / entry.name)
+        except OSError:
+            return
+        for child in sorted(children, key=lambda item: item.name)[:max_candidates]:
+            is_skills_root = child.name == "skills" and not (child / "SKILL.md").exists()
+            child_depth = 0 if is_skills_root else depth + 1
+            child_max = 6 if is_skills_root or directory.name == "skills" else max_depth
+            visit(child, child_depth, child_max)
+            if loaded >= max_skills:
+                return
+
+    visit(root, 0, 6 if root.name == "skills" else 2)
 
 
 def _install_windows_transaction(
@@ -675,9 +947,7 @@ def _validate_source(upstream_root: Path, source: Path, upstream_ref: str) -> No
             text=True,
         ).stdout.strip()
         if head != upstream_ref:
-            raise ValueError(
-                f"pinned HumanLayer checkout is at {head}, expected {upstream_ref}"
-            )
+            raise ValueError(f"pinned HumanLayer checkout is at {head}, expected {upstream_ref}")
         status_output = subprocess.run(
             [
                 "git",
@@ -751,8 +1021,22 @@ def _reject_external_collision_root(
     *,
     flat_markdown: bool,
     allowed_fingerprint: str,
+    policy: str = "generic",
+    limits: dict[str, int] | None = None,
+    allowed_symlink_targets: tuple[Path, ...] = (),
 ) -> None:
-    descriptor = _open_existing_absolute_directory_no_follow(root.resolve())
+    root = root.resolve()
+    if policy != "generic":
+        if root.is_dir():
+            _reject_host_visible_collisions_path(
+                root,
+                policy=policy,
+                limits=limits,
+                allowed_symlink_targets=allowed_symlink_targets,
+                allowed_fingerprint=allowed_fingerprint,
+            )
+        return
+    descriptor = _open_existing_absolute_directory_no_follow(root)
     if descriptor is None:
         return
     try:
@@ -782,10 +1066,14 @@ def _reject_logical_collisions(
             return
         visited.add(inode)
         for name in sorted(os.listdir(directory_fd)):
-            if not relative.parts and exclude_managed and (
-                name == SKILL_NAME
-                or name.startswith(_STAGE_PREFIX)
-                or name.startswith(_BACKUP_PREFIX)
+            if (
+                not relative.parts
+                and exclude_managed
+                and (
+                    name == SKILL_NAME
+                    or name.startswith(_STAGE_PREFIX)
+                    or name.startswith(_BACKUP_PREFIX)
+                )
             ):
                 continue
             child_relative = relative / name
@@ -869,9 +1157,7 @@ def _reject_show_me_file_at(
     skill = _entry_stat(directory_fd, name)
     if skill is None:
         return
-    if not stat.S_ISREG(skill.st_mode) and not (
-        follow_symlinks and stat.S_ISLNK(skill.st_mode)
-    ):
+    if not stat.S_ISREG(skill.st_mode) and not (follow_symlinks and stat.S_ISLNK(skill.st_mode)):
         raise ShowMeCollisionError(f"cannot verify skill identity at {location}")
     try:
         flags = os.O_RDONLY | (0 if follow_symlinks else os.O_NOFOLLOW)
@@ -885,9 +1171,7 @@ def _reject_show_me_file_at(
     except (OSError, UnicodeDecodeError) as exc:
         raise ShowMeCollisionError(f"cannot verify skill identity at {location}") from exc
     if _frontmatter_skill_name(text, location) == SKILL_NAME:
-        raise ShowMeCollisionError(
-            f"logical skill-name collision for {SKILL_NAME} at {location}"
-        )
+        raise ShowMeCollisionError(f"logical skill-name collision for {SKILL_NAME} at {location}")
 
 
 def _frontmatter_skill_name(text: str, location: str) -> str | None:
@@ -896,7 +1180,7 @@ def _frontmatter_skill_name(text: str, location: str) -> str | None:
         return None
     try:
         closing = next(index for index, line in enumerate(lines[1:], 1) if line.strip() == "---")
-        value = yaml.safe_load("\n".join(lines[1:closing]))
+        value = yaml.load("\n".join(lines[1:closing]), Loader=yaml.BaseLoader)
     except (StopIteration, yaml.YAMLError) as exc:
         raise ShowMeCollisionError(f"cannot parse skill frontmatter at {location}") from exc
     if value is None:
@@ -1005,9 +1289,7 @@ def _recover_transaction(skills_fd: int, dependencies_fd: int) -> None:
 
     if target_stat is not None:
         if not stat.S_ISDIR(target_stat.st_mode):
-            raise ShowMeCollisionError(
-                "uncommitted transaction target is not a regular directory"
-            )
+            raise ShowMeCollisionError("uncommitted transaction target is not a regular directory")
         target_fingerprint = _tree_fingerprint(_fd_path(skills_fd, SKILL_NAME))
         old_fingerprint = old_manifest["installed_fingerprint"] if old_manifest else None
         if target_fingerprint == new_fingerprint:
@@ -1051,9 +1333,7 @@ def _recover_transaction(skills_fd: int, dependencies_fd: int) -> None:
         )
     else:
         if target_stat is not None:
-            raise ShowMeCollisionError(
-                "fresh show-me transaction has an unexpected target"
-            )
+            raise ShowMeCollisionError("fresh show-me transaction has an unexpected target")
         _unlink_if_present(dependencies_fd, OWNERSHIP_MANIFEST_RELATIVE.name)
 
     _unlink_if_present(dependencies_fd, _TRANSACTION_NAME)
