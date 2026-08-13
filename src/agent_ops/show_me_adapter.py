@@ -94,6 +94,8 @@ def _open_native_windows_directory_pin(
 
     delete_access = 0x00010000
     file_list_directory = 0x0001
+    file_add_file = 0x0002
+    file_add_subdirectory = 0x0004
     file_read_attributes = 0x0080
     file_share_read = 0x00000001
     file_share_write = 0x00000002
@@ -114,7 +116,11 @@ def _open_native_windows_directory_pin(
     create_file.restype = wintypes.HANDLE
     handle = create_file(
         str(path),
-        file_list_directory | file_read_attributes | (delete_access if allow_rename else 0),
+        file_list_directory
+        | file_add_file
+        | file_add_subdirectory
+        | file_read_attributes
+        | (delete_access if allow_rename else 0),
         file_share_read | file_share_write | (file_share_delete if observe_only else 0),
         None,
         open_existing,
