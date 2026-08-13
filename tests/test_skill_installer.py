@@ -935,6 +935,45 @@ def test_openclaw_extra_skill_root_is_checked(tmp_path: Path, monkeypatch) -> No
         raise AssertionError("expected OpenClaw extra-root collision")
 
 
+def test_openclaw_named_profile_configured_skill_root_is_checked(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = _show_me_source(tmp_path / "source")
+    os_home = tmp_path / "os-home"
+    extra_root = tmp_path / "catalog"
+    collision = extra_root / "visual-helper"
+    collision.mkdir(parents=True)
+    (collision / "SKILL.md").write_text(
+        "---\nname: show-me\ndescription: profile\n---\n",
+        encoding="utf-8",
+    )
+    profile_state = os_home / ".openclaw-customer-a"
+    profile_state.mkdir(parents=True)
+    (profile_state / "openclaw.json").write_text(
+        json.dumps({"skills": {"load": {"extraDirs": [str(extra_root)]}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(os_home))
+    monkeypatch.setenv("OPENCLAW_PROFILE", "customer-a")
+    monkeypatch.delenv("OPENCLAW_STATE_DIR", raising=False)
+    monkeypatch.delenv("OPENCLAW_CONFIG_PATH", raising=False)
+    monkeypatch.delenv("OPENCLAW_HOME", raising=False)
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
+    )
+
+    try:
+        install_skill_dependencies(
+            framework=Framework.OPENCLAW,
+            dependencies=[_show_me_dependency(Framework.OPENCLAW)],
+        )
+    except ShowMeCollisionError as exc:
+        assert "logical skill-name collision" in str(exc)
+    else:
+        raise AssertionError("expected named-profile extra-root collision")
+
+
 def test_openclaw_state_without_config_falls_back_to_default_config(
     tmp_path: Path,
     monkeypatch,
@@ -971,6 +1010,35 @@ def test_openclaw_state_without_config_falls_back_to_default_config(
         assert "logical skill-name collision" in str(exc)
     else:
         raise AssertionError("expected default-config fallback extra-root collision")
+
+
+def test_openclaw_relative_include_root_fails_closed(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = _show_me_source(tmp_path / "source")
+    os_home = tmp_path / "os-home"
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "openclaw.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(os_home))
+    monkeypatch.setenv("OPENCLAW_STATE_DIR", str(state))
+    monkeypatch.setenv("OPENCLAW_INCLUDE_ROOTS", "relative-root")
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
+    )
+
+    try:
+        install_skill_dependencies(
+            framework=Framework.OPENCLAW,
+            dependencies=[_show_me_dependency(Framework.OPENCLAW)],
+        )
+    except ValueError as exc:
+        assert "OPENCLAW_INCLUDE_ROOTS entries must be absolute" in str(exc)
+    else:
+        raise AssertionError("expected relative include root to fail closed")
+
+    assert not (state / "skills" / "show-me").exists()
 
 
 def test_openclaw_extra_root_from_included_json5_is_checked(

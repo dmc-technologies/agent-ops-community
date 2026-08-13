@@ -183,11 +183,16 @@ def _openclaw_include_roots(config_path: Path) -> tuple[Path, ...]:
     configured = _normalize_home_value(os.environ.get("OPENCLAW_INCLUDE_ROOTS"))
     if configured is not None:
         for item in configured.split(os.pathsep):
-            if item.strip():
-                candidate = _expand_openclaw_path(item.strip(), _openclaw_effective_home())
+            authored = item.strip()
+            if not authored:
+                continue
+            if authored == "~" or authored.startswith(("~/", "~\\")):
+                candidate = _expand_openclaw_path(authored, _openclaw_effective_home())
+            else:
+                candidate = Path(authored)
                 if not candidate.is_absolute():
                     raise ValueError("OPENCLAW_INCLUDE_ROOTS entries must be absolute")
-                roots.append(candidate.resolve())
+            roots.append(candidate.resolve())
     return tuple(roots)
 
 
@@ -388,11 +393,15 @@ def _openclaw_active_config_path() -> Path:
     if configured is not None:
         return _expand_openclaw_path(configured, effective_home)
     state_override = _normalize_home_value(os.environ.get("OPENCLAW_STATE_DIR"))
-    selected_state = (
-        _expand_openclaw_path(state_override, effective_home)
-        if state_override is not None
-        else effective_home / ".openclaw"
-    )
+    if state_override is not None:
+        selected_state = _expand_openclaw_path(state_override, effective_home)
+    else:
+        profile = _normalize_home_value(os.environ.get("OPENCLAW_PROFILE"))
+        selected_state = (
+            effective_home / f".openclaw-{profile}"
+            if profile and profile.lower() != "default"
+            else effective_home / ".openclaw"
+        )
     state_dirs = [selected_state]
     if state_override is not None:
         state_dirs.extend([effective_home / ".openclaw", effective_home / ".clawdbot"])
