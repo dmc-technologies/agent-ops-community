@@ -19,12 +19,7 @@ KNOWLEDGE_GIT_EXPORT = (
     'git@github.com:your-org/agent-knowledge.git}"'
 )
 
-SKILL_INSTALL_BOOTSTRAPS = {
-    Framework.CODEX,
-    Framework.CLAUDE_CODE,
-    Framework.OPENCODE,
-    Framework.PRIME_AGENT,
-}
+SKILL_INSTALL_BOOTSTRAPS = set(SUPPORTED_BOOTSTRAPS)
 
 
 def skill_install_command(framework: Framework) -> str:

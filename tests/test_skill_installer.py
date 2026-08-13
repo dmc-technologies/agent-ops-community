@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import shutil
 import subprocess
 from pathlib import Path
 
 from agent_ops.registries import load_skill_dependencies
 from agent_ops.registries.models import Framework, SkillDependency, SkillDependencyInstall
+from agent_ops.show_me_adapter import (
+    OWNERSHIP_MANIFEST_RELATIVE as SHOW_ME_OWNERSHIP_MANIFEST_RELATIVE,
+)
+from agent_ops.show_me_adapter import ShowMeCollisionError
 from agent_ops.skill_installer import default_framework_home, install_skill_dependencies
 from agent_ops.superpowers_adapter import OWNERSHIP_MANIFEST_RELATIVE, SUPERPOWERS_SKILLS
 
@@ -311,11 +316,169 @@ def test_humanlayer_show_me_is_pinned_for_all_managed_frameworks() -> None:
     assert dependency.license == "MIT"
     assert set(dependency.install) == {framework.value for framework in Framework}
     assert all(
-        install.strategy == "copy-skills"
+        install.strategy == "humanlayer-show-me"
         and install.source == "plugins/show-me/skills"
         and install.destination == "skills"
         for install in dependency.install.values()
     )
+
+
+def _show_me_dependency() -> SkillDependency:
+    return SkillDependency(
+        id="humanlayer-show-me",
+        name="HumanLayer Show Me",
+        repo="https://github.com/humanlayer/skills.git",
+        ref="4d8d644ca747517973f58d7953f58d7cd07520cd",
+        version="1.0.0",
+        license="MIT",
+        install={
+            "prime-agent": SkillDependencyInstall(
+                strategy="humanlayer-show-me",
+                source="plugins/show-me/skills",
+                destination="skills",
+            )
+        },
+    )
+
+
+def _show_me_source(root: Path) -> Path:
+    skill = root / "plugins" / "show-me" / "skills" / "show-me"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\nname: show-me\ndescription: Visual explanation.\n---\n"
+        "Create the HTML. Then open it for the user:\n\n"
+        "```\nBash(open path/to/show-me-{description}.html)\n```\n",
+        encoding="utf-8",
+    )
+    return root
+
+
+def test_humanlayer_show_me_installs_adapted_skill_with_ownership(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = _show_me_source(tmp_path / "source")
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
+    )
+
+    install_skill_dependencies(
+        framework=Framework.PRIME_AGENT,
+        dependencies=[_show_me_dependency()],
+        home=tmp_path / "home",
+    )
+
+    installed = tmp_path / "home" / "skills" / "show-me" / "SKILL.md"
+    text = installed.read_text(encoding="utf-8")
+    assert "Bash(open" not in text
+    assert "absolute path" in text
+    assert (tmp_path / "home" / SHOW_ME_OWNERSHIP_MANIFEST_RELATIVE).is_file()
+
+
+def test_humanlayer_show_me_refuses_user_owned_collision(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = _show_me_source(tmp_path / "source")
+    existing = tmp_path / "home" / "skills" / "show-me"
+    existing.mkdir(parents=True)
+    (existing / "SKILL.md").write_text(
+        "---\nname: show-me\ndescription: personal\n---\nKeep me.\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
+    )
+
+    try:
+        install_skill_dependencies(
+            framework=Framework.PRIME_AGENT,
+            dependencies=[_show_me_dependency()],
+            home=tmp_path / "home",
+        )
+    except ShowMeCollisionError as exc:
+        assert "user-owned collision" in str(exc)
+    else:
+        raise AssertionError("expected user-owned show-me collision to fail")
+
+    assert "Keep me." in (existing / "SKILL.md").read_text(encoding="utf-8")
+    assert not (tmp_path / "home" / SHOW_ME_OWNERSHIP_MANIFEST_RELATIVE).exists()
+
+
+def test_humanlayer_show_me_updates_only_unchanged_managed_copy(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = _show_me_source(tmp_path / "source")
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
+    )
+    arguments = {
+        "framework": Framework.PRIME_AGENT,
+        "dependencies": [_show_me_dependency()],
+        "home": tmp_path / "home",
+    }
+    install_skill_dependencies(**arguments)
+    installed = tmp_path / "home" / "skills" / "show-me" / "SKILL.md"
+    installed.write_text(installed.read_text(encoding="utf-8") + "personal change\n")
+
+    try:
+        install_skill_dependencies(**arguments)
+    except ShowMeCollisionError as exc:
+        assert "changed since installation" in str(exc)
+    else:
+        raise AssertionError("expected changed managed show-me skill to fail")
+
+    assert installed.read_text(encoding="utf-8").endswith("personal change\n")
+
+
+def test_humanlayer_show_me_migrates_only_exact_upstream_copy(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = _show_me_source(tmp_path / "source")
+    existing = tmp_path / "home" / "skills" / "show-me"
+    shutil.copytree(source / "plugins" / "show-me" / "skills" / "show-me", existing)
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
+    )
+
+    install_skill_dependencies(
+        framework=Framework.PRIME_AGENT,
+        dependencies=[_show_me_dependency()],
+        home=tmp_path / "home",
+    )
+
+    text = (existing / "SKILL.md").read_text(encoding="utf-8")
+    assert "Bash(open" not in text
+    assert (tmp_path / "home" / SHOW_ME_OWNERSHIP_MANIFEST_RELATIVE).is_file()
+
+
+def test_humanlayer_show_me_refuses_logical_name_collision(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = _show_me_source(tmp_path / "source")
+    collision = tmp_path / "home" / "skills" / "visual-helper"
+    collision.mkdir(parents=True)
+    (collision / "SKILL.md").write_text(
+        "---\nname: show-me\ndescription: collision\n---\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
+    )
+
+    try:
+        install_skill_dependencies(
+            framework=Framework.PRIME_AGENT,
+            dependencies=[_show_me_dependency()],
+            home=tmp_path / "home",
+        )
+    except ShowMeCollisionError as exc:
+        assert "logical skill-name collision" in str(exc)
+    else:
+        raise AssertionError("expected logical show-me collision to fail")
 
 
 def test_prime_agent_uses_native_home_and_pinned_bundle_mappings(
@@ -393,6 +556,23 @@ def test_prime_agent_home_honors_native_environment_variable(
     monkeypatch.setenv("PRIME_AGENT_CODING_AGENT_DIR", str(configured_home))
 
     assert default_framework_home(Framework.PRIME_AGENT) == configured_home
+
+
+def test_framework_homes_honor_advertised_environment_variables(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    configured = {
+        Framework.CODEX: ("CODEX_HOME", tmp_path / "codex"),
+        Framework.CLAUDE_CODE: ("CLAUDE_HOME", tmp_path / "claude"),
+        Framework.CURSOR: ("CURSOR_HOME", tmp_path / "cursor"),
+        Framework.OPENCLAW: ("OPENCLAW_HOME", tmp_path / "openclaw"),
+        Framework.OPENCODE: ("OPENCODE_HOME", tmp_path / "opencode"),
+        Framework.LOCAL: ("AGENT_OPS_LOCAL_HOME", tmp_path / "local"),
+    }
+    for framework, (variable, home) in configured.items():
+        monkeypatch.setenv(variable, str(home))
+        assert default_framework_home(framework) == home
 
 
 def test_prime_superpowers_strategy_installs_adapted_namespaced_skills(

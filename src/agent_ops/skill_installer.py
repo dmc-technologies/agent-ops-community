@@ -9,6 +9,7 @@ from pathlib import Path
 
 from agent_ops.gstack_prime import install_prime_gstack
 from agent_ops.registries.models import Framework, SkillDependency, SkillDependencyInstall
+from agent_ops.show_me_adapter import install_show_me
 from agent_ops.superpowers_adapter import install_prime_superpowers
 
 
@@ -22,23 +23,20 @@ class InstalledSkillDependency:
 
 
 def default_framework_home(framework: Framework) -> Path:
-    match framework:
-        case Framework.CODEX:
-            return Path("~/.codex").expanduser()
-        case Framework.CLAUDE_CODE:
-            return Path("~/.claude").expanduser()
-        case Framework.OPENCODE:
-            return Path("~/.agents").expanduser()
-        case Framework.PRIME_AGENT:
-            return Path(
-                os.environ.get("PRIME_AGENT_CODING_AGENT_DIR") or "~/.prime/agent"
-            ).expanduser()
-        case Framework.CURSOR:
-            return Path("~/.cursor").expanduser()
-        case Framework.OPENCLAW:
-            return Path("~/.openclaw").expanduser()
-        case Framework.LOCAL:
-            return Path("~/.agentops").expanduser()
+    environment_defaults = {
+        Framework.CODEX: ("CODEX_HOME", "~/.codex"),
+        Framework.CLAUDE_CODE: ("CLAUDE_HOME", "~/.claude"),
+        Framework.OPENCODE: ("OPENCODE_HOME", "~/.agents"),
+        Framework.PRIME_AGENT: (
+            "PRIME_AGENT_CODING_AGENT_DIR",
+            "~/.prime/agent",
+        ),
+        Framework.CURSOR: ("CURSOR_HOME", "~/.cursor"),
+        Framework.OPENCLAW: ("OPENCLAW_HOME", "~/.openclaw"),
+        Framework.LOCAL: ("AGENT_OPS_LOCAL_HOME", "~/.agentops"),
+    }
+    variable, default = environment_defaults[framework]
+    return Path(os.environ.get(variable) or default).expanduser()
 
 
 def install_skill_dependencies(
@@ -153,6 +151,13 @@ def _install_dependency(
         if dependency_id != "superpowers":
             raise ValueError("prime-superpowers strategy is only valid for Superpowers")
         install_prime_superpowers(source, destination)
+        return
+    if install.strategy == "humanlayer-show-me":
+        if dependency_id != "humanlayer-show-me":
+            raise ValueError(
+                "humanlayer-show-me strategy is only valid for HumanLayer Show Me"
+            )
+        install_show_me(source, destination / "show-me")
         return
     if install.strategy == "copy-skills":
         if install.source is None:

@@ -55,30 +55,30 @@
   license: MIT
   install:
     codex:
-      strategy: copy-skills
+      strategy: humanlayer-show-me
       source: plugins/show-me/skills
       destination: skills
     claude-code:
-      strategy: copy-skills
+      strategy: humanlayer-show-me
       source: plugins/show-me/skills
       destination: skills
     cursor:
-      strategy: copy-skills
+      strategy: humanlayer-show-me
       source: plugins/show-me/skills
       destination: skills
     openclaw:
-      strategy: copy-skills
+      strategy: humanlayer-show-me
       source: plugins/show-me/skills
       destination: skills
     opencode:
-      strategy: copy-skills
+      strategy: humanlayer-show-me
       source: plugins/show-me/skills
       destination: skills
     prime-agent:
-      strategy: copy-skills
+      strategy: humanlayer-show-me
       source: plugins/show-me/skills
       destination: skills
     local:
-      strategy: copy-skills
+      strategy: humanlayer-show-me
       source: plugins/show-me/skills
       destination: skills
