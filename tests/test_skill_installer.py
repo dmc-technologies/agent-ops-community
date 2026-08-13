@@ -801,6 +801,306 @@ def test_openclaw_config_path_selects_managed_skill_root(
     assert default_framework_home(Framework.OPENCLAW) == tmp_path / "configured"
 
 
+def test_codex_system_skill_root_is_checked(tmp_path: Path, monkeypatch) -> None:
+    source = _show_me_source(tmp_path / "source")
+    system_root = tmp_path / "etc" / "codex" / "skills"
+    collision = system_root / "admin-show-me"
+    collision.mkdir(parents=True)
+    (collision / "SKILL.md").write_text(
+        "---\nname: show-me\ndescription: admin\n---\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(tmp_path / "os-home"))
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._codex_system_skill_root", lambda: system_root
+    )
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
+    )
+
+    try:
+        install_skill_dependencies(
+            framework=Framework.CODEX,
+            dependencies=[_show_me_dependency(Framework.CODEX)],
+            home=tmp_path / "codex",
+        )
+    except ShowMeCollisionError as exc:
+        assert "logical skill-name collision" in str(exc)
+    else:
+        raise AssertionError("expected Codex system-root collision")
+
+
+def test_opencode_configured_absolute_skill_root_is_checked(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = _show_me_source(tmp_path / "source")
+    os_home = tmp_path / "os-home"
+    configured_root = tmp_path / "catalog"
+    collision = configured_root / "visual-helper"
+    collision.mkdir(parents=True)
+    (collision / "SKILL.md").write_text(
+        "---\nname: show-me\ndescription: configured\n---\n",
+        encoding="utf-8",
+    )
+    config_home = tmp_path / "xdg" / "opencode"
+    config_home.mkdir(parents=True)
+    (config_home / "opencode.jsonc").write_text(
+        '{ "skills": { "paths": ["' + str(configured_root).replace("\\", "\\\\") + '"] } }',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(os_home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    monkeypatch.delenv("OPENCODE_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("OPENCODE_CONFIG", raising=False)
+    monkeypatch.delenv("OPENCODE_CONFIG_CONTENT", raising=False)
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
+    )
+
+    try:
+        install_skill_dependencies(
+            framework=Framework.OPENCODE,
+            dependencies=[_show_me_dependency(Framework.OPENCODE)],
+            home=os_home / ".agents",
+        )
+    except ShowMeCollisionError as exc:
+        assert "logical skill-name collision" in str(exc)
+    else:
+        raise AssertionError("expected OpenCode configured-root collision")
+
+
+def test_opencode_workspace_relative_configured_root_fails_before_mutation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = _show_me_source(tmp_path / "source")
+    os_home = tmp_path / "os-home"
+    monkeypatch.setenv("HOME", str(os_home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    monkeypatch.setenv(
+        "OPENCODE_CONFIG_CONTENT",
+        '{ "skills": { "paths": ["./project-catalog"] } }',
+    )
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
+    )
+
+    try:
+        install_skill_dependencies(
+            framework=Framework.OPENCODE,
+            dependencies=[_show_me_dependency(Framework.OPENCODE)],
+            home=os_home / ".agents",
+        )
+    except ValueError as exc:
+        assert "workspace-relative path" in str(exc)
+    else:
+        raise AssertionError("expected relative configured root to fail closed")
+
+    assert not (os_home / ".agents" / "skills" / "show-me").exists()
+
+
+def test_openclaw_extra_skill_root_is_checked(tmp_path: Path, monkeypatch) -> None:
+    source = _show_me_source(tmp_path / "source")
+    os_home = tmp_path / "os-home"
+    extra_root = tmp_path / "catalog"
+    collision = extra_root / "visual-helper"
+    collision.mkdir(parents=True)
+    (collision / "SKILL.md").write_text(
+        "---\nname: show-me\ndescription: extra\n---\n",
+        encoding="utf-8",
+    )
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "openclaw.json").write_text(
+        json.dumps({"skills": {"load": {"extraDirs": [str(extra_root)]}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(os_home))
+    monkeypatch.setenv("OPENCLAW_STATE_DIR", str(state))
+    monkeypatch.delenv("OPENCLAW_CONFIG_PATH", raising=False)
+    monkeypatch.delenv("OPENCLAW_HOME", raising=False)
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
+    )
+
+    try:
+        install_skill_dependencies(
+            framework=Framework.OPENCLAW,
+            dependencies=[_show_me_dependency(Framework.OPENCLAW)],
+        )
+    except ShowMeCollisionError as exc:
+        assert "logical skill-name collision" in str(exc)
+    else:
+        raise AssertionError("expected OpenClaw extra-root collision")
+
+
+def test_openclaw_state_without_config_falls_back_to_default_config(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = _show_me_source(tmp_path / "source")
+    effective_home = tmp_path / "effective-home"
+    extra_root = tmp_path / "catalog"
+    collision = extra_root / "visual-helper"
+    collision.mkdir(parents=True)
+    (collision / "SKILL.md").write_text(
+        "---\nname: show-me\ndescription: fallback\n---\n",
+        encoding="utf-8",
+    )
+    default_state = effective_home / ".openclaw"
+    default_state.mkdir(parents=True)
+    (default_state / "openclaw.json").write_text(
+        json.dumps({"skills": {"load": {"extraDirs": [str(extra_root)]}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(tmp_path / "os-home"))
+    monkeypatch.setenv("OPENCLAW_HOME", str(effective_home))
+    monkeypatch.setenv("OPENCLAW_STATE_DIR", str(tmp_path / "empty-state"))
+    monkeypatch.delenv("OPENCLAW_CONFIG_PATH", raising=False)
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
+    )
+
+    try:
+        install_skill_dependencies(
+            framework=Framework.OPENCLAW,
+            dependencies=[_show_me_dependency(Framework.OPENCLAW)],
+        )
+    except ShowMeCollisionError as exc:
+        assert "logical skill-name collision" in str(exc)
+    else:
+        raise AssertionError("expected default-config fallback extra-root collision")
+
+
+def test_openclaw_extra_root_from_included_json5_is_checked(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = _show_me_source(tmp_path / "source")
+    os_home = tmp_path / "os-home"
+    extra_root = tmp_path / "catalog"
+    collision = extra_root / "visual-helper"
+    collision.mkdir(parents=True)
+    (collision / "SKILL.md").write_text(
+        "---\nname: show-me\ndescription: included\n---\n",
+        encoding="utf-8",
+    )
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "skills.json5").write_text(
+        "{ skills: { load: { extraDirs: ['" + str(extra_root) + "'], }, }, }",
+        encoding="utf-8",
+    )
+    (state / "openclaw.json").write_text(
+        "{ $include: './skills.json5' }",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(os_home))
+    monkeypatch.setenv("OPENCLAW_STATE_DIR", str(state))
+    monkeypatch.delenv("OPENCLAW_CONFIG_PATH", raising=False)
+    monkeypatch.delenv("OPENCLAW_HOME", raising=False)
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
+    )
+
+    try:
+        install_skill_dependencies(
+            framework=Framework.OPENCLAW,
+            dependencies=[_show_me_dependency(Framework.OPENCLAW)],
+        )
+    except ShowMeCollisionError as exc:
+        assert "logical skill-name collision" in str(exc)
+    else:
+        raise AssertionError("expected included OpenClaw extra-root collision")
+
+
+def test_openclaw_nested_extra_dirs_include_is_checked(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = _show_me_source(tmp_path / "source")
+    extra_root = tmp_path / "catalog"
+    collision = extra_root / "visual-helper"
+    collision.mkdir(parents=True)
+    (collision / "SKILL.md").write_text(
+        "---\nname: show-me\ndescription: nested include\n---\n",
+        encoding="utf-8",
+    )
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "load.json5").write_text(
+        "{ extraDirs: ['" + str(extra_root) + "'] }",
+        encoding="utf-8",
+    )
+    (state / "openclaw.json").write_text(
+        "{ skills: { load: { $include: './load.json5' } } }",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(tmp_path / "os-home"))
+    monkeypatch.setenv("OPENCLAW_STATE_DIR", str(state))
+    monkeypatch.delenv("OPENCLAW_CONFIG_PATH", raising=False)
+    monkeypatch.delenv("OPENCLAW_HOME", raising=False)
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
+    )
+
+    try:
+        install_skill_dependencies(
+            framework=Framework.OPENCLAW,
+            dependencies=[_show_me_dependency(Framework.OPENCLAW)],
+        )
+    except ShowMeCollisionError as exc:
+        assert "logical skill-name collision" in str(exc)
+    else:
+        raise AssertionError("expected nested included extra-root collision")
+
+
+def test_openclaw_extra_root_expands_effective_home_and_environment(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = _show_me_source(tmp_path / "source")
+    os_home = tmp_path / "os-home"
+    effective_home = tmp_path / "effective-home"
+    configured_root = effective_home / "catalog" / "extra"
+    collision = configured_root / "visual-helper"
+    collision.mkdir(parents=True)
+    (collision / "SKILL.md").write_text(
+        "---\nname: show-me\ndescription: extra\n---\n",
+        encoding="utf-8",
+    )
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "openclaw.json").write_text(
+        json.dumps(
+            {
+                "env": {"vars": {"LEAF": "extra"}},
+                "skills": {"load": {"extraDirs": ["~/catalog/${LEAF}"]}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(os_home))
+    monkeypatch.setenv("OPENCLAW_HOME", str(effective_home))
+    monkeypatch.setenv("OPENCLAW_STATE_DIR", str(state))
+    monkeypatch.delenv("LEAF", raising=False)
+    monkeypatch.delenv("OPENCLAW_CONFIG_PATH", raising=False)
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
+    )
+
+    try:
+        install_skill_dependencies(
+            framework=Framework.OPENCLAW,
+            dependencies=[_show_me_dependency(Framework.OPENCLAW)],
+        )
+    except ShowMeCollisionError as exc:
+        assert "logical skill-name collision" in str(exc)
+    else:
+        raise AssertionError("expected expanded OpenClaw extra-root collision")
+
+
 def test_openclaw_custom_config_still_checks_default_state_personal_root(
     tmp_path: Path,
     monkeypatch,

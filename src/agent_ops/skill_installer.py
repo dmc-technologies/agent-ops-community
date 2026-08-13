@@ -8,6 +8,8 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+import json5
+
 from agent_ops.gstack_prime import install_prime_gstack
 from agent_ops.registries.models import Framework, SkillDependency, SkillDependencyInstall
 from agent_ops.show_me_adapter import install_show_me
@@ -145,14 +147,334 @@ def _expand_openclaw_path(value: str, base_home: Path) -> Path:
     return Path(value).resolve()
 
 
-def _openclaw_uses_default_state() -> bool:
-    os_home = _openclaw_os_home()
-    configured_home = _normalize_home_value(os.environ.get("OPENCLAW_HOME"))
-    effective_home = (
-        _expand_openclaw_path(configured_home, os_home)
-        if configured_home is not None
-        else os_home
+def _load_json5_value(path: Path) -> object:
+    if not path.is_file():
+        return {}
+    try:
+        return json5.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"cannot read active host configuration {path}: {exc}") from exc
+
+
+def _load_json5_object(path: Path) -> dict[str, object]:
+    loaded = _load_json5_value(path)
+    if not isinstance(loaded, dict):
+        raise ValueError(f"active host configuration must be an object: {path}")
+    return loaded
+
+
+def _deep_merge_openclaw_config(base: object, override: object) -> object:
+    if isinstance(base, dict) and isinstance(override, dict):
+        merged = dict(base)
+        for key, value in override.items():
+            merged[key] = (
+                _deep_merge_openclaw_config(merged[key], value)
+                if key in merged
+                else value
+            )
+        return merged
+    if isinstance(base, list) and isinstance(override, list):
+        return [*base, *override]
+    return override
+
+
+def _openclaw_include_roots(config_path: Path) -> tuple[Path, ...]:
+    roots = [config_path.resolve().parent]
+    configured = _normalize_home_value(os.environ.get("OPENCLAW_INCLUDE_ROOTS"))
+    if configured is not None:
+        for item in configured.split(os.pathsep):
+            if item.strip():
+                candidate = _expand_openclaw_path(item.strip(), _openclaw_effective_home())
+                if not candidate.is_absolute():
+                    raise ValueError("OPENCLAW_INCLUDE_ROOTS entries must be absolute")
+                roots.append(candidate.resolve())
+    return tuple(roots)
+
+
+def _path_is_within_roots(path: Path, roots: tuple[Path, ...]) -> bool:
+    resolved = path.resolve()
+    return any(resolved == root or root in resolved.parents for root in roots)
+
+
+def _resolve_openclaw_includes(
+    value: object,
+    *,
+    base_path: Path,
+    roots: tuple[Path, ...],
+    chain: tuple[Path, ...],
+) -> object:
+    if isinstance(value, list):
+        return [
+            _resolve_openclaw_includes(
+                item, base_path=base_path, roots=roots, chain=chain
+            )
+            for item in value
+        ]
+    if not isinstance(value, dict):
+        return value
+    include = value.get("$include")
+    if include is None:
+        return {
+            key: _resolve_openclaw_includes(
+                item, base_path=base_path, roots=roots, chain=chain
+            )
+            for key, item in value.items()
+        }
+    include_items = [include] if isinstance(include, str) else include
+    if not isinstance(include_items, list) or any(
+        not isinstance(item, str) for item in include_items
+    ):
+        raise ValueError("OpenClaw $include must be a string or string list")
+    merged: object = {}
+    for item in include_items:
+        include_path = Path(item)
+        if not include_path.is_absolute():
+            include_path = base_path.parent / include_path
+        include_path = include_path.resolve()
+        if not _path_is_within_roots(include_path, roots):
+            raise ValueError(f"OpenClaw config include escapes allowed roots: {include_path}")
+        if include_path in chain:
+            raise ValueError(f"circular OpenClaw config include: {include_path}")
+        if len(chain) >= 10:
+            raise ValueError("OpenClaw config include depth exceeds 10")
+        loaded = _load_json5_value(include_path)
+        merged = _deep_merge_openclaw_config(
+            merged,
+            _resolve_openclaw_includes(
+                loaded,
+                base_path=include_path,
+                roots=roots,
+                chain=(*chain, include_path),
+            ),
+        )
+    siblings = {
+        key: _resolve_openclaw_includes(
+            item, base_path=base_path, roots=roots, chain=chain
+        )
+        for key, item in value.items()
+        if key != "$include"
+    }
+    if siblings:
+        if not isinstance(merged, dict):
+            raise ValueError("OpenClaw $include sibling keys require an included object")
+        merged = _deep_merge_openclaw_config(merged, siblings)
+    return merged
+
+
+def _load_openclaw_config(path: Path) -> dict[str, object]:
+    normalized = path.resolve()
+    loaded = _load_json5_value(normalized)
+    resolved = _resolve_openclaw_includes(
+        loaded,
+        base_path=normalized,
+        roots=_openclaw_include_roots(normalized),
+        chain=(normalized,),
     )
+    if not isinstance(resolved, dict):
+        raise ValueError(f"active host configuration must be an object: {path}")
+    return resolved
+
+
+def _nested_string_list(config: dict[str, object], *keys: str) -> tuple[str, ...]:
+    current: object = config
+    for key in keys:
+        if not isinstance(current, dict):
+            return ()
+        current = current.get(key)
+    if current is None:
+        return ()
+    if not isinstance(current, list) or any(not isinstance(item, str) for item in current):
+        raise ValueError(f"active host configuration {'.'.join(keys)} must be a string list")
+    return tuple(item.strip() for item in current if item.strip())
+
+
+def _deep_merge_host_config(
+    base: dict[str, object], override: dict[str, object]
+) -> dict[str, object]:
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge_host_config(merged[key], value)  # type: ignore[arg-type]
+        else:
+            merged[key] = value
+    return merged
+
+
+def _expand_opencode_config_value(value: str, *, config_dir: Path) -> str:
+    def env_replace(match: re.Match[str]) -> str:
+        return os.environ.get(match.group(1), "")
+
+    expanded = re.sub(r"\{env:([^}]+)\}", env_replace, value)
+
+    def file_replace(match: re.Match[str]) -> str:
+        authored = match.group(1)
+        candidate = Path(authored)
+        if authored.startswith("~/"):
+            candidate = Path.home() / authored[2:]
+        elif not candidate.is_absolute():
+            candidate = config_dir / candidate
+        try:
+            return candidate.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise ValueError(
+                f"cannot read OpenCode config file reference {candidate}: {exc}"
+            ) from exc
+
+    return re.sub(r"\{file:([^}]+)\}", file_replace, expanded)
+
+
+def _opencode_configured_skill_roots() -> tuple[Path, ...]:
+    config: dict[str, object] = {}
+    paths_config_dir = _opencode_xdg_home()
+    xdg_home = _opencode_xdg_home()
+    config_home = _opencode_config_home()
+    config_files = [
+        xdg_home / "config.json",
+        xdg_home / "opencode.json",
+        xdg_home / "opencode.jsonc",
+    ]
+    if config_home != xdg_home:
+        config_files.extend(
+            [config_home / "opencode.json", config_home / "opencode.jsonc"]
+        )
+    custom = _normalize_home_value(os.environ.get("OPENCODE_CONFIG"))
+    if custom is not None:
+        config_files.append(Path(custom).expanduser())
+    for config_file in config_files:
+        loaded = _load_json5_object(config_file)
+        if _nested_string_list(loaded, "skills", "paths"):
+            paths_config_dir = config_file.resolve().parent
+        config = _deep_merge_host_config(config, loaded)
+    content = _normalize_home_value(os.environ.get("OPENCODE_CONFIG_CONTENT"))
+    if content is not None:
+        try:
+            loaded = json5.loads(content)
+        except ValueError as exc:
+            raise ValueError(f"cannot parse OPENCODE_CONFIG_CONTENT: {exc}") from exc
+        if not isinstance(loaded, dict):
+            raise ValueError("OPENCODE_CONFIG_CONTENT must be an object")
+        if _nested_string_list(loaded, "skills", "paths"):
+            paths_config_dir = Path.cwd()
+        config = _deep_merge_host_config(config, loaded)
+    roots = []
+    for authored in _nested_string_list(config, "skills", "paths"):
+        item = _expand_opencode_config_value(authored, config_dir=paths_config_dir)
+        # OpenCode resolves relative configured skill roots against each active workspace.
+        # A global installer cannot enumerate those project-scoped paths, so reject them
+        # rather than claim globally collision-safe installation.
+        if item == "~":
+            roots.append(Path.home())
+        elif item.startswith("~/") or (os.name == "nt" and item.startswith("~\\")):
+            roots.append(Path.home() / item[2:])
+        elif Path(item).is_absolute():
+            roots.append(Path(item))
+        else:
+            raise ValueError(
+                "OpenCode skills.paths contains a workspace-relative path; "
+                "use an absolute or home-relative path for global installation"
+            )
+    return tuple(root.resolve() for root in roots)
+
+
+def _openclaw_effective_home() -> Path:
+    os_home = _openclaw_os_home()
+    configured = _normalize_home_value(os.environ.get("OPENCLAW_HOME"))
+    return _expand_openclaw_path(configured, os_home) if configured is not None else os_home
+
+
+def _openclaw_active_config_path() -> Path:
+    effective_home = _openclaw_effective_home()
+    configured = _normalize_home_value(os.environ.get("OPENCLAW_CONFIG_PATH"))
+    if configured is not None:
+        return _expand_openclaw_path(configured, effective_home)
+    state_override = _normalize_home_value(os.environ.get("OPENCLAW_STATE_DIR"))
+    selected_state = (
+        _expand_openclaw_path(state_override, effective_home)
+        if state_override is not None
+        else effective_home / ".openclaw"
+    )
+    state_dirs = [selected_state]
+    if state_override is not None:
+        state_dirs.extend([effective_home / ".openclaw", effective_home / ".clawdbot"])
+    else:
+        state_dirs.append(effective_home / ".clawdbot")
+    candidates = [
+        state_dir / filename
+        for state_dir in state_dirs
+        for filename in ("openclaw.json", "clawdbot.json")
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return selected_state / "openclaw.json"
+
+
+def _expand_openclaw_config_environment(
+    value: str, config: dict[str, object]
+) -> str:
+    escaped = "\0AGENTOPS_OPENCLAW_ESCAPED\0"
+    value = value.replace("$${", escaped + "{")
+    configured_env: dict[str, str] = {}
+    raw_env = config.get("env")
+    if isinstance(raw_env, dict):
+        raw_vars = raw_env.get("vars")
+        candidates = {
+            key: item
+            for key, item in raw_env.items()
+            if key not in {"vars", "shellEnv"}
+        }
+        if isinstance(raw_vars, dict):
+            candidates.update(raw_vars)
+        configured_env = {
+            key: item
+            for key, item in candidates.items()
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key)
+            and isinstance(item, str)
+            and item.strip()
+            and "${" not in item
+        }
+
+    def replace(match: re.Match[str]) -> str:
+        name = match.group(1)
+        replacement = os.environ.get(name) or configured_env.get(name)
+        if replacement is None or replacement == "":
+            raise ValueError(f"OpenClaw skill root references missing environment variable {name}")
+        return replacement
+
+    expanded = re.sub(r"\$\{([A-Z_][A-Z0-9_]*)\}", replace, value)
+    return expanded.replace(escaped + "{", "${")
+
+
+def _openclaw_configured_skill_roots() -> tuple[Path, ...]:
+    config = _load_openclaw_config(_openclaw_active_config_path())
+    effective_home = _openclaw_effective_home()
+    roots = []
+    for item in _nested_string_list(config, "skills", "load", "extraDirs"):
+        roots.append(
+            _expand_openclaw_path(
+                _expand_openclaw_config_environment(item, config), effective_home
+            )
+        )
+    return tuple(root.resolve() for root in roots)
+
+
+def _codex_system_skill_root() -> Path:
+    if os.name == "nt":  # pragma: no cover - exercised on Windows
+        import ctypes
+
+        buffer = ctypes.create_unicode_buffer(260)
+        result = ctypes.windll.shell32.SHGetFolderPathW(None, 35, None, 0, buffer)
+        program_data = (
+            Path(buffer.value)
+            if result == 0 and buffer.value
+            else Path(r"C:\ProgramData")
+        )
+        return program_data / "OpenAI" / "Codex" / "skills"
+    return Path("/etc/codex/skills")
+
+
+def _openclaw_uses_default_state() -> bool:
+    effective_home = _openclaw_effective_home()
     state_override = _normalize_home_value(os.environ.get("OPENCLAW_STATE_DIR"))
     if state_override is None:
         return True
@@ -165,7 +487,7 @@ def _openclaw_uses_default_state() -> bool:
 def _show_me_collision_roots(framework: Framework, target_home: Path) -> tuple[Path, ...]:
     os_home = _openclaw_os_home()
     if framework is Framework.CODEX:
-        roots = [os_home / ".agents" / "skills"]
+        roots = [os_home / ".agents" / "skills", _codex_system_skill_root()]
     elif framework is Framework.CURSOR:
         roots = [
             os_home / ".agents" / "skills",
@@ -179,6 +501,7 @@ def _show_me_collision_roots(framework: Framework, target_home: Path) -> tuple[P
             for root in config_roots
             for child in (root / "skill", root / "skills")
         ]
+        roots.extend(_opencode_configured_skill_roots())
         if not _environment_truthy("OPENCODE_DISABLE_EXTERNAL_SKILLS"):
             roots.append(os_home / ".agents" / "skills")
             if not (
@@ -186,8 +509,10 @@ def _show_me_collision_roots(framework: Framework, target_home: Path) -> tuple[P
                 or _environment_truthy("OPENCODE_DISABLE_CLAUDE_CODE_SKILLS")
             ):
                 roots.append(os_home / ".claude" / "skills")
-    elif framework is Framework.OPENCLAW and _openclaw_uses_default_state():
-        roots = [os_home / ".agents" / "skills"]
+    elif framework is Framework.OPENCLAW:
+        roots = list(_openclaw_configured_skill_roots())
+        if _openclaw_uses_default_state():
+            roots.append(os_home / ".agents" / "skills")
     else:
         roots = []
     destination_root = (target_home / "skills").resolve()
