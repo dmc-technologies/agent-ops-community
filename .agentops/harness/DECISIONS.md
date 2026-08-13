@@ -4,6 +4,13 @@ Repository: `agent-ops-community`
 
 Record durable architecture, workflow, and harness decisions here.
 
+### 2026-08-13: HumanLayer show-me stays an exact pinned dependency
+
+- Decision: install only `plugins/show-me/skills/show-me` from `humanlayer/skills` version 1.0.0 at commit `4d8d644ca747517973f58d7953f58d7cd07520cd` through the existing `copy-skills` dependency strategy for all seven managed frameworks. Do not vendor or rewrite the upstream skill in Agent Ops.
+- Rationale: one exact upstream commit makes harness installation reproducible while preserving the requested skill identity and excluding the repository's four unrelated skills.
+- Applies to: the source and packaged skill-dependency registries, framework skill installation, and Prime Agent setup documentation.
+- Revisit when: HumanLayer publishes a required correction, the skill gains executable resources, or a supported framework needs a host-specific adaptation.
+
 ### 2026-08-09: Prime Agent uses native handoff and namespaced owned bundles
 
 - Decision: register Prime Agent as `prime-agent`; require every framework command handoff to receive an existing directory through `--cwd`; hand context packs to `prime-agent --print --cwd <repo> -- <prompt>` using that same directory; default installs to `${PRIME_AGENT_CODING_AGENT_DIR:-$HOME/.prime/agent}`; and generate namespaced `agentops-gstack-*` and `agentops-superpowers-*` skills with fingerprint ownership manifests outside the shared skill namespace.

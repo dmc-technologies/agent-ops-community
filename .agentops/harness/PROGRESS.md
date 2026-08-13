@@ -4,25 +4,27 @@ Repository: `agent-ops-community`
 
 ## Current State
 
-- Branch: `fix/prime-runtime-contracts`
-- Main baseline: the merged first Prime integration and its first public correction.
-- Current handoff: public pull request 13 now excludes `document-release` and `land-and-deploy` because Prime cannot safely reproduce their provider, release-artifact, and merge-head guarantees. The correction retains 29 verified gstack skills, preserves nested review and safety gates, and routes request creation by provider while requiring an explicit repository-owned procedure for merge, deployment, and release work.
-- Verification: Ruff, 102 tests, the source-tree harness check, and whitespace validation pass. A real pinned update installed 29 gstack and 14 Superpowers skills; neither excluded release workflow nor any route to it exists in generated Prime skills.
+- Branch: `feat/humanlayer-show-me-skill`
+- Main baseline: `4eda2a8`, the merge of public pull request 13.
+- Current handoff: HumanLayer's `show-me` skill is pinned at upstream commit `4d8d644ca747517973f58d7953f58d7cd07520cd` and configured for all seven Agent Ops frameworks without importing the repository's four unrelated skills.
+- Verification: the registry contract test failed before the dependency was added and now passes. The complete skill-installer test file, focused Ruff check, whitespace check, and exact pinned installation into disposable homes for all seven frameworks pass.
 
 ## Current Work
 
-- Goal: make Prime Agent a first-class supported framework without overwriting user-authored skills.
-- Active task: complete and merge one narrow post-merge correction, then resume the paused canonical reinstall.
-- Files in play: only the gstack adapter, Superpowers destination confinement, focused tests, Prime documentation, and this handoff.
-- Blockers: hosted deterministic checks and Review Gate on the updated corrective pull request.
+- Goal: make the requested visual-explanation skill available through both machine-global discovery and reproducible Agent Ops harness installation.
+- Active task: finish the public dependency change, run the complete local gate on one commit, and open the implementation pull request.
+- Files in play: the source and packaged dependency registries, installation contract test, public setup documentation, and harness handoff records.
+- Blockers: no product or implementation blocker. Complete-suite and hosted acceptance remain.
 
 ## Next Actions
 
-- Run the full public verification set and exact four-finding acceptance reproductions.
-- Open and merge the narrow corrective pull request after hosted CI and Review Gate pass.
-- Reinstall from both canonical main branches, restart Prime sessions, and complete the approved Agent Knowledge write with immediate readback during clock-out.
+- Commit the focused implementation slice and run the complete public verification set on the resulting head.
+- Record exact-head acceptance, open the pull request, and obtain hosted CI and Review Gate.
+- After merge, refresh the installed Agent Ops package from public `main`; the machine-global, Prime Agent, and local Agent Ops copies are already installed.
 
 ## Session Log
+
+- 2026-08-13: Added HumanLayer `show-me` 1.0.0 as one exact pinned dependency for all seven managed frameworks. The registry selects only `plugins/show-me/skills`, and disposable installs for Claude Code, Codex, Cursor, OpenClaw, OpenCode, Prime Agent, and local Agent Ops produced byte-identical `SKILL.md` files. The requested global `npx skills` installation also completed for its supported agents; explicit managed copies cover Prime Agent and local Agent Ops, which the upstream installer does not target.
 
 - 2026-08-10: To close the rollout without merging known release-safety defects, Prime now explicitly excludes `document-release` and `land-and-deploy`. This removes the incomplete release subsystem rather than expanding it. Provider-aware pull or merge request creation remains supported; release preparation, merge, and deployment require a supplied repository-owned procedure and stop when none exists. Exact pinned generation retained 29 gstack skills and contained no excluded workflow or route references.
 - 2026-08-10: Final provider review of the release sequence made document-release's allocator base-branch discovery provider-aware as well: GitHub uses `gh pr view`, GitLab uses `glab mr view`, and unknown or missing request/provider data exits 30 before version allocation. The focused adapter suite and exact pinned generation passed after this correction.

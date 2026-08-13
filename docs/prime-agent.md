@@ -1,17 +1,17 @@
 # Prime Agent Support
 
-Prime Agent is a first-class Agent Ops framework. Agent Ops builds Prime Agent context packs, produces direct CLI handoffs, generates bootstrap instructions, and installs collision-safe Prime variants of the pinned gstack and Superpowers bundles.
+Prime Agent is a first-class Agent Ops framework. Agent Ops builds Prime Agent context packs, produces direct CLI handoffs, generates bootstrap instructions, installs collision-safe Prime variants of the pinned gstack and Superpowers bundles, and installs HumanLayer's pinned `show-me` visual-explanation skill.
 
 ## Bootstrap and skills
 
-Generate the Prime Agent bootstrap and install both configured bundles:
+Generate the Prime Agent bootstrap and install all configured bundles:
 
 ```bash
 agentops bootstrap prime-agent
 agentops skills install prime-agent
 ```
 
-The default Prime Agent profile is `${PRIME_AGENT_CODING_AGENT_DIR:-$HOME/.prime/agent}`. Use `--home` to select another profile and `--dependency` to install only `gstack` or `superpowers`. A custom profile used for gstack must be an absolute path that is safe as an unquoted POSIX shell word; paths containing whitespace or shell metacharacters are rejected before generation. Restart an existing Prime Agent session after installing or updating skills so it reloads the profile inventory.
+The default Prime Agent profile is `${PRIME_AGENT_CODING_AGENT_DIR:-$HOME/.prime/agent}`. Use `--home` to select another profile and `--dependency` to install only `gstack`, `superpowers`, or `humanlayer-show-me`. A custom profile used for gstack must be an absolute path that is safe as an unquoted POSIX shell word; paths containing whitespace or shell metacharacters are rejected before generation. Restart an existing Prime Agent session after installing or updating skills so it reloads the profile inventory.
 
 Prime gstack installation runs the pinned upstream external-host generator with a Prime host definition, builds its runtime through the pinned Bun lockfile, and installs 31 generated skills with `agentops-gstack-*` directory and frontmatter names. Browser, design, and PDF runtime assets live under `.agentops/runtime/gstack`; they currently use about 600 MB on Linux. Provider-specific, self-management, and hook-enforced safety workflows that do not have a correct Prime contract are excluded. The exclusions include model benchmarking, paired external agents, automated multi-model planning, multi-model office hours, the provider-specific headed browser, automated shipping, and browser-skill authoring. The generated instructions use IPython for project shell and file work, RLM plus `agent_message` for child agents, ordinary assistant responses for user questions, and `/skill:agentops-gstack-*` for internal skill selection.
 
@@ -23,7 +23,7 @@ The adapters preflight every managed target before writing. A path can be update
 
 The first safe install can migrate the earlier raw Agent Ops copies. Migration occurs only when `skills/gstack` or the old flat Superpowers directories match the exact pinned upstream source, including directory structure and executable behavior where relevant. Any local change causes a refusal instead of deletion.
 
-The dependency registry pins both upstream repositories to exact Git commits. gstack generation runs `bun install --frozen-lockfile`, and installation stops before profile writes if Bun, generation, or required runtime compilation fails.
+The dependency registry pins all three upstream repositories to exact Git commits. The HumanLayer dependency selects only `plugins/show-me/skills/show-me` from its repository. gstack generation runs `bun install --frozen-lockfile`, and installation stops before profile writes if Bun, generation, or required runtime compilation fails.
 
 ## Context handoff
 

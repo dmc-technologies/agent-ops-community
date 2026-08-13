@@ -301,6 +301,23 @@ def test_install_skill_dependencies_fails_on_unsupported_explicit_dependency(
         raise AssertionError("expected unsupported explicit dependency to fail")
 
 
+def test_humanlayer_show_me_is_pinned_for_all_managed_frameworks() -> None:
+    registered = {dependency.id: dependency for dependency in load_skill_dependencies()}
+    dependency = registered["humanlayer-show-me"]
+
+    assert dependency.repo == "https://github.com/humanlayer/skills.git"
+    assert dependency.ref == "4d8d644ca747517973f58d7953f58d7cd07520cd"
+    assert dependency.version == "1.0.0"
+    assert dependency.license == "MIT"
+    assert set(dependency.install) == {framework.value for framework in Framework}
+    assert all(
+        install.strategy == "copy-skills"
+        and install.source == "plugins/show-me/skills"
+        and install.destination == "skills"
+        for install in dependency.install.values()
+    )
+
+
 def test_prime_agent_uses_native_home_and_pinned_bundle_mappings(
     tmp_path: Path,
     monkeypatch,
