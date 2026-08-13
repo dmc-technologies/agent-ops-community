@@ -25,16 +25,20 @@ class InstalledSkillDependency:
 def default_framework_home(framework: Framework) -> Path:
     environment_defaults = {
         Framework.CODEX: ("CODEX_HOME", "~/.codex"),
-        Framework.CLAUDE_CODE: ("CLAUDE_HOME", "~/.claude"),
-        Framework.OPENCODE: ("OPENCODE_HOME", "~/.agents"),
+        Framework.CLAUDE_CODE: ("CLAUDE_CONFIG_DIR", "~/.claude"),
         Framework.PRIME_AGENT: (
             "PRIME_AGENT_CODING_AGENT_DIR",
             "~/.prime/agent",
         ),
-        Framework.CURSOR: ("CURSOR_HOME", "~/.cursor"),
-        Framework.OPENCLAW: ("OPENCLAW_HOME", "~/.openclaw"),
-        Framework.LOCAL: ("AGENT_OPS_LOCAL_HOME", "~/.agentops"),
+        Framework.OPENCLAW: ("OPENCLAW_STATE_DIR", "~/.openclaw"),
     }
+    fixed_defaults = {
+        Framework.CURSOR: "~/.cursor",
+        Framework.OPENCODE: "~/.agents",
+        Framework.LOCAL: "~/.agentops",
+    }
+    if framework in fixed_defaults:
+        return Path(fixed_defaults[framework]).expanduser()
     variable, default = environment_defaults[framework]
     return Path(os.environ.get(variable) or default).expanduser()
 

@@ -44,8 +44,9 @@ def test_public_bootstrap_writes_generic_framework_files(tmp_path: Path) -> None
 
 
 def test_public_bootstrap_advertises_supported_skill_installs() -> None:
-    for framework in GENERIC_PRIVATE_FRAMEWORKS:
+    for framework in GENERIC_PRIVATE_FRAMEWORKS - {Framework.LOCAL}:
         assert f"agentops skills install {framework.value}" in bootstrap_text(framework)
+    assert "agentops skills install local" not in bootstrap_text(Framework.LOCAL)
 
     prime_bootstrap = bootstrap_text(Framework.PRIME_AGENT)
     assert (

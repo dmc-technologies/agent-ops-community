@@ -78,7 +78,3 @@
       strategy: humanlayer-show-me
       source: plugins/show-me/skills
       destination: skills
-    local:
-      strategy: humanlayer-show-me
-      source: plugins/show-me/skills
-      destination: skills

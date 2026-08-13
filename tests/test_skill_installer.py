@@ -4,6 +4,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from agent_ops import show_me_adapter
 from agent_ops.registries import load_skill_dependencies
 from agent_ops.registries.models import Framework, SkillDependency, SkillDependencyInstall
 from agent_ops.show_me_adapter import (
@@ -314,7 +315,9 @@ def test_humanlayer_show_me_is_pinned_for_all_managed_frameworks() -> None:
     assert dependency.ref == "4d8d644ca747517973f58d7953f58d7cd07520cd"
     assert dependency.version == "1.0.0"
     assert dependency.license == "MIT"
-    assert set(dependency.install) == {framework.value for framework in Framework}
+    assert set(dependency.install) == {
+        framework.value for framework in Framework if framework is not Framework.LOCAL
+    }
     assert all(
         install.strategy == "humanlayer-show-me"
         and install.source == "plugins/show-me/skills"
@@ -432,7 +435,7 @@ def test_humanlayer_show_me_updates_only_unchanged_managed_copy(
     assert installed.read_text(encoding="utf-8").endswith("personal change\n")
 
 
-def test_humanlayer_show_me_migrates_only_exact_upstream_copy(
+def test_humanlayer_show_me_refuses_unmanifested_exact_upstream_copy(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -443,15 +446,18 @@ def test_humanlayer_show_me_migrates_only_exact_upstream_copy(
         "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
     )
 
-    install_skill_dependencies(
-        framework=Framework.PRIME_AGENT,
-        dependencies=[_show_me_dependency()],
-        home=tmp_path / "home",
-    )
+    try:
+        install_skill_dependencies(
+            framework=Framework.PRIME_AGENT,
+            dependencies=[_show_me_dependency()],
+            home=tmp_path / "home",
+        )
+    except ShowMeCollisionError as exc:
+        assert "user-owned collision" in str(exc)
+    else:
+        raise AssertionError("expected unmanifested exact upstream skill to fail")
 
-    text = (existing / "SKILL.md").read_text(encoding="utf-8")
-    assert "Bash(open" not in text
-    assert (tmp_path / "home" / SHOW_ME_OWNERSHIP_MANIFEST_RELATIVE).is_file()
+    assert "Bash(open" in (existing / "SKILL.md").read_text(encoding="utf-8")
 
 
 def test_humanlayer_show_me_refuses_logical_name_collision(
@@ -479,6 +485,136 @@ def test_humanlayer_show_me_refuses_logical_name_collision(
         assert "logical skill-name collision" in str(exc)
     else:
         raise AssertionError("expected logical show-me collision to fail")
+
+
+def test_humanlayer_show_me_refuses_symlinked_profile_ancestor(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = _show_me_source(tmp_path / "source")
+    actual = tmp_path / "actual"
+    actual.mkdir()
+    linked = tmp_path / "linked"
+    linked.symlink_to(actual, target_is_directory=True)
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
+    )
+
+    try:
+        install_skill_dependencies(
+            framework=Framework.PRIME_AGENT,
+            dependencies=[_show_me_dependency()],
+            home=linked / "profile",
+        )
+    except ShowMeCollisionError as exc:
+        assert "symbolic link or non-directory" in str(exc)
+    else:
+        raise AssertionError("expected symlinked profile ancestor to fail")
+
+    assert not (actual / "profile" / "skills").exists()
+
+
+def test_humanlayer_show_me_recovers_interrupted_fresh_install(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = _show_me_source(tmp_path / "source")
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
+    )
+    original_write = show_me_adapter._write_json_at
+
+    def interrupt_manifest(directory_fd: int, name: str, value) -> None:
+        if name == SHOW_ME_OWNERSHIP_MANIFEST_RELATIVE.name:
+            raise KeyboardInterrupt
+        original_write(directory_fd, name, value)
+
+    monkeypatch.setattr(show_me_adapter, "_write_json_at", interrupt_manifest)
+    try:
+        install_skill_dependencies(
+            framework=Framework.PRIME_AGENT,
+            dependencies=[_show_me_dependency()],
+            home=tmp_path / "home",
+        )
+    except KeyboardInterrupt:
+        pass
+    else:
+        raise AssertionError("expected simulated installation interruption")
+
+    assert not (tmp_path / "home" / "skills" / "show-me").exists()
+    assert not (tmp_path / "home" / SHOW_ME_OWNERSHIP_MANIFEST_RELATIVE).exists()
+    transaction = (
+        tmp_path
+        / "home"
+        / SHOW_ME_OWNERSHIP_MANIFEST_RELATIVE.parent
+        / "humanlayer-show-me-transaction.json"
+    )
+    assert not transaction.exists()
+
+
+def test_humanlayer_show_me_recovers_interrupted_update(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = _show_me_source(tmp_path / "source")
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
+    )
+    arguments = {
+        "framework": Framework.PRIME_AGENT,
+        "dependencies": [_show_me_dependency()],
+        "home": tmp_path / "home",
+    }
+    install_skill_dependencies(**arguments)
+    installed = tmp_path / "home" / "skills" / "show-me" / "SKILL.md"
+    before = installed.read_bytes()
+    original_rename = show_me_adapter.os.rename
+
+    def interrupt_stage(source_name, destination_name, **kwargs) -> None:
+        if str(source_name).startswith(".humanlayer-show-me-stage-"):
+            raise KeyboardInterrupt
+        original_rename(source_name, destination_name, **kwargs)
+
+    monkeypatch.setattr(show_me_adapter.os, "rename", interrupt_stage)
+    try:
+        install_skill_dependencies(**arguments)
+    except KeyboardInterrupt:
+        pass
+    else:
+        raise AssertionError("expected simulated update interruption")
+
+    assert installed.read_bytes() == before
+    assert (tmp_path / "home" / SHOW_ME_OWNERSHIP_MANIFEST_RELATIVE).is_file()
+
+
+def test_humanlayer_show_me_refuses_symlinked_logical_name_collision(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = _show_me_source(tmp_path / "source")
+    external = tmp_path / "external"
+    external.mkdir()
+    (external / "SKILL.md").write_text(
+        "---\nname: show-me\ndescription: external\n---\n",
+        encoding="utf-8",
+    )
+    skills = tmp_path / "home" / "skills"
+    skills.mkdir(parents=True)
+    (skills / "visual-helper").symlink_to(external, target_is_directory=True)
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
+    )
+
+    try:
+        install_skill_dependencies(
+            framework=Framework.PRIME_AGENT,
+            dependencies=[_show_me_dependency()],
+            home=tmp_path / "home",
+        )
+    except ShowMeCollisionError as exc:
+        assert "logical skill-name collision" in str(exc)
+    else:
+        raise AssertionError("expected symlinked logical collision to fail")
 
 
 def test_prime_agent_uses_native_home_and_pinned_bundle_mappings(
@@ -558,21 +694,29 @@ def test_prime_agent_home_honors_native_environment_variable(
     assert default_framework_home(Framework.PRIME_AGENT) == configured_home
 
 
-def test_framework_homes_honor_advertised_environment_variables(
+def test_framework_homes_honor_native_environment_variables(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
     configured = {
         Framework.CODEX: ("CODEX_HOME", tmp_path / "codex"),
-        Framework.CLAUDE_CODE: ("CLAUDE_HOME", tmp_path / "claude"),
-        Framework.CURSOR: ("CURSOR_HOME", tmp_path / "cursor"),
-        Framework.OPENCLAW: ("OPENCLAW_HOME", tmp_path / "openclaw"),
-        Framework.OPENCODE: ("OPENCODE_HOME", tmp_path / "opencode"),
-        Framework.LOCAL: ("AGENT_OPS_LOCAL_HOME", tmp_path / "local"),
+        Framework.CLAUDE_CODE: ("CLAUDE_CONFIG_DIR", tmp_path / "claude"),
+        Framework.OPENCLAW: ("OPENCLAW_STATE_DIR", tmp_path / "openclaw"),
+        Framework.PRIME_AGENT: (
+            "PRIME_AGENT_CODING_AGENT_DIR",
+            tmp_path / "prime",
+        ),
     }
     for framework, (variable, home) in configured.items():
         monkeypatch.setenv(variable, str(home))
         assert default_framework_home(framework) == home
+
+    monkeypatch.setenv("CURSOR_HOME", str(tmp_path / "ignored-cursor"))
+    monkeypatch.setenv("OPENCODE_HOME", str(tmp_path / "ignored-opencode"))
+    monkeypatch.setenv("AGENT_OPS_LOCAL_HOME", str(tmp_path / "ignored-local"))
+    assert default_framework_home(Framework.CURSOR) == Path("~/.cursor").expanduser()
+    assert default_framework_home(Framework.OPENCODE) == Path("~/.agents").expanduser()
+    assert default_framework_home(Framework.LOCAL) == Path("~/.agentops").expanduser()
 
 
 def test_prime_superpowers_strategy_installs_adapted_namespaced_skills(
