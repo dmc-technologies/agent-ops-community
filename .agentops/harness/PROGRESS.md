@@ -7,19 +7,19 @@ Repository: `agent-ops-community`
 - Branch: `feat/humanlayer-show-me-skill`
 - Main baseline: `4eda2a8`, the merge of public pull request 13.
 - Current handoff: HumanLayer's `show-me` skill is pinned at upstream commit `4d8d644ca747517973f58d7953f58d7cd07520cd` and configured for all seven Agent Ops frameworks without importing the repository's four unrelated skills.
-- Verification: the registry contract test failed before the dependency was added and now passes. The complete skill-installer test file, focused Ruff check, whitespace check, and exact pinned installation into disposable homes for all seven frameworks pass.
+- Verification: the registry contract test failed before the dependency was added and now passes. On implementation commit `b2d5af1`, complete Ruff, all 103 tests, the source-tree harness check, whitespace validation, and exact pinned installation into disposable homes for all seven frameworks pass.
 
 ## Current Work
 
 - Goal: make the requested visual-explanation skill available through both machine-global discovery and reproducible Agent Ops harness installation.
-- Active task: finish the public dependency change, run the complete local gate on one commit, and open the implementation pull request.
+- Active task: publish the verified public dependency change and obtain hosted CI and Review Gate on the final pull-request head.
 - Files in play: the source and packaged dependency registries, installation contract test, public setup documentation, and harness handoff records.
-- Blockers: no product or implementation blocker. Complete-suite and hosted acceptance remain.
+- Blockers: no product or implementation blocker. Hosted acceptance and merge remain external.
 
 ## Next Actions
 
-- Commit the focused implementation slice and run the complete public verification set on the resulting head.
-- Record exact-head acceptance, open the pull request, and obtain hosted CI and Review Gate.
+- Open the pull request, apply `ai review`, and obtain hosted CI and Review Gate on its unchanged final head.
+- Merge only after the required checks pass.
 - After merge, refresh the installed Agent Ops package from public `main`; the machine-global, Prime Agent, and local Agent Ops copies are already installed.
 
 ## Session Log
