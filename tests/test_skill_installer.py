@@ -327,7 +327,9 @@ def test_humanlayer_show_me_is_pinned_for_all_managed_frameworks() -> None:
     )
 
 
-def _show_me_dependency() -> SkillDependency:
+def _show_me_dependency(
+    framework: Framework = Framework.PRIME_AGENT,
+) -> SkillDependency:
     return SkillDependency(
         id="humanlayer-show-me",
         name="HumanLayer Show Me",
@@ -336,7 +338,7 @@ def _show_me_dependency() -> SkillDependency:
         version="1.0.0",
         license="MIT",
         install={
-            "prime-agent": SkillDependencyInstall(
+            framework.value: SkillDependencyInstall(
                 strategy="humanlayer-show-me",
                 source="plugins/show-me/skills",
                 destination="skills",
@@ -654,6 +656,125 @@ def test_openclaw_home_resolves_active_state_precedence(
     assert default_framework_home(Framework.OPENCLAW) == (
         tmp_path / "~root" / "openclaw-home" / ".openclaw"
     )
+
+
+def test_openclaw_home_matches_operator_home_precedence(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("OPENCLAW_HOME", raising=False)
+    monkeypatch.delenv("OPENCLAW_STATE_DIR", raising=False)
+    monkeypatch.delenv("OPENCLAW_PROFILE", raising=False)
+    monkeypatch.setenv("HOME", "undefined")
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "userprofile"))
+    assert default_framework_home(Framework.OPENCLAW) == (
+        tmp_path / "userprofile" / ".openclaw"
+    )
+
+    monkeypatch.setenv("HOME", str(tmp_path / "home-wins"))
+    assert default_framework_home(Framework.OPENCLAW) == (
+        tmp_path / "home-wins" / ".openclaw"
+    )
+
+    monkeypatch.setenv("HOME", "null")
+    monkeypatch.setenv("USERPROFILE", " ")
+    monkeypatch.setenv("ANDROID_DATA", "/data")
+    monkeypatch.setenv("PREFIX", "/data/data/com.termux/files/usr")
+    assert default_framework_home(Framework.OPENCLAW) == (
+        Path("/data/data/com.termux/files") / "home" / ".openclaw"
+    )
+
+
+def test_opencode_refuses_other_global_root_and_flat_markdown_collisions(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = _show_me_source(tmp_path / "source")
+    os_home = tmp_path / "os-home"
+    target = os_home / ".agents"
+    collision = os_home / ".config" / "opencode" / "skills" / "show-me.md"
+    collision.parent.mkdir(parents=True)
+    collision.write_text("---\ndescription: old copy\n---\n", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(os_home))
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
+    )
+
+    try:
+        install_skill_dependencies(
+            framework=Framework.OPENCODE,
+            dependencies=[_show_me_dependency(Framework.OPENCODE)],
+            home=target,
+        )
+    except ShowMeCollisionError as exc:
+        assert "logical skill-path collision" in str(exc)
+        assert "show-me.md" in str(exc)
+    else:
+        raise AssertionError("expected other OpenCode global root collision to fail")
+
+    assert not (target / "skills" / "show-me").exists()
+
+
+def test_openclaw_default_state_refuses_personal_agent_skill_collision(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = _show_me_source(tmp_path / "source")
+    os_home = tmp_path / "os-home"
+    personal = os_home / ".agents" / "skills" / "group" / "show-me-copy"
+    personal.mkdir(parents=True)
+    (personal / "SKILL.md").write_text(
+        "---\nname: show-me\ndescription: personal\n---\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(os_home))
+    monkeypatch.delenv("OPENCLAW_HOME", raising=False)
+    monkeypatch.delenv("OPENCLAW_STATE_DIR", raising=False)
+    monkeypatch.delenv("OPENCLAW_PROFILE", raising=False)
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
+    )
+
+    try:
+        install_skill_dependencies(
+            framework=Framework.OPENCLAW,
+            dependencies=[_show_me_dependency(Framework.OPENCLAW)],
+        )
+    except ShowMeCollisionError as exc:
+        assert "logical skill-name collision" in str(exc)
+    else:
+        raise AssertionError("expected personal OpenClaw collision to fail")
+
+    assert not (os_home / ".openclaw" / "skills" / "show-me").exists()
+
+
+def test_openclaw_custom_state_excludes_personal_agent_skill_root(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = _show_me_source(tmp_path / "source")
+    os_home = tmp_path / "os-home"
+    personal = os_home / ".agents" / "skills" / "show-me"
+    personal.mkdir(parents=True)
+    (personal / "SKILL.md").write_text(
+        "---\nname: show-me\ndescription: default only\n---\n",
+        encoding="utf-8",
+    )
+    custom_state = tmp_path / "custom-state"
+    monkeypatch.setenv("HOME", str(os_home))
+    monkeypatch.setenv("OPENCLAW_STATE_DIR", str(custom_state))
+    monkeypatch.delenv("OPENCLAW_HOME", raising=False)
+    monkeypatch.delenv("OPENCLAW_PROFILE", raising=False)
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
+    )
+
+    install_skill_dependencies(
+        framework=Framework.OPENCLAW,
+        dependencies=[_show_me_dependency(Framework.OPENCLAW)],
+    )
+
+    assert (custom_state / "skills" / "show-me" / "SKILL.md").is_file()
 
 
 def test_openclaw_home_rejects_unsafe_profile_name(

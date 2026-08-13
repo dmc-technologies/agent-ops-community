@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -44,18 +45,57 @@ def default_framework_home(framework: Framework) -> Path:
     return Path(os.environ.get(variable) or default).expanduser()
 
 
+def _normalize_home_value(value: str | None) -> str | None:
+    normalized = value.strip() if value is not None else ""
+    return None if normalized in {"", "undefined", "null"} else normalized
+
+
+def _native_account_home() -> Path:
+    if os.name == "posix":
+        import pwd
+
+        return Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
+    if os.name == "nt":  # pragma: no cover - exercised on Windows
+        import ctypes
+
+        buffer = ctypes.create_unicode_buffer(260)
+        result = ctypes.windll.shell32.SHGetFolderPathW(None, 40, None, 0, buffer)
+        if result == 0 and buffer.value:
+            return Path(buffer.value).resolve()
+    return Path.home().resolve()
+
+
+def _openclaw_os_home() -> Path:
+    configured = _normalize_home_value(os.environ.get("HOME"))
+    if configured is None:
+        configured = _normalize_home_value(os.environ.get("USERPROFILE"))
+    if configured is not None:
+        return Path(configured).resolve()
+    prefix = _normalize_home_value(os.environ.get("PREFIX"))
+    android_data = _normalize_home_value(os.environ.get("ANDROID_DATA"))
+    if (
+        prefix is not None
+        and android_data is not None
+        and re.search(r"(?:^|/)com\.termux/files/usr/?$", prefix.replace("\\", "/"))
+    ):
+        return (Path(prefix).resolve().parent / "home").resolve()
+    return _native_account_home()
+
+
 def _default_openclaw_home() -> Path:
-    configured_home = os.environ.get("OPENCLAW_HOME", "").strip()
-    if configured_home in {"", "undefined", "null"}:
-        base_home = Path.home()
-    else:
-        base_home = _expand_openclaw_path(configured_home, Path.home())
+    os_home = _openclaw_os_home()
+    configured_home = _normalize_home_value(os.environ.get("OPENCLAW_HOME"))
+    base_home = (
+        _expand_openclaw_path(configured_home, os_home)
+        if configured_home is not None
+        else os_home
+    )
     # OPENCLAW_CONFIG_PATH selects a config file but does not relocate the
     # state-root skills directory, so it intentionally does not participate here.
-    state_override = os.environ.get("OPENCLAW_STATE_DIR", "").strip()
-    if state_override:
+    state_override = _normalize_home_value(os.environ.get("OPENCLAW_STATE_DIR"))
+    if state_override is not None:
         return _expand_openclaw_path(state_override, base_home)
-    profile = os.environ.get("OPENCLAW_PROFILE", "").strip()
+    profile = _normalize_home_value(os.environ.get("OPENCLAW_PROFILE"))
     if profile and profile.lower() != "default":
         if not profile[0].isalnum() or len(profile) > 64 or any(
             character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
@@ -74,12 +114,50 @@ def _expand_openclaw_path(value: str, base_home: Path) -> Path:
     if value == "~":
         return base_home
     if value.startswith("~/"):
-        return base_home / value[2:]
+        return (base_home / value[2:]).resolve()
     if value.startswith("~\\"):
         if os.name == "nt":  # pragma: no cover - exercised on Windows
-            return base_home / value[2:]
-        return Path(f"{base_home}{value[1:]}")
+            return (base_home / value[2:]).resolve()
+        return Path(f"{base_home}{value[1:]}").resolve()
     return Path(value).resolve()
+
+
+def _openclaw_uses_default_state(target_home: Path) -> bool:
+    os_home = _openclaw_os_home()
+    configured_home = _normalize_home_value(os.environ.get("OPENCLAW_HOME"))
+    effective_home = (
+        _expand_openclaw_path(configured_home, os_home)
+        if configured_home is not None
+        else os_home
+    )
+    state_override = _normalize_home_value(os.environ.get("OPENCLAW_STATE_DIR"))
+    profile = _normalize_home_value(os.environ.get("OPENCLAW_PROFILE"))
+    if profile and profile.lower() != "default":
+        return False
+    canonical = effective_home / ".openclaw"
+    if state_override is None:
+        return target_home.resolve() == _default_openclaw_home().resolve()
+    return (
+        _expand_openclaw_path(state_override, effective_home).resolve()
+        == canonical.resolve()
+        and target_home.resolve() == canonical.resolve()
+    )
+
+
+def _show_me_collision_roots(framework: Framework, target_home: Path) -> tuple[Path, ...]:
+    os_home = _openclaw_os_home()
+    if framework is Framework.OPENCODE:
+        roots = [
+            os_home / ".config" / "opencode" / "skills",
+            os_home / ".claude" / "skills",
+            os_home / ".agents" / "skills",
+        ]
+    elif framework is Framework.OPENCLAW and _openclaw_uses_default_state(target_home):
+        roots = [os_home / ".agents" / "skills"]
+    else:
+        roots = []
+    destination_root = (target_home / "skills").resolve()
+    return tuple(root.resolve() for root in roots if root.resolve() != destination_root)
 
 
 def install_skill_dependencies(
@@ -139,6 +217,8 @@ def install_skill_dependencies(
             continue
         source = _checkout_dependency(dependency, cache_root)
         _install_dependency(
+            framework=framework,
+            target_home=target_home,
             dependency_id=dependency.id,
             source=source,
             destination=destination,
@@ -177,6 +257,8 @@ def _checkout_dependency(dependency: SkillDependency, cache_root: Path) -> Path:
 
 def _install_dependency(
     *,
+    framework: Framework,
+    target_home: Path,
     dependency_id: str,
     source: Path,
     destination: Path,
@@ -200,7 +282,12 @@ def _install_dependency(
             raise ValueError(
                 "humanlayer-show-me strategy is only valid for HumanLayer Show Me"
             )
-        install_show_me(source, destination / "show-me")
+        install_show_me(
+            source,
+            destination / "show-me",
+            collision_roots=_show_me_collision_roots(framework, target_home),
+            flat_markdown=framework is Framework.OPENCODE,
+        )
         return
     if install.strategy == "copy-skills":
         if install.source is None:
