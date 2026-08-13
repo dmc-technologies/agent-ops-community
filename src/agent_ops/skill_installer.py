@@ -391,6 +391,16 @@ def _opencode_data_home() -> Path:
     return (base / "opencode").resolve()
 
 
+def _opencode_selected_database() -> Path:
+    authored = _normalize_home_value(os.environ.get("OPENCODE_DB"))
+    if authored is None:
+        return _opencode_data_home() / "opencode.db"
+    if authored == ":memory:":
+        raise ValueError("in-memory OpenCode database cannot be inspected reproducibly")
+    selected = Path(authored).expanduser()
+    return selected if selected.is_absolute() else _opencode_data_home() / selected
+
+
 def _reject_uninspectable_opencode_remote_config() -> None:
     auth_path = _opencode_data_home() / "auth.json"
     if auth_path.is_file():
@@ -407,20 +417,23 @@ def _reject_uninspectable_opencode_remote_config() -> None:
                 "OpenCode well-known remote configuration cannot be inspected reproducibly "
                 "by the global installer"
             )
-    for database in _opencode_data_home().glob("opencode*.db"):
-        try:
-            with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as connection:
-                row = connection.execute(
-                    "SELECT active_account_id FROM account_state "
-                    "WHERE active_account_id IS NOT NULL LIMIT 1"
-                ).fetchone()
-        except sqlite3.Error:
-            continue
-        if row:
-            raise ValueError(
-                "OpenCode active-account remote configuration cannot be inspected "
-                "reproducibly by the global installer"
-            )
+    database = _opencode_selected_database().absolute()
+    if not database.exists():
+        if _normalize_home_value(os.environ.get("OPENCODE_DB")) is not None:
+            raise ValueError(f"cannot inspect selected OpenCode database: {database}")
+        return
+    try:
+        with sqlite3.connect(f"{database.as_uri()}?mode=ro", uri=True) as connection:
+            row = connection.execute(
+                "SELECT active_org_id FROM account_state WHERE active_org_id IS NOT NULL LIMIT 1"
+            ).fetchone()
+    except sqlite3.Error as exc:
+        raise ValueError(f"cannot inspect selected OpenCode database: {database}") from exc
+    if row:
+        raise ValueError(
+            "OpenCode active-organization remote configuration cannot be inspected "
+            "reproducibly by the global installer"
+        )
 
 
 def _reject_uninspectable_opencode_skill_urls(config: dict[str, object]) -> None:
@@ -518,11 +531,8 @@ def _openclaw_active_config_path() -> Path:
     else:
         selected_state = effective_home / ".openclaw"
     state_dirs = [selected_state]
-    if profile is None:
-        if state_override is not None:
-            state_dirs.extend([effective_home / ".openclaw", effective_home / ".clawdbot"])
-        else:
-            state_dirs.append(effective_home / ".clawdbot")
+    if profile is None and state_override is None:
+        state_dirs.append(effective_home / ".clawdbot")
     candidates = [
         state_dir / filename
         for state_dir in state_dirs
@@ -564,8 +574,71 @@ def _expand_openclaw_config_environment(value: str, config: dict[str, object]) -
     return expanded.replace(escaped + "{", "${")
 
 
+def _openclaw_plugin_candidate_paths(config: dict[str, object]) -> tuple[Path, ...]:
+    effective_home = _openclaw_effective_home()
+    paths = [
+        _expand_openclaw_path(_expand_openclaw_config_environment(item, config), effective_home)
+        for item in _nested_string_list(config, "plugins", "load", "paths")
+    ]
+    roots = [_openclaw_active_config_path().parent / "extensions"]
+    agents = config.get("agents")
+    agent_list = agents.get("list") if isinstance(agents, dict) else None
+    if isinstance(agent_list, list):
+        for agent in agent_list:
+            if not isinstance(agent, dict) or not isinstance(agent.get("workspace"), str):
+                continue
+            workspace = _expand_openclaw_path(
+                _expand_openclaw_config_environment(agent["workspace"], config),
+                effective_home,
+            )
+            roots.append(workspace / ".openclaw" / "extensions")
+    for root in roots:
+        if root.is_dir():
+            paths.extend(sorted(root.iterdir(), key=lambda candidate: candidate.name))
+    return tuple(paths)
+
+
+def _openclaw_plugin_manifest(path: Path) -> tuple[str, list[str]]:
+    root = path if path.is_dir() else path.parent
+    manifest = root / "openclaw.plugin.json"
+    if not manifest.is_file():
+        raise ValueError(f"cannot inspect OpenClaw plugin manifest: {path}")
+    try:
+        loaded = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"cannot inspect OpenClaw plugin manifest: {manifest}") from exc
+    if not isinstance(loaded, dict) or not isinstance(loaded.get("id"), str):
+        raise ValueError(f"cannot inspect OpenClaw plugin manifest: {manifest}")
+    skills = loaded.get("skills", [])
+    if not isinstance(skills, list) or not all(isinstance(item, str) for item in skills):
+        raise ValueError(f"cannot inspect OpenClaw plugin skill inventory: {manifest}")
+    return loaded["id"], skills
+
+
+def _reject_uninspectable_openclaw_plugin_skills(config: dict[str, object]) -> None:
+    plugins = config.get("plugins")
+    if isinstance(plugins, dict) and plugins.get("enabled") is False:
+        return
+    entries = plugins.get("entries", {}) if isinstance(plugins, dict) else {}
+    deny = set(_nested_string_list(config, "plugins", "deny"))
+    allow = set(_nested_string_list(config, "plugins", "allow"))
+    for candidate in _openclaw_plugin_candidate_paths(config):
+        plugin_id, skills = _openclaw_plugin_manifest(candidate)
+        entry = entries.get(plugin_id) if isinstance(entries, dict) else None
+        if plugin_id in deny or (allow and plugin_id not in allow):
+            continue
+        if isinstance(entry, dict) and entry.get("enabled") is False:
+            continue
+        if skills:
+            raise ValueError(
+                "OpenClaw plugin skill inventory cannot be inspected reproducibly by the "
+                "global installer; disable plugin skill sources before global installation"
+            )
+
+
 def _openclaw_configured_skill_roots() -> tuple[Path, ...]:
     config = _load_openclaw_config(_openclaw_active_config_path())
+    _reject_uninspectable_openclaw_plugin_skills(config)
     effective_home = _openclaw_effective_home()
     roots = []
     for item in _nested_string_list(config, "skills", "load", "extraDirs"):

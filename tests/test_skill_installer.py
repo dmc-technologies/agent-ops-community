@@ -1163,7 +1163,7 @@ def test_openclaw_named_profile_configured_skill_root_is_checked(
         raise AssertionError("expected named-profile extra-root collision")
 
 
-def test_openclaw_state_without_config_falls_back_to_default_config(
+def test_openclaw_explicit_empty_state_does_not_inherit_default_config(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -1185,20 +1185,19 @@ def test_openclaw_state_without_config_falls_back_to_default_config(
     monkeypatch.setenv("HOME", str(tmp_path / "os-home"))
     monkeypatch.setenv("OPENCLAW_HOME", str(effective_home))
     monkeypatch.setenv("OPENCLAW_STATE_DIR", str(tmp_path / "empty-state"))
+    monkeypatch.delenv("OPENCLAW_PROFILE", raising=False)
     monkeypatch.delenv("OPENCLAW_CONFIG_PATH", raising=False)
     monkeypatch.setattr(
         "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
     )
 
-    try:
-        install_skill_dependencies(
-            framework=Framework.OPENCLAW,
-            dependencies=[_show_me_dependency(Framework.OPENCLAW)],
-        )
-    except ShowMeCollisionError as exc:
-        assert "logical skill-name collision" in str(exc)
-    else:
-        raise AssertionError("expected default-config fallback extra-root collision")
+    installed = install_skill_dependencies(
+        framework=Framework.OPENCLAW,
+        dependencies=[_show_me_dependency(Framework.OPENCLAW)],
+    )
+
+    assert len(installed) == 1
+    assert (tmp_path / "empty-state" / "skills" / "show-me" / "SKILL.md").is_file()
 
 
 def test_openclaw_relative_include_root_fails_closed(
@@ -2369,11 +2368,113 @@ def test_opencode_active_organization_remote_config_fails_closed(
     monkeypatch.setenv("XDG_DATA_HOME", str(data))
     monkeypatch.setenv("OPENCODE_TEST_MANAGED_CONFIG_DIR", str(tmp_path / "managed"))
 
-    with pytest.raises(ValueError, match="active-account remote configuration"):
+    with pytest.raises(ValueError, match="active-organization remote configuration"):
         install_skill_dependencies(
             framework=Framework.OPENCODE,
             dependencies=[_show_me_dependency(Framework.OPENCODE)],
         )
+
+
+def test_opencode_custom_database_active_organization_fails_before_checkout(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    database = tmp_path / "custom" / "selected.db"
+    database.parent.mkdir(parents=True)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TABLE account_state (active_account_id TEXT, active_org_id TEXT)"
+        )
+        connection.execute("INSERT INTO account_state VALUES (?, ?)", ("account", "organization"))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("OPENCODE_DB", str(database))
+    monkeypatch.setenv("OPENCODE_TEST_MANAGED_CONFIG_DIR", str(tmp_path / "managed"))
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency",
+        lambda dependency, cache: (_ for _ in ()).throw(AssertionError("checkout must not run")),
+    )
+
+    with pytest.raises(ValueError, match="active-organization remote configuration"):
+        install_skill_dependencies(
+            framework=Framework.OPENCODE,
+            dependencies=[_show_me_dependency(Framework.OPENCODE)],
+        )
+
+
+def test_opencode_relative_database_resolves_under_data_home(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    database = tmp_path / "data" / "opencode" / "selected.db"
+    database.parent.mkdir(parents=True)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TABLE account_state (active_account_id TEXT, active_org_id TEXT)"
+        )
+        connection.execute("INSERT INTO account_state VALUES (?, ?)", ("account", "organization"))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("OPENCODE_DB", "selected.db")
+    monkeypatch.setenv("OPENCODE_TEST_MANAGED_CONFIG_DIR", str(tmp_path / "managed"))
+
+    with pytest.raises(ValueError, match="active-organization remote configuration"):
+        install_skill_dependencies(
+            framework=Framework.OPENCODE,
+            dependencies=[_show_me_dependency(Framework.OPENCODE)],
+        )
+
+
+def test_opencode_missing_selected_database_fails_before_checkout(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    database = tmp_path / "missing" / "selected.db"
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("OPENCODE_DB", str(database))
+    monkeypatch.setenv("OPENCODE_TEST_MANAGED_CONFIG_DIR", str(tmp_path / "managed"))
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency",
+        lambda dependency, cache: (_ for _ in ()).throw(AssertionError("checkout must not run")),
+    )
+
+    with pytest.raises(ValueError, match="cannot inspect selected OpenCode database"):
+        install_skill_dependencies(
+            framework=Framework.OPENCODE,
+            dependencies=[_show_me_dependency(Framework.OPENCODE)],
+        )
+
+
+def test_opencode_personal_active_account_without_organization_is_allowed(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = _show_me_source(tmp_path / "source")
+    database = tmp_path / "data" / "opencode" / "opencode.db"
+    database.parent.mkdir(parents=True)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TABLE account_state (active_account_id TEXT, active_org_id TEXT)"
+        )
+        connection.execute("INSERT INTO account_state VALUES (?, ?)", ("account", None))
+    dormant = database.with_name("opencode-beta.db")
+    with sqlite3.connect(dormant) as connection:
+        connection.execute(
+            "CREATE TABLE account_state (active_account_id TEXT, active_org_id TEXT)"
+        )
+        connection.execute("INSERT INTO account_state VALUES (?, ?)", ("account", "organization"))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("OPENCODE_TEST_MANAGED_CONFIG_DIR", str(tmp_path / "managed"))
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
+    )
+
+    installed = install_skill_dependencies(
+        framework=Framework.OPENCODE,
+        dependencies=[_show_me_dependency(Framework.OPENCODE)],
+    )
+
+    assert len(installed) == 1
 
 
 def test_show_me_update_allows_other_unchanged_agentops_managed_copy(
@@ -2403,3 +2504,74 @@ def test_show_me_update_allows_other_unchanged_agentops_managed_copy(
     )
 
     assert (os_home / ".agents" / "skills" / "show-me" / "LICENSE").is_file()
+
+
+def test_openclaw_enabled_plugin_source_fails_before_checkout(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    state = tmp_path / "state"
+    plugin = state / "extensions" / "preview-plugin"
+    plugin.mkdir(parents=True)
+    (plugin / "openclaw.plugin.json").write_text(
+        json.dumps({"id": "preview-plugin", "skills": ["skills"]}),
+        encoding="utf-8",
+    )
+    skill = plugin / "skills" / "show-me"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\nname: show-me\ndescription: plugin\n---\n",
+        encoding="utf-8",
+    )
+    state.mkdir(exist_ok=True)
+    (state / "openclaw.json").write_text(
+        json.dumps({"plugins": {"entries": {"preview-plugin": {"enabled": True}}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("OPENCLAW_STATE_DIR", str(state))
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency",
+        lambda dependency, cache: (_ for _ in ()).throw(AssertionError("checkout must not run")),
+    )
+
+    with pytest.raises(ValueError, match="plugin skill inventory"):
+        install_skill_dependencies(
+            framework=Framework.OPENCLAW,
+            dependencies=[_show_me_dependency(Framework.OPENCLAW)],
+        )
+
+
+def test_openclaw_disabled_plugin_skill_source_is_allowed(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = _show_me_source(tmp_path / "source")
+    state = tmp_path / "state"
+    plugin = state / "extensions" / "preview-plugin"
+    skill = plugin / "skills" / "show-me"
+    skill.mkdir(parents=True)
+    (plugin / "openclaw.plugin.json").write_text(
+        json.dumps({"id": "preview-plugin", "skills": ["skills"]}),
+        encoding="utf-8",
+    )
+    (skill / "SKILL.md").write_text(
+        "---\nname: show-me\ndescription: plugin\n---\n",
+        encoding="utf-8",
+    )
+    (state / "openclaw.json").write_text(
+        json.dumps({"plugins": {"entries": {"preview-plugin": {"enabled": False}}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("OPENCLAW_STATE_DIR", str(state))
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
+    )
+
+    installed = install_skill_dependencies(
+        framework=Framework.OPENCLAW,
+        dependencies=[_show_me_dependency(Framework.OPENCLAW)],
+    )
+
+    assert len(installed) == 1

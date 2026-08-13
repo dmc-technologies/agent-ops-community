@@ -7,7 +7,7 @@ Repository: `agent-ops-community`
 - Branch: `feat/humanlayer-show-me-skill`
 - Main baseline: `4eda2a8`, the merge of public pull request 13.
 - Current handoff: public `agent-ops-community` pull request 14 pins HumanLayer's `show-me` skill at upstream commit `4d8d644ca747517973f58d7953f58d7cd07520cd` and configures it for all six Agent Ops agent hosts without importing the repository's four unrelated skills. Three Review Gate cycles exposed unsafe replacement, incomplete discovery, non-durable recovery, Linux-only filesystem assumptions, incomplete nested collision detection, and incorrect OpenClaw profile resolution. The corrected adapter now refuses unowned or modified targets, owns updates by fingerprint, locks and recovers durable transactions on POSIX and Windows, preserves changed crash-recovery content, scans flat and nested skill identities through confined no-follow operations, resolves OpenClaw's active state precedence, and uses a portable artifact-preview fallback. Replacement hosted acceptance, merge, and the post-merge package refresh remain pending external finalization. No external tracker applies to this public package change.
-- Verification: the registry contract test failed before the dependency was added and now passes. Complete Ruff, all 163 tests, the source-tree harness check, whitespace validation, focused installer/framework tests, six exact pinned disposable installs, POSIX and Windows-path transaction tests, interruption recovery, changed-target preservation, recursive collision, and no-follow profile-confinement checks pass.
+- Verification: the registry contract test failed before the dependency was added and now passes. Complete Ruff, all 169 tests, the source-tree harness check, whitespace validation, focused installer/framework tests, six exact pinned disposable installs, POSIX and Windows-path transaction tests, interruption recovery, changed-target preservation, recursive collision, and no-follow profile-confinement checks pass.
 
 ## Current Work
 
@@ -23,6 +23,8 @@ Repository: `agent-ops-community`
 - After merge, refresh the installed Agent Ops package from public `main`; the machine-global and Prime Agent copies are already installed.
 
 ## Session Log
+
+- 2026-08-13: Review Gate run `31699523095` found three configuration-source mismatches after Windows CI passed. The installer now honors exact `OPENCODE_DB` selection and active organization state, keeps explicit isolated OpenClaw state independent from the default profile, and fails closed before checkout when active OpenClaw plugin sources make the skill inventory unreproducible.
 
 - 2026-08-13: Review Gate run `31695523335` found a Windows time-of-check/time-of-use race and mapped-drive rejection. Windows transactions now pin verified directory and exact child identities with native no-follow handles, perform tree renames and state-file deletion through those handles, use atomic handle-renamed state writes, compare volume/file identities rather than drive spellings, and preserve quarantined transaction trees instead of unsafe recursive deletion. CI now includes a native Windows job for sharing, mapped-drive, and Win32 ABI coverage.
 
