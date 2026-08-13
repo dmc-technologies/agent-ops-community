@@ -1020,6 +1020,9 @@ def _rename_native_windows_handle(
     import ctypes
     from ctypes import wintypes
 
+    destination = destination_parent.path / destination_name
+    destination_text = str(destination)
+
     class RenameControl(ctypes.Union):
         _fields_ = [
             ("ReplaceIfExists", wintypes.BOOLEAN),
@@ -1032,14 +1035,17 @@ def _rename_native_windows_handle(
             ("Control", RenameControl),
             ("RootDirectory", wintypes.HANDLE),
             ("FileNameLength", wintypes.DWORD),
-            ("FileName", wintypes.WCHAR * len(destination_name)),
+            ("FileName", wintypes.WCHAR * len(destination_text)),
         ]
 
+    # Windows documents NULL as the common RootDirectory case. The absolute path is
+    # safe here because the parent handle remains pinned and its identity is checked
+    # immediately before and after this exact-handle rename.
     information = FileRenameInformation()
     information.ReplaceIfExists = replace
-    information.RootDirectory = wintypes.HANDLE(destination_parent.native_handle)
-    information.FileNameLength = len(destination_name.encode("utf-16-le"))
-    information.FileName = destination_name
+    information.RootDirectory = None
+    information.FileNameLength = len(destination_text.encode("utf-16-le"))
+    information.FileName = destination_text
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     set_information = kernel32.SetFileInformationByHandle
     set_information.argtypes = (
