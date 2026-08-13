@@ -50,13 +50,17 @@ def _environment_truthy(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {"1", "true"}
 
 
+def _opencode_xdg_home() -> Path:
+    xdg_config = _normalize_home_value(os.environ.get("XDG_CONFIG_HOME"))
+    base = Path(xdg_config).expanduser() if xdg_config is not None else Path.home() / ".config"
+    return (base / "opencode").resolve()
+
+
 def _opencode_config_home() -> Path:
     configured = _normalize_home_value(os.environ.get("OPENCODE_CONFIG_DIR"))
     if configured is not None:
         return Path(configured).expanduser().resolve()
-    xdg_config = _normalize_home_value(os.environ.get("XDG_CONFIG_HOME"))
-    base = Path(xdg_config).expanduser() if xdg_config is not None else Path.home() / ".config"
-    return (base / "opencode").resolve()
+    return _opencode_xdg_home()
 
 
 def _default_opencode_home() -> Path:
@@ -141,7 +145,7 @@ def _expand_openclaw_path(value: str, base_home: Path) -> Path:
     return Path(value).resolve()
 
 
-def _openclaw_uses_default_state(target_home: Path) -> bool:
+def _openclaw_uses_default_state() -> bool:
     os_home = _openclaw_os_home()
     configured_home = _normalize_home_value(os.environ.get("OPENCLAW_HOME"))
     effective_home = (
@@ -149,7 +153,13 @@ def _openclaw_uses_default_state(target_home: Path) -> bool:
         if configured_home is not None
         else os_home
     )
-    return target_home.resolve() == (effective_home / ".openclaw").resolve()
+    state_override = _normalize_home_value(os.environ.get("OPENCLAW_STATE_DIR"))
+    if state_override is None:
+        return True
+    return (
+        _expand_openclaw_path(state_override, effective_home).resolve()
+        == (effective_home / ".openclaw").resolve()
+    )
 
 
 def _show_me_collision_roots(framework: Framework, target_home: Path) -> tuple[Path, ...]:
@@ -163,7 +173,12 @@ def _show_me_collision_roots(framework: Framework, target_home: Path) -> tuple[P
             os_home / ".codex" / "skills",
         ]
     elif framework is Framework.OPENCODE:
-        roots = [_opencode_config_home() / "skill", _opencode_config_home() / "skills"]
+        config_roots = {_opencode_xdg_home(), _opencode_config_home()}
+        roots = [
+            child
+            for root in config_roots
+            for child in (root / "skill", root / "skills")
+        ]
         if not _environment_truthy("OPENCODE_DISABLE_EXTERNAL_SKILLS"):
             roots.append(os_home / ".agents" / "skills")
             if not (
@@ -171,7 +186,7 @@ def _show_me_collision_roots(framework: Framework, target_home: Path) -> tuple[P
                 or _environment_truthy("OPENCODE_DISABLE_CLAUDE_CODE_SKILLS")
             ):
                 roots.append(os_home / ".claude" / "skills")
-    elif framework is Framework.OPENCLAW and _openclaw_uses_default_state(target_home):
+    elif framework is Framework.OPENCLAW and _openclaw_uses_default_state():
         roots = [os_home / ".agents" / "skills"]
     else:
         roots = []

@@ -801,6 +801,43 @@ def test_openclaw_config_path_selects_managed_skill_root(
     assert default_framework_home(Framework.OPENCLAW) == tmp_path / "configured"
 
 
+def test_openclaw_custom_config_still_checks_default_state_personal_root(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = _show_me_source(tmp_path / "source")
+    os_home = tmp_path / "os-home"
+    personal = os_home / ".agents" / "skills" / "show-me"
+    personal.mkdir(parents=True)
+    (personal / "SKILL.md").write_text(
+        "---\nname: show-me\ndescription: personal\n---\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(os_home))
+    monkeypatch.setenv(
+        "OPENCLAW_CONFIG_PATH",
+        str(tmp_path / "configured" / "openclaw.json"),
+    )
+    monkeypatch.delenv("OPENCLAW_STATE_DIR", raising=False)
+    monkeypatch.delenv("OPENCLAW_HOME", raising=False)
+    monkeypatch.delenv("OPENCLAW_PROFILE", raising=False)
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
+    )
+
+    try:
+        install_skill_dependencies(
+            framework=Framework.OPENCLAW,
+            dependencies=[_show_me_dependency(Framework.OPENCLAW)],
+        )
+    except ShowMeCollisionError as exc:
+        assert "logical skill-path collision" in str(exc)
+    else:
+        raise AssertionError("expected custom-config personal collision")
+
+    assert not (tmp_path / "configured" / "skills" / "show-me").exists()
+
+
 def test_opencode_xdg_and_config_override_roots_are_checked(
     tmp_path: Path,
     monkeypatch,
@@ -809,10 +846,10 @@ def test_opencode_xdg_and_config_override_roots_are_checked(
     os_home = tmp_path / "os-home"
     xdg = tmp_path / "xdg"
     override = tmp_path / "override"
-    collision = override / "skills" / "visual-helper"
+    collision = xdg / "opencode" / "skills" / "visual-helper"
     collision.mkdir(parents=True)
     (collision / "SKILL.md").write_text(
-        "---\nname: 'show-me'\ndescription: override\n---\n",
+        "---\nname: 'show-me'\ndescription: xdg alongside override\n---\n",
         encoding="utf-8",
     )
     monkeypatch.setenv("HOME", str(os_home))
@@ -831,7 +868,7 @@ def test_opencode_xdg_and_config_override_roots_are_checked(
     except ShowMeCollisionError as exc:
         assert "logical skill-name collision" in str(exc)
     else:
-        raise AssertionError("expected configured OpenCode root collision to fail")
+        raise AssertionError("expected XDG root collision alongside configured override to fail")
 
 
 def test_show_me_yaml_frontmatter_collision_handles_folded_name(
@@ -979,8 +1016,8 @@ def test_openclaw_named_profile_excludes_personal_agent_skill_root(
     )
     monkeypatch.setenv("HOME", str(os_home))
     monkeypatch.setenv("OPENCLAW_PROFILE", "customer-a")
+    monkeypatch.setenv("OPENCLAW_STATE_DIR", str(os_home / ".openclaw-customer-a"))
     monkeypatch.delenv("OPENCLAW_HOME", raising=False)
-    monkeypatch.delenv("OPENCLAW_STATE_DIR", raising=False)
     monkeypatch.delenv("OPENCLAW_CONFIG_PATH", raising=False)
     monkeypatch.setattr(
         "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
