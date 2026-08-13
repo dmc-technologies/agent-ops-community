@@ -918,6 +918,13 @@ def test_show_me_retries_partial_unjournaled_garbage_cleanup(
 def test_windows_helpers_refuse_linked_descendant_and_lock(
     tmp_path: Path,
 ) -> None:
+    assert show_me_adapter._normalize_windows_final_path(
+        "\\\\?\\C:\\Users\\agent\\lock"
+    ) == "C:\\Users\\agent\\lock"
+    assert show_me_adapter._normalize_windows_final_path(
+        "\\\\?\\UNC\\server\\share\\lock"
+    ) == "\\\\server\\share\\lock"
+
     external = tmp_path / "external"
     external.mkdir()
     linked_ancestor = tmp_path / "linked-ancestor"

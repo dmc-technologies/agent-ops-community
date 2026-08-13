@@ -229,18 +229,27 @@ def _open_windows_lock(path: Path) -> int:
             raise ShowMeCollisionError(f"unsafe show-me lock path: {path}")
         if os.name == "nt":  # pragma: no cover - exercised on Windows
             import ctypes
+            from ctypes import wintypes
 
             handle = msvcrt.get_osfhandle(descriptor)
             buffer = ctypes.create_unicode_buffer(32768)
-            length = ctypes.windll.kernel32.GetFinalPathNameByHandleW(
-                handle,
+            get_final_path = ctypes.windll.kernel32.GetFinalPathNameByHandleW
+            get_final_path.argtypes = (
+                wintypes.HANDLE,
+                wintypes.LPWSTR,
+                wintypes.DWORD,
+                wintypes.DWORD,
+            )
+            get_final_path.restype = wintypes.DWORD
+            length = get_final_path(
+                wintypes.HANDLE(handle),
                 buffer,
                 len(buffer),
                 0,
             )
             if length == 0 or length >= len(buffer):
                 raise ShowMeCollisionError(f"cannot verify show-me lock path: {path}")
-            resolved = buffer.value.removeprefix("\\\\?\\")
+            resolved = _normalize_windows_final_path(buffer.value)
             if os.path.normcase(os.path.abspath(resolved)) != os.path.normcase(
                 expected_path
             ):
@@ -249,6 +258,16 @@ def _open_windows_lock(path: Path) -> int:
     except BaseException:
         os.close(descriptor)
         raise
+
+
+def _normalize_windows_final_path(value: str) -> str:
+    unc_prefix = "\\\\?\\UNC\\"
+    device_prefix = "\\\\?\\"
+    if value.upper().startswith(unc_prefix.upper()):
+        return "\\\\" + value[len(unc_prefix) :]
+    if value.startswith(device_prefix):
+        return value[len(device_prefix) :]
+    return value
 
 
 def _validate_windows_profile(profile_root: Path) -> None:

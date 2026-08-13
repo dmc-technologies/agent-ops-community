@@ -24,6 +24,8 @@ Repository: `agent-ops-community`
 
 ## Session Log
 
+- 2026-08-13: The Windows lock-handle check now declares the pointer-sized Win32 signature before calling `GetFinalPathNameByHandleW` and normalizes both drive and UNC device paths. This prevents 64-bit handle truncation from making native Windows installation fail closed for every profile while retaining link-escape detection.
+
 - 2026-08-13: A Windows confinement probe found that safe directory creation validated a missing parent chain but could skip an already-existing linked ancestor. Directory creation now validates every ancestor up to the filesystem root before any mutation, and the regression proves that no directory is created through the link.
 
 - 2026-08-13: A final confinement probe found POSIX profile creation still used recursive path creation before opening the root without following links. The installer now creates each missing profile component relative to an already-open parent descriptor and rejects a linked ancestor before it can create any external directory; the strengthened regression asserts that no external profile path is created.
