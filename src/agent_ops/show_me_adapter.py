@@ -1054,7 +1054,7 @@ def _rename_native_windows_handle(
         wintypes.HANDLE(handle),
         file_rename_info,
         ctypes.byref(information),
-        FileRenameInformation.FileName.offset + information.FileNameLength,
+        ctypes.sizeof(information),
     ):
         error = ctypes.get_last_error()
         raise ShowMeCollisionError(
