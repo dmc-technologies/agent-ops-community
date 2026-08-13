@@ -641,7 +641,9 @@ def test_openclaw_home_resolves_active_state_precedence(
     assert default_framework_home(Framework.OPENCLAW) == base_home / ".openclaw"
 
     monkeypatch.setenv("OPENCLAW_PROFILE", "customer-a")
+    monkeypatch.setenv("OPENCLAW_CONFIG_PATH", str(tmp_path / "other" / "config.json"))
     assert default_framework_home(Framework.OPENCLAW) == base_home / ".openclaw-customer-a"
+    monkeypatch.delenv("OPENCLAW_CONFIG_PATH")
 
     monkeypatch.setenv("OPENCLAW_STATE_DIR", "~/selected-state")
     assert default_framework_home(Framework.OPENCLAW) == base_home / "selected-state"
@@ -1384,7 +1386,7 @@ def test_openclaw_named_profile_excludes_personal_agent_skill_root(
     )
     monkeypatch.setenv("HOME", str(os_home))
     monkeypatch.setenv("OPENCLAW_PROFILE", "customer-a")
-    monkeypatch.setenv("OPENCLAW_STATE_DIR", str(os_home / ".openclaw-customer-a"))
+    monkeypatch.delenv("OPENCLAW_STATE_DIR", raising=False)
     monkeypatch.delenv("OPENCLAW_HOME", raising=False)
     monkeypatch.delenv("OPENCLAW_CONFIG_PATH", raising=False)
     monkeypatch.setattr(

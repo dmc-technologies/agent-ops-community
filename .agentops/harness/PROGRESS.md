@@ -24,6 +24,8 @@ Repository: `agent-ops-community`
 
 ## Session Log
 
+- 2026-08-13: Review Gate run `31688053732` found that OpenClaw profile projection still happened after config-path selection in one combination. Profile projection now occurs first: an explicit state override wins, otherwise a named profile selects its isolated state and managed skills even when an explicit config path remains in the environment; the personal-agent compatibility root is excluded for that isolated state.
+
 - 2026-08-13: An independent configured-root review found two OpenClaw edge cases before final acceptance. Named-profile config discovery now uses the same profile state as the install target when projected state/config overrides are absent, and relative `OPENCLAW_INCLUDE_ROOTS` values are rejected before path resolution exactly as the host requires.
 
 - 2026-08-13: Review Gate run `31684393102` found three configured global sources still outside collision checks. Codex now checks the machine-admin skill root (`/etc/codex/skills` or Windows ProgramData). OpenCode parses its global JSON/JSONC layers, inline override, environment/file substitutions, and absolute or home-relative `skills.paths`; workspace-relative roots fail closed because no global installation can enumerate every workspace. OpenClaw parses the active JSON5 config, bounded `$include` chain, environment substitution, and `skills.load.extraDirs` using effective-home, state, config, and legacy candidate precedence.

@@ -108,30 +108,31 @@ def _openclaw_os_home() -> Path:
     return _native_account_home()
 
 
+def _openclaw_profile() -> str | None:
+    profile = _normalize_home_value(os.environ.get("OPENCLAW_PROFILE"))
+    if not profile or profile.lower() == "default":
+        return None
+    if not profile[0].isalnum() or len(profile) > 64 or any(
+        character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+        for character in profile
+    ):
+        raise ValueError("OPENCLAW_PROFILE must use letters, numbers, '_' or '-'")
+    return profile
+
+
 def _default_openclaw_home() -> Path:
-    os_home = _openclaw_os_home()
-    configured_home = _normalize_home_value(os.environ.get("OPENCLAW_HOME"))
-    base_home = (
-        _expand_openclaw_path(configured_home, os_home)
-        if configured_home is not None
-        else os_home
-    )
-    # OPENCLAW_CONFIG_PATH relocates the managed skills root to the config file's
-    # parent when no explicit state directory is selected.
+    base_home = _openclaw_effective_home()
     state_override = _normalize_home_value(os.environ.get("OPENCLAW_STATE_DIR"))
     if state_override is not None:
         return _expand_openclaw_path(state_override, base_home)
+    profile = _openclaw_profile()
+    if profile is not None:
+        return base_home / f".openclaw-{profile}"
+    # Without profile projection, an explicit config path defines CONFIG_DIR,
+    # which is also the managed-skills directory.
     config_path = _normalize_home_value(os.environ.get("OPENCLAW_CONFIG_PATH"))
     if config_path is not None:
         return _expand_openclaw_path(config_path, base_home).parent
-    profile = _normalize_home_value(os.environ.get("OPENCLAW_PROFILE"))
-    if profile and profile.lower() != "default":
-        if not profile[0].isalnum() or len(profile) > 64 or any(
-            character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
-            for character in profile
-        ):
-            raise ValueError("OPENCLAW_PROFILE must use letters, numbers, '_' or '-'")
-        return base_home / f".openclaw-{profile}"
     return base_home / ".openclaw"
 
 
@@ -393,20 +394,19 @@ def _openclaw_active_config_path() -> Path:
     if configured is not None:
         return _expand_openclaw_path(configured, effective_home)
     state_override = _normalize_home_value(os.environ.get("OPENCLAW_STATE_DIR"))
+    profile = _openclaw_profile()
     if state_override is not None:
         selected_state = _expand_openclaw_path(state_override, effective_home)
+    elif profile is not None:
+        selected_state = effective_home / f".openclaw-{profile}"
     else:
-        profile = _normalize_home_value(os.environ.get("OPENCLAW_PROFILE"))
-        selected_state = (
-            effective_home / f".openclaw-{profile}"
-            if profile and profile.lower() != "default"
-            else effective_home / ".openclaw"
-        )
+        selected_state = effective_home / ".openclaw"
     state_dirs = [selected_state]
-    if state_override is not None:
-        state_dirs.extend([effective_home / ".openclaw", effective_home / ".clawdbot"])
-    else:
-        state_dirs.append(effective_home / ".clawdbot")
+    if profile is None:
+        if state_override is not None:
+            state_dirs.extend([effective_home / ".openclaw", effective_home / ".clawdbot"])
+        else:
+            state_dirs.append(effective_home / ".clawdbot")
     candidates = [
         state_dir / filename
         for state_dir in state_dirs
@@ -486,7 +486,7 @@ def _openclaw_uses_default_state() -> bool:
     effective_home = _openclaw_effective_home()
     state_override = _normalize_home_value(os.environ.get("OPENCLAW_STATE_DIR"))
     if state_override is None:
-        return True
+        return _openclaw_profile() is None
     return (
         _expand_openclaw_path(state_override, effective_home).resolve()
         == (effective_home / ".openclaw").resolve()
