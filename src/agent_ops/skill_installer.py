@@ -90,8 +90,8 @@ def _default_openclaw_home() -> Path:
         if configured_home is not None
         else os_home
     )
-    # OPENCLAW_CONFIG_PATH selects a config file but does not relocate the
-    # state-root skills directory, so it intentionally does not participate here.
+    # OPENCLAW_CONFIG_PATH relocates the managed skills root to the config file's
+    # parent when no explicit state directory is selected.
     state_override = _normalize_home_value(os.environ.get("OPENCLAW_STATE_DIR"))
     if state_override is not None:
         return _expand_openclaw_path(state_override, base_home)
