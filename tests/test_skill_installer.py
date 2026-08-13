@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 from pathlib import Path
@@ -487,6 +488,58 @@ def test_humanlayer_show_me_refuses_logical_name_collision(
         raise AssertionError("expected logical show-me collision to fail")
 
 
+def test_humanlayer_show_me_preserves_changed_crash_recovery_target(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = _show_me_source(tmp_path / "source")
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
+    )
+    arguments = {
+        "framework": Framework.PRIME_AGENT,
+        "dependencies": [_show_me_dependency()],
+        "home": tmp_path / "home",
+    }
+    install_skill_dependencies(**arguments)
+    home = tmp_path / "home"
+    destination = home / "skills" / "show-me"
+    manifest_path = home / SHOW_ME_OWNERSHIP_MANIFEST_RELATIVE
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    backup = home / "skills" / ".humanlayer-show-me-backup-crash"
+    shutil.copytree(destination, backup)
+    (destination / "SKILL.md").write_text(
+        (destination / "SKILL.md").read_text(encoding="utf-8") + "user edit\n",
+        encoding="utf-8",
+    )
+    transaction = manifest_path.with_name("humanlayer-show-me-transaction.json")
+    transaction.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "phase": "prepared",
+                "stage": ".humanlayer-show-me-stage-crash",
+                "backup": backup.name,
+                "had_destination": True,
+                "old_manifest": manifest,
+                "new_manifest": manifest,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    try:
+        install_skill_dependencies(**arguments)
+    except ShowMeCollisionError as exc:
+        assert "preserving transaction data" in str(exc)
+    else:
+        raise AssertionError("expected changed crash-recovery target to fail")
+
+    assert (destination / "SKILL.md").read_text(encoding="utf-8").endswith("user edit\n")
+    assert backup.is_dir()
+    assert transaction.is_file()
+
+
 def test_humanlayer_show_me_refuses_symlinked_profile_ancestor(
     tmp_path: Path,
     monkeypatch,
@@ -512,6 +565,108 @@ def test_humanlayer_show_me_refuses_symlinked_profile_ancestor(
         raise AssertionError("expected symlinked profile ancestor to fail")
 
     assert not (actual / "profile" / "skills").exists()
+
+
+def test_show_me_windows_path_transaction_installs_and_updates(
+    tmp_path: Path,
+) -> None:
+    source = _show_me_source(tmp_path / "source")
+    profile = tmp_path / "windows-profile"
+    destination = profile / "skills" / "show-me"
+
+    first = show_me_adapter._install_show_me_windows(
+        source / show_me_adapter.SOURCE_RELATIVE,
+        destination,
+        profile,
+        show_me_adapter.PINNED_REF,
+    )
+    second = show_me_adapter._install_show_me_windows(
+        source / show_me_adapter.SOURCE_RELATIVE,
+        destination,
+        profile,
+        show_me_adapter.PINNED_REF,
+    )
+
+    assert first == second
+    assert destination.is_dir()
+    assert "supported artifact preview or file-opening capability" in (
+        destination / "SKILL.md"
+    ).read_text(
+        encoding="utf-8"
+    )
+    assert not list((profile / "skills").glob(".humanlayer-show-me-*-*"))
+
+
+def test_show_me_windows_lock_fallback_locks_one_byte(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    calls: list[tuple[int, int, int]] = []
+
+    class FakeMsvcrt:
+        LK_LOCK = 1
+
+        @staticmethod
+        def locking(descriptor: int, mode: int, length: int) -> None:
+            calls.append((descriptor, mode, length))
+
+    lock_path = tmp_path / "lock"
+    with lock_path.open("a+b") as stream:
+        monkeypatch.setattr(show_me_adapter, "fcntl", None)
+        monkeypatch.setattr(show_me_adapter, "msvcrt", FakeMsvcrt)
+        show_me_adapter._lock_file(stream.fileno())
+
+    assert calls and calls[0][1:] == (FakeMsvcrt.LK_LOCK, 1)
+    assert lock_path.read_bytes() == b"\0"
+
+
+def test_openclaw_home_resolves_active_state_precedence(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    base_home = tmp_path / "openclaw-home"
+    monkeypatch.setenv("OPENCLAW_HOME", "   ")
+    assert default_framework_home(Framework.OPENCLAW) == Path.home() / ".openclaw"
+    monkeypatch.setenv("OPENCLAW_HOME", str(base_home))
+    monkeypatch.delenv("OPENCLAW_STATE_DIR", raising=False)
+    monkeypatch.delenv("OPENCLAW_PROFILE", raising=False)
+    monkeypatch.setenv("OPENCLAW_CONFIG_PATH", str(tmp_path / "other" / "config.json"))
+    assert default_framework_home(Framework.OPENCLAW) == base_home / ".openclaw"
+    (base_home / ".clawdbot").mkdir(parents=True)
+    assert default_framework_home(Framework.OPENCLAW) == base_home / ".clawdbot"
+    (base_home / ".openclaw").mkdir()
+    assert default_framework_home(Framework.OPENCLAW) == base_home / ".openclaw"
+
+    monkeypatch.setenv("OPENCLAW_PROFILE", "customer-a")
+    assert default_framework_home(Framework.OPENCLAW) == base_home / ".openclaw-customer-a"
+
+    monkeypatch.setenv("OPENCLAW_STATE_DIR", "~/selected-state")
+    assert default_framework_home(Framework.OPENCLAW) == base_home / "selected-state"
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OPENCLAW_STATE_DIR", "~root/selected-state")
+    assert default_framework_home(Framework.OPENCLAW) == (
+        tmp_path / "~root" / "selected-state"
+    )
+    monkeypatch.delenv("OPENCLAW_STATE_DIR")
+    monkeypatch.delenv("OPENCLAW_PROFILE")
+    monkeypatch.setenv("OPENCLAW_HOME", "~root/openclaw-home")
+    assert default_framework_home(Framework.OPENCLAW) == (
+        tmp_path / "~root" / "openclaw-home" / ".openclaw"
+    )
+
+
+def test_openclaw_home_rejects_unsafe_profile_name(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("OPENCLAW_STATE_DIR", raising=False)
+    monkeypatch.setenv("OPENCLAW_PROFILE", "../escape")
+    try:
+        default_framework_home(Framework.OPENCLAW)
+    except ValueError as exc:
+        assert "OPENCLAW_PROFILE" in str(exc)
+    else:
+        raise AssertionError("expected unsafe OpenClaw profile to fail")
 
 
 def test_humanlayer_show_me_recovers_interrupted_fresh_install(
@@ -587,6 +742,61 @@ def test_humanlayer_show_me_recovers_interrupted_update(
     assert (tmp_path / "home" / SHOW_ME_OWNERSHIP_MANIFEST_RELATIVE).is_file()
 
 
+def test_humanlayer_show_me_refuses_flat_root_skill_name_collision(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = _show_me_source(tmp_path / "source")
+    skills = tmp_path / "home" / "skills"
+    skills.mkdir(parents=True)
+    (skills / "SKILL.md").write_text(
+        "---\nname: show-me\ndescription: flat\n---\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
+    )
+
+    try:
+        install_skill_dependencies(
+            framework=Framework.PRIME_AGENT,
+            dependencies=[_show_me_dependency()],
+            home=tmp_path / "home",
+        )
+    except ShowMeCollisionError as exc:
+        assert "logical skill-name collision" in str(exc)
+        assert "skills/SKILL.md" in str(exc)
+    else:
+        raise AssertionError("expected flat logical collision to fail")
+
+
+def test_humanlayer_show_me_refuses_nested_logical_name_collision(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = _show_me_source(tmp_path / "source")
+    collision = tmp_path / "home" / "skills" / "personal" / "visual-helper"
+    collision.mkdir(parents=True)
+    (collision / "SKILL.md").write_text(
+        "---\nname: show-me\ndescription: nested\n---\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
+    )
+
+    try:
+        install_skill_dependencies(
+            framework=Framework.PRIME_AGENT,
+            dependencies=[_show_me_dependency()],
+            home=tmp_path / "home",
+        )
+    except ShowMeCollisionError as exc:
+        assert "logical skill-name collision" in str(exc)
+    else:
+        raise AssertionError("expected nested logical collision to fail")
+
+
 def test_humanlayer_show_me_refuses_symlinked_logical_name_collision(
     tmp_path: Path,
     monkeypatch,
@@ -612,7 +822,7 @@ def test_humanlayer_show_me_refuses_symlinked_logical_name_collision(
             home=tmp_path / "home",
         )
     except ShowMeCollisionError as exc:
-        assert "logical skill-name collision" in str(exc)
+        assert "symlinked skill identity" in str(exc)
     else:
         raise AssertionError("expected symlinked logical collision to fail")
 

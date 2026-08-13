@@ -87,7 +87,8 @@ class OpenCodeAdapter(FrameworkAdapter):
             cwd=str(cwd),
             notes=[
                 "Uses the opencode CLI non-interactive run mode with the context pack as prompt.",
-                "Skills and bootstrap install into ${OPENCODE_HOME:-~/.agents}.",
+                "Skills and bootstrap install into ~/.agents unless "
+                "--home selects another profile.",
             ],
         )
 

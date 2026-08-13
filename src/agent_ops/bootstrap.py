@@ -41,12 +41,8 @@ Set these variables for your machine:
 export AGENT_OPS_HOME="${{AGENT_OPS_HOME:-$PWD}}"
 export AGENT_KNOWLEDGE_HOME="${{AGENT_KNOWLEDGE_HOME:-~/agent-knowledge}}"
 export CODEX_HOME="${{CODEX_HOME:-~/.codex}}"
-export CLAUDE_HOME="${{CLAUDE_HOME:-~/.claude}}"
-export CURSOR_HOME="${{CURSOR_HOME:-~/.cursor}}"
-export OPENCLAW_HOME="${{OPENCLAW_HOME:-~/.openclaw}}"
-export OPENCODE_HOME="${{OPENCODE_HOME:-~/.agents}}"
+export CLAUDE_CONFIG_DIR="${{CLAUDE_CONFIG_DIR:-$HOME/.claude}}"
 export PRIME_AGENT_CODING_AGENT_DIR="${{PRIME_AGENT_CODING_AGENT_DIR:-$HOME/.prime/agent}}"
-export AGENT_OPS_LOCAL_HOME="${{AGENT_OPS_LOCAL_HOME:-~/.agentops}}"
 export KNOWLEDGE_MEMORY_DIR="${{KNOWLEDGE_MEMORY_DIR:-$AGENT_KNOWLEDGE_HOME}}"
 {KNOWLEDGE_GIT_EXPORT}
 ```

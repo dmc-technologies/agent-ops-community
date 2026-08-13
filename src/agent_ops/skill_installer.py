@@ -30,17 +30,56 @@ def default_framework_home(framework: Framework) -> Path:
             "PRIME_AGENT_CODING_AGENT_DIR",
             "~/.prime/agent",
         ),
-        Framework.OPENCLAW: ("OPENCLAW_STATE_DIR", "~/.openclaw"),
     }
     fixed_defaults = {
         Framework.CURSOR: "~/.cursor",
         Framework.OPENCODE: "~/.agents",
         Framework.LOCAL: "~/.agentops",
     }
+    if framework is Framework.OPENCLAW:
+        return _default_openclaw_home()
     if framework in fixed_defaults:
         return Path(fixed_defaults[framework]).expanduser()
     variable, default = environment_defaults[framework]
     return Path(os.environ.get(variable) or default).expanduser()
+
+
+def _default_openclaw_home() -> Path:
+    configured_home = os.environ.get("OPENCLAW_HOME", "").strip()
+    if configured_home in {"", "undefined", "null"}:
+        base_home = Path.home()
+    else:
+        base_home = _expand_openclaw_path(configured_home, Path.home())
+    # OPENCLAW_CONFIG_PATH selects a config file but does not relocate the
+    # state-root skills directory, so it intentionally does not participate here.
+    state_override = os.environ.get("OPENCLAW_STATE_DIR", "").strip()
+    if state_override:
+        return _expand_openclaw_path(state_override, base_home)
+    profile = os.environ.get("OPENCLAW_PROFILE", "").strip()
+    if profile and profile.lower() != "default":
+        if not profile[0].isalnum() or len(profile) > 64 or any(
+            character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+            for character in profile
+        ):
+            raise ValueError("OPENCLAW_PROFILE must use letters, numbers, '_' or '-'")
+        return base_home / f".openclaw-{profile}"
+    current_state = base_home / ".openclaw"
+    legacy_state = base_home / ".clawdbot"
+    if not current_state.exists() and legacy_state.exists():
+        return legacy_state
+    return current_state
+
+
+def _expand_openclaw_path(value: str, base_home: Path) -> Path:
+    if value == "~":
+        return base_home
+    if value.startswith("~/"):
+        return base_home / value[2:]
+    if value.startswith("~\\"):
+        if os.name == "nt":  # pragma: no cover - exercised on Windows
+            return base_home / value[2:]
+        return Path(f"{base_home}{value[1:]}")
+    return Path(value).resolve()
 
 
 def install_skill_dependencies(

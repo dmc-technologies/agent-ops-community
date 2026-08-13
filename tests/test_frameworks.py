@@ -47,6 +47,13 @@ def test_public_bootstrap_advertises_supported_skill_installs() -> None:
     for framework in GENERIC_PRIVATE_FRAMEWORKS - {Framework.LOCAL}:
         assert f"agentops skills install {framework.value}" in bootstrap_text(framework)
     assert "agentops skills install local" not in bootstrap_text(Framework.LOCAL)
+    claude_bootstrap = bootstrap_text(Framework.CLAUDE_CODE)
+    assert "CLAUDE_CONFIG_DIR" in claude_bootstrap
+    assert "CLAUDE_HOME" not in claude_bootstrap
+    openclaw_bootstrap = bootstrap_text(Framework.OPENCLAW)
+    assert "OPENCLAW_HOME" not in openclaw_bootstrap
+    assert "OPENCLAW_STATE_DIR" not in openclaw_bootstrap
+    assert "OPENCLAW_PROFILE" not in openclaw_bootstrap
 
     prime_bootstrap = bootstrap_text(Framework.PRIME_AGENT)
     assert (

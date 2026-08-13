@@ -67,6 +67,13 @@ Record durable architecture, workflow, and harness decisions here.
 - Applies to: Prime gstack generation, Superpowers installation, focused adapter tests, and Prime support documentation.
 - Revisit when: a workflow has an explicit Prime-native provider operation and complete packaged runtime, or generated gstack commands gain context-aware path serialization.
 
+### 2026-08-13: Adapted show-me installation follows each host's active profile and filesystem capabilities
+
+- Decision: HumanLayer `show-me` installs through a dedicated ownership transaction. POSIX hosts use no-follow directory descriptors and `/dev/fd`; Windows uses reparse-point checks, `msvcrt` locking, same-volume atomic renames, and the same fingerprint recovery rules. Collision discovery recursively checks nested host-visible skill definitions and refuses linked definitions it cannot confine. OpenClaw profile selection follows `OPENCLAW_STATE_DIR`, then a validated `OPENCLAW_PROFILE`, then its effective `OPENCLAW_HOME` with current/legacy state discovery; `OPENCLAW_CONFIG_PATH` is intentionally excluded because OpenClaw uses it only to select the config file and does not move the state-root skill directory.
+- Rationale: The managed installer must neither overwrite user-authored skills nor write into a host's inactive profile, and its safety contract must work on macOS and Windows rather than depending on Linux procfs or locking APIs.
+- Applies to: `src/agent_ops/show_me_adapter.py`, `src/agent_ops/skill_installer.py`, generated bootstraps, and skill-installer tests.
+- Revisit when: a supported host changes global skill discovery, OpenClaw changes state/config precedence, or Python exposes a stronger Windows directory-relative filesystem API.
+
 ## Template
 
 ### YYYY-MM-DD: Decision title
