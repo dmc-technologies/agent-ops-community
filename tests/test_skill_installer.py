@@ -647,10 +647,14 @@ def test_show_me_windows_transaction_refuses_replaced_skills_root(
             show_me_adapter.PINNED_REF,
         )
 
-    assert (profile / "skills" / "show-me" / "SKILL.md").read_text(encoding="utf-8") == (
-        "personal\n"
-    )
-    assert (displaced / "show-me" / "SKILL.md").is_file()
+    if os.name == "nt":
+        assert destination.is_dir()
+        assert not displaced.exists()
+    else:
+        assert (profile / "skills" / "show-me" / "SKILL.md").read_text(
+            encoding="utf-8"
+        ) == "personal\n"
+        assert (displaced / "show-me" / "SKILL.md").is_file()
 
 
 def test_show_me_windows_transaction_refuses_replaced_fingerprinted_child(
