@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sqlite3
 import subprocess
@@ -606,6 +607,189 @@ def test_show_me_windows_path_transaction_installs_and_updates(
         destination / "SKILL.md"
     ).read_text(encoding="utf-8")
     assert not list((profile / "skills").glob(".humanlayer-show-me-*-*"))
+
+
+def test_show_me_windows_transaction_refuses_replaced_skills_root(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = _show_me_source(tmp_path / "source")
+    profile = tmp_path / "windows-profile"
+    destination = profile / "skills" / "show-me"
+    show_me_adapter._install_show_me_windows(
+        source / show_me_adapter.SOURCE_RELATIVE,
+        destination,
+        profile,
+        show_me_adapter.PINNED_REF,
+    )
+    original_preflight = show_me_adapter._preflight_windows
+    displaced = profile / "displaced-skills"
+
+    def replace_skills_root(*args, **kwargs):
+        current = original_preflight(*args, **kwargs)
+        (profile / "skills").rename(displaced)
+        personal = profile / "skills" / "show-me"
+        personal.mkdir(parents=True)
+        (personal / "SKILL.md").write_text("personal\n", encoding="utf-8")
+        return current
+
+    monkeypatch.setattr(show_me_adapter, "_preflight_windows", replace_skills_root)
+
+    with pytest.raises(ShowMeCollisionError, match="directory identity changed"):
+        show_me_adapter._install_show_me_windows(
+            source / show_me_adapter.SOURCE_RELATIVE,
+            destination,
+            profile,
+            show_me_adapter.PINNED_REF,
+        )
+
+    assert (profile / "skills" / "show-me" / "SKILL.md").read_text(encoding="utf-8") == (
+        "personal\n"
+    )
+    assert (displaced / "show-me" / "SKILL.md").is_file()
+
+
+def test_show_me_windows_transaction_refuses_replaced_fingerprinted_child(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = _show_me_source(tmp_path / "source")
+    profile = tmp_path / "windows-profile"
+    destination = profile / "skills" / "show-me"
+    show_me_adapter._install_show_me_windows(
+        source / show_me_adapter.SOURCE_RELATIVE,
+        destination,
+        profile,
+        show_me_adapter.PINNED_REF,
+    )
+    original_preflight = show_me_adapter._preflight_windows
+    displaced = profile / "skills" / "displaced-show-me"
+
+    def replace_fingerprinted_child(*args, **kwargs):
+        current = original_preflight(*args, **kwargs)
+        destination.rename(displaced)
+        destination.mkdir()
+        (destination / "SKILL.md").write_text("personal\n", encoding="utf-8")
+        return current
+
+    monkeypatch.setattr(show_me_adapter, "_preflight_windows", replace_fingerprinted_child)
+
+    with pytest.raises(ShowMeCollisionError, match="managed show-me target changed"):
+        show_me_adapter._install_show_me_windows(
+            source / show_me_adapter.SOURCE_RELATIVE,
+            destination,
+            profile,
+            show_me_adapter.PINNED_REF,
+        )
+
+    assert (destination / "SKILL.md").read_text(encoding="utf-8") == "personal\n"
+    assert (displaced / "SKILL.md").is_file()
+
+
+def test_windows_directory_pin_compares_file_identity_across_mapped_aliases(
+    monkeypatch,
+) -> None:
+    expected = show_me_adapter._WindowsDirectoryPin(
+        path=Path("Z:/agent/skills"),
+        identity=(17, 42),
+        native_handle=100,
+    )
+    observed = show_me_adapter._WindowsDirectoryPin(
+        path=Path(r"\\server\share\agent\skills"),
+        identity=(17, 42),
+        native_handle=101,
+    )
+    monkeypatch.setattr(
+        show_me_adapter,
+        "_observe_windows_directory",
+        lambda path: observed,
+    )
+    monkeypatch.setattr(
+        show_me_adapter,
+        "_close_observed_windows_directory",
+        lambda pin: None,
+    )
+
+    show_me_adapter._verify_windows_directory_pin(expected)
+
+    changed = show_me_adapter._WindowsDirectoryPin(
+        path=observed.path,
+        identity=(17, 43),
+        native_handle=102,
+    )
+    monkeypatch.setattr(
+        show_me_adapter,
+        "_observe_windows_directory",
+        lambda path: changed,
+    )
+    with pytest.raises(ShowMeCollisionError, match="directory identity changed"):
+        show_me_adapter._verify_windows_directory_pin(expected)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows sharing semantics")
+def test_native_windows_directory_pin_blocks_sibling_replacement(tmp_path: Path) -> None:
+    skills = tmp_path / "skills"
+    skills.mkdir()
+
+    with show_me_adapter._pin_windows_directory(skills), pytest.raises(OSError):
+        skills.rename(tmp_path / "replacement")
+
+    assert skills.is_dir()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows subst")
+def test_native_windows_mapped_alias_uses_file_identity_and_lock(tmp_path: Path) -> None:
+    drive = next(
+        (f"{letter}:" for letter in "ZYXWVUTSRQP" if not Path(f"{letter}:/").exists()),
+        None,
+    )
+    if drive is None:
+        pytest.skip("no unused drive letter")
+    result = subprocess.run(
+        ["subst", drive, str(tmp_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        pytest.skip(f"subst unavailable: {result.stderr.strip()}")
+    try:
+        real = tmp_path / "dependencies"
+        real.mkdir()
+        mapped = Path(f"{drive}/dependencies")
+        with show_me_adapter._pin_windows_directory(mapped) as mapped_pin:
+            observed = show_me_adapter._observe_windows_directory(real)
+            try:
+                assert mapped_pin.identity == observed.identity
+            finally:
+                show_me_adapter._close_observed_windows_directory(observed)
+            descriptor = show_me_adapter._open_windows_lock(mapped / "lock", mapped_pin)
+            os.close(descriptor)
+    finally:
+        subprocess.run(["subst", drive, "/d"], check=False, capture_output=True)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows APIs")
+def test_native_windows_install_does_not_require_final_path_diagnostic(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = _show_me_source(tmp_path / "source")
+    profile = tmp_path / "profile"
+    monkeypatch.setattr(
+        show_me_adapter,
+        "_normalize_windows_final_path",
+        lambda value: (_ for _ in ()).throw(AssertionError("diagnostic path was required")),
+    )
+
+    show_me_adapter._install_show_me_windows(
+        source / show_me_adapter.SOURCE_RELATIVE,
+        profile / "skills" / "show-me",
+        profile,
+        show_me_adapter.PINNED_REF,
+    )
+
+    assert (profile / "skills" / "show-me" / "SKILL.md").is_file()
 
 
 def test_show_me_windows_lock_fallback_locks_one_byte(

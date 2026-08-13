@@ -9,6 +9,9 @@ import shutil
 import stat
 import subprocess
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -33,10 +36,185 @@ _LOCK_NAME = "humanlayer-show-me.lock"
 _TRANSACTION_NAME = "humanlayer-show-me-transaction.json"
 _STAGE_PREFIX = ".humanlayer-show-me-stage-"
 _BACKUP_PREFIX = ".humanlayer-show-me-backup-"
+_DELETE_PREFIX = ".humanlayer-show-me-preserved-"
 
 
 class ShowMeCollisionError(RuntimeError):
     """Installation would overwrite a skill Agent Ops cannot prove it owns."""
+
+
+@dataclass(frozen=True)
+class _WindowsDirectoryPin:
+    path: Path
+    identity: tuple[int, int]
+    native_handle: int | None = None
+    can_rename: bool = False
+
+
+@contextmanager
+def _pin_windows_directory(
+    path: Path,
+    *,
+    allow_rename: bool = False,
+) -> Iterator[_WindowsDirectoryPin]:
+    """Keep a directory immutable while Windows path APIs operate below it."""
+
+    if os.name != "nt":
+        info = path.lstat()
+        if not stat.S_ISDIR(info.st_mode) or path.is_symlink():
+            raise ShowMeCollisionError(f"unsafe Windows transaction directory: {path}")
+        pin = _WindowsDirectoryPin(
+            path=path,
+            identity=(info.st_dev, info.st_ino),
+            can_rename=allow_rename,
+        )
+        yield pin
+        return
+
+    pin = _open_native_windows_directory_pin(path, allow_rename=allow_rename)
+    try:
+        yield pin
+    finally:  # pragma: no cover - exercised on Windows
+        import ctypes
+        from ctypes import wintypes
+
+        ctypes.windll.kernel32.CloseHandle(wintypes.HANDLE(pin.native_handle))
+
+
+def _open_native_windows_directory_pin(
+    path: Path,
+    *,
+    allow_rename: bool = False,
+    observe_only: bool = False,
+) -> _WindowsDirectoryPin:
+    """Open a no-follow directory handle that denies rename/delete sharing."""
+
+    import ctypes
+    from ctypes import wintypes
+
+    delete_access = 0x00010000
+    file_list_directory = 0x0001
+    file_read_attributes = 0x0080
+    file_share_read = 0x00000001
+    file_share_write = 0x00000002
+    file_share_delete = 0x00000004
+    open_existing = 3
+    file_flag_open_reparse_point = 0x00200000
+    file_flag_backup_semantics = 0x02000000
+    create_file = ctypes.windll.kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    handle = create_file(
+        str(path),
+        file_list_directory | file_read_attributes | (delete_access if allow_rename else 0),
+        file_share_read | file_share_write | (file_share_delete if observe_only else 0),
+        None,
+        open_existing,
+        file_flag_open_reparse_point | file_flag_backup_semantics,
+        None,
+    )
+    invalid_handle = ctypes.c_void_p(-1).value
+    if handle == invalid_handle:
+        raise ShowMeCollisionError(f"cannot pin Windows transaction directory: {path}")
+    try:
+        identity, attributes = _windows_handle_identity(handle)
+        directory_attribute = 0x00000010
+        reparse_attribute = 0x00000400
+        if not attributes & directory_attribute or attributes & reparse_attribute:
+            raise ShowMeCollisionError(f"unsafe Windows transaction directory: {path}")
+        return _WindowsDirectoryPin(
+            path=path,
+            identity=identity,
+            native_handle=int(handle),
+            can_rename=allow_rename,
+        )
+    except BaseException:
+        ctypes.windll.kernel32.CloseHandle(wintypes.HANDLE(handle))
+        raise
+
+
+def _windows_handle_identity(handle: int) -> tuple[tuple[int, int], int]:
+    import ctypes
+    from ctypes import wintypes
+
+    class ByHandleFileInformation(ctypes.Structure):
+        _fields_ = [
+            ("dwFileAttributes", wintypes.DWORD),
+            ("ftCreationTime", wintypes.FILETIME),
+            ("ftLastAccessTime", wintypes.FILETIME),
+            ("ftLastWriteTime", wintypes.FILETIME),
+            ("dwVolumeSerialNumber", wintypes.DWORD),
+            ("nFileSizeHigh", wintypes.DWORD),
+            ("nFileSizeLow", wintypes.DWORD),
+            ("nNumberOfLinks", wintypes.DWORD),
+            ("nFileIndexHigh", wintypes.DWORD),
+            ("nFileIndexLow", wintypes.DWORD),
+        ]
+
+    information = ByHandleFileInformation()
+    get_information = ctypes.windll.kernel32.GetFileInformationByHandle
+    get_information.argtypes = (wintypes.HANDLE, ctypes.POINTER(ByHandleFileInformation))
+    get_information.restype = wintypes.BOOL
+    if not get_information(wintypes.HANDLE(handle), ctypes.byref(information)):
+        raise ShowMeCollisionError("cannot read Windows directory identity")
+    file_id = (information.nFileIndexHigh << 32) | information.nFileIndexLow
+    return (
+        (information.dwVolumeSerialNumber, file_id),
+        information.dwFileAttributes,
+    )
+
+
+def _observe_windows_directory(path: Path) -> _WindowsDirectoryPin:
+    if os.name != "nt":
+        info = path.lstat()
+        if not stat.S_ISDIR(info.st_mode) or path.is_symlink():
+            raise ShowMeCollisionError(f"unsafe Windows transaction directory: {path}")
+        return _WindowsDirectoryPin(
+            path=path,
+            identity=(info.st_dev, info.st_ino),
+        )
+    return _open_native_windows_directory_pin(  # pragma: no cover - Windows only
+        path,
+        observe_only=True,
+    )
+
+
+def _close_observed_windows_directory(pin: _WindowsDirectoryPin) -> None:
+    if pin.native_handle is None:
+        return
+    import ctypes  # pragma: no cover - Windows only
+    from ctypes import wintypes
+
+    ctypes.windll.kernel32.CloseHandle(wintypes.HANDLE(pin.native_handle))
+
+
+def _verify_windows_directory_pin(pin: _WindowsDirectoryPin) -> None:
+    try:
+        observed = _observe_windows_directory(pin.path)
+    except (FileNotFoundError, OSError, ShowMeCollisionError) as exc:
+        raise ShowMeCollisionError(
+            f"Windows transaction directory identity changed: {pin.path}"
+        ) from exc
+    try:
+        if observed.identity != pin.identity:
+            raise ShowMeCollisionError(
+                f"Windows transaction directory identity changed: {pin.path}"
+            )
+    finally:
+        _close_observed_windows_directory(observed)
+
+
+def _verify_windows_directory_pins(*pins: _WindowsDirectoryPin) -> None:
+    for pin in pins:
+        _verify_windows_directory_pin(pin)
 
 
 def install_show_me(
@@ -156,53 +334,74 @@ def _install_show_me_windows(
     skills_root = profile_root / "skills"
     agentops_root = profile_root / ".agentops"
     dependencies_root = profile_root / OWNERSHIP_MANIFEST_RELATIVE.parent
-    _ensure_windows_directory(skills_root)
-    _ensure_windows_directory(agentops_root)
-    _ensure_windows_directory(dependencies_root)
-    lock_path = dependencies_root / _LOCK_NAME
-    lock_fd = _open_windows_lock(lock_path)
-    with os.fdopen(lock_fd, "a+b") as lock_stream:
-        _lock_file(lock_stream.fileno())
-        _recover_windows_transaction(skills_root, dependencies_root)
-        stage = dependencies_root / f"{_STAGE_PREFIX}{uuid.uuid4().hex}"
-        try:
-            shutil.copytree(source, stage)
-            _copy_upstream_license(source.parents[3], stage)
-            _adapt_instructions(stage / "SKILL.md")
-            manifest = {
-                "schema_version": 1,
-                "upstream_repo": PINNED_REPO,
-                "upstream_ref": upstream_ref,
-                "skill": SKILL_NAME,
-                "source_fingerprint": _tree_fingerprint(source),
-                "installed_fingerprint": _tree_fingerprint(stage),
-            }
-            for collision_root in collision_roots:
-                _reject_external_collision_root_windows(
-                    collision_root,
+    with contextlib.ExitStack() as directory_handles:
+        profile_pin = directory_handles.enter_context(_pin_windows_directory(profile_root))
+        _ensure_windows_directory(skills_root)
+        skills_pin = directory_handles.enter_context(_pin_windows_directory(skills_root))
+        _ensure_windows_directory(agentops_root)
+        agentops_pin = directory_handles.enter_context(_pin_windows_directory(agentops_root))
+        _ensure_windows_directory(dependencies_root)
+        dependencies_pin = directory_handles.enter_context(
+            _pin_windows_directory(dependencies_root)
+        )
+        directory_pins = (profile_pin, skills_pin, agentops_pin, dependencies_pin)
+        _verify_windows_directory_pins(*directory_pins)
+        lock_path = dependencies_root / _LOCK_NAME
+        lock_fd = _open_windows_lock(lock_path, dependencies_pin)
+        with os.fdopen(lock_fd, "a+b") as lock_stream:
+            _lock_file(lock_stream.fileno())
+            _recover_windows_transaction(
+                skills_root,
+                dependencies_root,
+                directory_pins=directory_pins,
+            )
+            stage = dependencies_root / f"{_STAGE_PREFIX}{uuid.uuid4().hex}"
+            try:
+                _verify_windows_directory_pins(*directory_pins)
+                shutil.copytree(source, stage)
+                _copy_upstream_license(source.parents[3], stage)
+                _adapt_instructions(stage / "SKILL.md")
+                _verify_windows_directory_pins(*directory_pins)
+                manifest = {
+                    "schema_version": 1,
+                    "upstream_repo": PINNED_REPO,
+                    "upstream_ref": upstream_ref,
+                    "skill": SKILL_NAME,
+                    "source_fingerprint": _tree_fingerprint(source),
+                    "installed_fingerprint": _tree_fingerprint(stage),
+                }
+                for collision_root in collision_roots:
+                    _reject_external_collision_root_windows(
+                        collision_root,
+                        flat_markdown=flat_markdown,
+                        allowed_fingerprint=manifest["installed_fingerprint"],
+                        policy=collision_policy,
+                        limits=collision_limits,
+                        allowed_symlink_targets=collision_allowed_symlink_targets,
+                    )
+                current = _preflight_windows(
+                    skills_root,
+                    dependencies_root,
+                    destination,
                     flat_markdown=flat_markdown,
-                    allowed_fingerprint=manifest["installed_fingerprint"],
-                    policy=collision_policy,
-                    limits=collision_limits,
-                    allowed_symlink_targets=collision_allowed_symlink_targets,
+                    directory_pins=directory_pins,
                 )
-            current = _preflight_windows(
-                skills_root,
-                dependencies_root,
-                destination,
-                flat_markdown=flat_markdown,
-            )
-            _install_windows_transaction(
-                skills_root,
-                dependencies_root,
-                stage,
-                destination,
-                manifest,
-                current,
-            )
-            return manifest
-        finally:
-            _remove_unreferenced_windows_stage(stage, dependencies_root)
+                _install_windows_transaction(
+                    skills_root,
+                    dependencies_root,
+                    stage,
+                    destination,
+                    manifest,
+                    current,
+                    directory_pins=directory_pins,
+                )
+                return manifest
+            finally:
+                _remove_unreferenced_windows_stage(
+                    stage,
+                    dependencies_root,
+                    directory_pins=directory_pins,
+                )
 
 
 def _is_windows_reparse_point(path: Path) -> bool:
@@ -231,40 +430,158 @@ def _ensure_windows_directory(path: Path) -> None:
         raise ShowMeCollisionError(f"could not create confined profile directory: {path}")
 
 
-def _open_windows_lock(path: Path) -> int:
-    expected_path = os.path.abspath(path)
+def _open_native_windows_regular_handle(
+    path: Path,
+    *,
+    desired_access: int,
+    share_mode: int,
+    creation_disposition: int,
+) -> int:
+    import ctypes
+    from ctypes import wintypes
+
+    file_attribute_normal = 0x00000080
+    file_flag_open_reparse_point = 0x00200000
+    create_file = ctypes.windll.kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    handle = create_file(
+        str(path),
+        desired_access,
+        share_mode,
+        None,
+        creation_disposition,
+        file_attribute_normal | file_flag_open_reparse_point,
+        None,
+    )
+    invalid_handle = ctypes.c_void_p(-1).value
+    if handle == invalid_handle:
+        error = ctypes.windll.kernel32.GetLastError()
+        if error in {2, 3}:
+            raise FileNotFoundError(path)
+        raise ShowMeCollisionError(f"cannot open safe Windows state file: {path}")
+    try:
+        _, attributes = _windows_handle_identity(handle)
+        directory_attribute = 0x00000010
+        reparse_attribute = 0x00000400
+        if attributes & (directory_attribute | reparse_attribute):
+            raise ShowMeCollisionError(f"unsafe show-me state path: {path}")
+        return int(handle)
+    except BaseException:
+        ctypes.windll.kernel32.CloseHandle(wintypes.HANDLE(handle))
+        raise
+
+
+def _close_native_windows_handle(handle: int) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    ctypes.windll.kernel32.CloseHandle(wintypes.HANDLE(handle))
+
+
+def _delete_native_windows_handle(handle: int, path: Path) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    class FileDispositionInformation(ctypes.Structure):
+        _fields_ = [("DeleteFile", wintypes.BOOLEAN)]
+
+    information = FileDispositionInformation(True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    set_information = kernel32.SetFileInformationByHandle
+    set_information.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    )
+    set_information.restype = wintypes.BOOL
+    file_disposition_info = 4
+    if not set_information(
+        wintypes.HANDLE(handle),
+        file_disposition_info,
+        ctypes.byref(information),
+        ctypes.sizeof(information),
+    ):
+        error = ctypes.get_last_error()
+        raise ShowMeCollisionError(
+            f"cannot delete pinned Windows state file {path}: Windows error {error}"
+        )
+
+
+def _open_windows_lock(
+    path: Path,
+    parent_pin: _WindowsDirectoryPin | None = None,
+) -> int:
     if path.is_symlink() or _is_windows_reparse_point(path):
         raise ShowMeCollisionError(f"unsafe show-me lock path: {path}")
-    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_BINARY", 0)
-    descriptor = os.open(path, flags, 0o600)
+    if parent_pin is not None:
+        _verify_windows_directory_pin(parent_pin)
+
+    if os.name != "nt":
+        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_BINARY", 0)
+        descriptor = os.open(path, flags, 0o600)
+    else:  # pragma: no cover - exercised on Windows
+        import ctypes
+        from ctypes import wintypes
+
+        generic_read = 0x80000000
+        generic_write = 0x40000000
+        file_share_read = 0x00000001
+        file_share_write = 0x00000002
+        open_always = 4
+        file_attribute_normal = 0x00000080
+        file_flag_open_reparse_point = 0x00200000
+        create_file = ctypes.windll.kernel32.CreateFileW
+        create_file.argtypes = (
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        )
+        create_file.restype = wintypes.HANDLE
+        handle = create_file(
+            str(path),
+            generic_read | generic_write,
+            file_share_read | file_share_write,
+            None,
+            open_always,
+            file_attribute_normal | file_flag_open_reparse_point,
+            None,
+        )
+        invalid_handle = ctypes.c_void_p(-1).value
+        if handle == invalid_handle:
+            raise ShowMeCollisionError(f"cannot open safe show-me lock: {path}")
+        try:
+            _, attributes = _windows_handle_identity(handle)
+            directory_attribute = 0x00000010
+            reparse_attribute = 0x00000400
+            if attributes & (directory_attribute | reparse_attribute):
+                raise ShowMeCollisionError(f"unsafe show-me lock path: {path}")
+            descriptor = msvcrt.open_osfhandle(
+                int(handle),
+                os.O_RDWR | getattr(os, "O_BINARY", 0),
+            )
+        except BaseException:
+            ctypes.windll.kernel32.CloseHandle(wintypes.HANDLE(handle))
+            raise
+
     try:
         if not stat.S_ISREG(os.fstat(descriptor).st_mode):
             raise ShowMeCollisionError(f"unsafe show-me lock path: {path}")
-        if os.name == "nt":  # pragma: no cover - exercised on Windows
-            import ctypes
-            from ctypes import wintypes
-
-            handle = msvcrt.get_osfhandle(descriptor)
-            buffer = ctypes.create_unicode_buffer(32768)
-            get_final_path = ctypes.windll.kernel32.GetFinalPathNameByHandleW
-            get_final_path.argtypes = (
-                wintypes.HANDLE,
-                wintypes.LPWSTR,
-                wintypes.DWORD,
-                wintypes.DWORD,
-            )
-            get_final_path.restype = wintypes.DWORD
-            length = get_final_path(
-                wintypes.HANDLE(handle),
-                buffer,
-                len(buffer),
-                0,
-            )
-            if length == 0 or length >= len(buffer):
-                raise ShowMeCollisionError(f"cannot verify show-me lock path: {path}")
-            resolved = _normalize_windows_final_path(buffer.value)
-            if os.path.normcase(os.path.abspath(resolved)) != os.path.normcase(expected_path):
-                raise ShowMeCollisionError(f"show-me lock escaped profile: {path}")
+        if parent_pin is not None:
+            _verify_windows_directory_pin(parent_pin)
         return descriptor
     except BaseException:
         os.close(descriptor)
@@ -299,7 +616,9 @@ def _preflight_windows(
     destination: Path,
     *,
     flat_markdown: bool,
+    directory_pins: tuple[_WindowsDirectoryPin, ...] = (),
 ) -> dict[str, Any] | None:
+    _verify_windows_directory_pins(*directory_pins)
     _validate_windows_profile(skills_root)
     _validate_windows_profile(dependencies_root)
     _reject_logical_collisions_path(
@@ -314,12 +633,14 @@ def _preflight_windows(
     if not destination.exists():
         if current is not None:
             raise ShowMeCollisionError("managed show-me skill is missing")
+        _verify_windows_directory_pins(*directory_pins)
         return None
     if not destination.is_dir() or current is None:
         raise ShowMeCollisionError(f"user-owned collision at {destination}")
     _validate_manifest(current)
     if _tree_fingerprint(destination) != current["installed_fingerprint"]:
         raise ShowMeCollisionError("managed show-me skill changed since installation")
+    _verify_windows_directory_pins(*directory_pins)
     return current
 
 
@@ -682,6 +1003,142 @@ def _reject_openclaw_collisions(
     visit(root, 0, 6 if root.name == "skills" else 2)
 
 
+def _rename_native_windows_handle(
+    handle: int,
+    destination_parent: _WindowsDirectoryPin,
+    destination_name: str,
+    *,
+    replace: bool,
+    label: Path,
+) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    class RenameControl(ctypes.Union):
+        _fields_ = [
+            ("ReplaceIfExists", wintypes.BOOLEAN),
+            ("Flags", wintypes.DWORD),
+        ]
+
+    class FileRenameInformation(ctypes.Structure):
+        _anonymous_ = ("Control",)
+        _fields_ = [
+            ("Control", RenameControl),
+            ("RootDirectory", wintypes.HANDLE),
+            ("FileNameLength", wintypes.DWORD),
+            ("FileName", wintypes.WCHAR * len(destination_name)),
+        ]
+
+    information = FileRenameInformation()
+    information.ReplaceIfExists = replace
+    information.RootDirectory = wintypes.HANDLE(destination_parent.native_handle)
+    information.FileNameLength = len(destination_name.encode("utf-16-le"))
+    information.FileName = destination_name
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    set_information = kernel32.SetFileInformationByHandle
+    set_information.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    )
+    set_information.restype = wintypes.BOOL
+    file_rename_info = 3
+    if not set_information(
+        wintypes.HANDLE(handle),
+        file_rename_info,
+        ctypes.byref(information),
+        FileRenameInformation.FileName.offset + information.FileNameLength,
+    ):
+        error = ctypes.get_last_error()
+        raise ShowMeCollisionError(
+            f"cannot rename pinned Windows object {label}: Windows error {error}"
+        )
+
+
+def _rename_pinned_windows_directory(
+    source_pin: _WindowsDirectoryPin,
+    destination_parent: _WindowsDirectoryPin,
+    destination_name: str,
+) -> Path:
+    """Rename one verified tree without ever resolving its source name again."""
+
+    if not source_pin.can_rename:
+        raise ShowMeCollisionError("Windows directory handle lacks rename access")
+    if Path(destination_name).name != destination_name or destination_name in {"", ".", ".."}:
+        raise ShowMeCollisionError("unsafe Windows transaction destination name")
+    _verify_windows_directory_pin(source_pin)
+    _verify_windows_directory_pin(destination_parent)
+    destination = destination_parent.path / destination_name
+    if _windows_entry_exists(destination):
+        raise ShowMeCollisionError(f"Windows transaction destination already exists: {destination}")
+
+    if source_pin.native_handle is None:
+        source_pin.path.rename(destination)
+    else:  # pragma: no cover - exercised on Windows
+        _rename_native_windows_handle(
+            source_pin.native_handle,
+            destination_parent,
+            destination_name,
+            replace=False,
+            label=source_pin.path,
+        )
+
+    observed = _observe_windows_directory(destination)
+    try:
+        if observed.identity != source_pin.identity:
+            raise ShowMeCollisionError(
+                f"Windows transaction destination identity changed: {destination}"
+            )
+    finally:
+        _close_observed_windows_directory(observed)
+    _verify_windows_directory_pin(destination_parent)
+    return destination
+
+
+def _checked_windows_unlink(
+    path: Path,
+    directory_pins: tuple[_WindowsDirectoryPin, ...],
+    *,
+    missing_ok: bool = False,
+) -> None:
+    _verify_windows_directory_pins(*directory_pins)
+    if os.name != "nt":
+        path.unlink(missing_ok=missing_ok)
+    else:  # pragma: no cover - exercised on Windows
+        delete_access = 0x00010000
+        file_read_attributes = 0x00000080
+        file_share_read = 0x00000001
+        file_share_write = 0x00000002
+        open_existing = 3
+        try:
+            handle = _open_native_windows_regular_handle(
+                path,
+                desired_access=delete_access | file_read_attributes,
+                share_mode=file_share_read | file_share_write,
+                creation_disposition=open_existing,
+            )
+        except FileNotFoundError:
+            if missing_ok:
+                return
+            raise
+        try:
+            _delete_native_windows_handle(handle, path)
+        finally:
+            _close_native_windows_handle(handle)
+    _verify_windows_directory_pins(*directory_pins)
+
+
+def _windows_pin_for_path(
+    path: Path,
+    directory_pins: tuple[_WindowsDirectoryPin, ...],
+) -> _WindowsDirectoryPin:
+    for pin in directory_pins:
+        if pin.path == path:
+            return pin
+    raise ShowMeCollisionError(f"Windows transaction directory is not pinned: {path}")
+
+
 def _install_windows_transaction(
     skills_root: Path,
     dependencies_root: Path,
@@ -689,7 +1146,12 @@ def _install_windows_transaction(
     destination: Path,
     manifest: dict[str, Any],
     current: dict[str, Any] | None,
+    *,
+    directory_pins: tuple[_WindowsDirectoryPin, ...] = (),
 ) -> None:
+    _verify_windows_directory_pins(*directory_pins)
+    skills_pin = _windows_pin_for_path(skills_root, directory_pins)
+    dependencies_pin = _windows_pin_for_path(dependencies_root, directory_pins)
     backup = dependencies_root / f"{_BACKUP_PREFIX}{uuid.uuid4().hex}"
     state = {
         "schema_version": 1,
@@ -701,32 +1163,83 @@ def _install_windows_transaction(
         "new_manifest": manifest,
     }
     transaction = dependencies_root / _TRANSACTION_NAME
-    _write_json_path(transaction, state)
     try:
         _validate_windows_profile(skills_root)
         _validate_windows_profile(dependencies_root)
-        if current is not None:
-            os.replace(destination, backup)
-        os.replace(stage, destination)
-        _write_json_path(
-            dependencies_root / OWNERSHIP_MANIFEST_RELATIVE.name,
-            manifest,
+        with contextlib.ExitStack() as exact_trees:
+            stage_pin = exact_trees.enter_context(_pin_windows_directory(stage, allow_rename=True))
+            _verify_windows_transaction_tree(
+                stage,
+                manifest["installed_fingerprint"],
+                "installation stage",
+            )
+            destination_pin = None
+            if current is not None:
+                destination_pin = exact_trees.enter_context(
+                    _pin_windows_directory(destination, allow_rename=True)
+                )
+                _verify_windows_transaction_tree(
+                    destination,
+                    current["installed_fingerprint"],
+                    "managed show-me target",
+                )
+            elif _windows_entry_exists(destination):
+                raise ShowMeCollisionError(f"user-owned collision at {destination}")
+
+            _write_json_path(transaction, state, directory_pins=directory_pins)
+            if destination_pin is not None:
+                _rename_pinned_windows_directory(
+                    destination_pin,
+                    dependencies_pin,
+                    backup.name,
+                )
+            _rename_pinned_windows_directory(stage_pin, skills_pin, SKILL_NAME)
+            _verify_windows_transaction_tree(
+                destination,
+                manifest["installed_fingerprint"],
+                "installed show-me target",
+            )
+            _write_json_path(
+                dependencies_root / OWNERSHIP_MANIFEST_RELATIVE.name,
+                manifest,
+                directory_pins=directory_pins,
+            )
+            state["phase"] = "committed"
+            _write_json_path(transaction, state, directory_pins=directory_pins)
+        _recover_windows_transaction(
+            skills_root,
+            dependencies_root,
+            directory_pins=directory_pins,
         )
-        state["phase"] = "committed"
-        _write_json_path(transaction, state)
-        _recover_windows_transaction(skills_root, dependencies_root)
     except BaseException:
-        _recover_windows_transaction(skills_root, dependencies_root)
+        # Never run path-based recovery after an anchored directory changed.
+        _verify_windows_directory_pins(*directory_pins)
+        _recover_windows_transaction(
+            skills_root,
+            dependencies_root,
+            directory_pins=directory_pins,
+        )
         raise
 
 
-def _recover_windows_transaction(skills_root: Path, dependencies_root: Path) -> None:
+def _recover_windows_transaction(
+    skills_root: Path,
+    dependencies_root: Path,
+    *,
+    directory_pins: tuple[_WindowsDirectoryPin, ...] = (),
+) -> None:
+    _verify_windows_directory_pins(*directory_pins)
+    skills_pin = _windows_pin_for_path(skills_root, directory_pins)
+    dependencies_pin = _windows_pin_for_path(dependencies_root, directory_pins)
     _validate_windows_profile(skills_root)
     _validate_windows_profile(dependencies_root)
     transaction = dependencies_root / _TRANSACTION_NAME
     state = _read_json_path(transaction)
     if state is None:
-        _cleanup_windows_dependency_garbage(dependencies_root)
+        _cleanup_windows_dependency_garbage(
+            dependencies_root,
+            directory_pins=directory_pins,
+        )
         return
     _validate_transaction_state(state)
     destination = skills_root / SKILL_NAME
@@ -735,41 +1248,43 @@ def _recover_windows_transaction(skills_root: Path, dependencies_root: Path) -> 
     old_manifest = state["old_manifest"]
     new_fingerprint = state["new_manifest"]["installed_fingerprint"]
 
-    if _windows_entry_exists(stage):
-        _verify_windows_transaction_tree(stage, new_fingerprint, "recovery stage")
-    if _windows_entry_exists(backup):
-        if not state["had_destination"] or old_manifest is None:
-            raise ShowMeCollisionError("unexpected show-me recovery backup")
-        _verify_windows_transaction_tree(
-            backup,
-            old_manifest["installed_fingerprint"],
-            "recovery backup",
-        )
-
     if state["phase"] == "committed":
-        _verify_windows_transaction_tree(
-            destination,
-            new_fingerprint,
-            "committed transaction target",
+        with _pin_windows_directory(destination) as destination_pin:
+            _verify_windows_transaction_tree(
+                destination,
+                new_fingerprint,
+                "committed transaction target",
+            )
+            _verify_windows_directory_pin(destination_pin)
+        _checked_windows_unlink(transaction, directory_pins)
+        _cleanup_windows_dependency_garbage(
+            dependencies_root,
+            directory_pins=directory_pins,
         )
-        transaction.unlink()
-        _cleanup_windows_dependency_garbage(dependencies_root)
         return
 
     if _windows_entry_exists(destination):
-        _verify_windows_transaction_tree_shape(destination, "uncommitted transaction target")
-        target_fingerprint = _tree_fingerprint(destination)
         old_fingerprint = old_manifest["installed_fingerprint"] if old_manifest else None
-        if target_fingerprint == new_fingerprint:
-            if _windows_entry_exists(stage):
-                raise ShowMeCollisionError(
-                    "duplicate uncommitted show-me target; preserving transaction data"
-                )
-            os.replace(destination, stage)
-        elif old_fingerprint is None or target_fingerprint != old_fingerprint:
-            raise ShowMeCollisionError(
-                "uncommitted transaction target changed; preserving transaction data"
+        with _pin_windows_directory(destination, allow_rename=True) as destination_pin:
+            _verify_windows_transaction_tree_shape(
+                destination,
+                "uncommitted transaction target",
             )
+            target_fingerprint = _tree_fingerprint(destination)
+            if target_fingerprint == new_fingerprint:
+                if _windows_entry_exists(stage):
+                    raise ShowMeCollisionError(
+                        "duplicate uncommitted show-me target; preserving transaction data"
+                    )
+                _rename_pinned_windows_directory(
+                    destination_pin,
+                    dependencies_pin,
+                    stage.name,
+                )
+            elif old_fingerprint is None or target_fingerprint != old_fingerprint:
+                raise ShowMeCollisionError(
+                    "uncommitted transaction target changed; preserving transaction data"
+                )
 
     if state["had_destination"]:
         if old_manifest is None:
@@ -777,18 +1292,32 @@ def _recover_windows_transaction(skills_root: Path, dependencies_root: Path) -> 
         if not _windows_entry_exists(destination):
             if not _windows_entry_exists(backup):
                 raise ShowMeCollisionError("show-me transaction cannot recover its prior skill")
-            os.replace(backup, destination)
+            with _pin_windows_directory(backup, allow_rename=True) as backup_pin:
+                _verify_windows_transaction_tree(
+                    backup,
+                    old_manifest["installed_fingerprint"],
+                    "recovery backup",
+                )
+                _rename_pinned_windows_directory(backup_pin, skills_pin, SKILL_NAME)
         _write_json_path(
             dependencies_root / OWNERSHIP_MANIFEST_RELATIVE.name,
             old_manifest,
+            directory_pins=directory_pins,
         )
     else:
         if _windows_entry_exists(destination):
             raise ShowMeCollisionError("fresh show-me transaction has an unexpected target")
-        (dependencies_root / OWNERSHIP_MANIFEST_RELATIVE.name).unlink(missing_ok=True)
+        _checked_windows_unlink(
+            dependencies_root / OWNERSHIP_MANIFEST_RELATIVE.name,
+            directory_pins,
+            missing_ok=True,
+        )
 
-    transaction.unlink()
-    _cleanup_windows_dependency_garbage(dependencies_root)
+    _checked_windows_unlink(transaction, directory_pins)
+    _cleanup_windows_dependency_garbage(
+        dependencies_root,
+        directory_pins=directory_pins,
+    )
 
 
 def _windows_entry_exists(path: Path) -> bool:
@@ -815,47 +1344,153 @@ def _verify_windows_transaction_tree(
         raise ShowMeCollisionError(f"{label} changed; preserving transaction data")
 
 
-def _cleanup_windows_dependency_garbage(dependencies_root: Path) -> None:
+def _preserve_windows_transaction_tree(
+    path: Path,
+    dependencies_pin: _WindowsDirectoryPin,
+) -> Path:
+    """Quarantine an exact tree; never recurse through Windows reparse points."""
+
+    with _pin_windows_directory(path, allow_rename=True) as tree_pin:
+        _verify_windows_transaction_tree_shape(path, "show-me transaction garbage")
+        preserved_name = f"{_DELETE_PREFIX}{uuid.uuid4().hex}"
+        return _rename_pinned_windows_directory(
+            tree_pin,
+            dependencies_pin,
+            preserved_name,
+        )
+
+
+def _cleanup_windows_dependency_garbage(
+    dependencies_root: Path,
+    *,
+    directory_pins: tuple[_WindowsDirectoryPin, ...] = (),
+) -> None:
+    _verify_windows_directory_pins(*directory_pins)
     if _windows_entry_exists(dependencies_root / _TRANSACTION_NAME):
         return
+    dependencies_pin = _windows_pin_for_path(dependencies_root, directory_pins)
     for path in sorted(dependencies_root.iterdir(), key=lambda candidate: candidate.name):
         if path.name.startswith(_STAGE_PREFIX) or path.name.startswith(_BACKUP_PREFIX):
-            _verify_windows_transaction_tree_shape(path, "show-me transaction garbage")
-            shutil.rmtree(path)
+            _preserve_windows_transaction_tree(path, dependencies_pin)
 
 
-def _remove_unreferenced_windows_stage(stage: Path, dependencies_root: Path) -> None:
+def _remove_unreferenced_windows_stage(
+    stage: Path,
+    dependencies_root: Path,
+    *,
+    directory_pins: tuple[_WindowsDirectoryPin, ...] = (),
+) -> None:
     try:
+        _verify_windows_directory_pins(*directory_pins)
         state = _read_json_path(dependencies_root / _TRANSACTION_NAME)
     except ShowMeCollisionError:
         return
     if isinstance(state, dict) and state.get("stage") == stage.name:
         return
     if _windows_entry_exists(stage):
-        _verify_windows_transaction_tree_shape(stage, "unreferenced installation stage")
-        shutil.rmtree(stage)
+        dependencies_pin = _windows_pin_for_path(dependencies_root, directory_pins)
+        _preserve_windows_transaction_tree(stage, dependencies_pin)
 
 
-def _write_json_path(path: Path, value: Any) -> None:
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    with temporary.open("x", encoding="utf-8", newline="\n") as stream:
-        json.dump(value, stream, indent=2, sort_keys=True)
-        stream.write("\n")
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(temporary, path)
+def _write_json_path(
+    path: Path,
+    value: Any,
+    *,
+    directory_pins: tuple[_WindowsDirectoryPin, ...] = (),
+) -> None:
+    _verify_windows_directory_pins(*directory_pins)
+    payload = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    if os.name != "nt":
+        temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        with temporary.open("xb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    else:  # pragma: no cover - exercised on Windows
+        delete_access = 0x00010000
+        generic_write = 0x40000000
+        file_share_read = 0x00000001
+        create_new = 1
+        parent_pin = _windows_pin_for_path(path.parent, directory_pins)
+        temporary_name = f".{path.name}.{uuid.uuid4().hex}.tmp"
+        temporary = path.with_name(temporary_name)
+        handle = _open_native_windows_regular_handle(
+            temporary,
+            desired_access=delete_access | generic_write,
+            share_mode=file_share_read,
+            creation_disposition=create_new,
+        )
+        try:
+            descriptor = msvcrt.open_osfhandle(
+                handle,
+                os.O_WRONLY | getattr(os, "O_BINARY", 0),
+            )
+        except BaseException:
+            _close_native_windows_handle(handle)
+            raise
+        try:
+            written = 0
+            while written < len(payload):
+                written += os.write(descriptor, payload[written:])
+            os.fsync(descriptor)
+            _rename_native_windows_handle(
+                msvcrt.get_osfhandle(descriptor),
+                parent_pin,
+                path.name,
+                replace=True,
+                label=temporary,
+            )
+        finally:
+            os.close(descriptor)
+    _verify_windows_directory_pins(*directory_pins)
 
 
 def _read_json_path(path: Path) -> Any | None:
-    if path.is_symlink() or _is_windows_reparse_point(path):
-        raise ShowMeCollisionError(f"unsafe show-me state path: {path}")
-    if not path.exists():
-        return None
-    if not path.is_file():
-        raise ShowMeCollisionError(f"unsafe show-me state path: {path}")
+    if os.name != "nt":
+        if path.is_symlink() or _is_windows_reparse_point(path):
+            raise ShowMeCollisionError(f"unsafe show-me state path: {path}")
+        if not path.exists():
+            return None
+        if not path.is_file():
+            raise ShowMeCollisionError(f"unsafe show-me state path: {path}")
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise ShowMeCollisionError(f"invalid show-me state file: {path}") from exc
+    else:  # pragma: no cover - exercised on Windows
+        generic_read = 0x80000000
+        file_share_read = 0x00000001
+        open_existing = 3
+        try:
+            handle = _open_native_windows_regular_handle(
+                path,
+                desired_access=generic_read,
+                share_mode=file_share_read,
+                creation_disposition=open_existing,
+            )
+        except FileNotFoundError:
+            return None
+        try:
+            descriptor = msvcrt.open_osfhandle(
+                handle,
+                os.O_RDONLY | getattr(os, "O_BINARY", 0),
+            )
+        except BaseException:
+            _close_native_windows_handle(handle)
+            raise
+        try:
+            chunks: list[bytes] = []
+            while chunk := os.read(descriptor, 64 * 1024):
+                chunks.append(chunk)
+            text = b"".join(chunks).decode("utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise ShowMeCollisionError(f"invalid show-me state file: {path}") from exc
+        finally:
+            os.close(descriptor)
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
         raise ShowMeCollisionError(f"invalid show-me state file: {path}") from exc
 
 
