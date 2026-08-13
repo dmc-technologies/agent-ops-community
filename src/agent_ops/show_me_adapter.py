@@ -1035,7 +1035,7 @@ def _rename_native_windows_handle(
             ("Control", RenameControl),
             ("RootDirectory", wintypes.HANDLE),
             ("FileNameLength", wintypes.DWORD),
-            ("FileName", wintypes.WCHAR * len(destination_text)),
+            ("FileName", wintypes.WCHAR * (len(destination_text) + 1)),
         ]
 
     # Windows documents NULL as the common RootDirectory case. The absolute path is
@@ -1338,12 +1338,7 @@ def _verify_windows_transaction_tree_shape(path: Path, label: str) -> None:
         or _is_windows_reparse_point(path)
         or not path.is_dir()
     ):
-        siblings = []
-        with contextlib.suppress(OSError):
-            siblings = [entry.name for entry in path.parent.iterdir()]
-        raise ShowMeCollisionError(
-            f"{label} is missing or not a regular directory: {path}; siblings={siblings}"
-        )
+        raise ShowMeCollisionError(f"{label} is missing or not a regular directory")
 
 
 def _verify_windows_transaction_tree(
