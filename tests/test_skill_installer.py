@@ -918,6 +918,37 @@ def test_humanlayer_show_me_refuses_nested_logical_name_collision(
         raise AssertionError("expected nested logical collision to fail")
 
 
+def test_humanlayer_show_me_allows_unrelated_linked_skill_files(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = _show_me_source(tmp_path / "source")
+    external = tmp_path / "external"
+    external.mkdir()
+    external_skill = external / "SKILL.md"
+    external_skill.write_text(
+        "---\nname: gstack\ndescription: unrelated\n---\n",
+        encoding="utf-8",
+    )
+    external_reference = external / "ETHOS.md"
+    external_reference.write_text("Unrelated reference.\n", encoding="utf-8")
+    skill = tmp_path / "home" / "skills" / "gstack"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").symlink_to(external_skill)
+    (skill / "ETHOS.md").symlink_to(external_reference)
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
+    )
+
+    install_skill_dependencies(
+        framework=Framework.PRIME_AGENT,
+        dependencies=[_show_me_dependency()],
+        home=tmp_path / "home",
+    )
+
+    assert (tmp_path / "home" / "skills" / "show-me" / "SKILL.md").is_file()
+
+
 def test_humanlayer_show_me_refuses_symlinked_logical_name_collision(
     tmp_path: Path,
     monkeypatch,
@@ -943,7 +974,7 @@ def test_humanlayer_show_me_refuses_symlinked_logical_name_collision(
             home=tmp_path / "home",
         )
     except ShowMeCollisionError as exc:
-        assert "symlinked skill identity" in str(exc)
+        assert "logical skill-name collision" in str(exc)
     else:
         raise AssertionError("expected symlinked logical collision to fail")
 

@@ -279,11 +279,6 @@ def _reject_logical_collisions_path(
                 or child.name.startswith(_BACKUP_PREFIX)
             ):
                 continue
-            if child.is_symlink() or _is_windows_reparse_point(child):
-                raise ShowMeCollisionError(
-                    "cannot verify linked skill identity at "
-                    f"skills/{child_relative.as_posix()}"
-                )
             try:
                 is_directory = child.is_dir()
             except OSError as exc:
@@ -314,10 +309,10 @@ def _reject_logical_collisions_path(
                 _reject_show_me_frontmatter_path(child, Path(child.name))
 
     root_skill = skills_root / "SKILL.md"
-    if root_skill.is_symlink() or _is_windows_reparse_point(root_skill):
-        raise ShowMeCollisionError("cannot verify linked skill identity at skills/SKILL.md")
     if root_skill.is_file():
         _reject_show_me_frontmatter_path(root_skill, Path())
+    elif root_skill.is_symlink() or _is_windows_reparse_point(root_skill):
+        raise ShowMeCollisionError("cannot verify linked skill identity at skills/SKILL.md")
     visit(skills_root, Path())
 
 
@@ -697,7 +692,14 @@ def _reject_logical_collisions(
     flat_markdown: bool,
     allowed_fingerprint: str | None = None,
 ) -> None:
+    visited: set[tuple[int, int]] = set()
+
     def visit(directory_fd: int, relative: Path) -> None:
+        identity = os.fstat(directory_fd)
+        inode = (identity.st_dev, identity.st_ino)
+        if inode in visited:
+            return
+        visited.add(inode)
         for name in sorted(os.listdir(directory_fd)):
             if not relative.parts and exclude_managed and (
                 name == SKILL_NAME
@@ -709,35 +711,32 @@ def _reject_logical_collisions(
             entry = _entry_stat(directory_fd, name)
             if entry is None:
                 continue
-            if stat.S_ISLNK(entry.st_mode):
-                raise ShowMeCollisionError(
-                    "cannot verify symlinked skill identity at "
-                    f"skills/{child_relative.as_posix()}"
-                )
-            if stat.S_ISDIR(entry.st_mode):
-                if name == SKILL_NAME:
-                    if (
-                        not relative.parts
-                        and allowed_fingerprint is not None
-                        and _tree_fingerprint(_fd_path(directory_fd, name))
-                        == allowed_fingerprint
-                    ):
-                        continue
-                    raise ShowMeCollisionError(
-                        "logical skill-path collision for show-me at "
-                        f"skills/{child_relative.as_posix()}"
-                    )
+            child_fd: int | None = None
+            if stat.S_ISDIR(entry.st_mode) or stat.S_ISLNK(entry.st_mode):
                 try:
-                    child_fd = os.open(
-                        name,
-                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                        dir_fd=directory_fd,
-                    )
+                    flags = os.O_RDONLY | os.O_DIRECTORY
+                    if stat.S_ISDIR(entry.st_mode):
+                        flags |= os.O_NOFOLLOW
+                    child_fd = os.open(name, flags, dir_fd=directory_fd)
+                except (NotADirectoryError, FileNotFoundError):
+                    child_fd = None
                 except OSError as exc:
                     raise ShowMeCollisionError(
-                        f"cannot inspect skill directory at skills/{child_relative.as_posix()}"
+                        f"cannot inspect skill entry at skills/{child_relative.as_posix()}"
                     ) from exc
+            if child_fd is not None:
                 try:
+                    if name == SKILL_NAME:
+                        if (
+                            not relative.parts
+                            and allowed_fingerprint is not None
+                            and _tree_fingerprint(_fd_path(child_fd)) == allowed_fingerprint
+                        ):
+                            continue
+                        raise ShowMeCollisionError(
+                            "logical skill-path collision for show-me at "
+                            f"skills/{child_relative.as_posix()}"
+                        )
                     _reject_show_me_frontmatter_at(child_fd, child_relative)
                     visit(child_fd, child_relative)
                 finally:
@@ -745,14 +744,19 @@ def _reject_logical_collisions(
             elif (
                 flat_markdown
                 and not relative.parts
-                and stat.S_ISREG(entry.st_mode)
+                and (stat.S_ISREG(entry.st_mode) or stat.S_ISLNK(entry.st_mode))
                 and name.lower().endswith(".md")
             ):
                 if name.lower() == f"{SKILL_NAME}.md":
                     raise ShowMeCollisionError(
                         f"logical skill-path collision for show-me at skills/{name}"
                     )
-                _reject_show_me_file_at(directory_fd, name, f"skills/{name}")
+                _reject_show_me_file_at(
+                    directory_fd,
+                    name,
+                    f"skills/{name}",
+                    follow_symlinks=stat.S_ISLNK(entry.st_mode),
+                )
 
     _reject_show_me_frontmatter_at(skills_fd, Path())
     visit(skills_fd, Path())
@@ -765,19 +769,34 @@ def _skill_location(relative: Path) -> str:
 
 
 def _reject_show_me_frontmatter_at(directory_fd: int, relative: Path) -> None:
-    _reject_show_me_file_at(directory_fd, "SKILL.md", _skill_location(relative))
+    entry = _entry_stat(directory_fd, "SKILL.md")
+    _reject_show_me_file_at(
+        directory_fd,
+        "SKILL.md",
+        _skill_location(relative),
+        follow_symlinks=entry is not None and stat.S_ISLNK(entry.st_mode),
+    )
 
 
-def _reject_show_me_file_at(directory_fd: int, name: str, location: str) -> None:
+def _reject_show_me_file_at(
+    directory_fd: int,
+    name: str,
+    location: str,
+    *,
+    follow_symlinks: bool = False,
+) -> None:
     skill = _entry_stat(directory_fd, name)
     if skill is None:
         return
-    if not stat.S_ISREG(skill.st_mode):
+    if not stat.S_ISREG(skill.st_mode) and not (
+        follow_symlinks and stat.S_ISLNK(skill.st_mode)
+    ):
         raise ShowMeCollisionError(f"cannot verify skill identity at {location}")
     try:
+        flags = os.O_RDONLY | (0 if follow_symlinks else os.O_NOFOLLOW)
         descriptor = os.open(
             name,
-            os.O_RDONLY | os.O_NOFOLLOW,
+            flags,
             dir_fd=directory_fd,
         )
         with os.fdopen(descriptor, encoding="utf-8") as stream:
