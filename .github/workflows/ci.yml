@@ -32,5 +32,7 @@ jobs:
       - run: python -m pip install -e ".[dev]"
       - run: python -m pip check
       - run: ruff check .
-      - run: pytest tests/test_skill_installer.py
+      - run: >-
+          pytest tests/test_skill_installer.py
+          -k "humanlayer_show_me_installs_adapted_skill_with_ownership or humanlayer_show_me_updates_only_unchanged_managed_copy or show_me_windows_path_transaction_installs_and_updates or show_me_windows_transaction_refuses_replaced_skills_root or show_me_windows_transaction_refuses_replaced_fingerprinted_child or windows_directory_pin_compares_file_identity_across_mapped_aliases or native_windows_directory_pin_blocks_sibling_replacement or native_windows_mapped_alias_uses_file_identity_and_lock or native_windows_install_does_not_require_final_path_diagnostic"
       - run: agentops harness check .

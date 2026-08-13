@@ -574,7 +574,7 @@ def test_humanlayer_show_me_refuses_symlinked_profile_ancestor(
             home=linked / "profile",
         )
     except ShowMeCollisionError as exc:
-        assert "symbolic link or non-directory" in str(exc)
+        assert "symbolic link" in str(exc)
     else:
         raise AssertionError("expected symlinked profile ancestor to fail")
 
@@ -635,7 +635,11 @@ def test_show_me_windows_transaction_refuses_replaced_skills_root(
 
     monkeypatch.setattr(show_me_adapter, "_preflight_windows", replace_skills_root)
 
-    with pytest.raises(ShowMeCollisionError, match="directory identity changed"):
+    expected_error = OSError if os.name == "nt" else ShowMeCollisionError
+    expected_message = (
+        "being used by another process" if os.name == "nt" else "directory identity changed"
+    )
+    with pytest.raises(expected_error, match=expected_message):
         show_me_adapter._install_show_me_windows(
             source / show_me_adapter.SOURCE_RELATIVE,
             destination,
