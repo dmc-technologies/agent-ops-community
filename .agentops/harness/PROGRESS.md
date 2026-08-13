@@ -24,6 +24,8 @@ Repository: `agent-ops-community`
 
 ## Session Log
 
+- 2026-08-13: A Windows confinement probe found that safe directory creation validated a missing parent chain but could skip an already-existing linked ancestor. Directory creation now validates every ancestor up to the filesystem root before any mutation, and the regression proves that no directory is created through the link.
+
 - 2026-08-13: A final confinement probe found POSIX profile creation still used recursive path creation before opening the root without following links. The installer now creates each missing profile component relative to an already-open parent descriptor and rejects a linked ancestor before it can create any external directory; the strengthened regression asserts that no external profile path is created.
 
 - 2026-08-13: Hosted CI run `31677787673` exposed a test-environment dependency: the compatibility-root test inherited the runner's `XDG_CONFIG_HOME`, so it no longer exercised OpenCode's default `~/.config/opencode` root. The test now clears both native OpenCode override variables before asserting default-root behavior and passes with a simulated predefined runner XDG root.

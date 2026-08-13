@@ -920,6 +920,16 @@ def test_windows_helpers_refuse_linked_descendant_and_lock(
 ) -> None:
     external = tmp_path / "external"
     external.mkdir()
+    linked_ancestor = tmp_path / "linked-ancestor"
+    linked_ancestor.symlink_to(external, target_is_directory=True)
+    try:
+        show_me_adapter._ensure_windows_directory(linked_ancestor / "profile")
+    except ShowMeCollisionError as exc:
+        assert "symbolic link or junction" in str(exc)
+    else:
+        raise AssertionError("expected linked Windows ancestor to fail")
+    assert not (external / "profile").exists()
+
     linked_directory = tmp_path / "profile" / ".agentops"
     linked_directory.parent.mkdir()
     linked_directory.symlink_to(external, target_is_directory=True)

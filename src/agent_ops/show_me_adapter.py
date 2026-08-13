@@ -201,7 +201,7 @@ def _is_windows_reparse_point(path: Path) -> bool:
 
 def _ensure_windows_directory(path: Path) -> None:
     parent = path.parent
-    if parent != path and not parent.exists():
+    if parent != path:
         _ensure_windows_directory(parent)
     if path.is_symlink() or _is_windows_reparse_point(path):
         raise ShowMeCollisionError(
