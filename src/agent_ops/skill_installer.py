@@ -517,21 +517,23 @@ def _openclaw_effective_home() -> Path:
     return _expand_openclaw_path(configured, os_home) if configured is not None else os_home
 
 
-def _openclaw_active_config_path() -> Path:
+def _openclaw_active_config_path(target_state: Path | None = None) -> Path:
     effective_home = _openclaw_effective_home()
     configured = _normalize_home_value(os.environ.get("OPENCLAW_CONFIG_PATH"))
     if configured is not None:
         return _expand_openclaw_path(configured, effective_home)
     state_override = _normalize_home_value(os.environ.get("OPENCLAW_STATE_DIR"))
     profile = _openclaw_profile()
-    if state_override is not None:
+    if target_state is not None:
+        selected_state = target_state.expanduser().resolve()
+    elif state_override is not None:
         selected_state = _expand_openclaw_path(state_override, effective_home)
     elif profile is not None:
         selected_state = effective_home / f".openclaw-{profile}"
     else:
         selected_state = effective_home / ".openclaw"
     state_dirs = [selected_state]
-    if profile is None and state_override is None:
+    if target_state is None and profile is None and state_override is None:
         state_dirs.append(effective_home / ".clawdbot")
     candidates = [
         state_dir / filename
@@ -574,13 +576,15 @@ def _expand_openclaw_config_environment(value: str, config: dict[str, object]) -
     return expanded.replace(escaped + "{", "${")
 
 
-def _openclaw_plugin_candidate_paths(config: dict[str, object]) -> tuple[Path, ...]:
+def _openclaw_plugin_candidate_paths(
+    config: dict[str, object], target_state: Path
+) -> tuple[Path, ...]:
     effective_home = _openclaw_effective_home()
     paths = [
         _expand_openclaw_path(_expand_openclaw_config_environment(item, config), effective_home)
         for item in _nested_string_list(config, "plugins", "load", "paths")
     ]
-    roots = [_openclaw_active_config_path().parent / "extensions"]
+    roots = [target_state / "extensions"]
     agents = config.get("agents")
     agent_list = agents.get("list") if isinstance(agents, dict) else None
     if isinstance(agent_list, list):
@@ -615,14 +619,16 @@ def _openclaw_plugin_manifest(path: Path) -> tuple[str, list[str]]:
     return loaded["id"], skills
 
 
-def _reject_uninspectable_openclaw_plugin_skills(config: dict[str, object]) -> None:
+def _reject_uninspectable_openclaw_plugin_skills(
+    config: dict[str, object], target_state: Path
+) -> None:
     plugins = config.get("plugins")
     if isinstance(plugins, dict) and plugins.get("enabled") is False:
         return
     entries = plugins.get("entries", {}) if isinstance(plugins, dict) else {}
     deny = set(_nested_string_list(config, "plugins", "deny"))
     allow = set(_nested_string_list(config, "plugins", "allow"))
-    for candidate in _openclaw_plugin_candidate_paths(config):
+    for candidate in _openclaw_plugin_candidate_paths(config, target_state):
         plugin_id, skills = _openclaw_plugin_manifest(candidate)
         entry = entries.get(plugin_id) if isinstance(entries, dict) else None
         if plugin_id in deny or (allow and plugin_id not in allow):
@@ -636,9 +642,9 @@ def _reject_uninspectable_openclaw_plugin_skills(config: dict[str, object]) -> N
             )
 
 
-def _openclaw_configured_skill_roots() -> tuple[Path, ...]:
-    config = _load_openclaw_config(_openclaw_active_config_path())
-    _reject_uninspectable_openclaw_plugin_skills(config)
+def _openclaw_configured_skill_roots(target_state: Path) -> tuple[Path, ...]:
+    config = _load_openclaw_config(_openclaw_active_config_path(target_state))
+    _reject_uninspectable_openclaw_plugin_skills(config, target_state)
     effective_home = _openclaw_effective_home()
     roots = []
     for item in _nested_string_list(config, "skills", "load", "extraDirs"):
@@ -658,8 +664,10 @@ def _show_me_collision_policy(framework: Framework) -> str:
     return "generic"
 
 
-def _openclaw_collision_options() -> tuple[dict[str, int], tuple[Path, ...]]:
-    config = _load_openclaw_config(_openclaw_active_config_path())
+def _openclaw_collision_options(
+    target_state: Path,
+) -> tuple[dict[str, int], tuple[Path, ...]]:
+    config = _load_openclaw_config(_openclaw_active_config_path(target_state))
     limits: dict[str, int] = {}
     raw_limits: object = config.get("skills", {})
     raw_limits = raw_limits.get("limits", {}) if isinstance(raw_limits, dict) else {}
@@ -697,15 +705,9 @@ def _codex_system_skill_root() -> Path:
     return Path("/etc/codex/skills")
 
 
-def _openclaw_uses_default_state() -> bool:
+def _openclaw_uses_default_state(target_state: Path) -> bool:
     effective_home = _openclaw_effective_home()
-    state_override = _normalize_home_value(os.environ.get("OPENCLAW_STATE_DIR"))
-    if state_override is None:
-        return _openclaw_profile() is None
-    return (
-        _expand_openclaw_path(state_override, effective_home).resolve()
-        == (effective_home / ".openclaw").resolve()
-    )
+    return target_state.resolve() == (effective_home / ".openclaw").resolve()
 
 
 def _show_me_collision_roots(framework: Framework, target_home: Path) -> tuple[Path, ...]:
@@ -730,8 +732,8 @@ def _show_me_collision_roots(framework: Framework, target_home: Path) -> tuple[P
             ):
                 roots.append(os_home / ".claude" / "skills")
     elif framework is Framework.OPENCLAW:
-        roots = list(_openclaw_configured_skill_roots())
-        if _openclaw_uses_default_state():
+        roots = list(_openclaw_configured_skill_roots(target_home))
+        if _openclaw_uses_default_state(target_home):
             roots.append(os_home / ".agents" / "skills")
     else:
         roots = []
@@ -870,7 +872,9 @@ def _install_dependency(
         collision_limits: dict[str, int] | None = None
         collision_allowed_symlink_targets: tuple[Path, ...] = ()
         if framework is Framework.OPENCLAW:
-            collision_limits, collision_allowed_symlink_targets = _openclaw_collision_options()
+            collision_limits, collision_allowed_symlink_targets = _openclaw_collision_options(
+                target_home
+            )
         install_show_me(
             source,
             destination / "show-me",

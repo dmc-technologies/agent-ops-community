@@ -292,12 +292,23 @@ def install_show_me(
                 limits=collision_limits,
                 allowed_symlink_targets=collision_allowed_symlink_targets,
             )
-        current = _preflight(
+        current, target_fd = _preflight(
             skills_fd,
             dependencies_fd,
             flat_markdown=flat_markdown,
         )
-        _install_transaction(skills_fd, dependencies_fd, stage_name, manifest, current)
+        try:
+            _install_transaction(
+                skills_fd,
+                dependencies_fd,
+                stage_name,
+                manifest,
+                current,
+                target_fd=target_fd,
+            )
+        finally:
+            if target_fd is not None:
+                os.close(target_fd)
         return manifest
     finally:
         if skills_fd is not None and dependencies_fd is not None:
@@ -1647,7 +1658,7 @@ def _preflight(
     dependencies_fd: int,
     *,
     flat_markdown: bool,
-) -> dict[str, Any] | None:
+) -> tuple[dict[str, Any] | None, int | None]:
     _reject_logical_collisions(
         skills_fd,
         exclude_managed=True,
@@ -1658,16 +1669,31 @@ def _preflight(
     if target is None:
         if current is not None:
             raise ShowMeCollisionError("managed show-me skill is missing")
-        return None
+        return None, None
     if not stat.S_ISDIR(target.st_mode):
         raise ShowMeCollisionError("user-owned collision at skills/show-me")
     if current is None:
         raise ShowMeCollisionError("user-owned collision at skills/show-me")
     _validate_manifest(current)
-    actual = _tree_fingerprint(_fd_path(skills_fd, SKILL_NAME))
-    if actual != current["installed_fingerprint"]:
-        raise ShowMeCollisionError("managed show-me skill changed since installation")
-    return current
+    try:
+        target_fd = os.open(
+            SKILL_NAME,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=skills_fd,
+        )
+    except OSError as exc:
+        raise ShowMeCollisionError("managed show-me target changed before installation") from exc
+    try:
+        pinned = os.fstat(target_fd)
+        if (pinned.st_dev, pinned.st_ino) != (target.st_dev, target.st_ino):
+            raise ShowMeCollisionError("managed show-me target changed before installation")
+        actual = _tree_fingerprint(_fd_path(target_fd))
+        if actual != current["installed_fingerprint"]:
+            raise ShowMeCollisionError("managed show-me skill changed since installation")
+    except BaseException:
+        os.close(target_fd)
+        raise
+    return current, target_fd
 
 
 def _reject_external_collision_root(
@@ -1855,6 +1881,8 @@ def _install_transaction(
     stage_name: str,
     manifest: dict[str, Any],
     current: dict[str, Any] | None,
+    *,
+    target_fd: int | None,
 ) -> None:
     backup_name = f"{_BACKUP_PREFIX}{uuid.uuid4().hex}"
     state = {
@@ -1875,6 +1903,26 @@ def _install_transaction(
                 src_dir_fd=skills_fd,
                 dst_dir_fd=dependencies_fd,
             )
+            backup_stat = _entry_stat(dependencies_fd, backup_name)
+            pinned_stat = os.fstat(target_fd) if target_fd is not None else None
+            if (
+                backup_stat is None
+                or pinned_stat is None
+                or (backup_stat.st_dev, backup_stat.st_ino)
+                != (pinned_stat.st_dev, pinned_stat.st_ino)
+            ):
+                os.rename(
+                    backup_name,
+                    SKILL_NAME,
+                    src_dir_fd=dependencies_fd,
+                    dst_dir_fd=skills_fd,
+                )
+                _unlink_if_present(dependencies_fd, _TRANSACTION_NAME)
+                os.fsync(skills_fd)
+                os.fsync(dependencies_fd)
+                raise ShowMeCollisionError(
+                    "managed show-me target changed before replacement; restored replacement"
+                )
             os.fsync(skills_fd)
             os.fsync(dependencies_fd)
         os.rename(

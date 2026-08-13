@@ -554,6 +554,41 @@ def test_humanlayer_show_me_preserves_changed_crash_recovery_target(
     assert transaction.is_file()
 
 
+def test_posix_update_restores_concurrently_replaced_target(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    if os.name == "nt":
+        pytest.skip("requires POSIX descriptor transaction")
+    source = _show_me_source(tmp_path / "source")
+    profile = tmp_path / "home"
+    destination = profile / "skills" / "show-me"
+    show_me_adapter.install_show_me(source, destination)
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+    (replacement / "SKILL.md").write_text("personal replacement\n", encoding="utf-8")
+    displaced = tmp_path / "displaced-managed"
+    original_rename = os.rename
+    swapped = False
+
+    def swap_before_backup(src, dst, *args, **kwargs):
+        nonlocal swapped
+        if not swapped and src == "show-me" and kwargs.get("src_dir_fd") is not None:
+            swapped = True
+            original_rename(destination, displaced)
+            original_rename(replacement, destination)
+        return original_rename(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(show_me_adapter.os, "rename", swap_before_backup)
+
+    with pytest.raises(ShowMeCollisionError, match="restored replacement"):
+        show_me_adapter.install_show_me(source, destination)
+
+    assert (destination / "SKILL.md").read_text(encoding="utf-8") == "personal replacement\n"
+    assert displaced.is_dir()
+    assert not (profile / ".agentops" / "skill-dependencies" / ".transaction.json").exists()
+
+
 def test_humanlayer_show_me_refuses_symlinked_profile_ancestor(
     tmp_path: Path,
     monkeypatch,
@@ -1357,7 +1392,7 @@ def test_openclaw_extra_root_expands_effective_home_and_environment(
         raise AssertionError("expected expanded OpenClaw extra-root collision")
 
 
-def test_openclaw_custom_config_still_checks_default_state_personal_root(
+def test_openclaw_custom_config_does_not_inherit_default_state_personal_root(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -1381,17 +1416,13 @@ def test_openclaw_custom_config_still_checks_default_state_personal_root(
         "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
     )
 
-    try:
-        install_skill_dependencies(
-            framework=Framework.OPENCLAW,
-            dependencies=[_show_me_dependency(Framework.OPENCLAW)],
-        )
-    except ShowMeCollisionError as exc:
-        assert "logical skill-path collision" in str(exc)
-    else:
-        raise AssertionError("expected custom-config personal collision")
+    installed = install_skill_dependencies(
+        framework=Framework.OPENCLAW,
+        dependencies=[_show_me_dependency(Framework.OPENCLAW)],
+    )
 
-    assert not (tmp_path / "configured" / "skills" / "show-me").exists()
+    assert len(installed) == 1
+    assert (tmp_path / "configured" / "skills" / "show-me" / "SKILL.md").is_file()
 
 
 def test_opencode_xdg_and_config_override_roots_are_checked(
@@ -1466,7 +1497,10 @@ def test_show_me_stage_is_outside_host_discovery_root(
         "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
     )
 
-    def inspect_stage(skills_fd, dependencies_fd, stage_name, manifest, current) -> None:
+    def inspect_stage(
+        skills_fd, dependencies_fd, stage_name, manifest, current, *, target_fd
+    ) -> None:
+        assert target_fd is None
         assert not (show_me_adapter._fd_path(skills_fd) / stage_name).exists()
         assert (show_me_adapter._fd_path(dependencies_fd) / stage_name).is_dir()
         raise KeyboardInterrupt
@@ -2575,3 +2609,68 @@ def test_openclaw_disabled_plugin_skill_source_is_allowed(
     )
 
     assert len(installed) == 1
+
+
+def test_openclaw_explicit_home_uses_target_profile_config(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = _show_me_source(tmp_path / "source")
+    target = tmp_path / "selected-state"
+    extra = tmp_path / "selected-extra"
+    collision = extra / "visual"
+    collision.mkdir(parents=True)
+    (collision / "SKILL.md").write_text(
+        "---\nname: show-me\ndescription: selected\n---\n",
+        encoding="utf-8",
+    )
+    target.mkdir()
+    (target / "openclaw.json").write_text(
+        json.dumps({"skills": {"load": {"extraDirs": [str(extra)]}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(tmp_path / "ambient-home"))
+    monkeypatch.delenv("OPENCLAW_STATE_DIR", raising=False)
+    monkeypatch.delenv("OPENCLAW_CONFIG_PATH", raising=False)
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency",
+        lambda dependency, cache: source,
+    )
+
+    with pytest.raises(ShowMeCollisionError, match="logical skill-name collision"):
+        install_skill_dependencies(
+            framework=Framework.OPENCLAW,
+            dependencies=[_show_me_dependency(Framework.OPENCLAW)],
+            home=target,
+        )
+
+
+def test_openclaw_distinct_config_scans_selected_state_plugins(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    target = tmp_path / "selected-state"
+    config = tmp_path / "configs" / "openclaw.json"
+    config.parent.mkdir(parents=True)
+    config.write_text("{}", encoding="utf-8")
+    plugin = target / "extensions" / "preview-plugin"
+    skill = plugin / "skills" / "show-me"
+    skill.mkdir(parents=True)
+    (plugin / "openclaw.plugin.json").write_text(
+        json.dumps({"id": "preview-plugin", "skills": ["skills"]}),
+        encoding="utf-8",
+    )
+    (skill / "SKILL.md").write_text("---\nname: show-me\n---\n", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(tmp_path / "ambient-home"))
+    monkeypatch.setenv("OPENCLAW_CONFIG_PATH", str(config))
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency",
+        lambda dependency, cache: (_ for _ in ()).throw(AssertionError("checkout must not run")),
+    )
+
+    with pytest.raises(ValueError, match="plugin skill inventory"):
+        install_skill_dependencies(
+            framework=Framework.OPENCLAW,
+            dependencies=[_show_me_dependency(Framework.OPENCLAW)],
+            home=target,
+        )
