@@ -1338,7 +1338,12 @@ def _verify_windows_transaction_tree_shape(path: Path, label: str) -> None:
         or _is_windows_reparse_point(path)
         or not path.is_dir()
     ):
-        raise ShowMeCollisionError(f"{label} is missing or not a regular directory")
+        siblings = []
+        with contextlib.suppress(OSError):
+            siblings = [entry.name for entry in path.parent.iterdir()]
+        raise ShowMeCollisionError(
+            f"{label} is missing or not a regular directory: {path}; siblings={siblings}"
+        )
 
 
 def _verify_windows_transaction_tree(
