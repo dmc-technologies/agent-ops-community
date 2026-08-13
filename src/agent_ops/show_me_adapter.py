@@ -65,8 +65,7 @@ def install_show_me(
             flat_markdown,
         )
 
-    profile_root.mkdir(parents=True, exist_ok=True)
-    root_fd = _open_absolute_directory_no_follow(profile_root)
+    root_fd = _ensure_absolute_directory_no_follow(profile_root)
     skills_fd = dependencies_fd = lock_fd = None
     stage_name = f"{_STAGE_PREFIX}{uuid.uuid4().hex}"
     try:
@@ -573,17 +572,26 @@ def _validate_destination(destination: Path) -> tuple[Path, Path]:
     return raw, raw.parent.parent
 
 
-def _open_absolute_directory_no_follow(path: Path) -> int:
+def _ensure_absolute_directory_no_follow(path: Path) -> int:
     if not path.is_absolute():
         raise ShowMeCollisionError("selected profile must be an absolute path")
     descriptor = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
     try:
         for part in path.parts[1:]:
-            next_descriptor = os.open(
-                part,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                dir_fd=descriptor,
-            )
+            try:
+                next_descriptor = os.open(
+                    part,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=descriptor,
+                )
+            except FileNotFoundError:
+                with contextlib.suppress(FileExistsError):
+                    os.mkdir(part, 0o700, dir_fd=descriptor)
+                next_descriptor = os.open(
+                    part,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=descriptor,
+                )
             os.close(descriptor)
             descriptor = next_descriptor
     except OSError as exc:

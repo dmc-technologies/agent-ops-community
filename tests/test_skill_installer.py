@@ -566,7 +566,7 @@ def test_humanlayer_show_me_refuses_symlinked_profile_ancestor(
     else:
         raise AssertionError("expected symlinked profile ancestor to fail")
 
-    assert not (actual / "profile" / "skills").exists()
+    assert not (actual / "profile").exists()
 
 
 def test_show_me_windows_path_transaction_installs_and_updates(
