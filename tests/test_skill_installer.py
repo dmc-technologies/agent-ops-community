@@ -351,6 +351,11 @@ def _show_me_dependency(
 
 
 def _show_me_source(root: Path) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "LICENSE").write_text(
+        "MIT License\n\nCopyright (c) 2026 HumanLayer\n",
+        encoding="utf-8",
+    )
     skill = root / "plugins" / "show-me" / "skills" / "show-me"
     skill.mkdir(parents=True)
     (skill / "SKILL.md").write_text(
@@ -381,6 +386,9 @@ def test_humanlayer_show_me_installs_adapted_skill_with_ownership(
     text = installed.read_text(encoding="utf-8")
     assert "Bash(open" not in text
     assert "absolute path" in text
+    assert (tmp_path / "home" / "skills" / "show-me" / "LICENSE").read_text(encoding="utf-8") == (
+        source / "LICENSE"
+    ).read_text(encoding="utf-8")
     assert (tmp_path / "home" / SHOW_ME_OWNERSHIP_MANIFEST_RELATIVE).is_file()
 
 
@@ -2174,3 +2182,32 @@ def test_opencode_active_organization_remote_config_fails_closed(
             framework=Framework.OPENCODE,
             dependencies=[_show_me_dependency(Framework.OPENCODE)],
         )
+
+
+def test_show_me_update_allows_other_unchanged_agentops_managed_copy(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = _show_me_source(tmp_path / "source")
+    os_home = tmp_path / "os-home"
+    monkeypatch.setenv("HOME", str(os_home))
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency", lambda dependency, cache: source
+    )
+    install_skill_dependencies(
+        framework=Framework.CLAUDE_CODE,
+        dependencies=[_show_me_dependency(Framework.CLAUDE_CODE)],
+    )
+    claude_license = os_home / ".claude" / "skills" / "show-me" / "LICENSE"
+    claude_license.unlink()
+    manifest = os_home / ".claude" / SHOW_ME_OWNERSHIP_MANIFEST_RELATIVE
+    value = json.loads(manifest.read_text(encoding="utf-8"))
+    value["installed_fingerprint"] = show_me_adapter._tree_fingerprint(claude_license.parent)
+    manifest.write_text(json.dumps(value), encoding="utf-8")
+
+    install_skill_dependencies(
+        framework=Framework.OPENCODE,
+        dependencies=[_show_me_dependency(Framework.OPENCODE)],
+    )
+
+    assert (os_home / ".agents" / "skills" / "show-me" / "LICENSE").is_file()

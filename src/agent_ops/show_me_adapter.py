@@ -89,6 +89,7 @@ def install_show_me(
         _recover_transaction(skills_fd, dependencies_fd)
         _stage_skill(source, dependencies_fd, stage_name)
         staged = _fd_path(dependencies_fd, stage_name)
+        _copy_upstream_license(upstream_root, staged)
         _adapt_instructions(staged / "SKILL.md")
         manifest = {
             "schema_version": 1,
@@ -166,6 +167,7 @@ def _install_show_me_windows(
         stage = dependencies_root / f"{_STAGE_PREFIX}{uuid.uuid4().hex}"
         try:
             shutil.copytree(source, stage)
+            _copy_upstream_license(source.parents[3], stage)
             _adapt_instructions(stage / "SKILL.md")
             manifest = {
                 "schema_version": 1,
@@ -464,6 +466,17 @@ def _is_within(root: Path, candidate: Path) -> bool:
         return False
 
 
+def _is_agentops_managed_show_me(skill_dir: Path) -> bool:
+    profile_root = skill_dir.parent.parent
+    manifest_path = profile_root / OWNERSHIP_MANIFEST_RELATIVE
+    try:
+        value = json.loads(manifest_path.read_text(encoding="utf-8"))
+        _validate_manifest(value)
+    except (OSError, ValueError, ShowMeCollisionError):
+        return False
+    return _tree_fingerprint(skill_dir) == value["installed_fingerprint"]
+
+
 def _reject_candidate_skill(
     skill_file: Path,
     *,
@@ -479,7 +492,9 @@ def _reject_candidate_skill(
     if name == SKILL_NAME:
         parent = skill_file.parent
         if parent.name == SKILL_NAME:
-            if _tree_fingerprint(parent) == allowed_fingerprint:
+            if _tree_fingerprint(parent) == allowed_fingerprint or _is_agentops_managed_show_me(
+                parent
+            ):
                 return True
             raise ShowMeCollisionError(f"logical skill-path collision for {SKILL_NAME} at {parent}")
         raise ShowMeCollisionError(f"logical skill-name collision for {SKILL_NAME} at {skill_file}")
@@ -959,6 +974,13 @@ def _validate_source(upstream_root: Path, source: Path, upstream_ref: str) -> No
 def _stage_skill(source: Path, skills_fd: int, stage_name: str) -> None:
     os.mkdir(stage_name, 0o700, dir_fd=skills_fd)
     shutil.copytree(source, _fd_path(skills_fd, stage_name), dirs_exist_ok=True)
+
+
+def _copy_upstream_license(upstream_root: Path, staged: Path) -> None:
+    license_file = upstream_root / "LICENSE"
+    if not license_file.is_file():
+        raise ValueError("pinned HumanLayer checkout is missing its LICENSE notice")
+    shutil.copy2(license_file, staged / "LICENSE")
 
 
 def _adapt_instructions(skill_file: Path) -> None:
