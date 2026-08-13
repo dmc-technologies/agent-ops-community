@@ -1096,14 +1096,9 @@ def _rename_pinned_windows_directory(
             label=source_pin.path,
         )
 
-    observed = _observe_windows_directory(destination)
-    try:
-        if observed.identity != source_pin.identity:
-            raise ShowMeCollisionError(
-                f"Windows transaction destination identity changed: {destination}"
-            )
-    finally:
-        _close_observed_windows_directory(observed)
+    # The exact source handle remains open and therefore continues to identify and
+    # protect the renamed tree. Reopening the destination with DELETE access would
+    # correctly fail against that handle's delete-sharing denial.
     _verify_windows_directory_pin(destination_parent)
     return destination
 
