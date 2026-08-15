@@ -8,6 +8,7 @@ import socket
 import stat
 import threading
 from collections.abc import Callable
+from contextlib import suppress
 from pathlib import Path
 
 import pytest
@@ -1385,3 +1386,404 @@ def test_audit_reports_invalid_manifest_entries_without_blocking(
     else:
         assert manifest_path.is_symlink()
         assert manifest_path.readlink() == outside
+
+
+def test_install_verifies_promoted_files_before_manifest_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    destination = home / "skills/example/SKILL.md"
+    plan = _plan(home, PlannedFile(Path("skills/example/SKILL.md"), b"body\n", 0o644))
+
+    def change_promoted_file(*_args: object) -> None:
+        destination.write_bytes(b"changed\n")
+
+    monkeypatch.setattr(transaction_module, "_before_manifest_replace", change_promoted_file)
+
+    with pytest.raises(IncompleteRollbackError, match="evidence retained"):
+        install_provider_plans((plan,))
+
+    assert destination.read_bytes() == b"changed\n"
+    assert not list((home / ".agentops/deployment/manifests").glob("*.json"))
+    records = list((home / ".agentops/deployment/transactions").glob("*/record.json"))
+    assert len(records) == 1
+    assert json.loads(records[0].read_text())["state"] == "prepared"
+
+
+def test_rollback_verifies_untouched_prior_files_before_restoring_manifest(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    original = _plan(
+        home,
+        PlannedFile(Path("skills/changed/SKILL.md"), b"old\n", 0o644),
+        PlannedFile(Path("skills/untouched/SKILL.md"), b"untouched\n", 0o644),
+    )
+    install_provider_plans((original,))
+    prior_manifest_path = next((home / ".agentops/deployment/manifests").glob("*.json"))
+    prior_manifest = prior_manifest_path.read_bytes()
+    replacement = _plan(
+        home,
+        PlannedFile(Path("skills/changed/SKILL.md"), b"new\n", 0o644),
+        revision="2" * 40,
+    )
+    manifests = install_provider_plans((replacement,))
+    replacement_manifest = prior_manifest_path.read_bytes()
+    untouched = home / "skills/untouched/SKILL.md"
+    untouched.write_bytes(b"changed outside transaction\n")
+
+    with pytest.raises(IncompleteRollbackError, match="prior managed file"):
+        rollback_manifests(manifests)
+
+    assert prior_manifest_path.read_bytes() == replacement_manifest
+    assert prior_manifest_path.read_bytes() != prior_manifest
+    record_path = transaction_module._TRANSACTION_PATHS[manifests[0].transaction_id]
+    assert record_path.exists()
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "file-descendant",
+        "file-removal-ancestor",
+        "removal-ancestor",
+        "duplicate-destination",
+        "reserved-metadata",
+    ],
+)
+def test_plan_topology_is_rejected_before_target_mutation(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    home = tmp_path / "home"
+    target = TargetSpec("codex-dev", Framework.CODEX, home, "feature")
+    if case == "file-descendant":
+        plans = (
+            ProviderPlan(
+                "fixture",
+                "1" * 40,
+                target,
+                (
+                    PlannedFile(Path("skills/foo"), b"file\n", 0o644),
+                    PlannedFile(Path("skills/foo/bar"), b"child\n", 0o644),
+                ),
+            ),
+        )
+    elif case == "file-removal-ancestor":
+        plans = (
+            ProviderPlan(
+                "fixture",
+                "1" * 40,
+                target,
+                (PlannedFile(Path("skills/foo/bar"), b"child\n", 0o644),),
+                (Path("skills/foo"),),
+            ),
+        )
+    elif case == "removal-ancestor":
+        plans = (
+            ProviderPlan(
+                "fixture",
+                "1" * 40,
+                target,
+                (),
+                (Path("skills/foo"), Path("skills/foo/bar")),
+            ),
+        )
+    elif case == "duplicate-destination":
+        duplicate = PlannedFile(Path("skills/foo/SKILL.md"), b"body\n", 0o644)
+        plans = (
+            ProviderPlan("one", "1" * 40, target, (duplicate,)),
+            ProviderPlan("two", "1" * 40, target, (duplicate,)),
+        )
+    else:
+        plans = (
+            ProviderPlan(
+                "fixture",
+                "1" * 40,
+                target,
+                (PlannedFile(Path(".agentops/deployments/owned"), b"bad\n", 0o644),),
+            ),
+        )
+
+    with pytest.raises(ValueError, match="plan topology|reserved|duplicate"):
+        install_provider_plans(plans)
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_different_targets_cannot_share_one_home(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    first = _plan(home, PlannedFile(Path("skills/one/SKILL.md"), b"one\n", 0o644))
+    second = ProviderPlan(
+        "second",
+        "1" * 40,
+        TargetSpec("other-target", Framework.CODEX, home, "feature"),
+        (PlannedFile(Path("skills/two/SKILL.md"), b"two\n", 0o644),),
+    )
+
+    with pytest.raises(ValueError, match="same target home"):
+        install_provider_plans((first, second))
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_prior_owned_directory_drift_rejects_before_transaction_mutation(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    original = _plan(home, PlannedFile(Path("skills/example/SKILL.md"), b"old\n", 0o644))
+    install_provider_plans((original,))
+    directory = home / "skills/example"
+    directory.chmod(0o700)
+    transaction_root = home / ".agentops/deployment/transactions"
+    transactions_before = sorted(path.relative_to(home) for path in transaction_root.rglob("*"))
+    replacement = _plan(
+        home,
+        PlannedFile(Path("skills/example/SKILL.md"), b"new\n", 0o644),
+        revision="2" * 40,
+    )
+
+    with pytest.raises(ValueError, match="prior owned directory changed"):
+        install_provider_plans((replacement,))
+
+    assert (home / "skills/example/SKILL.md").read_bytes() == b"old\n"
+    transactions_after = sorted(
+        path.relative_to(home) for path in transaction_root.rglob("*")
+    )
+    assert transactions_after == transactions_before
+    assert not audit_provider_plans((original,)).matches
+
+
+def test_replaced_lock_entry_cannot_create_concurrent_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = multiprocessing.get_context("fork")
+    home = tmp_path / "home"
+    plan = _plan(home, PlannedFile(Path("skills/example/SKILL.md"), b"body\n", 0o644))
+    first_entered = context.Event()
+    release_first = context.Event()
+    second_entered = context.Event()
+    calls = context.Value("i", 0)
+
+    def replace_lock_then_coordinate(*_args: object) -> None:
+        with calls.get_lock():
+            calls.value += 1
+            current = calls.value
+        if current == 1:
+            lock_path = tmp_path / ".home.agentops-deployment.lock"
+            os.replace(lock_path, tmp_path / "displaced-lock")
+            lock_path.write_bytes(b"")
+            lock_path.chmod(0o600)
+            first_entered.set()
+            assert release_first.wait(timeout=3)
+        else:
+            second_entered.set()
+
+    monkeypatch.setattr(
+        transaction_module,
+        "_before_manifest_replace",
+        replace_lock_then_coordinate,
+    )
+
+    def install() -> None:
+        with suppress(BaseException):
+            install_provider_plans((plan,))
+
+    first = context.Process(target=install)
+    second = context.Process(target=install)
+    first.start()
+    assert first_entered.wait(timeout=2)
+    second.start()
+    entered_concurrently = second_entered.wait(timeout=0.3)
+    release_first.set()
+    first.join(timeout=3)
+    second.join(timeout=3)
+    for process in (first, second):
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=2)
+
+    assert not entered_concurrently
+    assert not first.is_alive()
+    assert not second.is_alive()
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["duplicate-manifest-key", "unknown-manifest-member", "noncanonical-files"],
+)
+def test_strict_manifest_json_rejects_ambiguity_before_mutation(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    home = tmp_path / "home"
+    initial = _plan(
+        home,
+        PlannedFile(Path("skills/a/SKILL.md"), b"a\n", 0o644),
+        PlannedFile(Path("skills/b/SKILL.md"), b"b\n", 0o644),
+    )
+    install_provider_plans((initial,))
+    manifest_path = next((home / ".agentops/deployment/manifests").glob("*.json"))
+    if case == "duplicate-manifest-key":
+        content = manifest_path.read_text().replace(
+            '"schema_version": 1,',
+            '"schema_version": 1,\n  "schema_version": 1,',
+        )
+        manifest_path.write_text(content)
+    else:
+        manifest = json.loads(manifest_path.read_text())
+        if case == "unknown-manifest-member":
+            manifest["files"][0]["unknown"] = "value"
+        else:
+            manifest["files"].reverse()
+        manifest_path.write_text(json.dumps(manifest))
+        manifest_path.chmod(0o600)
+    before = manifest_path.read_bytes()
+
+    with pytest.raises(ValueError, match="duplicate JSON key|unknown|canonical"):
+        install_provider_plans((initial,))
+
+    assert manifest_path.read_bytes() == before
+    assert len(list((home / ".agentops/deployment/transactions").glob("*/record.json"))) == 1
+
+
+@pytest.mark.parametrize("case", ["duplicate-record-key", "unknown-operation-member"])
+def test_strict_transaction_json_rejects_ambiguity(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    home = tmp_path / "home"
+    plan = _plan(home, PlannedFile(Path("skills/example/SKILL.md"), b"body\n", 0o644))
+    install_provider_plans((plan,))
+    record_path = next((home / ".agentops/deployment/transactions").glob("*/record.json"))
+    if case == "duplicate-record-key":
+        content = record_path.read_text().replace(
+            '"schema_version": 3,',
+            '"schema_version": 3,\n  "schema_version": 3,',
+        )
+        record_path.write_text(content)
+    else:
+        record = json.loads(record_path.read_text())
+        record["operations"][0]["unknown"] = "value"
+        record_path.write_text(json.dumps(record))
+
+    with pytest.raises(ValueError, match="duplicate JSON key|unknown"):
+        recover_transaction(record_path)
+
+    assert record_path.exists()
+
+
+@pytest.mark.parametrize("name", ["on", "off", "yes", "no"])
+def test_frontmatter_names_preserve_yaml_strings_for_duplicates(
+    tmp_path: Path,
+    name: str,
+) -> None:
+    home = tmp_path / "home"
+    plan = _plan(
+        home,
+        PlannedFile(
+            Path("skills/one/SKILL.md"),
+            f"---\nname: {name}\n---\n".encode(),
+            0o644,
+        ),
+        PlannedFile(
+            Path("skills/two/SKILL.md"),
+            f'---\nname: "{name}"\n---\n'.encode(),
+            0o644,
+        ),
+    )
+    install_provider_plans((plan,))
+
+    audit = audit_provider_plans((plan,))
+
+    assert audit.duplicates == (
+        f"{name}: skills/one/SKILL.md, skills/two/SKILL.md",
+    )
+
+
+def test_public_api_fails_closed_on_non_posix_without_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    plan = _plan(home, PlannedFile(Path("skills/example/SKILL.md"), b"body\n", 0o644))
+    monkeypatch.setattr(transaction_module, "_POSIX_SUPPORTED", False, raising=False)
+
+    calls = (
+        lambda: install_provider_plans((plan,)),
+        lambda: rollback_manifests(()),
+        lambda: audit_provider_plans((plan,)),
+        lambda: recover_transaction(tmp_path / "record.json"),
+    )
+    for call in calls:
+        with pytest.raises(transaction_module.UnsupportedPlatformError, match="POSIX"):
+            call()
+
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("replacement", [False, True])
+def test_successful_rollback_is_idempotent_and_durable(
+    tmp_path: Path,
+    replacement: bool,
+) -> None:
+    home = tmp_path / "home"
+    original = _plan(home, PlannedFile(Path("skills/example/SKILL.md"), b"old\n", 0o644))
+    manifests = install_provider_plans((original,))
+    if replacement:
+        updated = _plan(
+            home,
+            PlannedFile(Path("skills/example/SKILL.md"), b"new\n", 0o600),
+            revision="2" * 40,
+        )
+        manifests = install_provider_plans((updated,))
+    manifest = manifests[0]
+    record_path = transaction_module._TRANSACTION_PATHS[manifest.transaction_id]
+
+    rollback_manifests(manifests)
+    rollback_manifests(manifests)
+
+    assert record_path.exists()
+    assert json.loads(record_path.read_text())["state"] == "rolled-back"
+    transaction_module._TRANSACTION_PATHS.pop(manifest.transaction_id)
+    assert recover_transaction(record_path) == manifest
+    rollback_manifests(manifests)
+    if replacement:
+        assert (home / "skills/example/SKILL.md").read_bytes() == b"old\n"
+    else:
+        assert not (home / "skills/example/SKILL.md").exists()
+
+
+def test_repeat_rollback_rejects_recreated_owned_directory(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    plan = _plan(home, PlannedFile(Path("skills/example/SKILL.md"), b"body\n", 0o644))
+    manifests = install_provider_plans((plan,))
+
+    rollback_manifests(manifests)
+    recreated = home / "skills/example"
+    recreated.mkdir(parents=True)
+
+    with pytest.raises(IncompleteRollbackError, match="created owned directory"):
+        rollback_manifests(manifests)
+
+    assert recreated.is_dir()
+
+
+def test_noop_removal_does_not_break_canonical_transaction_order(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    original = _plan(home, PlannedFile(Path("skills/z/SKILL.md"), b"old\n", 0o644))
+    install_provider_plans((original,))
+    replacement = ProviderPlan(
+        "fixture",
+        "2" * 40,
+        TargetSpec("codex-dev", Framework.CODEX, home, "feature"),
+        (),
+        (Path("skills/a/SKILL.md"), Path("skills/z/SKILL.md")),
+    )
+    manifests = install_provider_plans((replacement,))
+
+    rollback_manifests(manifests)
+
+    assert (home / "skills/z/SKILL.md").read_bytes() == b"old\n"

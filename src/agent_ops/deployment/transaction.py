@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-import fcntl
 import hashlib
 import json
 import os
@@ -14,6 +13,11 @@ from pathlib import Path, PureWindowsPath
 from typing import Any
 
 import yaml
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - exercised by import on non-POSIX systems
+    fcntl = None  # type: ignore[assignment]
 
 from agent_ops.deployment.models import (
     DeploymentAudit,
@@ -34,11 +38,12 @@ __all__ = (
 )
 
 _SCHEMA_VERSION = 1
-_TRANSACTION_SCHEMA_VERSION = 2
+_TRANSACTION_SCHEMA_VERSION = 3
 _DIRECTORY_EVIDENCE_SCHEMA_VERSION = 1
 _OWNERSHIP_MANIFEST_MODE = 0o600
 _METADATA = Path(".agentops/deployment")
 _TRANSACTION_PATHS: dict[str, Path] = {}
+_POSIX_SUPPORTED = os.name == "posix" and fcntl is not None
 
 
 class PublicationIndeterminateError(OSError):
@@ -47,6 +52,17 @@ class PublicationIndeterminateError(OSError):
 
 class IncompleteRollbackError(OSError):
     """Rollback stopped to preserve changed content or required evidence."""
+
+
+class UnsupportedPlatformError(RuntimeError):
+    """Descriptor-bound deployment transactions require a POSIX platform."""
+
+
+def _require_supported_platform() -> None:
+    if not _POSIX_SUPPORTED:
+        raise UnsupportedPlatformError(
+            "deployment transactions require a supported POSIX platform"
+        )
 
 
 def _before_manifest_replace(
@@ -82,7 +98,7 @@ def _absolute_home(path: Path) -> Path:
     raw = os.fspath(path.expanduser())
     if raw in ("", "."):
         raise ValueError(f"unsafe target home: {path}")
-    home = Path(os.path.abspath(raw))
+    home = Path(os.path.normcase(os.path.abspath(raw)))
     if home == Path("/"):
         raise ValueError(f"unsafe target home: {path}")
     return home
@@ -141,15 +157,48 @@ def _open_directory_at(parent: int, name: str, *, create: bool, mode: int) -> in
 
 
 class _HomeFS:
-    def __init__(self, home: Path, descriptor: int) -> None:
+    def __init__(
+        self,
+        home: Path,
+        descriptor: int,
+        *,
+        lock_parent: int | None = None,
+        lock_name: str | None = None,
+        lock_identity: tuple[int, int] | None = None,
+    ) -> None:
         self.home = home
         self.descriptor = descriptor
+        self._lock_parent = lock_parent
+        self._lock_name = lock_name
+        self._lock_identity = lock_identity
 
     def __enter__(self) -> _HomeFS:
         return self
 
     def __exit__(self, *_args: object) -> None:
         os.close(self.descriptor)
+
+    def verify_lock_identity(self) -> None:
+        if (
+            self._lock_parent is None
+            or self._lock_name is None
+            or self._lock_identity is None
+        ):
+            return
+        try:
+            item = os.stat(
+                self._lock_name,
+                dir_fd=self._lock_parent,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise ValueError("deployment lock identity changed") from exc
+        if (
+            not stat.S_ISREG(item.st_mode)
+            or item.st_nlink != 1
+            or (item.st_dev, item.st_ino) != self._lock_identity
+        ):
+            raise ValueError("deployment lock identity changed")
 
     @staticmethod
     def _parts(relative: Path) -> tuple[str, ...]:
@@ -203,6 +252,7 @@ class _HomeFS:
             os.close(descriptor)
 
     def ensure_dir(self, relative: Path, mode: int) -> None:
+        self.verify_lock_identity()
         descriptor = self.open_dir(relative, create=True, mode=mode)
         try:
             os.fchmod(descriptor, mode)
@@ -267,6 +317,32 @@ class _HomeFS:
             finally:
                 os.close(descriptor)
 
+    def matches_fingerprint_file(
+        self,
+        relative: Path,
+        fingerprint: str,
+        mode: int,
+    ) -> bool:
+        with self.parent(relative) as (parent, leaf):
+            descriptor = os.open(
+                leaf,
+                os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW,
+                dir_fd=parent,
+            )
+            try:
+                item = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(item.st_mode)
+                    or stat.S_IMODE(item.st_mode) != mode
+                ):
+                    return False
+                fingerprint_state = hashlib.sha256()
+                while chunk := os.read(descriptor, 1024 * 1024):
+                    fingerprint_state.update(chunk)
+                return fingerprint_state.hexdigest() == fingerprint
+            finally:
+                os.close(descriptor)
+
     def scan_entries(self, relative: Path) -> dict[Path, str]:
         root = self.open_dir(relative)
         found: dict[Path, str] = {}
@@ -310,6 +386,7 @@ class _HomeFS:
         }
 
     def write_file(self, relative: Path, content: bytes, mode: int) -> None:
+        self.verify_lock_identity()
         if not _valid_file_mode(mode):
             raise ValueError(f"invalid file mode: {mode!r}")
         with self.parent(relative, create=True) as (parent, leaf):
@@ -342,6 +419,7 @@ class _HomeFS:
         self.replace(temporary, relative)
 
     def unlink(self, relative: Path) -> None:
+        self.verify_lock_identity()
         with self.parent(relative) as (parent, leaf):
             item = os.stat(leaf, dir_fd=parent, follow_symlinks=False)
             if not stat.S_ISREG(item.st_mode):
@@ -350,6 +428,7 @@ class _HomeFS:
             os.fsync(parent)
 
     def remove_empty_dir(self, relative: Path) -> bool:
+        self.verify_lock_identity()
         with self.parent(relative) as (parent, leaf):
             try:
                 os.rmdir(leaf, dir_fd=parent)
@@ -361,6 +440,7 @@ class _HomeFS:
             return True
 
     def publish_new(self, source: Path, destination: Path) -> None:
+        self.verify_lock_identity()
         with (
             self.parent(source) as (source_parent, source_leaf),
             self.parent(destination, create=True) as (destination_parent, destination_leaf),
@@ -377,6 +457,7 @@ class _HomeFS:
             os.fsync(destination_parent)
 
     def replace(self, source: Path, destination: Path) -> None:
+        self.verify_lock_identity()
         with (
             self.parent(source) as (source_parent, source_leaf),
             self.parent(destination, create=True) as (destination_parent, destination_leaf),
@@ -411,6 +492,8 @@ def _replace_at(
 def _target_lock(home: Path) -> Iterator[_HomeFS]:
     parent = _open_absolute_directory(home.parent, create=True)
     try:
+        assert fcntl is not None
+        fcntl.flock(parent, fcntl.LOCK_EX)
         lock_name = f".{home.name}.agentops-deployment.lock"
         lock = os.open(
             lock_name,
@@ -424,18 +507,32 @@ def _target_lock(home: Path) -> Iterator[_HomeFS]:
                 raise ValueError("deployment lock is not a regular file")
             os.fchmod(lock, 0o600)
             fcntl.flock(lock, fcntl.LOCK_EX)
+            canonical = os.stat(lock_name, dir_fd=parent, follow_symlinks=False)
+            if (canonical.st_dev, canonical.st_ino) != (
+                lock_stat.st_dev,
+                lock_stat.st_ino,
+            ):
+                raise ValueError("deployment lock identity changed")
             home_descriptor = _open_directory_at(
                 parent,
                 home.name,
                 create=True,
                 mode=0o700,
             )
-            with _HomeFS(home, home_descriptor) as home_fs:
+            with _HomeFS(
+                home,
+                home_descriptor,
+                lock_parent=parent,
+                lock_name=lock_name,
+                lock_identity=(lock_stat.st_dev, lock_stat.st_ino),
+            ) as home_fs:
                 yield home_fs
         finally:
             fcntl.flock(lock, fcntl.LOCK_UN)
             os.close(lock)
     finally:
+        if fcntl is not None:
+            fcntl.flock(parent, fcntl.LOCK_UN)
         os.close(parent)
 
 
@@ -481,17 +578,58 @@ def _manifest_bytes(manifest: DeploymentManifest) -> bytes:
     return (json.dumps(_manifest_to_dict(manifest), indent=2, sort_keys=True) + "\n").encode()
 
 
-def _validated_manifest_data(content: bytes, *, target: TargetSpec) -> dict[str, Any]:
+def _strict_json_loads(content: bytes, *, label: str) -> object:
+    def reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate JSON key in {label}: {key}")
+            result[key] = value
+        return result
+
     try:
-        data = json.loads(content.decode())
+        return json.loads(content.decode(), object_pairs_hook=reject_duplicates)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError(f"invalid deployment manifest JSON: {exc}") from exc
+        raise ValueError(f"invalid {label} JSON: {exc}") from exc
+
+
+def _require_exact_keys(
+    value: dict[str, Any],
+    allowed: set[str],
+    *,
+    label: str,
+) -> None:
+    keys = set(value)
+    if keys != allowed:
+        unknown = sorted(keys - allowed)
+        missing = sorted(allowed - keys)
+        if unknown:
+            raise ValueError(f"unknown {label} member: {unknown[0]}")
+        raise ValueError(f"missing {label} member: {missing[0]}")
+
+
+def _validated_manifest_data(content: bytes, *, target: TargetSpec) -> dict[str, Any]:
+    data = _strict_json_loads(content, label="deployment manifest")
     if (
         not isinstance(data, dict)
         or type(data.get("schema_version")) is not int
         or data["schema_version"] != _SCHEMA_VERSION
     ):
         raise ValueError("invalid deployment manifest schema")
+    _require_exact_keys(
+        data,
+        {
+            "schema_version",
+            "target_id",
+            "framework",
+            "source_revision",
+            "provider_ids",
+            "transaction_id",
+            "files",
+            "directories",
+        },
+        label="deployment manifest",
+    )
     if data.get("target_id") != target.id or data.get("framework") != target.framework.value:
         raise ValueError("deployment manifest target does not match plan")
     if not isinstance(data.get("source_revision"), str) or not data["source_revision"]:
@@ -524,6 +662,11 @@ def _validated_manifest_data(content: bytes, *, target: TargetSpec) -> dict[str,
             or not _valid_file_mode(item.get("mode"))
         ):
             raise ValueError("invalid deployment manifest file")
+        _require_exact_keys(
+            item,
+            {"path", "fingerprint", "mode"},
+            label="deployment manifest file",
+        )
         file_path = _validated_manifest_path(item["path"], kind="file")
         if file_path in file_paths:
             raise ValueError("invalid deployment manifest duplicate file path")
@@ -536,6 +679,11 @@ def _validated_manifest_data(content: bytes, *, target: TargetSpec) -> dict[str,
             or not _valid_directory_mode(item.get("mode"))
         ):
             raise ValueError("invalid deployment manifest directory")
+        _require_exact_keys(
+            item,
+            {"path", "mode"},
+            label="deployment manifest directory",
+        )
         directory_path = _validated_manifest_path(item["path"], kind="directory")
         if directory_path in directory_paths:
             raise ValueError("invalid deployment manifest duplicate directory path")
@@ -548,6 +696,12 @@ def _validated_manifest_data(content: bytes, *, target: TargetSpec) -> dict[str,
             current = current.parent
     if directory_paths != expected_directories:
         raise ValueError("invalid deployment manifest directory closure")
+    file_order = [item["path"] for item in data["files"]]
+    directory_order = [item["path"] for item in data["directories"]]
+    if file_order != sorted(file_order):
+        raise ValueError("deployment manifest files are not in canonical order")
+    if directory_order != sorted(directory_order):
+        raise ValueError("deployment manifest directories are not in canonical order")
     return data
 
 
@@ -616,7 +770,7 @@ def _frontmatter_name(content: bytes) -> str | None:
         return None
     try:
         end = next(index for index, line in enumerate(lines[1:], 1) if line.strip() == "---")
-        data = yaml.safe_load("\n".join(lines[1:end]))
+        data = yaml.load("\n".join(lines[1:end]), Loader=yaml.BaseLoader)
     except (StopIteration, yaml.YAMLError):
         return None
     if not isinstance(data, dict) or not isinstance(data.get("name"), str):
@@ -640,6 +794,7 @@ def _validate_and_group(
     providers: dict[tuple[str, Framework, Path, str, str], set[str]] = {}
     removals: dict[tuple[str, Framework, Path, str, str], set[Path]] = {}
     target_keys: dict[str, tuple[str, Framework, Path, str, str]] = {}
+    home_targets: dict[Path, str] = {}
     for plan in plans:
         home = _absolute_home(plan.target.home)
         if home != plan.target.home:
@@ -654,23 +809,54 @@ def _validate_and_group(
         prior_key = target_keys.setdefault(plan.target.id, key)
         if prior_key != key:
             raise ValueError(f"incompatible plans for target {plan.target.id!r}")
+        prior_target = home_targets.setdefault(home, plan.target.id)
+        if prior_target != plan.target.id:
+            raise ValueError("different target IDs resolve to the same target home")
         files = groups.setdefault(key, {})
         providers.setdefault(key, set()).add(plan.provider_id)
         planned_removals = removals.setdefault(key, set())
         for item in plan.files:
             path = _safe_relative(item.path)
+            if path.parts[0] == ".agentops":
+                raise ValueError(f"planned path overlaps reserved metadata: {path}")
             if not isinstance(item.content, bytes) or not _valid_file_mode(item.mode):
                 raise ValueError(f"invalid planned file: {path}")
             prior = files.get(path)
-            if prior is not None and prior != item:
-                raise ValueError(f"conflicting planned file: {path}")
+            if prior is not None:
+                raise ValueError(f"duplicate planned destination: {path}")
             files[path] = item
         for removal in plan.removals:
-            planned_removals.add(_safe_relative(removal))
+            removal_path = _safe_relative(removal)
+            if removal_path.parts[0] == ".agentops":
+                raise ValueError(
+                    f"planned removal overlaps reserved metadata: {removal_path}"
+                )
+            if removal_path in planned_removals:
+                raise ValueError(f"duplicate planned removal: {removal_path}")
+            planned_removals.add(removal_path)
     for key, files in groups.items():
-        overlap = set(files).intersection(removals[key])
-        if overlap:
-            raise ValueError(f"planned file is also removed: {min(overlap, key=str)}")
+        file_paths = sorted(files, key=str)
+        removal_paths = sorted(removals[key], key=str)
+        for index, path in enumerate(file_paths):
+            if any(
+                path in other.parents or other in path.parents
+                for other in file_paths[index + 1 :]
+            ):
+                raise ValueError(f"invalid plan topology at file destination: {path}")
+        for index, path in enumerate(removal_paths):
+            if any(
+                path == other or path in other.parents or other in path.parents
+                for other in removal_paths[index + 1 :]
+            ):
+                raise ValueError(f"invalid plan topology at removal destination: {path}")
+        for file_path in file_paths:
+            if any(
+                file_path == removal
+                or file_path in removal.parents
+                or removal in file_path.parents
+                for removal in removal_paths
+            ):
+                raise ValueError(f"invalid plan topology across file and removal: {file_path}")
     results = []
     for key in sorted(groups, key=lambda item: (str(item[2]), item[0])):
         target_id, framework, home, channel, source_revision = key
@@ -766,14 +952,129 @@ def _file_matches(
     mode: int,
 ) -> bool:
     try:
-        item = home_fs.stat(path)
-        content = home_fs.read_file(path)
-    except (FileNotFoundError, OSError):
+        return home_fs.matches_fingerprint_file(path, fingerprint, mode)
+    except OSError:
         return False
-    return (
-        stat.S_ISREG(item.st_mode)
-        and stat.S_IMODE(item.st_mode) == mode
-        and _fingerprint(content) == fingerprint
+
+
+def _verify_manifest_files_and_directories(
+    home_fs: _HomeFS,
+    manifest_data: dict[str, Any],
+    *,
+    error_type: type[Exception],
+    context: str,
+) -> None:
+    for item in manifest_data["files"]:
+        path = Path(item["path"])
+        if not _file_matches(home_fs, path, item["fingerprint"], item["mode"]):
+            raise error_type(f"{context} managed file changed: {path}")
+    for item in manifest_data["directories"]:
+        path = Path(item["path"])
+        try:
+            directory_stat = home_fs.stat(path)
+        except OSError as exc:
+            raise error_type(f"{context} owned directory changed: {path}") from exc
+        if (
+            not stat.S_ISDIR(directory_stat.st_mode)
+            or stat.S_IMODE(directory_stat.st_mode) != item["mode"]
+        ):
+            raise error_type(f"{context} owned directory changed: {path}")
+
+
+def _verify_planned_final_state(
+    home_fs: _HomeFS,
+    manifest: DeploymentManifest,
+    removals: tuple[Path, ...],
+) -> None:
+    _verify_manifest_files_and_directories(
+        home_fs,
+        _manifest_to_dict(manifest),
+        error_type=ValueError,
+        context="final deployment",
+    )
+    for path in removals:
+        if home_fs.exists(path):
+            raise ValueError(f"final deployment removal still exists: {path}")
+
+
+def _verify_prior_prestate(
+    home_fs: _HomeFS,
+    prior_data: dict[str, Any],
+    operations: list[dict[str, Any]],
+) -> None:
+    operations_by_path = {
+        Path(operation["destination"]): operation for operation in operations
+    }
+    for item in prior_data["files"]:
+        path = Path(item["path"])
+        operation = operations_by_path.get(path)
+        if operation is not None and operation["backup"] is not None:
+            continue
+        if not _file_matches(home_fs, path, item["fingerprint"], item["mode"]):
+            raise IncompleteRollbackError(f"prior managed file changed: {path}")
+    for item in prior_data["directories"]:
+        path = Path(item["path"])
+        try:
+            directory_stat = home_fs.stat(path)
+        except OSError as exc:
+            raise IncompleteRollbackError(f"prior owned directory changed: {path}") from exc
+        if (
+            not stat.S_ISDIR(directory_stat.st_mode)
+            or stat.S_IMODE(directory_stat.st_mode) != item["mode"]
+        ):
+            raise IncompleteRollbackError(f"prior owned directory changed: {path}")
+
+
+def _verify_completed_rollback(
+    home_fs: _HomeFS,
+    record: dict[str, Any],
+    prior_data: dict[str, Any] | None,
+    prior_manifest: bytes | None,
+) -> None:
+    manifest_path = Path(record["manifest_path"])
+    if prior_data is None:
+        if home_fs.exists(manifest_path):
+            raise IncompleteRollbackError(
+                "rollback completion does not match absent prior manifest"
+            )
+        for operation in record["operations"]:
+            destination = Path(operation["destination"])
+            if operation["kind"] == "installed" and home_fs.exists(destination):
+                raise IncompleteRollbackError(
+                    f"rollback completion has installed destination: {destination}"
+                )
+            if operation["kind"] == "adopted" and not _file_matches(
+                home_fs,
+                destination,
+                operation["expected_fingerprint"],
+                operation["expected_mode"],
+            ):
+                raise IncompleteRollbackError(
+                    f"rollback completion changed adopted destination: {destination}"
+                )
+        for directory in record["directories"]:
+            path = Path(directory["path"])
+            if directory["created"] and home_fs.exists(path):
+                raise IncompleteRollbackError(
+                    f"rollback completion has created owned directory: {path}"
+                )
+        return
+    assert prior_manifest is not None
+    try:
+        manifest_matches = home_fs.matches_exact_file(
+            manifest_path,
+            prior_manifest,
+            _OWNERSHIP_MANIFEST_MODE,
+        )
+    except OSError:
+        manifest_matches = False
+    if not manifest_matches:
+        raise IncompleteRollbackError("rollback completion prior manifest changed")
+    _verify_manifest_files_and_directories(
+        home_fs,
+        prior_data,
+        error_type=IncompleteRollbackError,
+        context="rollback completion prior",
     )
 
 
@@ -801,6 +1102,7 @@ def _publication_outcome(
 def install_provider_plans(
     plans: tuple[ProviderPlan, ...],
 ) -> tuple[DeploymentManifest, ...]:
+    _require_supported_platform()
     manifests: list[DeploymentManifest] = []
     for group in _validate_and_group(plans):
         target = group.target
@@ -828,6 +1130,12 @@ def install_provider_plans(
                 _validate_ownership_manifest_stat(prior_manifest_stat)
                 prior_manifest_mode = stat.S_IMODE(prior_manifest_stat.st_mode)
                 prior_data = _validated_manifest_data(prior_manifest_content, target=target)
+                _verify_manifest_files_and_directories(
+                    home_fs,
+                    prior_data,
+                    error_type=ValueError,
+                    context="prior",
+                )
             managed = {
                 Path(item["path"]): (item["fingerprint"], item["mode"])
                 for item in prior_data["files"]
@@ -874,14 +1182,16 @@ def install_provider_plans(
                     operation["prior_mode"] = prior[1]
                     operation["prior_exists"] = True
                 operations.append(operation)
-            for index, removal in enumerate(group.removals, start=len(operations)):
+            for removal in group.removals:
                 prior = managed.get(removal)
                 if prior is None:
                     if home_fs.exists(removal):
                         raise ValueError(f"refusing to remove unmanaged destination: {removal}")
                     continue
+                index = len(operations)
                 operation = {
                     "kind": "removal",
+                    "index": index,
                     "destination": removal.as_posix(),
                     "staged": None,
                     "backup": None,
@@ -1037,6 +1347,14 @@ def install_provider_plans(
                         manifest_temp,
                         manifest_path,
                     )
+                    home_fs.verify_lock_identity()
+                    if not home_fs.matches_exact_file(
+                        manifest_temp,
+                        manifest_content,
+                        _OWNERSHIP_MANIFEST_MODE,
+                    ):
+                        raise ValueError("ownership manifest candidate changed before publication")
+                    _verify_planned_final_state(home_fs, manifest, group.removals)
                     if prior_manifest_content is None:
                         home_fs.publish_new(manifest_temp, manifest_path)
                     else:
@@ -1155,18 +1473,31 @@ def _decode_record(
     home: Path,
     transaction_id: str,
 ) -> tuple[dict[str, Any], DeploymentManifest]:
-    try:
-        record = json.loads(content.decode())
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError(f"invalid transaction record JSON: {exc}") from exc
+    record = _strict_json_loads(content, label="transaction record")
     if (
         not isinstance(record, dict)
         or type(record.get("schema_version")) is not int
         or record["schema_version"] != _TRANSACTION_SCHEMA_VERSION
-        or record.get("state") not in {"prepared", "committed", "indeterminate"}
+        or record.get("state")
+        not in {"prepared", "committed", "indeterminate", "rolled-back"}
         or not isinstance(record.get("manifest"), dict)
     ):
         raise ValueError("invalid transaction record schema")
+    _require_exact_keys(
+        record,
+        {
+            "schema_version",
+            "state",
+            "manifest",
+            "manifest_path",
+            "manifest_content",
+            "prior_manifest_content",
+            "prior_manifest_mode",
+            "directories",
+            "operations",
+        },
+        label="transaction record",
+    )
     target, manifest = _manifest_from_data(record["manifest"], home=home)
     if manifest.transaction_id != transaction_id:
         raise ValueError("invalid transaction record identifier")
@@ -1206,6 +1537,22 @@ def _decode_record(
             "removal",
         }:
             raise ValueError("invalid transaction record operation")
+        _require_exact_keys(
+            operation,
+            {
+                "kind",
+                "destination",
+                "staged",
+                "backup",
+                "expected_fingerprint",
+                "expected_mode",
+                "prior_fingerprint",
+                "prior_mode",
+                "prior_exists",
+                "index",
+            },
+            label="transaction operation",
+        )
         if not isinstance(operation.get("destination"), str):
             raise ValueError("invalid transaction record destination")
         destination = _safe_relative(Path(operation["destination"]))
@@ -1313,6 +1660,11 @@ def _decode_record(
             or not _valid_directory_mode(directory.get("mode"))
         ):
             raise ValueError("invalid transaction record directory")
+        _require_exact_keys(
+            directory,
+            {"path", "created", "mode", "prestate_evidence"},
+            label="transaction directories do not match manifest",
+        )
         directory_path = _safe_relative(Path(directory["path"]))
         if directory_path in directory_paths:
             raise ValueError("transaction directories do not match manifest")
@@ -1334,6 +1686,21 @@ def _decode_record(
     }
     if recorded_directories != manifest_directories:
         raise ValueError("transaction directories do not match manifest")
+    if any(
+        type(operation["index"]) is not int or operation["index"] != index
+        for index, operation in enumerate(operations)
+    ):
+        raise ValueError("transaction operations are not in canonical order")
+    operation_order = [
+        (operation["kind"] == "removal", operation["destination"])
+        for operation in operations
+    ]
+    if operation_order != sorted(operation_order):
+        raise ValueError("transaction operations are not in canonical order")
+    if [item["path"] for item in directories] != sorted(
+        item["path"] for item in directories
+    ):
+        raise ValueError("transaction directories are not in canonical order")
     return record, manifest
 
 
@@ -1422,9 +1789,17 @@ def _validate_transaction_evidence(
             raise ValueError("transaction directory pre-state evidence is invalid")
 
 
-def _rollback_record(home_fs: _HomeFS, record: dict[str, Any], record_path: Path) -> None:
+def _rollback_record(
+    home_fs: _HomeFS,
+    record: dict[str, Any],
+    record_path: Path,
+    *,
+    retain_completed: bool = False,
+) -> None:
+    home_fs.verify_lock_identity()
     prior_manifest = _prior_manifest_content(record)
     prior_manifest_mode = record.get("prior_manifest_mode")
+    prior_data: dict[str, Any] | None = None
     if (
         prior_manifest is None
         and prior_manifest_mode is not None
@@ -1432,6 +1807,17 @@ def _rollback_record(home_fs: _HomeFS, record: dict[str, Any], record_path: Path
         and not _valid_ownership_manifest_mode(prior_manifest_mode)
     ):
         raise IncompleteRollbackError("rollback incomplete: invalid prior manifest mode")
+    if prior_manifest is not None:
+        recovery_target = TargetSpec(
+            record["manifest"]["target_id"],
+            Framework(record["manifest"]["framework"]),
+            home_fs.home,
+            "recovery",
+        )
+        prior_data = _validated_manifest_data(prior_manifest, target=recovery_target)
+    if record["state"] == "rolled-back":
+        _verify_completed_rollback(home_fs, record, prior_data, prior_manifest)
+        return
     _validate_transaction_evidence(
         home_fs,
         record,
@@ -1486,6 +1872,8 @@ def _rollback_record(home_fs: _HomeFS, record: dict[str, Any], record_path: Path
                 raise IncompleteRollbackError(
                     f"rollback incomplete: backup changed: {backup}"
                 )
+    if prior_data is not None:
+        _verify_prior_prestate(home_fs, prior_data, record["operations"])
     try:
         for operation in reversed(record["operations"]):
             destination = Path(operation["destination"])
@@ -1494,6 +1882,21 @@ def _rollback_record(home_fs: _HomeFS, record: dict[str, Any], record_path: Path
                 home_fs.unlink(destination)
             if backup is not None and home_fs.exists(backup):
                 home_fs.publish_new(backup, destination)
+        if prior_data is not None:
+            _verify_manifest_files_and_directories(
+                home_fs,
+                prior_data,
+                error_type=IncompleteRollbackError,
+                context="prior",
+            )
+        else:
+            for operation in record["operations"]:
+                if operation["kind"] == "installed" and home_fs.exists(
+                    Path(operation["destination"])
+                ):
+                    raise IncompleteRollbackError(
+                        "rollback incomplete: newly installed destination remains"
+                    )
         current_manifest = home_fs.read_optional(manifest_path)
         if prior_manifest is None:
             if current_manifest == expected_manifest:
@@ -1512,6 +1915,7 @@ def _rollback_record(home_fs: _HomeFS, record: dict[str, Any], record_path: Path
         ):
             if directory["created"]:
                 home_fs.remove_empty_dir(Path(directory["path"]))
+        _verify_completed_rollback(home_fs, record, prior_data, prior_manifest)
         manifest_temp = record_path.parent / "manifest.tmp"
         if home_fs.exists(manifest_temp):
             if home_fs.read_file(manifest_temp) != expected_manifest:
@@ -1534,7 +1938,11 @@ def _rollback_record(home_fs: _HomeFS, record: dict[str, Any], record_path: Path
             evidence = directory["prestate_evidence"]
             if evidence is not None:
                 home_fs.unlink(Path(evidence))
-        home_fs.unlink(record_path)
+        if retain_completed:
+            record["state"] = "rolled-back"
+            home_fs.write_atomic(record_path, _record_bytes(record), 0o600)
+        else:
+            home_fs.unlink(record_path)
         _prune_transaction_directories(home_fs, record_path.parent, record)
     except IncompleteRollbackError:
         raise
@@ -1565,6 +1973,7 @@ def _prune_transaction_directories(
 
 
 def rollback_manifests(manifests: tuple[DeploymentManifest, ...]) -> None:
+    _require_supported_platform()
     for manifest in reversed(manifests):
         path = _TRANSACTION_PATHS.get(manifest.transaction_id)
         if path is None:
@@ -1582,17 +1991,17 @@ def rollback_manifests(manifests: tuple[DeploymentManifest, ...]) -> None:
                 )
                 if locked_manifest != manifest:
                     raise ValueError("transaction manifest changed before rollback")
-                _rollback_record(home_fs, record, relative)
+                _rollback_record(home_fs, record, relative, retain_completed=True)
         except IncompleteRollbackError:
             raise
         except OSError as exc:
             raise IncompleteRollbackError(
                 f"rollback incomplete; evidence retained at {path}"
             ) from exc
-        _TRANSACTION_PATHS.pop(manifest.transaction_id, None)
 
 
 def recover_transaction(path: Path) -> DeploymentManifest:
+    _require_supported_platform()
     home, relative, _record, manifest = _read_validated_record(path)
     with _target_lock(home) as home_fs:
         content = home_fs.read_file(relative)
@@ -1601,6 +2010,10 @@ def recover_transaction(path: Path) -> DeploymentManifest:
             home=home,
             transaction_id=manifest.transaction_id,
         )
+        if record["state"] == "rolled-back":
+            _rollback_record(home_fs, record, relative)
+            _TRANSACTION_PATHS[manifest.transaction_id] = path
+            return manifest
         _validate_transaction_evidence(home_fs, record, relative)
         expected_manifest = base64.b64decode(record["manifest_content"], validate=True)
         manifest_path = Path(record["manifest_path"])
@@ -1663,6 +2076,7 @@ def recover_transaction(path: Path) -> DeploymentManifest:
 
 
 def audit_provider_plans(plans: tuple[ProviderPlan, ...]) -> DeploymentAudit:
+    _require_supported_platform()
     groups = _validate_and_group(plans)
     if not groups:
         return DeploymentAudit(target_id="none", matches=True)
