@@ -2111,3 +2111,95 @@ def test_grouped_plans_reject_conflicting_duplicate_files_before_mutation(
         install_provider_plans(plans)
 
     assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("missing_ancestor", [False, True])
+def test_concurrent_first_home_creation_serializes_without_file_exists(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    missing_ancestor: bool,
+) -> None:
+    context = multiprocessing.get_context("fork")
+    race_name = "missing" if missing_ancestor else "home"
+    home = tmp_path / "missing" / "home" if missing_ancestor else tmp_path / "home"
+    barrier = context.Barrier(2)
+    results = context.Queue()
+    original_mkdir = os.mkdir
+
+    def race_mkdir(
+        path: str | bytes,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        if path == race_name:
+            barrier.wait(timeout=3)
+        original_mkdir(path, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(transaction_module.os, "mkdir", race_mkdir)
+    plan = _plan(home, PlannedFile(Path("skills/example/SKILL.md"), b"body\n", 0o644))
+
+    def install() -> None:
+        try:
+            manifests = install_provider_plans((plan,))
+        except BaseException as exc:
+            results.put((type(exc).__name__, str(exc)))
+        else:
+            results.put(("returned", manifests[0].target_id))
+
+    workers = (context.Process(target=install), context.Process(target=install))
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=5)
+        if worker.is_alive():
+            worker.terminate()
+            worker.join(timeout=2)
+
+    assert all(not worker.is_alive() for worker in workers)
+    assert all(worker.exitcode == 0 for worker in workers)
+    observed = sorted(results.get(timeout=2) for _worker in workers)
+    assert observed == [("returned", "codex-dev"), ("returned", "codex-dev")]
+    assert audit_provider_plans((plan,)).matches
+
+
+@pytest.mark.parametrize("replacement", ["symlink", "file"])
+def test_first_home_creation_rejects_unsafe_race_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replacement: str,
+) -> None:
+    home = tmp_path / "home"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    original_mkdir = os.mkdir
+
+    def replace_instead_of_mkdir(
+        path: str | bytes,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        if path != "home":
+            original_mkdir(path, mode, dir_fd=dir_fd)
+            return
+        if replacement == "symlink":
+            os.symlink(outside, path, dir_fd=dir_fd)
+        else:
+            descriptor = os.open(
+                path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=dir_fd,
+            )
+            os.close(descriptor)
+        raise FileExistsError("injected unsafe creation race")
+
+    monkeypatch.setattr(transaction_module.os, "mkdir", replace_instead_of_mkdir)
+    plan = _plan(home, PlannedFile(Path("skills/example/SKILL.md"), b"body\n", 0o644))
+
+    with pytest.raises(OSError):
+        install_provider_plans((plan,))
+
+    assert list(outside.iterdir()) == []
+    assert not list(tmp_path.rglob("record.json"))

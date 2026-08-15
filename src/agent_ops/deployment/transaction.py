@@ -7,7 +7,7 @@ import os
 import stat
 import uuid
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 from typing import Any
@@ -121,6 +121,32 @@ def _absolute_home(path: Path) -> Path:
     return home
 
 
+def _create_or_open_directory_at(parent: int, name: str, *, mode: int) -> int:
+    with suppress(FileExistsError):
+        os.mkdir(name, 0o700, dir_fd=parent)
+    descriptor = os.open(
+        name,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        dir_fd=parent,
+    )
+    try:
+        opened = os.fstat(descriptor)
+        canonical = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or not stat.S_ISDIR(canonical.st_mode)
+            or (opened.st_dev, opened.st_ino) != (canonical.st_dev, canonical.st_ino)
+        ):
+            raise ValueError(f"directory creation identity changed: {name}")
+        os.fchmod(descriptor, mode)
+        os.fsync(descriptor)
+        os.fsync(parent)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
 def _open_absolute_directory(path: Path, *, create: bool, mode: int = 0o700) -> int:
     if not path.is_absolute():
         raise ValueError(f"directory path must be absolute: {path}")
@@ -136,14 +162,11 @@ def _open_absolute_directory(path: Path, *, create: bool, mode: int = 0o700) -> 
             except FileNotFoundError:
                 if not create:
                     raise
-                os.mkdir(part, 0o700, dir_fd=descriptor)
-                child = os.open(
+                child = _create_or_open_directory_at(
+                    descriptor,
                     part,
-                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                    dir_fd=descriptor,
+                    mode=mode,
                 )
-                os.fchmod(child, mode)
-                os.fsync(descriptor)
             os.close(descriptor)
             descriptor = child
         return descriptor
@@ -162,15 +185,11 @@ def _open_directory_at(parent: int, name: str, *, create: bool, mode: int) -> in
     except FileNotFoundError:
         if not create:
             raise
-        os.mkdir(name, 0o700, dir_fd=parent)
-        descriptor = os.open(
+        return _create_or_open_directory_at(
+            parent,
             name,
-            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-            dir_fd=parent,
+            mode=mode,
         )
-        os.fchmod(descriptor, mode)
-        os.fsync(parent)
-        return descriptor
 
 
 class _HomeFS:
