@@ -1145,3 +1145,90 @@ def test_wrong_ownership_manifest_mode_is_rejected_without_mutation(
         manifest_path.stat().st_mtime_ns,
     ) == manifest_before
     assert transaction_snapshot() == transactions_before
+
+
+def test_wrong_mode_manifest_publication_remains_indeterminate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    plan = _plan(home, PlannedFile(Path("skills/example/SKILL.md"), b"body\n", 0o644))
+
+    def publish_wrong_mode_then_fail(
+        home_fs: object,
+        _record_path: Path,
+        manifest_temp: Path,
+        manifest_path: Path,
+    ) -> None:
+        home_fs.replace(manifest_temp, manifest_path)
+        (home / manifest_path).chmod(0o644)
+        raise OSError("publication result unavailable")
+
+    monkeypatch.setattr(
+        transaction_module,
+        "_before_manifest_replace",
+        publish_wrong_mode_then_fail,
+    )
+
+    with pytest.raises(PublicationIndeterminateError, match="indeterminate"):
+        install_provider_plans((plan,))
+
+    record_path = next((home / ".agentops/deployment/transactions").glob("*/record.json"))
+    record = json.loads(record_path.read_text())
+    manifest_path = home / record["manifest_path"]
+    assert record["state"] == "indeterminate"
+    assert stat.S_IMODE(manifest_path.stat().st_mode) == 0o644
+    assert (home / "skills/example/SKILL.md").read_bytes() == b"body\n"
+    assert record_path.exists()
+
+
+def test_recovery_does_not_commit_expected_manifest_bytes_at_wrong_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    plan = _plan(home, PlannedFile(Path("skills/example/SKILL.md"), b"body\n", 0o644))
+
+    def retain_unpublished_manifest(
+        home_fs: object,
+        _record_path: Path,
+        manifest_temp: Path,
+        _manifest_path: Path,
+    ) -> None:
+        home_fs.replace(manifest_temp, Path(".agentops/deployment/lost-manifest"))
+        raise OSError("publication result unavailable")
+
+    monkeypatch.setattr(
+        transaction_module,
+        "_before_manifest_replace",
+        retain_unpublished_manifest,
+    )
+    with pytest.raises(PublicationIndeterminateError):
+        install_provider_plans((plan,))
+
+    record_path = next((home / ".agentops/deployment/transactions").glob("*/record.json"))
+    record_before = record_path.read_bytes()
+    record = json.loads(record_before)
+    manifest_path = home / record["manifest_path"]
+    lost_manifest = home / ".agentops/deployment/lost-manifest"
+    manifest_path.parent.mkdir()
+    os.replace(lost_manifest, manifest_path)
+    manifest_path.chmod(0o644)
+    manifest_before = (
+        manifest_path.read_bytes(),
+        manifest_path.stat().st_ino,
+        stat.S_IMODE(manifest_path.stat().st_mode),
+        manifest_path.stat().st_mtime_ns,
+    )
+
+    with pytest.raises(PublicationIndeterminateError, match="indeterminate"):
+        recover_transaction(record_path)
+
+    assert record_path.read_bytes() == record_before
+    assert json.loads(record_path.read_text())["state"] == "indeterminate"
+    assert (
+        manifest_path.read_bytes(),
+        manifest_path.stat().st_ino,
+        stat.S_IMODE(manifest_path.stat().st_mode),
+        manifest_path.stat().st_mtime_ns,
+    ) == manifest_before

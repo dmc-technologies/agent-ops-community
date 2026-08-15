@@ -242,6 +242,23 @@ class _HomeFS:
         except FileNotFoundError:
             return None
 
+    def matches_exact_file(self, relative: Path, content: bytes, mode: int) -> bool:
+        with self.parent(relative) as (parent, leaf):
+            descriptor = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent)
+            try:
+                item = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(item.st_mode)
+                    or stat.S_IMODE(item.st_mode) != mode
+                ):
+                    return False
+                chunks: list[bytes] = []
+                while chunk := os.read(descriptor, 1024 * 1024):
+                    chunks.append(chunk)
+                return b"".join(chunks) == content
+            finally:
+                os.close(descriptor)
+
     def scan_entries(self, relative: Path) -> dict[Path, str]:
         root = self.open_dir(relative)
         found: dict[Path, str] = {}
@@ -735,10 +752,14 @@ def _publication_outcome(
     try:
         if home_fs.exists(manifest_temp):
             return "not-published"
-        published = home_fs.read_optional(manifest_path)
+        published = home_fs.matches_exact_file(
+            manifest_path,
+            expected_content,
+            _OWNERSHIP_MANIFEST_MODE,
+        )
     except OSError:
         return "indeterminate"
-    if published == expected_content:
+    if published:
         return "committed"
     return "indeterminate"
 
@@ -1551,6 +1572,19 @@ def recover_transaction(path: Path) -> DeploymentManifest:
         manifest_path = Path(record["manifest_path"])
         current_manifest = home_fs.read_optional(manifest_path)
         if current_manifest == expected_manifest:
+            try:
+                manifest_is_exact = home_fs.matches_exact_file(
+                    manifest_path,
+                    expected_manifest,
+                    _OWNERSHIP_MANIFEST_MODE,
+                )
+            except OSError:
+                manifest_is_exact = False
+            if not manifest_is_exact:
+                raise PublicationIndeterminateError(
+                    "manifest publication remains indeterminate; "
+                    "ownership manifest type or mode is invalid"
+                )
             if record["state"] != "committed":
                 record["state"] = "committed"
                 home_fs.write_atomic(relative, _record_bytes(record), 0o600)
