@@ -1364,7 +1364,11 @@ def _promote_dependency_checkout(staged: Path, destination: Path, cache_root: Pa
         os.replace(destination, quarantine)
     try:
         os.replace(staged, destination)
-    except BaseException as exc:
+    except (KeyboardInterrupt, SystemExit) as exc:
+        if quarantine is not None:
+            exc.add_note(f"prior checkout preserved at {quarantine}")
+        raise
+    except Exception as exc:
         if quarantine is None:
             raise
         raise ValueError(
@@ -1373,7 +1377,10 @@ def _promote_dependency_checkout(staged: Path, destination: Path, cache_root: Pa
     if quarantine is not None:
         try:
             _remove_cache_tree_no_follow(quarantine, cache_root)
-        except BaseException as exc:
+        except (KeyboardInterrupt, SystemExit) as exc:
+            exc.add_note(f"prior checkout preserved at {quarantine}")
+            raise
+        except Exception as exc:
             raise ValueError(
                 "dependency cache promotion cleanup failed; prior checkout preserved at "
                 f"{quarantine}"

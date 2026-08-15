@@ -80,6 +80,34 @@ def _tree_snapshot(root: Path) -> dict[str, tuple[str, int, bytes | str | None]]
     return snapshot
 
 
+def _cached_gstack_dependency(
+    tmp_path: Path,
+) -> tuple[SkillDependency, Path, Path, Path]:
+    origin = tmp_path / "origin"
+    repo_url = _git_repo(origin)
+    (origin / "SKILL.md").write_text("managed\n", encoding="utf-8")
+    ref = _commit(origin)
+    dependency = SkillDependency(
+        id="gstack",
+        name="GStack",
+        repo=repo_url,
+        ref=ref,
+        install={
+            "codex": SkillDependencyInstall(strategy="gstack", destination="skills/gstack")
+        },
+    )
+    cache = tmp_path / "cache"
+    home = tmp_path / "home"
+    install_skill_dependencies(
+        framework=Framework.CODEX,
+        dependencies=[dependency],
+        home=home,
+        cache_dir=cache,
+        dry_run=True,
+    )
+    return dependency, cache, home, cache / f"gstack-{ref[:12]}"
+
+
 def _shared_ownership_manifest(home: Path) -> Path:
     manifests = list((home / ".agentops/deployment/manifests").glob("*.json"))
     assert len(manifests) == 1
@@ -1055,6 +1083,123 @@ def test_dependency_checkout_failed_promotion_reports_preserved_cache_path(
     preserved = Path(str(raised.value).rsplit(" at ", 1)[1])
     assert preserved.parent == cache
     assert preserved.is_dir()
+    assert not list(cache.glob(".gstack-stage-*"))
+
+
+@pytest.mark.parametrize(
+    ("exception_type", "value"),
+    [(KeyboardInterrupt, "injected interrupt"), (SystemExit, 23)],
+)
+def test_dependency_checkout_promotion_preserves_process_control_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    exception_type: type[BaseException],
+    value: str | int,
+) -> None:
+    import agent_ops.skill_installer as skill_installer
+
+    dependency, cache, home, destination = _cached_gstack_dependency(tmp_path)
+    injected = exception_type(value)
+    original_replace = skill_installer.os.replace
+
+    def interrupt_promotion(source: str | Path, target: str | Path) -> None:
+        if Path(source).name == "checkout" and Path(target) == destination:
+            raise injected
+        original_replace(source, target)
+
+    monkeypatch.setattr(skill_installer.os, "replace", interrupt_promotion)
+
+    with pytest.raises(exception_type) as raised:
+        install_skill_dependencies(
+            framework=Framework.CODEX,
+            dependencies=[dependency],
+            home=home,
+            cache_dir=cache,
+            dry_run=True,
+        )
+
+    assert raised.value is injected
+    assert raised.value.args == (value,)
+    quarantines = list(cache.glob(f".{destination.name}.quarantine-*"))
+    assert len(quarantines) == 1
+    assert raised.value.__notes__ == [f"prior checkout preserved at {quarantines[0]}"]
+    assert not list(cache.glob(".gstack-stage-*"))
+
+
+@pytest.mark.parametrize(
+    ("exception_type", "value"),
+    [(KeyboardInterrupt, "injected interrupt"), (SystemExit, 29)],
+)
+def test_dependency_checkout_cleanup_preserves_process_control_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    exception_type: type[BaseException],
+    value: str | int,
+) -> None:
+    import agent_ops.skill_installer as skill_installer
+
+    dependency, cache, home, destination = _cached_gstack_dependency(tmp_path)
+    injected = exception_type(value)
+    cleanup_paths: list[Path] = []
+
+    def interrupt_cleanup(path: Path, _cache_root: Path) -> None:
+        cleanup_paths.append(path)
+        raise injected
+
+    monkeypatch.setattr(
+        skill_installer,
+        "_remove_cache_tree_no_follow",
+        interrupt_cleanup,
+    )
+
+    with pytest.raises(exception_type) as raised:
+        install_skill_dependencies(
+            framework=Framework.CODEX,
+            dependencies=[dependency],
+            home=home,
+            cache_dir=cache,
+            dry_run=True,
+        )
+
+    assert raised.value is injected
+    assert raised.value.args == (value,)
+    assert len(cleanup_paths) == 1
+    assert cleanup_paths[0].is_dir()
+    assert raised.value.__notes__ == [f"prior checkout preserved at {cleanup_paths[0]}"]
+    assert destination.is_dir()
+    assert not list(cache.glob(".gstack-stage-*"))
+
+
+def test_dependency_checkout_cleanup_wraps_operational_failure_with_evidence_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import agent_ops.skill_installer as skill_installer
+
+    dependency, cache, home, _destination = _cached_gstack_dependency(tmp_path)
+    cleanup_paths: list[Path] = []
+
+    def fail_cleanup(path: Path, _cache_root: Path) -> None:
+        cleanup_paths.append(path)
+        raise OSError("injected cleanup failure")
+
+    monkeypatch.setattr(
+        skill_installer,
+        "_remove_cache_tree_no_follow",
+        fail_cleanup,
+    )
+
+    with pytest.raises(ValueError, match="prior checkout preserved at") as raised:
+        install_skill_dependencies(
+            framework=Framework.CODEX,
+            dependencies=[dependency],
+            home=home,
+            cache_dir=cache,
+            dry_run=True,
+        )
+
+    assert len(cleanup_paths) == 1
+    assert str(raised.value).endswith(str(cleanup_paths[0]))
+    assert cleanup_paths[0].is_dir()
     assert not list(cache.glob(".gstack-stage-*"))
 
 
