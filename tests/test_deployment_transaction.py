@@ -1034,3 +1034,50 @@ def test_nonregular_backup_evidence_is_rejected_before_recovery(
 
     assert destination.read_bytes() == b"body\n"
     assert record_path.exists()
+
+
+def test_managed_directory_without_owner_read_is_rejected_before_mutation(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    directory = home / "skills/example"
+    directory.mkdir(parents=True)
+    directory.chmod(0o300)
+    marker = directory / "unmanaged.txt"
+    marker.write_bytes(b"keep\n")
+    before = (directory.stat().st_ino, stat.S_IMODE(directory.stat().st_mode))
+    plan = _plan(home, PlannedFile(Path("skills/example/SKILL.md"), b"body\n", 0o644))
+
+    try:
+        with pytest.raises(ValueError, match="invalid managed directory mode"):
+            install_provider_plans((plan,))
+
+        assert (directory.stat().st_ino, stat.S_IMODE(directory.stat().st_mode)) == before
+        assert marker.read_bytes() == b"keep\n"
+        assert not (home / ".agentops").exists()
+    finally:
+        directory.chmod(0o700)
+
+
+@pytest.mark.parametrize("mode", [0o700, 0o777])
+def test_owner_auditable_managed_directory_modes_round_trip(
+    tmp_path: Path,
+    mode: int,
+) -> None:
+    home = tmp_path / "home"
+    directory = home / "skills/example"
+    directory.mkdir(parents=True)
+    directory.chmod(mode)
+    original_inode = directory.stat().st_ino
+    plan = _plan(home, PlannedFile(Path("skills/example/SKILL.md"), b"body\n", 0o644))
+
+    manifests = install_provider_plans((plan,))
+
+    recorded = next(
+        item for item in manifests[0].directories if item.path == Path("skills/example")
+    )
+    assert recorded.mode == mode
+    assert audit_provider_plans((plan,)).matches
+    rollback_manifests(manifests)
+    assert directory.stat().st_ino == original_inode
+    assert stat.S_IMODE(directory.stat().st_mode) == mode

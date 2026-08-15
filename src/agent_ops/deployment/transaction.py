@@ -534,7 +534,7 @@ def _valid_file_mode(value: object) -> bool:
 
 
 def _valid_directory_mode(value: object) -> bool:
-    return _valid_permission_mode(value) and value & 0o300 == 0o300
+    return _valid_permission_mode(value) and value & 0o700 == 0o700
 
 
 def _validated_manifest_path(value: str, *, kind: str) -> Path:
@@ -625,6 +625,8 @@ def _validate_and_group(
 
 
 def _ensure_directory(home_fs: _HomeFS, path: Path, mode: int) -> bool:
+    if not _valid_directory_mode(mode):
+        raise ValueError(f"invalid directory mode: {path}")
     if home_fs.exists(path):
         item = home_fs.stat(path)
         if not stat.S_ISDIR(item.st_mode):
@@ -684,6 +686,8 @@ def _directory_evidence_path(transaction: Path, directory: Path) -> Path:
 
 
 def _directory_evidence_bytes(directory: Path, mode: int) -> bytes:
+    if not _valid_directory_mode(mode):
+        raise ValueError(f"invalid directory evidence mode: {directory}")
     evidence = {
         "schema_version": _DIRECTORY_EVIDENCE_SCHEMA_VERSION,
         "path": directory.as_posix(),
@@ -762,6 +766,16 @@ def install_provider_plans(
                 Path(item["path"]): (item["fingerprint"], item["mode"])
                 for item in prior_data["files"]
             } if prior_data is not None else {}
+            for directory in manifest.directories:
+                if not home_fs.exists(directory.path):
+                    continue
+                directory_stat = home_fs.stat(directory.path)
+                if stat.S_ISLNK(directory_stat.st_mode):
+                    raise OSError(f"managed directory is a symbolic link: {directory.path}")
+                if not stat.S_ISDIR(directory_stat.st_mode):
+                    raise ValueError(f"managed directory is not a directory: {directory.path}")
+                if not _valid_directory_mode(stat.S_IMODE(directory_stat.st_mode)):
+                    raise ValueError(f"invalid managed directory mode: {directory.path}")
             operations: list[dict[str, Any]] = []
             for index, item in enumerate(files):
                 destination_exists = home_fs.exists(item.path)
