@@ -224,7 +224,11 @@ class _HomeFS:
 
     def read_file(self, relative: Path) -> bytes:
         with self.parent(relative) as (parent, leaf):
-            descriptor = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent)
+            descriptor = os.open(
+                leaf,
+                os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW,
+                dir_fd=parent,
+            )
             try:
                 item = os.fstat(descriptor)
                 if not stat.S_ISREG(item.st_mode):
@@ -244,7 +248,11 @@ class _HomeFS:
 
     def matches_exact_file(self, relative: Path, content: bytes, mode: int) -> bool:
         with self.parent(relative) as (parent, leaf):
-            descriptor = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent)
+            descriptor = os.open(
+                leaf,
+                os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW,
+                dir_fd=parent,
+            )
             try:
                 item = os.fstat(descriptor)
                 if (
@@ -1570,7 +1578,13 @@ def recover_transaction(path: Path) -> DeploymentManifest:
         _validate_transaction_evidence(home_fs, record, relative)
         expected_manifest = base64.b64decode(record["manifest_content"], validate=True)
         manifest_path = Path(record["manifest_path"])
-        current_manifest = home_fs.read_optional(manifest_path)
+        try:
+            current_manifest = home_fs.read_optional(manifest_path)
+        except OSError as exc:
+            raise PublicationIndeterminateError(
+                "manifest publication remains indeterminate; "
+                "ownership manifest is not a readable regular file"
+            ) from exc
         if current_manifest == expected_manifest:
             try:
                 manifest_is_exact = home_fs.matches_exact_file(

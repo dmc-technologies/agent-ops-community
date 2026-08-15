@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import multiprocessing
 import os
 import socket
 import stat
 import threading
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -35,6 +37,36 @@ def _plan(
         target=TargetSpec("codex-dev", Framework.CODEX, home, "feature"),
         files=tuple(files),
     )
+
+
+def _run_bounded(function: Callable[[], object]) -> tuple[str, str]:
+    context = multiprocessing.get_context("fork")
+    receiver, sender = context.Pipe(duplex=False)
+
+    def invoke() -> None:
+        receiver.close()
+        try:
+            function()
+        except BaseException as exc:
+            sender.send((type(exc).__name__, str(exc)))
+        else:
+            sender.send(("returned", ""))
+        finally:
+            sender.close()
+
+    process = context.Process(target=invoke)
+    process.start()
+    sender.close()
+    process.join(timeout=2)
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=2)
+        pytest.fail("filesystem operation exceeded bounded deadline")
+    assert process.exitcode == 0
+    assert receiver.poll()
+    result = receiver.recv()
+    receiver.close()
+    return result
 
 
 def test_transaction_installs_and_audits_exact_plan(tmp_path: Path) -> None:
@@ -1232,3 +1264,82 @@ def test_recovery_does_not_commit_expected_manifest_bytes_at_wrong_mode(
         stat.S_IMODE(manifest_path.stat().st_mode),
         manifest_path.stat().st_mtime_ns,
     ) == manifest_before
+
+
+def test_fifo_manifest_publication_classification_does_not_block(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    plan = _plan(home, PlannedFile(Path("skills/example/SKILL.md"), b"body\n", 0o644))
+
+    def publish_fifo_then_fail(
+        home_fs: object,
+        _record_path: Path,
+        manifest_temp: Path,
+        manifest_path: Path,
+    ) -> None:
+        home_fs.replace(manifest_temp, Path(".agentops/deployment/lost-manifest"))
+        destination = home / manifest_path
+        destination.parent.mkdir()
+        os.mkfifo(destination, 0o600)
+        destination.chmod(0o600)
+        raise OSError("publication result unavailable")
+
+    monkeypatch.setattr(
+        transaction_module,
+        "_before_manifest_replace",
+        publish_fifo_then_fail,
+    )
+
+    result = _run_bounded(lambda: install_provider_plans((plan,)))
+
+    assert result[0] == "PublicationIndeterminateError"
+    record_path = next((home / ".agentops/deployment/transactions").glob("*/record.json"))
+    record = json.loads(record_path.read_text())
+    manifest_path = home / record["manifest_path"]
+    assert record["state"] == "indeterminate"
+    assert stat.S_ISFIFO(manifest_path.stat().st_mode)
+    assert stat.S_IMODE(manifest_path.stat().st_mode) == 0o600
+    assert (home / "skills/example/SKILL.md").read_bytes() == b"body\n"
+
+
+def test_recovery_rejects_fifo_manifest_without_blocking(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    plan = _plan(home, PlannedFile(Path("skills/example/SKILL.md"), b"body\n", 0o644))
+
+    def retain_unpublished_manifest(
+        home_fs: object,
+        _record_path: Path,
+        manifest_temp: Path,
+        _manifest_path: Path,
+    ) -> None:
+        home_fs.replace(manifest_temp, Path(".agentops/deployment/lost-manifest"))
+        raise OSError("publication result unavailable")
+
+    monkeypatch.setattr(
+        transaction_module,
+        "_before_manifest_replace",
+        retain_unpublished_manifest,
+    )
+    with pytest.raises(PublicationIndeterminateError):
+        install_provider_plans((plan,))
+
+    record_path = next((home / ".agentops/deployment/transactions").glob("*/record.json"))
+    record_before = record_path.read_bytes()
+    record = json.loads(record_before)
+    manifest_path = home / record["manifest_path"]
+    manifest_path.parent.mkdir()
+    os.mkfifo(manifest_path, 0o600)
+    manifest_path.chmod(0o600)
+
+    result = _run_bounded(lambda: recover_transaction(record_path))
+
+    assert result[0] == "PublicationIndeterminateError"
+    assert record_path.read_bytes() == record_before
+    assert json.loads(record_path.read_text())["state"] == "indeterminate"
+    assert stat.S_ISFIFO(manifest_path.stat().st_mode)
+    assert stat.S_IMODE(manifest_path.stat().st_mode) == 0o600
