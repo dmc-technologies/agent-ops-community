@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import multiprocessing
 import os
 import subprocess
 import threading
@@ -13,7 +14,14 @@ import pytest
 
 import agent_ops.deployment.source_store as source_store_module
 from agent_ops.deployment.models import RewriteAcceptance, SourceSnapshot, SourceSpec
-from agent_ops.deployment.source_store import SourceStore, _validate_provider_data_closure
+from agent_ops.deployment.source_store import (
+    SourceStore,
+    _GitTimeout,
+    _normalize_source_url,
+    _open_provider_data_closure,
+    _run_git,
+    _validate_provider_data_closure,
+)
 
 
 def _git(*args: str, cwd: Path | None = None) -> str:
@@ -44,6 +52,10 @@ def git_remote(tmp_path: Path) -> Path:
     _git("init", "-b", "main", str(work))
     (work / "catalog").mkdir()
     (work / "catalog" / "skill.txt").write_text("one\n")
+    (work / "catalog" / "inert.py").write_text(
+        "raise AssertionError('must remain inert')\n"
+    )
+    (work / ".gitignore").write_text("ignored-extra\n")
     _git("add", ".", cwd=work)
     _git("commit", "-m", "initial", cwd=work)
     _git("remote", "add", "origin", str(remote), cwd=work)
@@ -85,6 +97,22 @@ def _force_rewrite(remote: Path, ref: str, content: str) -> str:
     _git("commit", "-m", content.strip(), cwd=work)
     _git("push", "--force", "origin", f"HEAD:{ref}", cwd=work)
     return _git("rev-parse", "HEAD", cwd=work)
+
+
+def _process_fetch(
+    state: str,
+    remote: str,
+    barrier: multiprocessing.synchronize.Barrier,
+    results: multiprocessing.queues.Queue,
+) -> None:
+    try:
+        barrier.wait(timeout=10)
+        snapshot = SourceStore(Path(state)).fetch(
+            SourceSpec("example", remote), "refs/heads/main"
+        )
+        results.put(("ok", snapshot.commit))
+    except BaseException as error:
+        results.put(("error", repr(error)))
 
 
 def test_branch_refresh_resolves_one_immutable_commit(
@@ -180,7 +208,10 @@ def test_mirror_fetches_only_requested_ref(git_remote: Path, tmp_path: Path) -> 
     refs = set(_git("for-each-ref", "--format=%(refname)", cwd=mirror).splitlines())
     assert not any(ref.startswith("refs/remotes/") for ref in refs)
     assert not any(ref.startswith("refs/heads/") for ref in refs)
-    assert refs <= {"refs/agentops/fetched"}
+    expected = "refs/agentops/accepted/" + hashlib.sha256(
+        b"refs/heads/feat/example"
+    ).hexdigest()
+    assert refs == {expected}
 
 
 def test_fast_forward_refresh_records_new_snapshot(
@@ -365,6 +396,7 @@ def test_same_commit_fetched_from_another_ref_reports_requested_ref(
     store.fetch(_source(git_remote), "refs/heads/main")
     alias = store.fetch(_source(git_remote), "refs/heads/alias")
     assert alias.ref == "refs/heads/alias"
+    assert store.snapshot("example", alias.commit).ref == "refs/heads/main"
 
 
 @pytest.mark.parametrize("commit", ["abc", "g" * 40, "../" + "a" * 40])
@@ -382,7 +414,7 @@ def test_snapshot_lookup_normalizes_uppercase_and_rejects_tampering(
     store = SourceStore(tmp_path / "state")
     snapshot = store.fetch(_source(git_remote), "refs/heads/main")
     assert store.snapshot("example", snapshot.commit.upper()).commit == snapshot.commit
-    metadata = tmp_path / f"state/sources/example/snapshot-metadata/{snapshot.commit}.json"
+    metadata = snapshot.root / ".git/agentops-snapshot.json"
     metadata.write_text(
         json.dumps(
             {"source_id": "example", "ref": "refs/heads/main", "commit": "0" * 40}
@@ -436,7 +468,7 @@ def test_snapshot_lookup_rejects_missing_or_nonregular_state(
 ) -> None:
     store = SourceStore(tmp_path / "state")
     snapshot = store.fetch(_source(git_remote), "refs/heads/main")
-    metadata = tmp_path / f"state/sources/example/snapshot-metadata/{snapshot.commit}.json"
+    metadata = snapshot.root / ".git/agentops-snapshot.json"
     if replacement == "metadata-link":
         moved_metadata = metadata.with_suffix(".moved")
         metadata.rename(moved_metadata)
@@ -477,7 +509,9 @@ def test_unexpected_source_paths_and_failed_fetch_leave_no_temporaries(
     mirror.parent.mkdir(parents=True)
     mirror.symlink_to(tmp_path, target_is_directory=True)
     with pytest.raises(RuntimeError, match="mirror"):
-        SourceStore(state).fetch(SourceSpec("example", "/missing"), "refs/heads/main")
+        SourceStore(state).fetch(
+            SourceSpec("example", str(tmp_path)), "refs/heads/main"
+        )
     assert mirror.is_symlink()
     assert not list((state / "sources/example").glob(".tmp-*"))
 
@@ -485,7 +519,7 @@ def test_unexpected_source_paths_and_failed_fetch_leave_no_temporaries(
 def test_git_process_control_exception_propagates_unchanged(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    class StopGit(BaseException):
+    class StopGit(KeyboardInterrupt):
         pass
 
     stop = StopGit()
@@ -496,7 +530,7 @@ def test_git_process_control_exception_propagates_unchanged(
     monkeypatch.setattr(source_store_module, "_run_git", stop_git)
     with pytest.raises(StopGit) as caught:
         SourceStore(tmp_path / "state").fetch(
-            SourceSpec("example", "/missing"), "refs/heads/main"
+            SourceSpec("example", str(tmp_path)), "refs/heads/main"
         )
     assert caught.value is stop
     assert not list((tmp_path / "state/sources/example").glob(".tmp-*"))
@@ -535,15 +569,13 @@ def test_provider_data_closure_accepts_confined_inert_data(
     snapshot = SourceStore(tmp_path / "state").fetch(
         _source(git_remote), "refs/heads/main"
     )
-    code = snapshot.root / "catalog" / "inert.py"
-    code.write_text("raise AssertionError('must not execute')\n")
     validated = _validate_provider_data_closure(
         snapshot, (Path("catalog/skill.txt"), Path("catalog/inert.py"), Path("catalog"))
     )
-    assert validated == (
-        snapshot.root / "catalog/skill.txt",
-        snapshot.root / "catalog/inert.py",
-        snapshot.root / "catalog",
+    assert tuple(entry.relative_path for entry in validated) == (
+        Path("catalog/skill.txt"),
+        Path("catalog/inert.py"),
+        Path("catalog"),
     )
 
 
@@ -579,7 +611,7 @@ def test_provider_data_closure_rejects_symlink_escape(
     outside = tmp_path / "outside"
     outside.write_text("outside\n")
     (snapshot.root / "catalog/escape").symlink_to(outside)
-    with pytest.raises(RuntimeError, match="symlink"):
+    with pytest.raises(RuntimeError, match="snapshot worktree|symlink"):
         _validate_provider_data_closure(snapshot, (Path("catalog/escape"),))
 
 
@@ -594,8 +626,36 @@ def test_provider_data_directory_rejects_nested_symlink_escape(
     (snapshot.root / "catalog/nested-escape").symlink_to(
         outside, target_is_directory=True
     )
+    with pytest.raises(RuntimeError, match="snapshot worktree|symlink"):
+        _validate_provider_data_closure(snapshot, (Path("catalog"),))
+
+
+def test_provider_data_directory_rejects_tracked_symlink(
+    git_remote: Path, tmp_path: Path
+) -> None:
+    work = _remote_work(git_remote)
+    _git("checkout", "main", cwd=work)
+    (work / "catalog/tracked-link").symlink_to("../../outside")
+    _git("add", "catalog/tracked-link", cwd=work)
+    _git("commit", "-m", "tracked symlink", cwd=work)
+    _git("push", "origin", "HEAD:refs/heads/main", cwd=work)
+    snapshot = SourceStore(tmp_path / "state").fetch(
+        _source(git_remote), "refs/heads/main"
+    )
     with pytest.raises(RuntimeError, match="symlink"):
         _validate_provider_data_closure(snapshot, (Path("catalog"),))
+
+
+def test_provider_data_closure_rejects_duplicate_paths(
+    git_remote: Path, tmp_path: Path
+) -> None:
+    snapshot = SourceStore(tmp_path / "state").fetch(
+        _source(git_remote), "refs/heads/main"
+    )
+    with pytest.raises(ValueError, match="duplicate"):
+        _validate_provider_data_closure(
+            snapshot, (Path("catalog/skill.txt"), Path("catalog/skill.txt"))
+        )
 
 
 def test_ref_state_uses_canonical_strict_json(git_remote: Path, tmp_path: Path) -> None:
@@ -610,3 +670,406 @@ def test_ref_state_uses_canonical_strict_json(git_remote: Path, tmp_path: Path) 
     )
     with pytest.raises(RuntimeError, match="duplicate"):
         store.fetch(_source(git_remote), "refs/heads/main")
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "ext::touch /tmp/sentinel",
+        "evil::payload",
+        "ftp://example.invalid/repo.git",
+        "git://example.invalid/repo.git",
+        "-u./repo",
+        "https://example.invalid/repo.git\n--upload-pack=evil",
+        "ssh://example.invalid/repo.git\x00evil",
+        "nosuchscheme://example.invalid/repo.git",
+        "example.invalid:-upload-pack=evil",
+    ],
+)
+def test_source_url_allowlist_rejects_before_mutation(tmp_path: Path, url: str) -> None:
+    state = tmp_path / "state"
+    with pytest.raises(ValueError, match="source URL"):
+        SourceStore(state).fetch(SourceSpec("example", url), "refs/heads/main")
+    assert not state.exists()
+
+
+def test_remote_helper_cannot_execute_from_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sentinel = tmp_path / "sentinel"
+    binary = tmp_path / "bin"
+    binary.mkdir()
+    helper = binary / "git-remote-evil"
+    helper.write_text(f"#!/bin/sh\nprintf executed > {sentinel}\n")
+    helper.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{binary}{os.pathsep}{os.environ['PATH']}")
+    state = tmp_path / "state"
+    with pytest.raises(ValueError, match="source URL"):
+        SourceStore(state).fetch(
+            SourceSpec("example", "evil::payload"), "refs/heads/main"
+        )
+    assert not state.exists()
+    assert not sentinel.exists()
+
+
+def test_non_string_source_url_rejects_before_mutation(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    source = SourceSpec("example", 123)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="source URL"):
+        SourceStore(state).fetch(source, "refs/heads/main")
+    assert not state.exists()
+
+
+def test_source_url_allowlist_canonicalizes_supported_forms(git_remote: Path) -> None:
+    assert _normalize_source_url(str(git_remote)) == str(git_remote.resolve())
+    assert _normalize_source_url(git_remote.as_uri()) == git_remote.resolve().as_uri()
+    assert _normalize_source_url("https://example.invalid/repo.git") == (
+        "https://example.invalid/repo.git"
+    )
+    assert _normalize_source_url("ssh://user@example.invalid/repo.git") == (
+        "ssh://user@example.invalid/repo.git"
+    )
+    assert _normalize_source_url("user@example.invalid:repo.git") == (
+        "user@example.invalid:repo.git"
+    )
+    assert _normalize_source_url("git-host:repo.git") == "git-host:repo.git"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["untracked", "ignored", "assume-unchanged", "skip-worktree", "mode", "type"],
+)
+def test_snapshot_lookup_compares_exact_head_tree(
+    git_remote: Path, tmp_path: Path, mutation: str
+) -> None:
+    store = SourceStore(tmp_path / "state")
+    snapshot = store.fetch(_source(git_remote), "refs/heads/main")
+    tracked = snapshot.root / "catalog/skill.txt"
+    if mutation == "untracked":
+        (snapshot.root / "extra").write_text("extra\n")
+    elif mutation == "ignored":
+        (snapshot.root / "ignored-extra").write_text("ignored\n")
+    elif mutation == "assume-unchanged":
+        _git("update-index", "--assume-unchanged", "catalog/skill.txt", cwd=snapshot.root)
+        tracked.write_text("changed\n")
+    elif mutation == "skip-worktree":
+        _git("update-index", "--skip-worktree", "catalog/skill.txt", cwd=snapshot.root)
+        tracked.write_text("changed\n")
+    elif mutation == "mode":
+        tracked.chmod(0o755)
+    else:
+        tracked.unlink()
+        tracked.mkdir()
+    with pytest.raises(RuntimeError, match="snapshot worktree"):
+        store.snapshot("example", snapshot.commit)
+
+
+def test_closure_requires_exact_tracked_head_entry(
+    git_remote: Path, tmp_path: Path
+) -> None:
+    snapshot = SourceStore(tmp_path / "state").fetch(
+        _source(git_remote), "refs/heads/main"
+    )
+    (snapshot.root / "untracked-data").write_text("outside identity\n")
+    with pytest.raises(RuntimeError, match="snapshot worktree"):
+        _validate_provider_data_closure(snapshot, (Path("untracked-data"),))
+
+
+def test_partial_snapshot_publication_self_heals(git_remote: Path, tmp_path: Path) -> None:
+    store = SourceStore(tmp_path / "state")
+    source = _source(git_remote)
+    snapshot = store.fetch(source, "refs/heads/main")
+    (snapshot.root / ".git/agentops-snapshot.json").unlink()
+    stale = tmp_path / "state/sources/example/.tmp-snapshot-dead"
+    stale.mkdir()
+    (stale / "partial").write_text("partial\n")
+    repaired = store.fetch(source, "refs/heads/main")
+    assert repaired.commit == snapshot.commit
+    assert (repaired.root / ".git/agentops-snapshot.json").is_file()
+    assert not stale.exists()
+
+
+def test_legacy_metadata_only_state_self_heals(git_remote: Path, tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    source_root = state / "sources/example"
+    legacy = source_root / "snapshot-metadata"
+    legacy.mkdir(parents=True)
+    commit = _git("rev-parse", "refs/heads/main", cwd=git_remote)
+    (legacy / f"{commit}.json").write_text("{}\n")
+    snapshot = SourceStore(state).fetch(_source(git_remote), "refs/heads/main")
+    assert snapshot.commit == commit
+    assert not (legacy / f"{commit}.json").exists()
+
+
+def test_legacy_metadata_parent_symlink_never_unlinks_outside(
+    git_remote: Path, tmp_path: Path
+) -> None:
+    state = tmp_path / "state"
+    source_root = state / "sources/example"
+    source_root.mkdir(parents=True)
+    outside = tmp_path / "outside-metadata"
+    outside.mkdir()
+    commit = _git("rev-parse", "refs/heads/main", cwd=git_remote)
+    sentinel = outside / f"{commit}.json"
+    sentinel.write_text("outside\n")
+    (source_root / "snapshot-metadata").symlink_to(
+        outside, target_is_directory=True
+    )
+    with pytest.raises(RuntimeError, match="legacy snapshot metadata directory"):
+        SourceStore(state).fetch(_source(git_remote), "refs/heads/main")
+    assert sentinel.read_text() == "outside\n"
+
+
+def test_snapshot_metadata_publishes_inside_atomic_directory(
+    git_remote: Path, tmp_path: Path
+) -> None:
+    snapshot = SourceStore(tmp_path / "state").fetch(
+        _source(git_remote), "refs/heads/main"
+    )
+    source_root = tmp_path / "state/sources/example"
+    assert (snapshot.root / ".git/agentops-snapshot.json").is_file()
+    assert not (source_root / "snapshot-metadata").exists()
+
+
+def test_per_ref_history_survives_gc_for_exact_rewrite(
+    git_remote: Path, tmp_path: Path
+) -> None:
+    store = SourceStore(tmp_path / "state")
+    source = _source(git_remote)
+    ref = "refs/heads/feat/example"
+    previous = store.fetch(source, ref)
+    rewritten = _force_rewrite(git_remote, ref, "after gc rewrite\n")
+    mirror = tmp_path / "state/sources/example/mirror.git"
+    _git("gc", "--prune=now", cwd=mirror)
+    accepted = store.fetch(
+        source, ref, rewrite=RewriteAcceptance(previous.commit, rewritten)
+    )
+    assert accepted.commit == rewritten
+
+
+def test_two_refs_retain_independent_accepted_history(
+    git_remote: Path, tmp_path: Path
+) -> None:
+    store = SourceStore(tmp_path / "state")
+    source = _source(git_remote)
+    main = store.fetch(source, "refs/heads/main")
+    feature = store.fetch(source, "refs/heads/feat/example")
+    mirror = tmp_path / "state/sources/example/mirror.git"
+    refs = _git("for-each-ref", "--format=%(refname) %(objectname)", cwd=mirror)
+    assert hashlib.sha256(b"refs/heads/main").hexdigest() in refs
+    assert hashlib.sha256(b"refs/heads/feat/example").hexdigest() in refs
+    assert main.commit in refs
+    assert feature.commit in refs
+
+
+@pytest.mark.parametrize(
+    ("ref", "message"),
+    [
+        ("refs/heads/main", "stable ref history"),
+        ("refs/heads/feat/example", "development ref history"),
+    ],
+)
+def test_missing_retained_history_is_deterministic_policy_error(
+    git_remote: Path, tmp_path: Path, ref: str, message: str
+) -> None:
+    store = SourceStore(tmp_path / "state")
+    source = _source(git_remote)
+    store.fetch(source, ref)
+    mirror = tmp_path / "state/sources/example/mirror.git"
+    accepted_ref = "refs/agentops/accepted/" + hashlib.sha256(ref.encode()).hexdigest()
+    _git("update-ref", "-d", accepted_ref, cwd=mirror)
+    _git("reflog", "expire", "--expire=now", "--all", cwd=mirror)
+    _git("gc", "--prune=now", cwd=mirror)
+    with pytest.raises(RuntimeError, match=message):
+        store.fetch(source, ref)
+
+
+def test_descriptor_closure_pins_entry_and_rejects_replacement(
+    git_remote: Path, tmp_path: Path
+) -> None:
+    snapshot = SourceStore(tmp_path / "state").fetch(
+        _source(git_remote), "refs/heads/main"
+    )
+    target = snapshot.root / "catalog/skill.txt"
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"outside secret\n")
+    with _open_provider_data_closure(
+        snapshot, (Path("catalog/skill.txt"),)
+    ) as closure:
+        entry = closure.entries[0]
+        assert entry.read_bytes() == b"one\n"
+        moved = target.with_name("skill.moved")
+        target.rename(moved)
+        target.symlink_to(outside)
+        with pytest.raises(RuntimeError, match="changed during consumption"):
+            entry.read_bytes()
+    assert closure.closed
+
+
+def test_descriptor_closure_binds_root_before_verification_returns(
+    git_remote: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot = SourceStore(tmp_path / "state").fetch(
+        _source(git_remote), "refs/heads/main"
+    )
+    original = source_store_module._verify_exact_checkout
+    moved = snapshot.root.with_name("verified-root")
+
+    def replace_after_verify(*args: object, **kwargs: object) -> object:
+        expected = original(*args, **kwargs)
+        snapshot.root.rename(moved)
+        snapshot.root.mkdir()
+        (snapshot.root / "catalog").mkdir()
+        (snapshot.root / "catalog/skill.txt").write_bytes(b"outside secret\n")
+        return expected
+
+    monkeypatch.setattr(
+        source_store_module, "_verify_exact_checkout", replace_after_verify
+    )
+    with pytest.raises(RuntimeError, match="changed during verification"):
+        _open_provider_data_closure(snapshot, (Path("catalog/skill.txt"),))
+
+
+def test_descriptor_closure_closes_on_process_control(
+    git_remote: Path, tmp_path: Path
+) -> None:
+    class StopConsumption(BaseException):
+        pass
+
+    stop = StopConsumption()
+    snapshot = SourceStore(tmp_path / "state").fetch(
+        _source(git_remote), "refs/heads/main"
+    )
+    closure = _open_provider_data_closure(
+        snapshot, (Path("catalog/skill.txt"),)
+    )
+    with pytest.raises(StopConsumption) as caught, closure:
+        raise stop
+    assert caught.value is stop
+    assert closure.closed
+
+
+def test_metadata_replacement_race_rejects_pinned_old_bytes(
+    git_remote: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SourceStore(tmp_path / "state")
+    snapshot = store.fetch(_source(git_remote), "refs/heads/main")
+    metadata = snapshot.root / ".git/agentops-snapshot.json"
+    outside = tmp_path / "outside-metadata"
+    outside.write_text(metadata.read_text())
+    original = source_store_module._read_fd_bytes
+    replaced = False
+
+    def replace_after_open(descriptor: int) -> bytes:
+        nonlocal replaced
+        if not replaced:
+            replaced = True
+            moved = metadata.with_name("agentops-snapshot.moved")
+            metadata.rename(moved)
+            metadata.symlink_to(outside)
+        return original(descriptor)
+
+    monkeypatch.setattr(source_store_module, "_read_fd_bytes", replace_after_open)
+    with pytest.raises(RuntimeError, match="metadata changed during read"):
+        store.snapshot("example", snapshot.commit)
+
+
+def test_git_timeout_kills_complete_process_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    binary = tmp_path / "bin"
+    binary.mkdir()
+    marker = tmp_path / "child-pid"
+    fake_git = binary / "git"
+    fake_git.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, signal, subprocess, sys\n"
+        "child = subprocess.Popen([sys.executable, '-c', "
+        "'import signal; signal.pause()'])\n"
+        f"open({str(marker)!r}, 'w').write(str(child.pid))\n"
+        "signal.pause()\n"
+    )
+    fake_git.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{binary}{os.pathsep}{os.environ['PATH']}")
+    with pytest.raises(_GitTimeout, match="timed out"):
+        _run_git(("version",), timeout=0.2)
+    child_pid = int(marker.read_text())
+    child_state = Path(f"/proc/{child_pid}/stat")
+    try:
+        state = child_state.read_text().split()[2]
+    except (FileNotFoundError, ProcessLookupError):
+        state = "gone"
+    assert state in {"gone", "Z"}
+
+
+def test_git_runner_preserves_process_control_when_cleanup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StopGit(KeyboardInterrupt):
+        pass
+
+    stop = StopGit()
+
+    class FailingProcess:
+        pid = 987654321
+        returncode = None
+
+        def communicate(self, timeout: float) -> tuple[str, str]:
+            if timeout == 1.0:
+                raise RuntimeError("cleanup failed")
+            raise stop
+
+        def poll(self) -> None:
+            return None
+
+    monkeypatch.setattr(source_store_module.subprocess, "Popen", lambda *a, **k: FailingProcess())
+    with pytest.raises(StopGit) as caught:
+        _run_git(("version",), timeout=0.2)
+    assert caught.value is stop
+
+
+def test_source_store_passes_configured_git_timeout(
+    git_remote: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[float] = []
+    original = source_store_module._run_git
+
+    def observe_timeout(*args: object, **kwargs: object) -> object:
+        observed.append(kwargs["timeout"])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(source_store_module, "_run_git", observe_timeout)
+    SourceStore(tmp_path / "state", git_timeout=3.5).fetch(
+        _source(git_remote), "refs/heads/main"
+    )
+    assert observed and set(observed) == {3.5}
+
+
+def test_cross_process_same_source_creation_is_coherent(
+    git_remote: Path, tmp_path: Path
+) -> None:
+    context = multiprocessing.get_context("fork")
+    barrier = context.Barrier(2)
+    results = context.Queue()
+    processes = [
+        context.Process(
+            target=_process_fetch,
+            args=(str(tmp_path / "state"), str(git_remote), barrier, results),
+        )
+        for _ in range(2)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=20)
+        assert not process.is_alive()
+        assert process.exitcode == 0
+    observed = [results.get(timeout=5) for _ in processes]
+    assert {status for status, _ in observed} == {"ok"}
+    assert len({commit for _, commit in observed}) == 1
