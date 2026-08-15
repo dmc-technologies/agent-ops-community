@@ -42,6 +42,7 @@ _TRANSACTION_SCHEMA_VERSION = 3
 _DIRECTORY_EVIDENCE_SCHEMA_VERSION = 1
 _OWNERSHIP_MANIFEST_MODE = 0o600
 _METADATA = Path(".agentops/deployment")
+_LOCK_NAME = ".agentops-deployment.lock"
 _TRANSACTION_PATHS: dict[str, Path] = {}
 _POSIX_SUPPORTED = os.name == "posix" and fcntl is not None
 
@@ -91,6 +92,22 @@ def _safe_relative(path: Path) -> Path:
         or any(part == ".." for part in windows.parts)
     ):
         raise ValueError(f"unsafe managed path: {path}")
+    return path
+
+
+def _canonical_relative_text(value: object, *, label: str) -> Path:
+    if (
+        not isinstance(value, str)
+        or not value
+        or "\\" in value
+        or value.startswith("/")
+        or value.endswith("/")
+        or any(part in {"", ".", ".."} for part in value.split("/"))
+    ):
+        raise ValueError(f"unsafe noncanonical {label} path")
+    path = _safe_relative(Path(value))
+    if path.as_posix() != value:
+        raise ValueError(f"unsafe noncanonical {label} path")
     return path
 
 
@@ -162,13 +179,17 @@ class _HomeFS:
         home: Path,
         descriptor: int,
         *,
-        lock_parent: int | None = None,
+        canonical_parent: int | None = None,
+        canonical_home_name: str | None = None,
+        home_identity: tuple[int, int] | None = None,
         lock_name: str | None = None,
         lock_identity: tuple[int, int] | None = None,
     ) -> None:
         self.home = home
         self.descriptor = descriptor
-        self._lock_parent = lock_parent
+        self._canonical_parent = canonical_parent
+        self._canonical_home_name = canonical_home_name
+        self._home_identity = home_identity
         self._lock_name = lock_name
         self._lock_identity = lock_identity
 
@@ -180,25 +201,34 @@ class _HomeFS:
 
     def verify_lock_identity(self) -> None:
         if (
-            self._lock_parent is None
+            self._canonical_parent is None
+            or self._canonical_home_name is None
+            or self._home_identity is None
             or self._lock_name is None
             or self._lock_identity is None
         ):
             return
         try:
-            item = os.stat(
+            home_item = os.stat(
+                self._canonical_home_name,
+                dir_fd=self._canonical_parent,
+                follow_symlinks=False,
+            )
+            lock_item = os.stat(
                 self._lock_name,
-                dir_fd=self._lock_parent,
+                dir_fd=self.descriptor,
                 follow_symlinks=False,
             )
         except OSError as exc:
-            raise ValueError("deployment lock identity changed") from exc
+            raise ValueError("deployment home or lock identity changed") from exc
         if (
-            not stat.S_ISREG(item.st_mode)
-            or item.st_nlink != 1
-            or (item.st_dev, item.st_ino) != self._lock_identity
+            not stat.S_ISDIR(home_item.st_mode)
+            or (home_item.st_dev, home_item.st_ino) != self._home_identity
+            or not stat.S_ISREG(lock_item.st_mode)
+            or lock_item.st_nlink != 1
+            or (lock_item.st_dev, lock_item.st_ino) != self._lock_identity
         ):
-            raise ValueError("deployment lock identity changed")
+            raise ValueError("deployment home or lock identity changed")
 
     @staticmethod
     def _parts(relative: Path) -> tuple[str, ...]:
@@ -493,46 +523,65 @@ def _target_lock(home: Path) -> Iterator[_HomeFS]:
     parent = _open_absolute_directory(home.parent, create=True)
     try:
         assert fcntl is not None
-        fcntl.flock(parent, fcntl.LOCK_EX)
-        lock_name = f".{home.name}.agentops-deployment.lock"
-        lock = os.open(
-            lock_name,
-            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
-            0o600,
-            dir_fd=parent,
+        home_descriptor = _open_directory_at(
+            parent,
+            home.name,
+            create=True,
+            mode=0o700,
         )
         try:
-            lock_stat = os.fstat(lock)
-            if not stat.S_ISREG(lock_stat.st_mode) or lock_stat.st_nlink != 1:
-                raise ValueError("deployment lock is not a regular file")
-            os.fchmod(lock, 0o600)
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            canonical = os.stat(lock_name, dir_fd=parent, follow_symlinks=False)
-            if (canonical.st_dev, canonical.st_ino) != (
-                lock_stat.st_dev,
-                lock_stat.st_ino,
-            ):
-                raise ValueError("deployment lock identity changed")
-            home_descriptor = _open_directory_at(
-                parent,
+            home_stat = os.fstat(home_descriptor)
+            fcntl.flock(home_descriptor, fcntl.LOCK_EX)
+            canonical_home = os.stat(
                 home.name,
-                create=True,
-                mode=0o700,
+                dir_fd=parent,
+                follow_symlinks=False,
             )
-            with _HomeFS(
-                home,
-                home_descriptor,
-                lock_parent=parent,
-                lock_name=lock_name,
-                lock_identity=(lock_stat.st_dev, lock_stat.st_ino),
-            ) as home_fs:
-                yield home_fs
+            if (
+                not stat.S_ISDIR(canonical_home.st_mode)
+                or (canonical_home.st_dev, canonical_home.st_ino)
+                != (home_stat.st_dev, home_stat.st_ino)
+            ):
+                raise ValueError("deployment home identity changed")
+            lock_name = _LOCK_NAME
+            lock = os.open(
+                lock_name,
+                os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+                0o600,
+                dir_fd=home_descriptor,
+            )
+            try:
+                lock_stat = os.fstat(lock)
+                if not stat.S_ISREG(lock_stat.st_mode) or lock_stat.st_nlink != 1:
+                    raise ValueError("deployment lock is not a regular file")
+                os.fchmod(lock, 0o600)
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                canonical = os.stat(
+                    lock_name,
+                    dir_fd=home_descriptor,
+                    follow_symlinks=False,
+                )
+                if (canonical.st_dev, canonical.st_ino) != (
+                    lock_stat.st_dev,
+                    lock_stat.st_ino,
+                ):
+                    raise ValueError("deployment lock identity changed")
+                yield _HomeFS(
+                    home,
+                    home_descriptor,
+                    canonical_parent=parent,
+                    canonical_home_name=home.name,
+                    home_identity=(home_stat.st_dev, home_stat.st_ino),
+                    lock_name=lock_name,
+                    lock_identity=(lock_stat.st_dev, lock_stat.st_ino),
+                )
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+                os.close(lock)
         finally:
-            fcntl.flock(lock, fcntl.LOCK_UN)
-            os.close(lock)
+            fcntl.flock(home_descriptor, fcntl.LOCK_UN)
+            os.close(home_descriptor)
     finally:
-        if fcntl is not None:
-            fcntl.flock(parent, fcntl.LOCK_UN)
         os.close(parent)
 
 
@@ -755,10 +804,12 @@ def _read_ownership_manifest_for_audit(
 
 
 def _validated_manifest_path(value: str, *, kind: str) -> Path:
-    path = _safe_relative(Path(value))
-    if path.as_posix() != value:
-        raise ValueError(f"invalid deployment manifest non-normalized {kind} path")
-    return path
+    try:
+        return _canonical_relative_text(value, label=f"deployment manifest {kind}")
+    except ValueError as exc:
+        raise ValueError(
+            f"invalid deployment manifest non-normalized {kind} path"
+        ) from exc
 
 
 def _frontmatter_name(content: bytes) -> str | None:
@@ -817,22 +868,22 @@ def _validate_and_group(
         planned_removals = removals.setdefault(key, set())
         for item in plan.files:
             path = _safe_relative(item.path)
-            if path.parts[0] == ".agentops":
+            if path.parts[0] in {".agentops", _LOCK_NAME}:
                 raise ValueError(f"planned path overlaps reserved metadata: {path}")
             if not isinstance(item.content, bytes) or not _valid_file_mode(item.mode):
                 raise ValueError(f"invalid planned file: {path}")
             prior = files.get(path)
             if prior is not None:
-                raise ValueError(f"duplicate planned destination: {path}")
+                if prior.content != item.content or prior.mode != item.mode:
+                    raise ValueError(f"conflicting duplicate planned destination: {path}")
+                continue
             files[path] = item
         for removal in plan.removals:
             removal_path = _safe_relative(removal)
-            if removal_path.parts[0] == ".agentops":
+            if removal_path.parts[0] in {".agentops", _LOCK_NAME}:
                 raise ValueError(
                     f"planned removal overlaps reserved metadata: {removal_path}"
                 )
-            if removal_path in planned_removals:
-                raise ValueError(f"duplicate planned removal: {removal_path}")
             planned_removals.add(removal_path)
     for key, files in groups.items():
         file_paths = sorted(files, key=str)
@@ -995,6 +1046,25 @@ def _verify_planned_final_state(
     for path in removals:
         if home_fs.exists(path):
             raise ValueError(f"final deployment removal still exists: {path}")
+
+
+def _verify_recovery_final_state(
+    home_fs: _HomeFS,
+    manifest: DeploymentManifest,
+    record: dict[str, Any],
+) -> None:
+    removals = tuple(
+        Path(operation["destination"])
+        for operation in record["operations"]
+        if operation["kind"] == "removal"
+    )
+    try:
+        home_fs.verify_lock_identity()
+        _verify_planned_final_state(home_fs, manifest, removals)
+    except (OSError, ValueError) as exc:
+        raise PublicationIndeterminateError(
+            "recovery final state is invalid; evidence retained"
+        ) from exc
 
 
 def _verify_prior_prestate(
@@ -1502,7 +1572,11 @@ def _decode_record(
     if manifest.transaction_id != transaction_id:
         raise ValueError("invalid transaction record identifier")
     transaction = _METADATA / "transactions" / transaction_id
-    if record.get("manifest_path") != _manifest_path(target).as_posix():
+    manifest_path = _canonical_relative_text(
+        record.get("manifest_path"),
+        label="transaction manifest",
+    )
+    if manifest_path != _manifest_path(target):
         raise ValueError("unsafe transaction record manifest path")
     try:
         manifest_content = base64.b64decode(record["manifest_content"], validate=True)
@@ -1553,12 +1627,16 @@ def _decode_record(
             },
             label="transaction operation",
         )
-        if not isinstance(operation.get("destination"), str):
-            raise ValueError("invalid transaction record destination")
-        destination = _safe_relative(Path(operation["destination"]))
+        destination = _canonical_relative_text(
+            operation.get("destination"),
+            label="transaction destination",
+        )
         if destination in destinations:
             raise ValueError("invalid duplicate transaction destination")
         destinations.add(destination)
+        operation_index = operation.get("index")
+        if type(operation_index) is not int or operation_index < 0:
+            raise ValueError("invalid transaction operation index")
         expected_fingerprint = operation.get("expected_fingerprint")
         expected_mode = operation.get("expected_mode")
         if operation["kind"] == "removal":
@@ -1572,22 +1650,28 @@ def _decode_record(
         ):
             raise ValueError("invalid transaction expected file")
         staged = operation.get("staged")
+        staged_path = (
+            _canonical_relative_text(staged, label="transaction staged")
+            if staged is not None
+            else None
+        )
         expected_staged = (
-            (transaction / "rendered" / destination).as_posix()
+            transaction / "rendered" / destination
             if operation["kind"] == "installed"
             else None
         )
-        if staged != expected_staged:
+        if staged_path != expected_staged:
             raise ValueError("unsafe transaction staged path")
         backup = operation.get("backup")
         if backup is not None:
-            if not isinstance(backup, str):
-                raise ValueError("unsafe transaction backup path")
-            backup_path = _safe_relative(Path(backup))
-            if backup_path.parent != transaction / "backups":
-                raise ValueError("unsafe transaction backup path")
+            backup_path = _canonical_relative_text(
+                backup,
+                label="transaction backup",
+            )
             if backup_path in backup_paths:
                 raise ValueError("invalid duplicate transaction backup")
+            if backup_path != transaction / "backups" / f"{operation_index:04d}":
+                raise ValueError("unsafe transaction backup path")
             backup_paths.add(backup_path)
         prior_fingerprint = operation.get("prior_fingerprint")
         prior_mode = operation.get("prior_mode")
@@ -1665,17 +1749,28 @@ def _decode_record(
             {"path", "created", "mode", "prestate_evidence"},
             label="transaction directories do not match manifest",
         )
-        directory_path = _safe_relative(Path(directory["path"]))
+        directory_path = _canonical_relative_text(
+            directory["path"],
+            label="transaction directory",
+        )
         if directory_path in directory_paths:
             raise ValueError("transaction directories do not match manifest")
         directory_paths.add(directory_path)
         evidence = directory.get("prestate_evidence")
-        expected_evidence = _directory_evidence_path(transaction, directory_path).as_posix()
+        evidence_path = (
+            _canonical_relative_text(
+                evidence,
+                label="transaction directory evidence",
+            )
+            if evidence is not None
+            else None
+        )
+        expected_evidence = _directory_evidence_path(transaction, directory_path)
         if (
             directory["created"]
-            and evidence is not None
+            and evidence_path is not None
             or not directory["created"]
-            and evidence != expected_evidence
+            and evidence_path != expected_evidence
         ):
             raise ValueError("transaction directory pre-state evidence is incoherent")
     manifest_directories = {
@@ -1732,6 +1827,7 @@ def _validate_transaction_evidence(
     record_path: Path,
     *,
     missing_backup_error: type[Exception] = ValueError,
+    allow_missing: bool = False,
 ) -> None:
     transaction = record_path.parent
     backup_root = transaction / "backups"
@@ -1748,7 +1844,7 @@ def _validate_transaction_evidence(
         raise ValueError("transaction backup evidence has invalid entries")
     actual_backups = set(backup_entries)
     missing_backups = expected_backups - actual_backups
-    if missing_backups:
+    if missing_backups and not allow_missing:
         missing = min(missing_backups, key=str)
         raise missing_backup_error(
             f"rollback incomplete: backup evidence is missing: {missing}"
@@ -1769,13 +1865,17 @@ def _validate_transaction_evidence(
     if invalid_directories:
         raise ValueError("transaction directory pre-state evidence has invalid entries")
     actual_directories = set(directory_entries)
-    if actual_directories != expected_directories:
+    if actual_directories - expected_directories or (
+        not allow_missing and expected_directories - actual_directories
+    ):
         raise ValueError("transaction directory pre-state evidence is not one-to-one")
     for directory in record["directories"]:
         evidence_text = directory["prestate_evidence"]
         if evidence_text is None:
             continue
         evidence_path = Path(evidence_text)
+        if evidence_path not in actual_directories:
+            continue
         expected_content = _directory_evidence_bytes(
             Path(directory["path"]),
             directory["mode"],
@@ -1787,6 +1887,89 @@ def _validate_transaction_evidence(
             or home_fs.read_file(evidence_path) != expected_content
         ):
             raise ValueError("transaction directory pre-state evidence is invalid")
+
+
+def _rollback_link_path(record_path: Path, operation: dict[str, Any]) -> Path:
+    return record_path.parent / "rollback" / f"{operation['index']:04d}"
+
+
+def _rollback_is_complete(
+    home_fs: _HomeFS,
+    record: dict[str, Any],
+    prior_data: dict[str, Any] | None,
+    prior_manifest: bytes | None,
+) -> bool:
+    try:
+        _verify_completed_rollback(home_fs, record, prior_data, prior_manifest)
+    except IncompleteRollbackError:
+        return False
+    return True
+
+
+def _cleanup_rollback_evidence(
+    home_fs: _HomeFS,
+    record: dict[str, Any],
+    record_path: Path,
+    expected_manifest: bytes,
+) -> None:
+    _validate_transaction_evidence(
+        home_fs,
+        record,
+        record_path,
+        missing_backup_error=IncompleteRollbackError,
+        allow_missing=True,
+    )
+    manifest_temp = record_path.parent / "manifest.tmp"
+    if home_fs.exists(manifest_temp):
+        if not home_fs.matches_exact_file(
+            manifest_temp,
+            expected_manifest,
+            _OWNERSHIP_MANIFEST_MODE,
+        ):
+            raise IncompleteRollbackError("rollback cleanup manifest temporary changed")
+        home_fs.unlink(manifest_temp)
+    for operation in record["operations"]:
+        staged = Path(operation["staged"]) if operation["staged"] else None
+        if staged is not None and home_fs.exists(staged):
+            if not _file_matches(
+                home_fs,
+                staged,
+                operation["expected_fingerprint"],
+                operation["expected_mode"],
+            ):
+                raise IncompleteRollbackError(
+                    f"rollback cleanup staged file changed: {staged}"
+                )
+            home_fs.unlink(staged)
+        rollback_link = _rollback_link_path(record_path, operation)
+        if home_fs.exists(rollback_link):
+            if not _file_matches(
+                home_fs,
+                rollback_link,
+                operation["prior_fingerprint"],
+                operation["prior_mode"],
+            ):
+                raise IncompleteRollbackError(
+                    f"rollback cleanup restore link changed: {rollback_link}"
+                )
+            home_fs.unlink(rollback_link)
+        backup = Path(operation["backup"]) if operation["backup"] else None
+        if backup is not None and home_fs.exists(backup):
+            if not _file_matches(
+                home_fs,
+                backup,
+                operation["prior_fingerprint"],
+                operation["prior_mode"],
+            ):
+                raise IncompleteRollbackError(
+                    f"rollback cleanup backup changed: {backup}"
+                )
+            home_fs.unlink(backup)
+    for directory in record["directories"]:
+        evidence = directory["prestate_evidence"]
+        if evidence is not None and home_fs.exists(Path(evidence)):
+            home_fs.unlink(Path(evidence))
+    _prune_transaction_directories(home_fs, record_path.parent, record)
 
 
 def _rollback_record(
@@ -1815,8 +1998,20 @@ def _rollback_record(
             "recovery",
         )
         prior_data = _validated_manifest_data(prior_manifest, target=recovery_target)
+    expected_manifest = base64.b64decode(record["manifest_content"], validate=True)
     if record["state"] == "rolled-back":
         _verify_completed_rollback(home_fs, record, prior_data, prior_manifest)
+        try:
+            _cleanup_rollback_evidence(
+                home_fs,
+                record,
+                record_path,
+                expected_manifest,
+            )
+        except (OSError, ValueError) as exc:
+            raise IncompleteRollbackError(
+                "rollback cleanup incomplete; evidence retained"
+            ) from exc
         return
     _validate_transaction_evidence(
         home_fs,
@@ -1824,7 +2019,6 @@ def _rollback_record(
         record_path,
         missing_backup_error=IncompleteRollbackError,
     )
-    expected_manifest = base64.b64decode(record["manifest_content"], validate=True)
     manifest_path = Path(record["manifest_path"])
     current_manifest = home_fs.read_optional(manifest_path)
     if current_manifest not in {expected_manifest, prior_manifest, None}:
@@ -1833,26 +2027,31 @@ def _rollback_record(
         destination = Path(operation["destination"])
         backup = Path(operation["backup"]) if operation["backup"] else None
         kind = operation["kind"]
-        if kind == "installed" and home_fs.exists(destination) and not _file_matches(
-            home_fs,
-            destination,
-            operation["expected_fingerprint"],
-            operation["expected_mode"],
-        ):
-            raise IncompleteRollbackError(
-                f"rollback incomplete: installed destination changed: {destination}"
+        if kind == "installed" and home_fs.exists(destination):
+            matches_expected = _file_matches(
+                home_fs,
+                destination,
+                operation["expected_fingerprint"],
+                operation["expected_mode"],
             )
+            matches_prior = backup is not None and _file_matches(
+                home_fs,
+                destination,
+                operation["prior_fingerprint"],
+                operation["prior_mode"],
+            )
+            if not matches_expected and not matches_prior:
+                raise IncompleteRollbackError(
+                    f"rollback incomplete: installed destination changed: {destination}"
+                )
         if (
             kind == "removal"
             and home_fs.exists(destination)
-            and (
-                backup is not None
-                or not _file_matches(
-                    home_fs,
-                    destination,
-                    operation["prior_fingerprint"],
-                    operation["prior_mode"],
-                )
+            and not _file_matches(
+                home_fs,
+                destination,
+                operation["prior_fingerprint"],
+                operation["prior_mode"],
             )
         ):
             raise IncompleteRollbackError(
@@ -1875,13 +2074,56 @@ def _rollback_record(
     if prior_data is not None:
         _verify_prior_prestate(home_fs, prior_data, record["operations"])
     try:
+        if _rollback_is_complete(home_fs, record, prior_data, prior_manifest):
+            record["state"] = "rolled-back"
+            home_fs.write_atomic(record_path, _record_bytes(record), 0o600)
+            _cleanup_rollback_evidence(
+                home_fs,
+                record,
+                record_path,
+                expected_manifest,
+            )
+            if not retain_completed:
+                home_fs.unlink(record_path)
+                _prune_transaction_directories(home_fs, record_path.parent, record)
+            return
         for operation in reversed(record["operations"]):
             destination = Path(operation["destination"])
             backup = Path(operation["backup"]) if operation["backup"] else None
-            if operation["kind"] == "installed" and home_fs.exists(destination):
+            if (
+                operation["kind"] == "installed"
+                and backup is None
+                and home_fs.exists(destination)
+            ):
                 home_fs.unlink(destination)
-            if backup is not None and home_fs.exists(backup):
-                home_fs.publish_new(backup, destination)
+            if backup is not None and not _file_matches(
+                home_fs,
+                destination,
+                operation["prior_fingerprint"],
+                operation["prior_mode"],
+            ):
+                rollback_link = _rollback_link_path(record_path, operation)
+                _ensure_directory(home_fs, rollback_link.parent, 0o700)
+                if home_fs.exists(rollback_link):
+                    if not _file_matches(
+                        home_fs,
+                        rollback_link,
+                        operation["prior_fingerprint"],
+                        operation["prior_mode"],
+                    ):
+                        raise IncompleteRollbackError(
+                            f"rollback incomplete: restore link changed: {rollback_link}"
+                        )
+                else:
+                    home_fs.write_file(
+                        rollback_link,
+                        home_fs.read_file(backup),
+                        operation["prior_mode"],
+                    )
+                if home_fs.exists(destination):
+                    home_fs.replace(rollback_link, destination)
+                else:
+                    home_fs.publish_new(rollback_link, destination)
         if prior_data is not None:
             _verify_manifest_files_and_directories(
                 home_fs,
@@ -1916,34 +2158,17 @@ def _rollback_record(
             if directory["created"]:
                 home_fs.remove_empty_dir(Path(directory["path"]))
         _verify_completed_rollback(home_fs, record, prior_data, prior_manifest)
-        manifest_temp = record_path.parent / "manifest.tmp"
-        if home_fs.exists(manifest_temp):
-            if home_fs.read_file(manifest_temp) != expected_manifest:
-                raise IncompleteRollbackError("rollback incomplete: manifest temporary changed")
-            home_fs.unlink(manifest_temp)
-        for operation in record["operations"]:
-            staged = Path(operation["staged"]) if operation["staged"] else None
-            if staged is not None and home_fs.exists(staged):
-                if not _file_matches(
-                    home_fs,
-                    staged,
-                    operation["expected_fingerprint"],
-                    operation["expected_mode"],
-                ):
-                    raise IncompleteRollbackError(
-                        f"rollback incomplete: staged file changed: {staged}"
-                    )
-                home_fs.unlink(staged)
-        for directory in record["directories"]:
-            evidence = directory["prestate_evidence"]
-            if evidence is not None:
-                home_fs.unlink(Path(evidence))
-        if retain_completed:
-            record["state"] = "rolled-back"
-            home_fs.write_atomic(record_path, _record_bytes(record), 0o600)
-        else:
+        record["state"] = "rolled-back"
+        home_fs.write_atomic(record_path, _record_bytes(record), 0o600)
+        _cleanup_rollback_evidence(
+            home_fs,
+            record,
+            record_path,
+            expected_manifest,
+        )
+        if not retain_completed:
             home_fs.unlink(record_path)
-        _prune_transaction_directories(home_fs, record_path.parent, record)
+            _prune_transaction_directories(home_fs, record_path.parent, record)
     except IncompleteRollbackError:
         raise
     except OSError as exc:
@@ -1955,7 +2180,12 @@ def _prune_transaction_directories(
     transaction: Path,
     record: dict[str, Any],
 ) -> None:
-    candidates = {transaction / "rendered", transaction / "backups", transaction}
+    candidates = {
+        transaction / "rendered",
+        transaction / "backups",
+        transaction / "rollback",
+        transaction,
+    }
     candidates.update(
         {
             transaction / "prestate/directories",
@@ -1969,7 +2199,8 @@ def _prune_transaction_directories(
                 candidates.add(current)
                 current = current.parent
     for path in sorted(candidates, key=lambda item: len(item.parts), reverse=True):
-        home_fs.remove_empty_dir(path)
+        if home_fs.exists(path):
+            home_fs.remove_empty_dir(path)
 
 
 def rollback_manifests(manifests: tuple[DeploymentManifest, ...]) -> None:
@@ -2011,7 +2242,7 @@ def recover_transaction(path: Path) -> DeploymentManifest:
             transaction_id=manifest.transaction_id,
         )
         if record["state"] == "rolled-back":
-            _rollback_record(home_fs, record, relative)
+            _rollback_record(home_fs, record, relative, retain_completed=True)
             _TRANSACTION_PATHS[manifest.transaction_id] = path
             return manifest
         _validate_transaction_evidence(home_fs, record, relative)
@@ -2038,6 +2269,7 @@ def recover_transaction(path: Path) -> DeploymentManifest:
                     "manifest publication remains indeterminate; "
                     "ownership manifest type or mode is invalid"
                 )
+            _verify_recovery_final_state(home_fs, manifest, record)
             if record["state"] != "committed":
                 record["state"] = "committed"
                 home_fs.write_atomic(relative, _record_bytes(record), 0o600)
@@ -2064,7 +2296,25 @@ def recover_transaction(path: Path) -> DeploymentManifest:
                     f"transaction removal is incomplete; evidence retained: {destination}"
                 )
         recovery_temp = relative.parent / "recovery-manifest.tmp"
-        home_fs.write_file(recovery_temp, expected_manifest, _OWNERSHIP_MANIFEST_MODE)
+        if not home_fs.exists(recovery_temp):
+            home_fs.write_file(
+                recovery_temp,
+                expected_manifest,
+                _OWNERSHIP_MANIFEST_MODE,
+            )
+        try:
+            candidate_is_exact = home_fs.matches_exact_file(
+                recovery_temp,
+                expected_manifest,
+                _OWNERSHIP_MANIFEST_MODE,
+            )
+        except OSError:
+            candidate_is_exact = False
+        if not candidate_is_exact:
+            raise PublicationIndeterminateError(
+                "recovery manifest candidate is invalid; evidence retained"
+            )
+        _verify_recovery_final_state(home_fs, manifest, record)
         if current_manifest is None:
             home_fs.publish_new(recovery_temp, manifest_path)
         else:

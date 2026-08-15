@@ -1450,6 +1450,7 @@ def test_rollback_verifies_untouched_prior_files_before_restoring_manifest(
         "removal-ancestor",
         "duplicate-destination",
         "reserved-metadata",
+        "reserved-lock",
     ],
 )
 def test_plan_topology_is_rejected_before_target_mutation(
@@ -1492,9 +1493,23 @@ def test_plan_topology_is_rejected_before_target_mutation(
         )
     elif case == "duplicate-destination":
         duplicate = PlannedFile(Path("skills/foo/SKILL.md"), b"body\n", 0o644)
+        conflicting = PlannedFile(
+            Path("skills/foo/SKILL.md"),
+            b"different\n",
+            0o644,
+        )
         plans = (
             ProviderPlan("one", "1" * 40, target, (duplicate,)),
-            ProviderPlan("two", "1" * 40, target, (duplicate,)),
+            ProviderPlan("two", "1" * 40, target, (conflicting,)),
+        )
+    elif case == "reserved-metadata":
+        plans = (
+            ProviderPlan(
+                "fixture",
+                "1" * 40,
+                target,
+                (PlannedFile(Path(".agentops/deployments/owned"), b"bad\n", 0o644),),
+            ),
         )
     else:
         plans = (
@@ -1502,7 +1517,7 @@ def test_plan_topology_is_rejected_before_target_mutation(
                 "fixture",
                 "1" * 40,
                 target,
-                (PlannedFile(Path(".agentops/deployments/owned"), b"bad\n", 0o644),),
+                (PlannedFile(Path(".agentops-deployment.lock"), b"bad\n", 0o600),),
             ),
         )
 
@@ -1572,7 +1587,7 @@ def test_replaced_lock_entry_cannot_create_concurrent_authority(
             calls.value += 1
             current = calls.value
         if current == 1:
-            lock_path = tmp_path / ".home.agentops-deployment.lock"
+            lock_path = home / ".agentops-deployment.lock"
             os.replace(lock_path, tmp_path / "displaced-lock")
             lock_path.write_bytes(b"")
             lock_path.chmod(0o600)
@@ -1787,3 +1802,312 @@ def test_noop_removal_does_not_break_canonical_transaction_order(tmp_path: Path)
     rollback_manifests(manifests)
 
     assert (home / "skills/z/SKILL.md").read_bytes() == b"old\n"
+
+
+def _install_indeterminate_transaction(
+    home: Path,
+    plan: ProviderPlan,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Path, Path]:
+    def retain_unpublished_manifest(
+        home_fs: object,
+        _record_path: Path,
+        manifest_temp: Path,
+        _manifest_path: Path,
+    ) -> None:
+        lost_manifest = Path(".agentops/deployment/lost-manifest")
+        home_fs.replace(manifest_temp, lost_manifest)
+        raise OSError("publication result unavailable")
+
+    monkeypatch.setattr(
+        transaction_module,
+        "_before_manifest_replace",
+        retain_unpublished_manifest,
+    )
+    with pytest.raises(PublicationIndeterminateError):
+        install_provider_plans((plan,))
+    record_path = next((home / ".agentops/deployment/transactions").glob("*/record.json"))
+    return record_path, home / ".agentops/deployment/lost-manifest"
+
+
+def test_recovery_verifies_complete_state_before_accepting_expected_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    plan = _plan(home, PlannedFile(Path("skills/example/SKILL.md"), b"body\n", 0o644))
+    record_path, lost_manifest = _install_indeterminate_transaction(
+        home,
+        plan,
+        monkeypatch,
+    )
+    record_before = record_path.read_bytes()
+    record = json.loads(record_before)
+    manifest_path = home / record["manifest_path"]
+    manifest_path.parent.mkdir()
+    os.replace(lost_manifest, manifest_path)
+    manifest_path.chmod(0o600)
+    destination = home / "skills/example/SKILL.md"
+    destination.write_bytes(b"changed\n")
+
+    with pytest.raises(PublicationIndeterminateError, match="state|output"):
+        recover_transaction(record_path)
+
+    assert record_path.read_bytes() == record_before
+    assert json.loads(record_path.read_text())["state"] == "indeterminate"
+    assert manifest_path.exists()
+    assert destination.read_bytes() == b"changed\n"
+
+
+def test_recovery_verifies_owned_directories_before_publishing_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    plan = _plan(home, PlannedFile(Path("skills/example/SKILL.md"), b"body\n", 0o644))
+    record_path, _lost_manifest = _install_indeterminate_transaction(
+        home,
+        plan,
+        monkeypatch,
+    )
+    record_before = record_path.read_bytes()
+    record = json.loads(record_before)
+    manifest_path = home / record["manifest_path"]
+    directory = home / "skills/example"
+    directory.chmod(0o700)
+
+    with pytest.raises(PublicationIndeterminateError, match="directory|state"):
+        recover_transaction(record_path)
+
+    assert record_path.read_bytes() == record_before
+    assert json.loads(record_path.read_text())["state"] == "indeterminate"
+    assert not manifest_path.exists()
+    assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+
+    directory.chmod(0o755)
+    recovered = recover_transaction(record_path)
+
+    assert recovered.source_revision == "1" * 40
+    assert stat.S_IMODE(manifest_path.stat().st_mode) == 0o600
+
+
+def test_rollback_marker_failure_preserves_evidence_for_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    original = _plan(home, PlannedFile(Path("skills/example/SKILL.md"), b"old\n", 0o600))
+    install_provider_plans((original,))
+    replacement = _plan(
+        home,
+        PlannedFile(Path("skills/example/SKILL.md"), b"new\n", 0o644),
+        revision="2" * 40,
+    )
+    manifests = install_provider_plans((replacement,))
+    record_path = transaction_module._TRANSACTION_PATHS[manifests[0].transaction_id]
+    record = json.loads(record_path.read_text())
+    backup = home / record["operations"][0]["backup"]
+    record_relative = record_path.relative_to(home)
+    original_write_atomic = transaction_module._HomeFS.write_atomic
+
+    def fail_rolled_back_marker(
+        home_fs: object,
+        relative: Path,
+        content: bytes,
+        mode: int,
+    ) -> None:
+        if relative == record_relative and json.loads(content).get("state") == "rolled-back":
+            raise OSError("injected rollback marker failure")
+        original_write_atomic(home_fs, relative, content, mode)
+
+    monkeypatch.setattr(
+        transaction_module._HomeFS,
+        "write_atomic",
+        fail_rolled_back_marker,
+    )
+
+    with pytest.raises(IncompleteRollbackError, match="evidence retained"):
+        rollback_manifests(manifests)
+
+    assert json.loads(record_path.read_text())["state"] == "committed"
+    assert backup.exists()
+    restored = home / "skills/example/SKILL.md"
+    assert backup.stat().st_ino != restored.stat().st_ino
+    monkeypatch.setattr(
+        transaction_module._HomeFS,
+        "write_atomic",
+        original_write_atomic,
+    )
+
+    rollback_manifests(manifests)
+
+    assert (home / "skills/example/SKILL.md").read_bytes() == b"old\n"
+    assert json.loads(record_path.read_text())["state"] == "rolled-back"
+    assert not backup.exists()
+
+
+def test_rollback_cleanup_failure_is_retryable_after_durable_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    original = _plan(home, PlannedFile(Path("skills/example/SKILL.md"), b"old\n", 0o600))
+    install_provider_plans((original,))
+    replacement = _plan(
+        home,
+        PlannedFile(Path("skills/example/SKILL.md"), b"new\n", 0o644),
+        revision="2" * 40,
+    )
+    manifests = install_provider_plans((replacement,))
+    record_path = transaction_module._TRANSACTION_PATHS[manifests[0].transaction_id]
+    record = json.loads(record_path.read_text())
+    backup_relative = Path(record["operations"][0]["backup"])
+    backup = home / backup_relative
+    original_unlink = transaction_module._HomeFS.unlink
+    failed = False
+
+    def fail_first_backup_cleanup(home_fs: object, relative: Path) -> None:
+        nonlocal failed
+        if relative == backup_relative and not failed:
+            failed = True
+            raise OSError("injected cleanup failure")
+        original_unlink(home_fs, relative)
+
+    monkeypatch.setattr(transaction_module._HomeFS, "unlink", fail_first_backup_cleanup)
+
+    with pytest.raises(IncompleteRollbackError, match="evidence retained"):
+        rollback_manifests(manifests)
+
+    assert json.loads(record_path.read_text())["state"] == "rolled-back"
+    assert backup.exists()
+    monkeypatch.setattr(transaction_module._HomeFS, "unlink", original_unlink)
+
+    rollback_manifests(manifests)
+    assert recover_transaction(record_path) == manifests[0]
+
+    assert (home / "skills/example/SKILL.md").read_bytes() == b"old\n"
+    assert not backup.exists()
+
+
+def test_recovery_rejects_noncanonical_transaction_path_text_before_mutation(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    plan = _plan(home, PlannedFile(Path("skills/example/SKILL.md"), b"body\n", 0o644))
+    install_provider_plans((plan,))
+    record_path = next((home / ".agentops/deployment/transactions").glob("*/record.json"))
+    record = json.loads(record_path.read_text())
+    record["operations"][0]["destination"] = "skills//example/SKILL.md"
+    record_path.write_text(json.dumps(record))
+    record_path.chmod(0o600)
+    before = record_path.read_bytes()
+    destination = home / "skills/example/SKILL.md"
+    destination_before = destination.read_bytes()
+
+    with pytest.raises(ValueError, match="canonical|normalized"):
+        recover_transaction(record_path)
+
+    assert record_path.read_bytes() == before
+    assert destination.read_bytes() == destination_before
+
+
+def test_different_sibling_homes_reach_publication_barrier_concurrently(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    barrier = threading.Barrier(2, timeout=2)
+    failures: list[BaseException] = []
+
+    def coordinate(*_args: object) -> None:
+        barrier.wait()
+
+    monkeypatch.setattr(transaction_module, "_before_manifest_replace", coordinate)
+
+    def install(home: Path) -> None:
+        plan = _plan(
+            home,
+            PlannedFile(Path("skills/example/SKILL.md"), home.name.encode(), 0o644),
+        )
+        try:
+            install_provider_plans((plan,))
+        except BaseException as exc:  # pragma: no cover - asserted after join
+            failures.append(exc)
+
+    workers = (
+        threading.Thread(target=install, args=(tmp_path / "one",)),
+        threading.Thread(target=install, args=(tmp_path / "two",)),
+    )
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=5)
+
+    assert all(not worker.is_alive() for worker in workers)
+    assert failures == []
+
+
+def test_replaced_home_identity_fails_closed_before_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    displaced = tmp_path / "displaced-home"
+    plan = _plan(home, PlannedFile(Path("skills/example/SKILL.md"), b"body\n", 0o644))
+
+    def replace_home(*_args: object) -> None:
+        os.replace(home, displaced)
+        home.mkdir()
+
+    monkeypatch.setattr(transaction_module, "_before_manifest_replace", replace_home)
+
+    with pytest.raises(IncompleteRollbackError, match="identity|evidence retained"):
+        install_provider_plans((plan,))
+
+    assert not list(home.rglob("*.json"))
+    assert (displaced / "skills/example/SKILL.md").read_bytes() == b"body\n"
+
+
+def test_grouped_plans_deduplicate_identical_files_and_removals(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    target = TargetSpec("codex-dev", Framework.CODEX, home, "feature")
+    shared = PlannedFile(Path("skills/example/SKILL.md"), b"body\n", 0o644)
+    removal = Path("skills/obsolete/SKILL.md")
+    plans = (
+        ProviderPlan("one", "1" * 40, target, (shared,), (removal,)),
+        ProviderPlan("two", "1" * 40, target, (shared,), (removal,)),
+    )
+
+    manifests = install_provider_plans(plans)
+
+    assert manifests[0].provider_ids == ("one", "two")
+    assert len(manifests[0].files) == 1
+    assert manifests[0].files[0].path == shared.path
+    assert manifests[0].files[0].fingerprint == shared.fingerprint
+    assert manifests[0].files[0].mode == shared.mode
+    assert audit_provider_plans(plans).matches
+
+
+def test_grouped_plans_reject_conflicting_duplicate_files_before_mutation(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    target = TargetSpec("codex-dev", Framework.CODEX, home, "feature")
+    plans = (
+        ProviderPlan(
+            "one",
+            "1" * 40,
+            target,
+            (PlannedFile(Path("skills/example/SKILL.md"), b"one\n", 0o644),),
+        ),
+        ProviderPlan(
+            "two",
+            "1" * 40,
+            target,
+            (PlannedFile(Path("skills/example/SKILL.md"), b"two\n", 0o644),),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="conflicting|duplicate"):
+        install_provider_plans(plans)
+
+    assert list(tmp_path.iterdir()) == []
