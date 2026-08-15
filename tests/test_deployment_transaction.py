@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import socket
 import stat
 import threading
 from pathlib import Path
@@ -929,3 +930,107 @@ def test_recovery_rejects_boolean_and_special_directory_modes(
         recover_transaction(record_path)
 
     assert (home / "skills/example/SKILL.md").read_bytes() == b"body\n"
+
+
+@pytest.mark.parametrize("mode", [0o000, 0o111, 0o222, 0o333])
+def test_file_modes_without_owner_read_are_rejected_before_mutation(
+    tmp_path: Path,
+    mode: int,
+) -> None:
+    home = tmp_path / "home"
+    plan = _plan(home, PlannedFile(Path("skills/example/file"), b"body\n", mode))
+
+    with pytest.raises(ValueError, match="invalid planned file"):
+        install_provider_plans((plan,))
+
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("mode", [0o400, 0o600, 0o777])
+def test_owner_readable_file_modes_install_audit_and_rollback(
+    tmp_path: Path,
+    mode: int,
+) -> None:
+    home = tmp_path / "home"
+    destination = home / "skills/example/SKILL.md"
+    plan = _plan(home, PlannedFile(Path("skills/example/SKILL.md"), b"body\n", mode))
+
+    manifests = install_provider_plans((plan,))
+    installed = destination.stat()
+    audit = audit_provider_plans((plan,))
+    audited = destination.stat()
+
+    assert audit.matches
+    assert stat.S_IMODE(installed.st_mode) == mode
+    assert (audited.st_ino, audited.st_mode, audited.st_mtime_ns) == (
+        installed.st_ino,
+        installed.st_mode,
+        installed.st_mtime_ns,
+    )
+    rollback_manifests(manifests)
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize("operation", ["rollback", "recover"])
+@pytest.mark.parametrize("tree", ["backups", "prestate/directories"])
+def test_unexpected_empty_evidence_directory_is_rejected_before_mutation(
+    tmp_path: Path,
+    operation: str,
+    tree: str,
+) -> None:
+    home = tmp_path / "home"
+    destination = home / "skills/example/SKILL.md"
+    plan = _plan(home, PlannedFile(Path("skills/example/SKILL.md"), b"body\n", 0o644))
+    manifests = install_provider_plans((plan,))
+    record_path = next((home / ".agentops/deployment/transactions").glob("*/record.json"))
+    unexpected = record_path.parent / tree / "unexpected"
+    unexpected.mkdir()
+    manifest_path = next((home / ".agentops/deployment/manifests").glob("*.json"))
+    before = (destination.read_bytes(), manifest_path.read_bytes(), record_path.read_bytes())
+
+    with pytest.raises(ValueError, match="evidence"):
+        if operation == "rollback":
+            rollback_manifests(manifests)
+        else:
+            recover_transaction(record_path)
+
+    assert unexpected.is_dir()
+    after = (destination.read_bytes(), manifest_path.read_bytes(), record_path.read_bytes())
+    assert after == before
+
+
+@pytest.mark.parametrize("entry_kind", ["symlink", "fifo", "socket"])
+def test_nonregular_backup_evidence_is_rejected_before_recovery(
+    tmp_path: Path,
+    entry_kind: str,
+) -> None:
+    home = tmp_path / "home"
+    destination = home / "skills/example/SKILL.md"
+    plan = _plan(home, PlannedFile(Path("skills/example/SKILL.md"), b"body\n", 0o644))
+    install_provider_plans((plan,))
+    record_path = next((home / ".agentops/deployment/transactions").glob("*/record.json"))
+    evidence = record_path.parent / "backups" / "unexpected"
+    open_socket: socket.socket | None = None
+    if entry_kind == "symlink":
+        evidence.symlink_to(tmp_path / "outside")
+    elif entry_kind == "fifo":
+        os.mkfifo(evidence)
+    else:
+        open_socket = socket.socket(socket.AF_UNIX)
+        evidence_directory = os.open(
+            evidence.parent,
+            os.O_RDONLY | os.O_DIRECTORY,
+        )
+        try:
+            open_socket.bind(f"/proc/self/fd/{evidence_directory}/{evidence.name}")
+        finally:
+            os.close(evidence_directory)
+    try:
+        with pytest.raises(ValueError, match="evidence"):
+            recover_transaction(record_path)
+    finally:
+        if open_socket is not None:
+            open_socket.close()
+
+    assert destination.read_bytes() == b"body\n"
+    assert record_path.exists()

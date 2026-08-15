@@ -241,9 +241,9 @@ class _HomeFS:
         except FileNotFoundError:
             return None
 
-    def scan_tree(self, relative: Path) -> set[Path]:
+    def scan_entries(self, relative: Path) -> dict[Path, str]:
         root = self.open_dir(relative)
-        found: set[Path] = set()
+        found: dict[Path, str] = {}
 
         def visit(descriptor: int, prefix: Path) -> None:
             with os.scandir(descriptor) as entries:
@@ -251,6 +251,7 @@ class _HomeFS:
                     item = entry.stat(follow_symlinks=False)
                     path = prefix / entry.name
                     if stat.S_ISDIR(item.st_mode):
+                        found[path] = "directory"
                         child = os.open(
                             entry.name,
                             os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
@@ -260,8 +261,14 @@ class _HomeFS:
                             visit(child, path)
                         finally:
                             os.close(child)
+                    elif stat.S_ISREG(item.st_mode):
+                        found[path] = "regular"
+                    elif stat.S_ISLNK(item.st_mode):
+                        found[path] = "symlink"
+                    elif stat.S_ISSOCK(item.st_mode):
+                        found[path] = "socket"
                     else:
-                        found.add(path)
+                        found[path] = "other"
 
         try:
             visit(root, Path())
@@ -269,11 +276,20 @@ class _HomeFS:
             os.close(root)
         return found
 
+    def scan_tree(self, relative: Path) -> set[Path]:
+        return {
+            path
+            for path, kind in self.scan_entries(relative).items()
+            if kind != "directory"
+        }
+
     def write_file(self, relative: Path, content: bytes, mode: int) -> None:
+        if not _valid_file_mode(mode):
+            raise ValueError(f"invalid file mode: {mode!r}")
         with self.parent(relative, create=True) as (parent, leaf):
             descriptor = os.open(
                 leaf,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                 0o600,
                 dir_fd=parent,
             )
@@ -281,6 +297,13 @@ class _HomeFS:
                 view = memoryview(content)
                 while view:
                     view = view[os.write(descriptor, view) :]
+                os.fsync(descriptor)
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                chunks: list[bytes] = []
+                while chunk := os.read(descriptor, 1024 * 1024):
+                    chunks.append(chunk)
+                if b"".join(chunks) != content:
+                    raise OSError(f"staged file content mismatch: {relative}")
                 os.fchmod(descriptor, mode)
                 os.fsync(descriptor)
             finally:
@@ -472,7 +495,7 @@ def _validated_manifest_data(content: bytes, *, target: TargetSpec) -> dict[str,
             or not isinstance(item.get("fingerprint"), str)
             or len(item["fingerprint"]) != 64
             or any(character not in "0123456789abcdef" for character in item["fingerprint"])
-            or not _valid_permission_mode(item.get("mode"))
+            or not _valid_file_mode(item.get("mode"))
         ):
             raise ValueError("invalid deployment manifest file")
         file_path = _validated_manifest_path(item["path"], kind="file")
@@ -484,7 +507,7 @@ def _validated_manifest_data(content: bytes, *, target: TargetSpec) -> dict[str,
         if (
             not isinstance(item, dict)
             or not isinstance(item.get("path"), str)
-            or not _valid_permission_mode(item.get("mode"))
+            or not _valid_directory_mode(item.get("mode"))
         ):
             raise ValueError("invalid deployment manifest directory")
         directory_path = _validated_manifest_path(item["path"], kind="directory")
@@ -504,6 +527,14 @@ def _validated_manifest_data(content: bytes, *, target: TargetSpec) -> dict[str,
 
 def _valid_permission_mode(value: object) -> bool:
     return type(value) is int and 0 <= value <= 0o777
+
+
+def _valid_file_mode(value: object) -> bool:
+    return _valid_permission_mode(value) and bool(value & 0o400)
+
+
+def _valid_directory_mode(value: object) -> bool:
+    return _valid_permission_mode(value) and value & 0o300 == 0o300
 
 
 def _validated_manifest_path(value: str, *, kind: str) -> Path:
@@ -565,7 +596,7 @@ def _validate_and_group(
         planned_removals = removals.setdefault(key, set())
         for item in plan.files:
             path = _safe_relative(item.path)
-            if not isinstance(item.content, bytes) or not _valid_permission_mode(item.mode):
+            if not isinstance(item.content, bytes) or not _valid_file_mode(item.mode):
                 raise ValueError(f"invalid planned file: {path}")
             prior = files.get(path)
             if prior is not None and prior != item:
@@ -825,6 +856,8 @@ def install_provider_plans(
                     if not stat.S_ISDIR(directory_stat.st_mode):
                         raise ValueError(f"managed directory is not a directory: {directory.path}")
                     directory_mode = stat.S_IMODE(directory_stat.st_mode)
+                if not _valid_directory_mode(directory_mode):
+                    raise ValueError(f"invalid managed directory mode: {directory.path}")
                 actual_directories.append(ManifestDirectory(directory.path, directory_mode))
                 evidence_path = (
                     _directory_evidence_path(transaction, directory.path)
@@ -1104,7 +1137,7 @@ def _decode_record(
             not isinstance(expected_fingerprint, str)
             or len(expected_fingerprint) != 64
             or any(character not in "0123456789abcdef" for character in expected_fingerprint)
-            or not _valid_permission_mode(expected_mode)
+            or not _valid_file_mode(expected_mode)
         ):
             raise ValueError("invalid transaction expected file")
         staged = operation.get("staged")
@@ -1134,7 +1167,7 @@ def _decode_record(
             not isinstance(prior_fingerprint, str)
             or len(prior_fingerprint) != 64
             or any(character not in "0123456789abcdef" for character in prior_fingerprint)
-            or not _valid_permission_mode(prior_mode)
+            or not _valid_file_mode(prior_mode)
         ):
             raise ValueError("invalid transaction prior file")
         if prior_fingerprint is None and prior_mode is not None:
@@ -1193,7 +1226,7 @@ def _decode_record(
             not isinstance(directory, dict)
             or not isinstance(directory.get("path"), str)
             or not isinstance(directory.get("created"), bool)
-            or not _valid_permission_mode(directory.get("mode"))
+            or not _valid_directory_mode(directory.get("mode"))
         ):
             raise ValueError("invalid transaction record directory")
         directory_path = _safe_relative(Path(directory["path"]))
@@ -1233,11 +1266,11 @@ def _prior_manifest_content(record: dict[str, Any]) -> bytes | None:
     return base64.b64decode(encoded, validate=True) if encoded is not None else None
 
 
-def _evidence_files(home_fs: _HomeFS, root: Path) -> set[Path]:
+def _evidence_entries(home_fs: _HomeFS, root: Path) -> dict[Path, str]:
     try:
-        return {root / path for path in home_fs.scan_tree(root)}
+        return {root / path: kind for path, kind in home_fs.scan_entries(root).items()}
     except FileNotFoundError:
-        return set()
+        return {}
     except OSError as exc:
         raise ValueError(f"invalid transaction evidence directory: {root}") from exc
 
@@ -1256,7 +1289,13 @@ def _validate_transaction_evidence(
         for operation in record["operations"]
         if operation["backup"] is not None
     }
-    actual_backups = _evidence_files(home_fs, backup_root)
+    backup_entries = _evidence_entries(home_fs, backup_root)
+    invalid_backups = {
+        path: kind for path, kind in backup_entries.items() if kind != "regular"
+    }
+    if invalid_backups:
+        raise ValueError("transaction backup evidence has invalid entries")
+    actual_backups = set(backup_entries)
     missing_backups = expected_backups - actual_backups
     if missing_backups:
         missing = min(missing_backups, key=str)
@@ -1272,7 +1311,13 @@ def _validate_transaction_evidence(
         for directory in record["directories"]
         if directory["prestate_evidence"] is not None
     }
-    actual_directories = _evidence_files(home_fs, directory_root)
+    directory_entries = _evidence_entries(home_fs, directory_root)
+    invalid_directories = {
+        path: kind for path, kind in directory_entries.items() if kind != "regular"
+    }
+    if invalid_directories:
+        raise ValueError("transaction directory pre-state evidence has invalid entries")
+    actual_directories = set(directory_entries)
     if actual_directories != expected_directories:
         raise ValueError("transaction directory pre-state evidence is not one-to-one")
     for directory in record["directories"]:
