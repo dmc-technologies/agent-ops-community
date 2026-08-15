@@ -88,7 +88,14 @@ def test_bootstrap_writes_public_agentops_file(tmp_path: Path) -> None:
     assert "agent-knowledge" in text
 
 
-def test_skills_install_dry_run_reports_gstack_destination(tmp_path: Path) -> None:
+def test_skills_install_dry_run_reports_gstack_destination(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "gstack"
+    source.mkdir()
+    (source / "SKILL.md").write_bytes(b"gstack\n")
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency",
+        lambda _dependency, _cache: source,
+    )
     result = runner.invoke(
         app,
         [
@@ -99,6 +106,8 @@ def test_skills_install_dry_run_reports_gstack_destination(tmp_path: Path) -> No
             "gstack",
             "--home",
             str(tmp_path / "home"),
+            "--cache-dir",
+            str(tmp_path / "cache"),
             "--dry-run",
         ],
     )
@@ -179,7 +188,35 @@ verification:
     assert command["command"][0] == "codex"
 
 
-def test_prime_agent_cli_handoff_and_skill_install_dry_run(tmp_path: Path) -> None:
+def test_prime_agent_cli_handoff_and_skill_install_dry_run(tmp_path: Path, monkeypatch) -> None:
+    gstack = tmp_path / "gstack"
+    gstack.mkdir()
+    (gstack / "SKILL.md").write_bytes(b"gstack\n")
+    superpowers = tmp_path / "superpowers"
+    (superpowers / "skills").mkdir(parents=True)
+
+    def checkout(dependency, _cache):
+        return gstack if dependency.id == "gstack" else superpowers
+
+    def render_gstack(_source, destination, **_kwargs):
+        skill = destination / "skills/generated-gstack/SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_bytes(b"gstack\n")
+        manifest = destination / ".agentops/gstack-prime-manifest.json"
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text(json.dumps({"files": ["skills/generated-gstack/SKILL.md"]}))
+
+    def render_superpowers(_source, destination):
+        skill = destination / "generated-superpowers/SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_bytes(b"superpowers\n")
+        manifest = destination.parent / ".agentops/skill-dependencies/superpowers.json"
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text(json.dumps({"skills": ["generated-superpowers"]}))
+
+    monkeypatch.setattr("agent_ops.skill_installer._checkout_dependency", checkout)
+    monkeypatch.setattr("agent_ops.skill_installer.install_prime_gstack", render_gstack)
+    monkeypatch.setattr("agent_ops.skill_installer.install_prime_superpowers", render_superpowers)
     job = tmp_path / "job.yaml"
     job.write_text(
         """
@@ -212,8 +249,14 @@ verification:
             "skills",
             "install",
             "prime-agent",
+            "--dependency",
+            "gstack",
+            "--dependency",
+            "superpowers",
             "--home",
             str(tmp_path / "prime-home"),
+            "--cache-dir",
+            str(tmp_path / "cache"),
             "--dry-run",
         ],
     )

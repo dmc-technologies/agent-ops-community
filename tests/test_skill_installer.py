@@ -13,6 +13,7 @@ from typer.testing import CliRunner
 from agent_ops import show_me_adapter
 from agent_ops.cli import app
 from agent_ops.deployment.models import ProviderPlan, TargetSpec
+from agent_ops.deployment.transaction import UnsupportedPlatformError
 from agent_ops.registries import load_skill_dependencies
 from agent_ops.registries.models import Framework, SkillDependency, SkillDependencyInstall
 from agent_ops.show_me_adapter import (
@@ -298,11 +299,7 @@ def test_install_skill_dependencies_preserves_explicit_relative_home(
         name="GStack",
         repo="https://example.invalid/gstack.git",
         ref="abc123",
-        install={
-            "codex": SkillDependencyInstall(
-                strategy="gstack", destination="skills/gstack"
-            )
-        },
+        install={"codex": SkillDependencyInstall(strategy="gstack", destination="skills/gstack")},
     )
     monkeypatch.setattr(
         "agent_ops.skill_installer._checkout_dependency",
@@ -330,19 +327,11 @@ def test_non_posix_dry_run_pairs_relative_plan_target_without_absolutizing(
         name="GStack",
         repo="https://example.invalid/gstack.git",
         ref="abc123",
-        install={
-            "codex": SkillDependencyInstall(
-                strategy="gstack", destination="skills/gstack"
-            )
-        },
+        install={"codex": SkillDependencyInstall(strategy="gstack", destination="skills/gstack")},
     )
-    target = TargetSpec(
-        "public-skills:codex", Framework.CODEX, Path("relative-home"), "public"
-    )
+    target = TargetSpec("public-skills:codex", Framework.CODEX, Path("relative-home"), "public")
     plan = ProviderPlan("public-skill:gstack", "revision", target, ())
-    monkeypatch.setattr(
-        "agent_ops.skill_installer._use_shared_transaction_engine", lambda: False
-    )
+    monkeypatch.setattr("agent_ops.skill_installer._use_shared_transaction_engine", lambda: False)
     monkeypatch.setattr(
         "agent_ops.skill_installer.build_public_skill_plans", lambda **_kwargs: (plan,)
     )
@@ -358,9 +347,7 @@ def test_non_posix_dry_run_pairs_relative_plan_target_without_absolutizing(
     assert rows[0].destination == Path("relative-home/skills/gstack")
 
 
-def test_skills_install_cli_preserves_explicit_relative_home(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_skills_install_cli_preserves_explicit_relative_home(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
     source = tmp_path / "source"
     source.mkdir()
@@ -399,11 +386,7 @@ def test_dry_run_rejects_cache_inside_target_before_checkout_or_mutation(
         name="GStack",
         repo="https://example.invalid/gstack.git",
         ref="abc123",
-        install={
-            "codex": SkillDependencyInstall(
-                strategy="gstack", destination="skills/gstack"
-            )
-        },
+        install={"codex": SkillDependencyInstall(strategy="gstack", destination="skills/gstack")},
     )
     checkout_called = False
 
@@ -441,11 +424,7 @@ def test_planning_excludes_source_cache_metadata_from_materialized_files(
         name="GStack",
         repo="https://example.invalid/gstack.git",
         ref="abc123",
-        install={
-            "codex": SkillDependencyInstall(
-                strategy="gstack", destination="skills/gstack"
-            )
-        },
+        install={"codex": SkillDependencyInstall(strategy="gstack", destination="skills/gstack")},
     )
     captured: list[tuple[ProviderPlan, ...]] = []
     monkeypatch.setattr(
@@ -468,6 +447,75 @@ def test_planning_excludes_source_cache_metadata_from_materialized_files(
     assert Path("skills/gstack/.cache/generated.txt") not in paths
 
 
+def test_prime_gstack_planning_passes_confined_renderer_environment(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "SKILL.md").write_bytes(b"source\n")
+    dependency = SkillDependency(
+        id="gstack",
+        name="GStack",
+        repo="https://example.invalid/gstack.git",
+        ref="1" * 40,
+        install={"prime-agent": SkillDependencyInstall(strategy="prime-gstack", destination=".")},
+    )
+    environments: list[dict[str, str] | None] = []
+
+    def render(
+        _source: Path,
+        destination: Path,
+        *,
+        renderer_env: dict[str, str] | None = None,
+    ) -> None:
+        environments.append(renderer_env)
+        skill = destination / "skills/generated/SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_bytes(b"generated\n")
+        manifest = destination / ".agentops/gstack-prime-manifest.json"
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text(
+            json.dumps({"files": ["skills/generated/SKILL.md"]}),
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency",
+        lambda _dependency, _cache: source,
+    )
+    monkeypatch.setattr("agent_ops.skill_installer.install_prime_gstack", render)
+    cache = tmp_path / "cache"
+    home = tmp_path / "prime-home"
+
+    rows = install_skill_dependencies(
+        framework=Framework.PRIME_AGENT,
+        dependencies=[dependency],
+        home=home,
+        cache_dir=cache,
+        dry_run=True,
+    )
+
+    assert rows[0].destination == home
+    assert not home.exists()
+    environment = environments[0]
+    assert environment is not None
+    confined = {
+        "HOME",
+        "BUN_INSTALL",
+        "BUN_INSTALL_CACHE_DIR",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+    }
+    assert confined <= set(environment)
+    for name in confined:
+        assert Path(environment[name]).is_relative_to(cache)
+        assert not Path(environment[name]).exists()
+
+
 @pytest.mark.parametrize("shape", ["empty", "reordered", "extra", "identity"])
 def test_non_posix_dry_run_rejects_plan_dependency_mismatch(
     tmp_path: Path, monkeypatch, shape: str
@@ -479,9 +527,7 @@ def test_non_posix_dry_run_rejects_plan_dependency_mismatch(
             repo="https://example.invalid/gstack.git",
             ref="1" * 40,
             install={
-                "codex": SkillDependencyInstall(
-                    strategy="gstack", destination="skills/gstack"
-                )
+                "codex": SkillDependencyInstall(strategy="gstack", destination="skills/gstack")
             },
         ),
         SkillDependency(
@@ -498,9 +544,7 @@ def test_non_posix_dry_run_rejects_plan_dependency_mismatch(
             },
         ),
     ]
-    target = TargetSpec(
-        "public-skills:codex", Framework.CODEX, tmp_path / "home", "public"
-    )
+    target = TargetSpec("public-skills:codex", Framework.CODEX, tmp_path / "home", "public")
     valid = [
         ProviderPlan("public-skill:gstack", "revision", target, ()),
         ProviderPlan("public-skill:superpowers", "revision", target, ()),
@@ -516,9 +560,7 @@ def test_non_posix_dry_run_rejects_plan_dependency_mismatch(
             ProviderPlan("public-skill:other", "revision", target, ()),
             valid[1],
         )
-    monkeypatch.setattr(
-        "agent_ops.skill_installer._use_shared_transaction_engine", lambda: False
-    )
+    monkeypatch.setattr("agent_ops.skill_installer._use_shared_transaction_engine", lambda: False)
     monkeypatch.setattr(
         "agent_ops.skill_installer.build_public_skill_plans", lambda **_kwargs: plans
     )
@@ -537,31 +579,17 @@ def test_non_posix_single_bundle_revalidates_planned_checkout_before_native_appl
 ) -> None:
     import agent_ops.skill_installer as skill_installer
 
-    source = tmp_path / "source"
-    source.mkdir()
-    skill = source / "SKILL.md"
-    skill.write_bytes(b"planned\n")
-    dependency = SkillDependency(
-        id="gstack",
-        name="GStack",
-        repo="https://example.invalid/gstack.git",
-        ref="1" * 40,
-        install={
-            "codex": SkillDependencyInstall(
-                strategy="gstack", destination="skills/gstack"
-            )
-        },
-    )
+    source = _show_me_source(tmp_path / "source")
+    license_file = source / "LICENSE"
+    dependency = _show_me_dependency(Framework.CODEX)
     native_calls: list[Path] = []
     home = tmp_path / "home"
     original_install = skill_installer._install_dependency
 
     def change_source(**_kwargs) -> None:
-        skill.write_bytes(b"changed after planning\n")
+        license_file.write_bytes(b"changed after planning\n")
 
-    monkeypatch.setattr(
-        "agent_ops.skill_installer._use_shared_transaction_engine", lambda: False
-    )
+    monkeypatch.setattr("agent_ops.skill_installer._use_shared_transaction_engine", lambda: False)
     monkeypatch.setattr(
         "agent_ops.skill_installer._checkout_dependency",
         lambda _dependency, _cache: source,
@@ -588,6 +616,111 @@ def test_non_posix_single_bundle_revalidates_planned_checkout_before_native_appl
         )
 
     assert native_calls == []
+
+
+@pytest.mark.parametrize(
+    ("strategy", "source_path", "destination"),
+    [
+        ("gstack", None, "skills/gstack"),
+        ("copy-repo", None, "skills/repository"),
+        ("copy-skills", "skills", "skills"),
+        ("prime-gstack", None, "."),
+        ("prime-superpowers", "skills", "skills"),
+    ],
+)
+def test_non_posix_native_application_rejects_nontransactional_strategies(
+    tmp_path: Path,
+    monkeypatch,
+    strategy: str,
+    source_path: str | None,
+    destination: str,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    dependency = SkillDependency(
+        id="gstack" if strategy != "prime-superpowers" else "superpowers",
+        name="Dependency",
+        repo="https://example.invalid/dependency.git",
+        ref="1" * 40,
+        install={
+            "codex": SkillDependencyInstall(
+                strategy=strategy,
+                source=source_path,
+                destination=destination,
+            )
+        },
+    )
+    target = TargetSpec("public-skills:codex", Framework.CODEX, tmp_path / "home", "public")
+    plan = ProviderPlan(f"public-skill:{dependency.id}", "revision", target, ())
+    native_calls: list[str] = []
+
+    def build(**kwargs):
+        kwargs["_resolved_sources"][dependency.id] = source
+        return (plan,)
+
+    monkeypatch.setattr("agent_ops.skill_installer._use_shared_transaction_engine", lambda: False)
+    monkeypatch.setattr("agent_ops.skill_installer.build_public_skill_plans", build)
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._build_public_skill_plans", lambda **_kwargs: (plan,)
+    )
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._install_dependency",
+        lambda **kwargs: native_calls.append(kwargs["dependency_id"]),
+    )
+
+    with pytest.raises(UnsupportedPlatformError, match="native.*transaction"):
+        install_skill_dependencies(
+            framework=Framework.CODEX,
+            dependencies=[dependency],
+            home=target.home,
+        )
+
+    assert native_calls == []
+    assert not target.home.exists()
+
+
+@pytest.mark.parametrize("copy_failure", [False, True])
+def test_non_posix_native_application_allows_only_show_me_transaction(
+    tmp_path: Path, monkeypatch, copy_failure: bool
+) -> None:
+    source = _show_me_source(tmp_path / "source")
+    dependency = _show_me_dependency(Framework.CODEX)
+    target = TargetSpec("public-skills:codex", Framework.CODEX, tmp_path / "home", "public")
+    plan = ProviderPlan("public-skill:humanlayer-show-me", "revision", target, ())
+    native_calls: list[str] = []
+
+    def build(**kwargs):
+        kwargs["_resolved_sources"][dependency.id] = source
+        return (plan,)
+
+    def install(**kwargs) -> None:
+        native_calls.append(kwargs["dependency_id"])
+        if copy_failure:
+            raise OSError("injected native copy failure")
+
+    monkeypatch.setattr("agent_ops.skill_installer._use_shared_transaction_engine", lambda: False)
+    monkeypatch.setattr("agent_ops.skill_installer.build_public_skill_plans", build)
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._build_public_skill_plans", lambda **_kwargs: (plan,)
+    )
+    monkeypatch.setattr("agent_ops.skill_installer._install_dependency", install)
+
+    if copy_failure:
+        with pytest.raises(OSError, match="copy failure"):
+            install_skill_dependencies(
+                framework=Framework.CODEX,
+                dependencies=[dependency],
+                home=target.home,
+            )
+    else:
+        install_skill_dependencies(
+            framework=Framework.CODEX,
+            dependencies=[dependency],
+            home=target.home,
+        )
+
+    assert native_calls == ["humanlayer-show-me"]
+    assert not target.home.exists()
 
 
 def test_dependency_checkout_rejects_symbolic_link_cache_destination(
@@ -632,6 +765,46 @@ def test_dependency_checkout_rejects_symbolic_link_cache_destination(
         text=True,
     ).stdout
     assert after == before
+    assert not (tmp_path / "home").exists()
+
+
+def test_dependency_checkout_rejects_external_gitdir_before_git_mutation(
+    tmp_path: Path,
+) -> None:
+    external = tmp_path / "external"
+    repo_url = _git_repo(external)
+    (external / "SKILL.md").write_text("first\n", encoding="utf-8")
+    first_ref = _commit(external)
+    (external / "SKILL.md").write_text("second\n", encoding="utf-8")
+    second_ref = _commit(external)
+    cache = tmp_path / "cache"
+    checkout = cache / f"gstack-{first_ref[:12]}"
+    checkout.mkdir(parents=True)
+    (checkout / ".git").write_text(f"gitdir: {(external / '.git').as_posix()}\n", encoding="utf-8")
+    dependency = SkillDependency(
+        id="gstack",
+        name="GStack",
+        repo=repo_url,
+        ref=first_ref,
+        install={"codex": SkillDependencyInstall(strategy="gstack", destination="skills/gstack")},
+    )
+
+    with pytest.raises(ValueError, match="checkout metadata.*directory"):
+        install_skill_dependencies(
+            framework=Framework.CODEX,
+            dependencies=[dependency],
+            home=tmp_path / "home",
+            cache_dir=cache,
+            dry_run=True,
+        )
+
+    head = subprocess.run(
+        ["git", "-C", str(external), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert head == second_ref
     assert not (tmp_path / "home").exists()
 
 

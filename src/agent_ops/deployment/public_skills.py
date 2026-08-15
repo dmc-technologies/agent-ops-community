@@ -45,6 +45,8 @@ _MANIFEST_KEYS = {
     "directories",
     "files",
 }
+PROVIDER_INDEX_PATH = Path("skills/.agentops-public-provider-index.json")
+_PROVIDER_INDEX_MODE = 0o600
 
 
 def build_public_skill_plans(
@@ -73,7 +75,6 @@ def build_public_skill_plans(
         home=target_home,
         channel="public",
     )
-    source_revision = _combined_revision(dependencies, framework)
     _validate_target_ancestors(
         target_home,
         show_me=any(dependency.id == "humanlayer-show-me" for dependency in dependencies),
@@ -85,6 +86,7 @@ def build_public_skill_plans(
         show_me=any(dependency.id == "humanlayer-show-me" for dependency in dependencies),
     )
     prior_paths = set(prior_files)
+    prior_index = _prior_provider_index(target, prior_paths)
     plans: list[ProviderPlan] = []
     for dependency in dependencies:
         install = dependency.install[framework.value]
@@ -97,15 +99,18 @@ def build_public_skill_plans(
             source=source,
             target=target,
             prior_paths=prior_paths,
+            cache_root=cache_root,
             install_dependency=install_dependency,
         )
-        plans.append(replace(plan, source_revision=source_revision))
+        plans.append(plan)
 
-    desired = {item.path for plan in plans for item in plan.files}
-    stale = tuple(sorted(prior_paths - desired, key=lambda path: path.as_posix()))
-    if stale:
-        plans[0] = replace(plans[0], removals=stale)
-    return tuple(plans)
+    return _complete_provider_plans(
+        target=target,
+        dependencies=dependencies,
+        selected_plans=plans,
+        prior_files=prior_files,
+        prior_index=prior_index,
+    )
 
 
 def _captured_absolute_path(path: Path, *, cwd: Path) -> Path:
@@ -127,19 +132,128 @@ def _validate_cache_target_separation(*, cache_root: Path, target_home: Path) ->
             )
 
 
-def _combined_revision(
-    dependencies: list[SkillDependency], framework: Framework
-) -> str:
-    inputs = [
-        {
+def _complete_provider_plans(
+    *,
+    target: TargetSpec,
+    dependencies: list[SkillDependency],
+    selected_plans: list[ProviderPlan],
+    prior_files: dict[Path, tuple[str, int]],
+    prior_index: dict[str, dict[str, object]],
+) -> tuple[ProviderPlan, ...]:
+    selected = {plan.provider_id: plan for plan in selected_plans}
+    revisions = {f"public-skill:{dependency.id}": dependency.ref for dependency in dependencies}
+    descriptors = {
+        f"public-skill:{dependency.id}": {
             "id": dependency.id,
             "repo": dependency.repo,
             "ref": dependency.ref,
-            "install": dependency.install[framework.value].model_dump(mode="json"),
+            "install": dependency.install[target.framework.value].model_dump(mode="json"),
         }
         for dependency in dependencies
-    ]
-    return "public-skills:" + json.dumps(inputs, separators=(",", ":"), sort_keys=True)
+    }
+    if prior_files and not prior_index:
+        if len(selected_plans) != 1:
+            raise ValueError("shared ownership manifest is missing public provider ownership")
+        provider_id = selected_plans[0].provider_id
+        prior_index = {
+            provider_id: {
+                "provider_id": provider_id,
+                "source_revision": revisions[provider_id],
+                "source_descriptor": descriptors[provider_id],
+                "paths": sorted(
+                    path.as_posix() for path in prior_files if path != PROVIDER_INDEX_PATH
+                ),
+            }
+        }
+
+    complete = list(selected_plans)
+    for provider_id, entry in sorted(prior_index.items()):
+        if provider_id in selected:
+            continue
+        files = tuple(
+            PlannedFile(
+                Path(path),
+                (target.home / path).read_bytes(),
+                prior_files[Path(path)][1],
+            )
+            for path in entry["paths"]
+        )
+        complete.append(
+            ProviderPlan(
+                provider_id,
+                str(entry["source_revision"]),
+                target,
+                files,
+            )
+        )
+        revisions[provider_id] = str(entry["source_revision"])
+        descriptors[provider_id] = entry["source_descriptor"]
+
+    ownership: dict[str, tuple[Path, ...]] = {}
+    claimed: set[Path] = set()
+    for plan in complete:
+        paths = tuple(sorted((item.path for item in plan.files), key=lambda path: path.as_posix()))
+        if PROVIDER_INDEX_PATH in paths:
+            raise ValueError("rendered bundle overlaps public provider ownership index")
+        overlap = claimed.intersection(paths)
+        if overlap:
+            raise ValueError(f"public provider ownership overlaps: {min(overlap)}")
+        claimed.update(paths)
+        ownership[plan.provider_id] = paths
+
+    for index, plan in enumerate(complete):
+        prior_owned = {
+            Path(path) for path in prior_index.get(plan.provider_id, {}).get("paths", [])
+        }
+        if plan.provider_id in selected:
+            removals = tuple(
+                sorted(
+                    prior_owned - set(ownership[plan.provider_id]), key=lambda path: path.as_posix()
+                )
+            )
+            complete[index] = replace(plan, removals=removals)
+
+    index_content = _provider_index_bytes(target, ownership, revisions, descriptors)
+    owner = min(range(len(complete)), key=lambda item: complete[item].provider_id)
+    complete[owner] = replace(
+        complete[owner],
+        files=(
+            *complete[owner].files,
+            PlannedFile(PROVIDER_INDEX_PATH, index_content, _PROVIDER_INDEX_MODE),
+        ),
+    )
+    aggregate_revision = "public-skills:" + json.dumps(
+        [
+            descriptors[provider_id]
+            for provider_id in sorted(ownership)
+        ],
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return tuple(replace(plan, source_revision=aggregate_revision) for plan in complete)
+
+
+def _provider_index_bytes(
+    target: TargetSpec,
+    ownership: dict[str, tuple[Path, ...]],
+    revisions: dict[str, str],
+    descriptors: dict[str, object],
+) -> bytes:
+    data = {
+        "schema_version": 1,
+        "target_id": target.id,
+        "framework": target.framework.value,
+        "providers": [
+            {
+                "provider_id": provider_id,
+                "source_revision": revisions[provider_id],
+                "source_descriptor": descriptors[provider_id],
+                "paths": [path.as_posix() for path in ownership[provider_id]],
+            }
+            for provider_id in sorted(ownership)
+        ],
+    }
+    return (json.dumps(data, indent=2, sort_keys=True) + "\n").encode()
 
 
 def _source_closure(source: Path, install: SkillDependencyInstall) -> tuple[Path, ...]:
@@ -186,9 +300,7 @@ def _validate_checkout(
             text=True,
         ).stdout
         if status_output:
-            raise ValueError(
-                f"pinned {dependency.id} checkout contains changed or untracked files"
-            )
+            raise ValueError(f"pinned {dependency.id} checkout contains changed or untracked files")
     for closure in _source_closure(source, install):
         _validate_regular_closure(closure, source_root=source)
 
@@ -242,38 +354,114 @@ def _render_dependency(
     source: Path,
     target: TargetSpec,
     prior_paths: set[Path],
+    cache_root: Path,
     install_dependency: InstallDependency,
 ) -> ProviderPlan:
-    with tempfile.TemporaryDirectory(prefix=f"agentops-public-{dependency.id}-") as temporary:
-        temporary_root = Path(temporary)
-        shadow_home = temporary_root / "home"
-        _copy_shadow_state(target.home, shadow_home)
-        _remove_prior_shared_files(shadow_home, prior_paths)
-        if prior_paths:
-            _remove_superseded_legacy_state(shadow_home, dependency.id)
-        destination = shadow_home / install.destination
-        install_dependency(
-            framework=framework,
-            target_home=shadow_home,
-            context_home=target.home,
-            dependency_id=dependency.id,
-            source=source,
-            destination=destination,
-            install=install,
+    cache_created = False
+    temporary_parent = None
+    if install.strategy == "prime-gstack":
+        if not cache_root.exists():
+            cache_root.mkdir(parents=True)
+            cache_created = True
+        temporary_parent = cache_root
+    try:
+        temporary_context = tempfile.TemporaryDirectory(
+            prefix=f"agentops-public-{dependency.id}-",
+            dir=temporary_parent,
         )
-        files = _managed_files(
-            dependency=dependency,
-            install=install,
-            source=source,
-            shadow_home=shadow_home,
-            target_home=target.home,
+        with temporary_context as temporary:
+            return _render_dependency_in_workspace(
+                temporary=temporary,
+                framework=framework,
+                dependency=dependency,
+                install=install,
+                source=source,
+                target=target,
+                prior_paths=prior_paths,
+                install_dependency=install_dependency,
+            )
+    finally:
+        if cache_created:
+            with suppress(OSError):
+                cache_root.rmdir()
+
+
+def _render_dependency_in_workspace(
+    *,
+    temporary: str,
+    framework: Framework,
+    dependency: SkillDependency,
+    install: SkillDependencyInstall,
+    source: Path,
+    target: TargetSpec,
+    prior_paths: set[Path],
+    install_dependency: InstallDependency,
+) -> ProviderPlan:
+    temporary_root = Path(temporary).resolve()
+    shadow_home = temporary_root / "home"
+    _copy_shadow_state(target.home, shadow_home)
+    _remove_prior_shared_files(shadow_home, prior_paths)
+    if prior_paths:
+        _remove_superseded_legacy_state(shadow_home, dependency.id)
+    destination = shadow_home / install.destination
+    install_dependency(
+        framework=framework,
+        target_home=shadow_home,
+        context_home=target.home,
+        dependency_id=dependency.id,
+        source=source,
+        destination=destination,
+        install=install,
+        renderer_env=(
+            _renderer_environment(temporary_root / "renderer-environment")
+            if install.strategy == "prime-gstack"
+            else None
+        ),
+    )
+    files = _managed_files(
+        dependency=dependency,
+        install=install,
+        source=source,
+        shadow_home=shadow_home,
+        target_home=target.home,
+    )
+    return ProviderPlan(
+        provider_id=f"public-skill:{dependency.id}",
+        source_revision=dependency.ref,
+        target=target,
+        files=files,
+    )
+
+
+def _renderer_environment(workspace: Path) -> dict[str, str]:
+    inherited = {
+        name: os.environ[name]
+        for name in (
+            "PATH",
+            "PATHEXT",
+            "SYSTEMROOT",
+            "COMSPEC",
+            "WINDIR",
+            "LANG",
+            "LC_ALL",
+            "TZ",
         )
-        return ProviderPlan(
-            provider_id=f"public-skill:{dependency.id}",
-            source_revision=dependency.ref,
-            target=target,
-            files=files,
-        )
+        if name in os.environ
+    }
+    paths = {
+        "HOME": workspace / "home",
+        "BUN_INSTALL": workspace / "bun/install",
+        "BUN_INSTALL_CACHE_DIR": workspace / "bun/cache",
+        "XDG_CACHE_HOME": workspace / "xdg/cache",
+        "XDG_CONFIG_HOME": workspace / "xdg/config",
+        "XDG_DATA_HOME": workspace / "xdg/data",
+        "TMPDIR": workspace / "tmp",
+        "TMP": workspace / "tmp",
+        "TEMP": workspace / "tmp",
+    }
+    for path in set(paths.values()):
+        path.mkdir(parents=True, exist_ok=True)
+    return {**inherited, **{name: str(path) for name, path in paths.items()}}
 
 
 def _copy_shadow_state(target_home: Path, shadow_home: Path) -> None:
@@ -396,9 +584,7 @@ def _managed_files(
         content = item.read_bytes()
         if install.strategy in {"prime-gstack", "prime-superpowers"} and b"\0" not in content:
             content = content.replace(shadow_marker, target_marker)
-        planned.append(
-            PlannedFile(relative, content, stat.S_IMODE(item.stat().st_mode))
-        )
+        planned.append(PlannedFile(relative, content, stat.S_IMODE(item.stat().st_mode)))
     return tuple(planned)
 
 
@@ -434,6 +620,101 @@ def _prior_shared_files(target: TargetSpec) -> dict[Path, tuple[str, int]]:
     for item in data["files"]:
         files[Path(item["path"])] = (item["fingerprint"], item["mode"])
     return files
+
+
+def _prior_provider_index(
+    target: TargetSpec,
+    prior_paths: set[Path],
+) -> dict[str, dict[str, object]]:
+    path = target.home / PROVIDER_INDEX_PATH
+    if PROVIDER_INDEX_PATH not in prior_paths:
+        if path.exists() or path.is_symlink():
+            raise ValueError("unmanaged public provider ownership index conflicts with plan")
+        return {}
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("public provider ownership index is not a regular file")
+
+    def reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate JSON key in public provider ownership: {key}")
+            result[key] = value
+        return result
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=reject_duplicates)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid public provider ownership JSON: {exc}") from exc
+    if not isinstance(data, dict) or set(data) != {
+        "schema_version",
+        "target_id",
+        "framework",
+        "providers",
+    }:
+        raise ValueError("invalid public provider ownership schema")
+    if (
+        type(data["schema_version"]) is not int
+        or data["schema_version"] != 1
+        or data["target_id"] != target.id
+        or data["framework"] != target.framework.value
+        or not isinstance(data["providers"], list)
+        or not data["providers"]
+    ):
+        raise ValueError("invalid public provider ownership identity")
+    entries: dict[str, dict[str, object]] = {}
+    claimed: set[Path] = set()
+    provider_order: list[str] = []
+    for entry in data["providers"]:
+        if not isinstance(entry, dict) or set(entry) != {
+            "provider_id",
+            "source_revision",
+            "source_descriptor",
+            "paths",
+        }:
+            raise ValueError("invalid public provider ownership entry")
+        provider_id = entry["provider_id"]
+        revision = entry["source_revision"]
+        descriptor = entry["source_descriptor"]
+        values = entry["paths"]
+        if (
+            not isinstance(provider_id, str)
+            or not provider_id.startswith("public-skill:")
+            or provider_id == "public-skill:"
+            or not isinstance(revision, str)
+            or not revision
+            or not isinstance(descriptor, dict)
+            or set(descriptor) != {"id", "repo", "ref", "install"}
+            or descriptor["id"] != provider_id.removeprefix("public-skill:")
+            or not isinstance(descriptor["repo"], str)
+            or not descriptor["repo"]
+            or descriptor["ref"] != revision
+            or not isinstance(descriptor["install"], dict)
+            or not isinstance(values, list)
+        ):
+            raise ValueError("invalid public provider ownership entry")
+        paths = [_manifest_relative_path(value, kind="provider file") for value in values]
+        if (
+            paths != sorted(set(paths), key=lambda item: item.as_posix())
+            or PROVIDER_INDEX_PATH in paths
+            or claimed.intersection(paths)
+        ):
+            raise ValueError("invalid public provider ownership paths")
+        claimed.update(paths)
+        provider_order.append(provider_id)
+        if provider_id in entries:
+            raise ValueError("duplicate public provider ownership provider")
+        entries[provider_id] = {
+            "provider_id": provider_id,
+            "source_revision": revision,
+            "source_descriptor": descriptor,
+            "paths": [item.as_posix() for item in paths],
+        }
+    if provider_order != sorted(provider_order):
+        raise ValueError("public provider ownership providers are not canonical")
+    if claimed | {PROVIDER_INDEX_PATH} != prior_paths:
+        raise ValueError("public provider ownership does not match shared manifest")
+    return entries
 
 
 def _decode_shared_manifest(content: bytes, *, target: TargetSpec) -> dict:
@@ -512,9 +793,7 @@ def _decode_shared_manifest(content: bytes, *, target: TargetSpec) -> dict:
             parent = parent.parent
     if directory_paths != expected_directories:
         raise ValueError("invalid shared ownership manifest directory closure")
-    if [item["path"] for item in data["files"]] != sorted(
-        item["path"] for item in data["files"]
-    ):
+    if [item["path"] for item in data["files"]] != sorted(item["path"] for item in data["files"]):
         raise ValueError("shared ownership manifest files are not in canonical order")
     if [item["path"] for item in data["directories"]] != sorted(
         item["path"] for item in data["directories"]
@@ -593,8 +872,7 @@ def _validate_target_ancestors(target_home: Path, *, show_me: bool) -> None:
             return
         if stat.S_ISLNK(item.st_mode) or not stat.S_ISDIR(item.st_mode):
             message = (
-                "selected profile path contains a symbolic link or non-directory: "
-                f"{target_home}"
+                f"selected profile path contains a symbolic link or non-directory: {target_home}"
             )
             if show_me:
                 raise ShowMeCollisionError(message)
@@ -610,6 +888,7 @@ def _default_install_dependency(
     source: Path,
     destination: Path,
     install: SkillDependencyInstall,
+    renderer_env: dict[str, str] | None = None,
 ) -> None:
     del framework, context_home
     if install.strategy in {"gstack", "copy-repo"}:
@@ -648,7 +927,7 @@ def _default_install_dependency(
     if install.strategy == "prime-gstack":
         from agent_ops.gstack_prime import install_prime_gstack
 
-        install_prime_gstack(source, target_home)
+        install_prime_gstack(source, target_home, renderer_env=renderer_env)
         return
     raise ValueError(f"unsupported skill dependency install strategy {install.strategy!r}")
 

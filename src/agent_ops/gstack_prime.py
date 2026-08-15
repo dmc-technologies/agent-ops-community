@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -82,9 +83,14 @@ def _file_sha256(path: Path) -> str:
     return _sha256(path.read_bytes())
 
 
-def _run(command: list[str], *, cwd: Path | None = None) -> subprocess.CompletedProcess[bytes]:
+def _run(
+    command: list[str],
+    *,
+    cwd: Path | None = None,
+    env: Mapping[str, str] | None = None,
+) -> subprocess.CompletedProcess[bytes]:
     try:
-        return subprocess.run(command, cwd=cwd, check=True, capture_output=True)
+        return subprocess.run(command, cwd=cwd, env=env, check=True, capture_output=True)
     except FileNotFoundError as exc:
         raise GstackPrimeSourceError(f"Bun executable is unavailable: {command[0]}") from exc
     except (OSError, subprocess.CalledProcessError) as exc:
@@ -1034,6 +1040,7 @@ def install_prime_gstack(
     coding_agent_dir: Path | None = None,
     *,
     bun: str | Path = "bun",
+    renderer_env: Mapping[str, str] | None = None,
 ) -> GstackPrimeInstallResult:
     """Build and safely install Prime-native skills from the pinned gstack commit."""
     if coding_agent_dir is None:
@@ -1057,9 +1064,17 @@ def install_prime_gstack(
         shutil.copytree(pristine, source)
         _add_prime_host(source)
         _patch_browse_runtime(source)
-        _run([str(bun), "install", "--frozen-lockfile"], cwd=source)
-        _run([str(bun), "run", "gen:skill-docs", "--host", "prime"], cwd=source)
-        _run([str(bun), "run", "build"], cwd=source)
+        _run(
+            [str(bun), "install", "--frozen-lockfile"],
+            cwd=source,
+            env=renderer_env,
+        )
+        _run(
+            [str(bun), "run", "gen:skill-docs", "--host", "prime"],
+            cwd=source,
+            env=renderer_env,
+        )
+        _run([str(bun), "run", "build"], cwd=source, env=renderer_env)
         _run(
             [
                 str(bun),
@@ -1078,6 +1093,7 @@ def install_prime_gstack(
                 "@ngrok/ngrok",
             ],
             cwd=source,
+            env=renderer_env,
         )
         missing = [
             relative for relative in _REQUIRED_EXECUTABLES if not (source / relative).is_file()

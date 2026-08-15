@@ -114,9 +114,7 @@ def test_public_bundle_plans_contain_exact_bytes_modes_and_identity(tmp_path: Pa
         "public-skill:humanlayer-show-me",
     ]
     assert len({plan.source_revision for plan in plans}) == 1
-    assert all(
-        dependency.ref in plans[0].source_revision for dependency in dependencies
-    )
+    assert all(dependency.ref in plans[0].source_revision for dependency in dependencies)
     assert all(
         plan.target == TargetSpec("public-skills:codex", Framework.CODEX, home, "public")
         for plan in plans
@@ -127,9 +125,10 @@ def test_public_bundle_plans_contain_exact_bytes_modes_and_identity(tmp_path: Pa
     )
     assert files[Path("skills/gstack/SKILL.md")].content == b"gstack\n"
     assert files[Path("skills/writing-plans/SKILL.md")].content == b"plans\n"
-    assert b"supported artifact preview or file-opening capability" in files[
-        Path("skills/show-me/SKILL.md")
-    ].content
+    assert (
+        b"supported artifact preview or file-opening capability"
+        in files[Path("skills/show-me/SKILL.md")].content
+    )
     assert not home.exists()
 
 
@@ -144,9 +143,7 @@ def test_public_plan_builder_renders_over_shadow_without_mutating_existing_targe
     installed = home / "skills/gstack/SKILL.md"
     installed.parent.mkdir(parents=True)
     installed.write_bytes(b"old\n")
-    dependency = _dependency(
-        "gstack", ref="1" * 40, strategy="gstack", destination="skills/gstack"
-    )
+    dependency = _dependency("gstack", ref="1" * 40, strategy="gstack", destination="skills/gstack")
 
     plans = build_public_skill_plans(
         framework=Framework.CODEX,
@@ -156,17 +153,14 @@ def test_public_plan_builder_renders_over_shadow_without_mutating_existing_targe
         checkout_dependency=lambda _dependency, _cache: source,
     )
 
-    assert plans[0].files == (
-        PlannedFile(Path("skills/gstack/SKILL.md"), b"new\n", 0o644),
-    )
+    assert plans[0].files[0] == PlannedFile(Path("skills/gstack/SKILL.md"), b"new\n", 0o644)
+    assert plans[0].files[1].path == Path("skills/.agentops-public-provider-index.json")
     assert installed.read_bytes() == b"old\n"
 
 
 def test_public_plan_builder_rejects_cache_overlap_before_checkout(tmp_path: Path) -> None:
     home = tmp_path / "home"
-    dependency = _dependency(
-        "gstack", ref="1" * 40, strategy="gstack", destination="skills/gstack"
-    )
+    dependency = _dependency("gstack", ref="1" * 40, strategy="gstack", destination="skills/gstack")
     checkout_called = False
 
     def checkout(_dependency: SkillDependency, _cache: Path) -> Path:
@@ -244,9 +238,7 @@ def test_all_bundles_plan_before_one_shared_transaction(tmp_path: Path, monkeypa
     applied: list[tuple[ProviderPlan, ...]] = []
     monkeypatch.setattr("agent_ops.deployment.public_skills._render_dependency", fail_final)
     monkeypatch.setattr("agent_ops.skill_installer.install_provider_plans", applied.append)
-    monkeypatch.setattr(
-        "agent_ops.skill_installer._checkout_dependency", _checkout_from(sources)
-    )
+    monkeypatch.setattr("agent_ops.skill_installer._checkout_dependency", _checkout_from(sources))
 
     with pytest.raises(ValueError, match="injected final bundle failure"):
         install_skill_dependencies(
@@ -281,6 +273,7 @@ def test_successful_install_calls_shared_transaction_once_with_complete_tuple(
     superpowers.mkdir(parents=True)
     (superpowers / "SKILL.md").write_text("superpowers\n", encoding="utf-8")
     calls: list[tuple[ProviderPlan, ...]] = []
+
     def install(plans: tuple[ProviderPlan, ...]) -> None:
         calls.append(plans)
         apply_provider_plans(plans)
@@ -361,9 +354,7 @@ def test_non_posix_multi_bundle_route_fails_before_native_application(
         planned.append(tuple(item.id for item in kwargs["dependencies"]))
         if len(kwargs["dependencies"]) == 1:
             return original_build(**kwargs)
-        target = TargetSpec(
-            "public-skills:codex", Framework.CODEX, kwargs["target_home"], "public"
-        )
+        target = TargetSpec("public-skills:codex", Framework.CODEX, kwargs["target_home"], "public")
         return tuple(
             ProviderPlan(f"public-skill:{item.id}", "revision", target, ())
             for item in kwargs["dependencies"]
@@ -394,14 +385,15 @@ def test_non_posix_multi_bundle_route_fails_before_native_application(
     assert applied == []
     assert not home.exists()
 
-    install_skill_dependencies(
-        framework=Framework.CODEX,
-        dependencies=[dependencies[0]],
-        home=home,
-    )
+    with pytest.raises(UnsupportedPlatformError, match="rollback transaction"):
+        install_skill_dependencies(
+            framework=Framework.CODEX,
+            dependencies=[dependencies[0]],
+            home=home,
+        )
 
     assert planned[-1] == ("gstack",)
-    assert applied == ["gstack"]
+    assert applied == []
 
 
 def test_shared_manifest_removes_stale_owned_files_and_preserves_unknowns(
@@ -411,9 +403,7 @@ def test_shared_manifest_removes_stale_owned_files_and_preserves_unknowns(
     source.mkdir()
     old = source / "old.txt"
     old.write_bytes(b"old\n")
-    dependency = _dependency(
-        "gstack", ref="1" * 40, strategy="gstack", destination="skills/gstack"
-    )
+    dependency = _dependency("gstack", ref="1" * 40, strategy="gstack", destination="skills/gstack")
     monkeypatch.setattr(
         "agent_ops.skill_installer._checkout_dependency",
         lambda _dependency, _cache: source,
@@ -439,6 +429,178 @@ def test_shared_manifest_removes_stale_owned_files_and_preserves_unknowns(
     assert data["provider_ids"] == ["public-skill:gstack"]
 
 
+def test_subset_update_carries_unselected_provider_ownership_without_checkout(
+    tmp_path: Path, monkeypatch
+) -> None:
+    dependencies = [
+        _dependency("gstack", ref="1" * 40, strategy="gstack", destination="skills/gstack"),
+        _dependency(
+            "superpowers",
+            ref="2" * 40,
+            strategy="copy-skills",
+            source="skills",
+            destination="skills",
+        ),
+    ]
+    gstack = tmp_path / "gstack"
+    gstack.mkdir()
+    (gstack / "old.txt").write_bytes(b"old a\n")
+    superpowers = tmp_path / "superpowers/skills/provider-b"
+    superpowers.mkdir(parents=True)
+    preserved = superpowers / "SKILL.md"
+    preserved.write_bytes(b"provider b\n")
+    preserved.chmod(0o640)
+    sources = {"gstack": gstack, "superpowers": tmp_path / "superpowers"}
+    checkouts: list[str] = []
+
+    def checkout(dependency: SkillDependency, _cache: Path) -> Path:
+        checkouts.append(dependency.id)
+        return sources[dependency.id]
+
+    monkeypatch.setattr("agent_ops.skill_installer._checkout_dependency", checkout)
+    home = tmp_path / "home"
+    install_skill_dependencies(framework=Framework.CODEX, dependencies=dependencies, home=home)
+    b_target = home / "skills/provider-b/SKILL.md"
+    unknown = home / "skills/private-notes.txt"
+    unknown.write_bytes(b"unknown\n")
+    (gstack / "old.txt").unlink()
+    (gstack / "new.txt").write_bytes(b"new a\n")
+    dependencies[0] = dependencies[0].model_copy(update={"ref": "3" * 40})
+    checkouts.clear()
+
+    install_skill_dependencies(
+        framework=Framework.CODEX,
+        dependencies=dependencies,
+        dependency_ids=["gstack"],
+        home=home,
+    )
+
+    assert checkouts == ["gstack"]
+    assert not (home / "skills/gstack/old.txt").exists()
+    assert (home / "skills/gstack/new.txt").read_bytes() == b"new a\n"
+    assert b_target.read_bytes() == b"provider b\n"
+    assert stat.S_IMODE(b_target.stat().st_mode) == 0o640
+    assert unknown.read_bytes() == b"unknown\n"
+    manifest = json.loads(
+        next((home / ".agentops/deployment/manifests").glob("*.json")).read_text()
+    )
+    assert manifest["provider_ids"] == [
+        "public-skill:gstack",
+        "public-skill:superpowers",
+    ]
+    index = json.loads((home / "skills/.agentops-public-provider-index.json").read_text())
+    assert [item["provider_id"] for item in index["providers"]] == manifest["provider_ids"]
+
+
+@pytest.mark.parametrize("drift", ["missing", "changed"])
+def test_subset_dry_run_rejects_unselected_provider_drift_before_checkout(
+    tmp_path: Path, monkeypatch, drift: str
+) -> None:
+    dependencies = [
+        _dependency("gstack", ref="1" * 40, strategy="gstack", destination="skills/gstack"),
+        _dependency(
+            "superpowers",
+            ref="2" * 40,
+            strategy="copy-skills",
+            source="skills",
+            destination="skills",
+        ),
+    ]
+    gstack = tmp_path / "gstack"
+    gstack.mkdir()
+    (gstack / "SKILL.md").write_bytes(b"provider a\n")
+    superpowers = tmp_path / "superpowers/skills/provider-b"
+    superpowers.mkdir(parents=True)
+    (superpowers / "SKILL.md").write_bytes(b"provider b\n")
+    sources = {"gstack": gstack, "superpowers": tmp_path / "superpowers"}
+    checkouts: list[str] = []
+
+    def checkout(dependency: SkillDependency, _cache: Path) -> Path:
+        checkouts.append(dependency.id)
+        return sources[dependency.id]
+
+    monkeypatch.setattr("agent_ops.skill_installer._checkout_dependency", checkout)
+    home = tmp_path / "home"
+    install_skill_dependencies(framework=Framework.CODEX, dependencies=dependencies, home=home)
+    installed = home / "skills/provider-b/SKILL.md"
+    if drift == "missing":
+        installed.unlink()
+    else:
+        installed.write_bytes(b"changed\n")
+    checkouts.clear()
+
+    with pytest.raises(ValueError, match="prior managed file changed"):
+        install_skill_dependencies(
+            framework=Framework.CODEX,
+            dependencies=dependencies,
+            dependency_ids=["gstack"],
+            home=home,
+            dry_run=True,
+        )
+
+    assert checkouts == []
+
+
+@pytest.mark.parametrize("dry_run", [True, False])
+def test_dry_run_and_live_reject_unmanaged_conflict_without_mutation(
+    tmp_path: Path, monkeypatch, dry_run: bool
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "SKILL.md").write_bytes(b"planned\n")
+    dependency = _dependency("gstack", ref="1" * 40, strategy="gstack", destination="skills/gstack")
+    home = tmp_path / "home"
+    conflict = home / "skills/gstack/SKILL.md"
+    conflict.parent.mkdir(parents=True)
+    conflict.write_bytes(b"unmanaged\n")
+    before = conflict.read_bytes()
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency",
+        lambda _dependency, _cache: source,
+    )
+
+    with pytest.raises(ValueError, match="unmanaged destination conflicts"):
+        install_skill_dependencies(
+            framework=Framework.CODEX,
+            dependencies=[dependency],
+            home=home,
+            dry_run=dry_run,
+        )
+
+    assert conflict.read_bytes() == before
+    assert not (home / ".agentops/deployment").exists()
+
+
+@pytest.mark.parametrize("dry_run", [True, False])
+def test_dry_run_and_live_reject_prior_directory_drift_without_mutation(
+    tmp_path: Path, monkeypatch, dry_run: bool
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "SKILL.md").write_bytes(b"planned\n")
+    dependency = _dependency("gstack", ref="1" * 40, strategy="gstack", destination="skills/gstack")
+    home = tmp_path / "home"
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency",
+        lambda _dependency, _cache: source,
+    )
+    install_skill_dependencies(framework=Framework.CODEX, dependencies=[dependency], home=home)
+    directory = home / "skills/gstack"
+    directory.chmod(0o700)
+    before = (directory / "SKILL.md").read_bytes()
+
+    with pytest.raises(ValueError, match="prior .*directory changed"):
+        install_skill_dependencies(
+            framework=Framework.CODEX,
+            dependencies=[dependency],
+            home=home,
+            dry_run=dry_run,
+        )
+
+    assert (directory / "SKILL.md").read_bytes() == before
+    assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+
+
 @pytest.mark.parametrize("owned_path", ["{absolute}", "../outside.txt"])
 def test_shared_manifest_rejects_unsafe_owned_paths_before_shadow_removal(
     tmp_path: Path, monkeypatch, owned_path: str
@@ -446,9 +608,7 @@ def test_shared_manifest_rejects_unsafe_owned_paths_before_shadow_removal(
     source = tmp_path / "source"
     source.mkdir()
     (source / "SKILL.md").write_bytes(b"managed\n")
-    dependency = _dependency(
-        "gstack", ref="1" * 40, strategy="gstack", destination="skills/gstack"
-    )
+    dependency = _dependency("gstack", ref="1" * 40, strategy="gstack", destination="skills/gstack")
     home = tmp_path / "home"
     monkeypatch.setattr(
         "agent_ops.skill_installer._checkout_dependency",
@@ -490,9 +650,7 @@ def test_shared_manifest_rejects_duplicate_json_members(tmp_path: Path, monkeypa
     source = tmp_path / "source"
     source.mkdir()
     (source / "SKILL.md").write_bytes(b"managed\n")
-    dependency = _dependency(
-        "gstack", ref="1" * 40, strategy="gstack", destination="skills/gstack"
-    )
+    dependency = _dependency("gstack", ref="1" * 40, strategy="gstack", destination="skills/gstack")
     home = tmp_path / "home"
     monkeypatch.setattr(
         "agent_ops.skill_installer._checkout_dependency",
@@ -554,9 +712,7 @@ def test_source_closure_rejects_nonregular_entries(tmp_path: Path, kind: str) ->
         unsafe.symlink_to(outside)
     else:
         os.mkfifo(unsafe)
-    dependency = _dependency(
-        "gstack", ref="1" * 40, strategy="gstack", destination="skills/gstack"
-    )
+    dependency = _dependency("gstack", ref="1" * 40, strategy="gstack", destination="skills/gstack")
 
     with pytest.raises(ValueError, match="unsupported source entry"):
         build_public_skill_plans(
@@ -571,9 +727,7 @@ def test_source_closure_rejects_nonregular_entries(tmp_path: Path, kind: str) ->
 
 
 @pytest.mark.parametrize("kind", ["directory-symlink", "excluded-file-alias"])
-def test_source_closure_rejects_unsafe_materialized_aliases(
-    tmp_path: Path, kind: str
-) -> None:
+def test_source_closure_rejects_unsafe_materialized_aliases(tmp_path: Path, kind: str) -> None:
     source = tmp_path / "source"
     source.mkdir()
     (source / "SKILL.md").write_text("body", encoding="utf-8")
@@ -588,9 +742,7 @@ def test_source_closure_rejects_unsafe_materialized_aliases(
         excluded.mkdir(parents=True)
         (excluded / "secret.txt").write_bytes(b"secret\n")
         (source / "alias.txt").symlink_to(excluded / "secret.txt")
-    dependency = _dependency(
-        "gstack", ref="1" * 40, strategy="gstack", destination="skills/gstack"
-    )
+    dependency = _dependency("gstack", ref="1" * 40, strategy="gstack", destination="skills/gstack")
 
     with pytest.raises(ValueError, match="unsupported source entry"):
         build_public_skill_plans(
@@ -611,9 +763,7 @@ def test_source_closure_materializes_confined_regular_file_alias(tmp_path: Path)
     regular.write_bytes(b"aliased\n")
     regular.chmod(0o640)
     (source / "alias.txt").symlink_to(regular)
-    dependency = _dependency(
-        "gstack", ref="1" * 40, strategy="gstack", destination="skills/gstack"
-    )
+    dependency = _dependency("gstack", ref="1" * 40, strategy="gstack", destination="skills/gstack")
 
     plan = build_public_skill_plans(
         framework=Framework.CODEX,
@@ -635,9 +785,7 @@ def test_source_closure_materializes_fully_validated_directory_alias(tmp_path: P
     skill.write_bytes(b"aliased directory\n")
     skill.chmod(0o640)
     (source / "alias").symlink_to(regular, target_is_directory=True)
-    dependency = _dependency(
-        "gstack", ref="1" * 40, strategy="gstack", destination="skills/gstack"
-    )
+    dependency = _dependency("gstack", ref="1" * 40, strategy="gstack", destination="skills/gstack")
 
     plan = build_public_skill_plans(
         framework=Framework.CODEX,
@@ -647,9 +795,10 @@ def test_source_closure_materializes_fully_validated_directory_alias(tmp_path: P
         checkout_dependency=lambda _dependency, _cache: source,
     )[0]
 
-    assert PlannedFile(
-        Path("skills/gstack/alias/SKILL.md"), b"aliased directory\n", 0o640
-    ) in plan.files
+    assert (
+        PlannedFile(Path("skills/gstack/alias/SKILL.md"), b"aliased directory\n", 0o640)
+        in plan.files
+    )
 
 
 def test_checkout_rejects_untracked_output_before_rendering(tmp_path: Path) -> None:

@@ -1218,6 +1218,7 @@ def install_provider_plans(
             transaction_id=transaction_id,
         )
         with _target_lock(target.home) as home_fs:
+            _validate_group_current_state(home_fs, group)
             manifest_path = _manifest_path(target)
             prior_manifest_content = home_fs.read_optional(manifest_path)
             prior_data = None
@@ -1520,6 +1521,94 @@ def install_provider_plans(
                 raise
         manifests.append(manifest)
     return tuple(manifests)
+
+
+def _validate_group_current_state(home_fs: _HomeFS, group: _PlanGroup) -> None:
+    manifest_path = _manifest_path(group.target)
+    prior_content = home_fs.read_optional(manifest_path)
+    prior_data = None
+    if prior_content is not None:
+        _validate_ownership_manifest_stat(home_fs.stat(manifest_path))
+        prior_data = _validated_manifest_data(prior_content, target=group.target)
+        _verify_manifest_files_and_directories(
+            home_fs,
+            prior_data,
+            error_type=ValueError,
+            context="prior",
+        )
+    managed = (
+        {
+            Path(item["path"]): (item["fingerprint"], item["mode"])
+            for item in prior_data["files"]
+        }
+        if prior_data is not None
+        else {}
+    )
+    for directory in _directories(group.files):
+        if not home_fs.exists(directory.path):
+            continue
+        item = home_fs.stat(directory.path)
+        if stat.S_ISLNK(item.st_mode):
+            raise OSError(f"managed directory is a symbolic link: {directory.path}")
+        if not stat.S_ISDIR(item.st_mode):
+            raise ValueError(f"managed directory is not a directory: {directory.path}")
+        if not _valid_directory_mode(stat.S_IMODE(item.st_mode)):
+            raise ValueError(f"invalid managed directory mode: {directory.path}")
+    for item in group.files:
+        if not home_fs.exists(item.path):
+            continue
+        installed_stat = home_fs.stat(item.path)
+        if stat.S_ISLNK(installed_stat.st_mode):
+            raise ValueError(f"destination is a symbolic link: {item.path}")
+        if not stat.S_ISREG(installed_stat.st_mode):
+            raise ValueError(f"destination is not a regular file: {item.path}")
+        installed = home_fs.read_file(item.path)
+        installed_mode = stat.S_IMODE(installed_stat.st_mode)
+        prior = managed.get(item.path)
+        if prior is None:
+            if installed != item.content or installed_mode != item.mode:
+                raise ValueError(f"unmanaged destination conflicts with plan: {item.path}")
+        elif _fingerprint(installed) != prior[0] or installed_mode != prior[1]:
+            raise ValueError(f"managed destination changed: {item.path}")
+    for removal in group.removals:
+        prior = managed.get(removal)
+        if prior is None:
+            if home_fs.exists(removal):
+                raise ValueError(f"refusing to remove unmanaged destination: {removal}")
+            continue
+        if not home_fs.exists(removal):
+            continue
+        item = home_fs.stat(removal)
+        content = home_fs.read_file(removal)
+        if (
+            not stat.S_ISREG(item.st_mode)
+            or _fingerprint(content) != prior[0]
+            or stat.S_IMODE(item.st_mode) != prior[1]
+        ):
+            raise ValueError(f"managed destination changed: {removal}")
+
+
+def _preflight_provider_plans_read_only(plans: tuple[ProviderPlan, ...]) -> None:
+    """Validate every live-apply precondition without creating target state."""
+    _require_supported_platform()
+    for group in _validate_and_group(plans):
+        try:
+            descriptor = _open_absolute_directory(group.target.home, create=False)
+        except FileNotFoundError:
+            continue
+        opened = os.fstat(descriptor)
+        home_fs = _HomeFS(
+            group.target.home,
+            descriptor,
+            home_identity=(opened.st_dev, opened.st_ino),
+        )
+        with home_fs:
+            lock_path = Path(_LOCK_NAME)
+            if home_fs.exists(lock_path):
+                lock_stat = home_fs.stat(lock_path)
+                if not stat.S_ISREG(lock_stat.st_mode) or lock_stat.st_nlink != 1:
+                    raise ValueError("deployment lock is not a regular single-link file")
+            _validate_group_current_state(home_fs, group)
 
 
 def _manifest_from_data(

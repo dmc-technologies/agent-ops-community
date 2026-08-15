@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -161,6 +162,68 @@ def test_install_generates_namespaced_prime_skills_and_built_runtime(
     manifest = json.loads((target / gstack_prime.MANIFEST_NAME).read_text())
     assert manifest["owner"] == gstack_prime.MANIFEST_OWNER
     assert manifest["files"]["skills/agentops-gstack-review/SKILL.md"]
+
+
+def test_install_uses_explicit_renderer_environment_for_bun(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    upstream, bun, ref = _upstream_repo(tmp_path / "upstream")
+    monkeypatch.setattr(gstack_prime, "PINNED_GSTACK_REF", ref)
+    environment_log = tmp_path / "renderer-environment.json"
+    wrapper = tmp_path / "environment-bun"
+    required = (
+        "HOME",
+        "BUN_INSTALL",
+        "BUN_INSTALL_CACHE_DIR",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+    )
+    wrapper.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        f"required = {required!r}\n"
+        "values = {name: os.environ[name] for name in required}\n"
+        "for value in values.values():\n"
+        "    path = Path(value)\n"
+        "    path.mkdir(parents=True, exist_ok=True)\n"
+        "    (path / 'renderer-write').write_text('confined')\n"
+        f"Path({str(environment_log)!r}).write_text(json.dumps(values))\n"
+        f"os.execv({str(bun)!r}, [{str(bun)!r}, *sys.argv[1:]])\n",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    workspace = tmp_path / "cache/render"
+    renderer_env = {"PATH": os.environ["PATH"]}
+    renderer_env.update(
+        {
+            "HOME": str(workspace / "home"),
+            "BUN_INSTALL": str(workspace / "bun/install"),
+            "BUN_INSTALL_CACHE_DIR": str(workspace / "bun/cache"),
+            "XDG_CACHE_HOME": str(workspace / "xdg/cache"),
+            "XDG_CONFIG_HOME": str(workspace / "xdg/config"),
+            "XDG_DATA_HOME": str(workspace / "xdg/data"),
+            "TMPDIR": str(workspace / "tmp"),
+            "TMP": str(workspace / "tmp"),
+            "TEMP": str(workspace / "tmp"),
+        }
+    )
+
+    gstack_prime.install_prime_gstack(
+        upstream,
+        tmp_path / "prime-agent",
+        bun=wrapper,
+        renderer_env=renderer_env,
+    )
+
+    recorded = json.loads(environment_log.read_text())
+    assert recorded == {name: renderer_env[name] for name in required}
+    assert all(Path(value).is_relative_to(tmp_path / "cache") for value in recorded.values())
+    assert all((Path(value) / "renderer-write").is_file() for value in recorded.values())
 
 
 def test_install_refuses_colliding_user_file_without_partial_writes(
@@ -476,7 +539,6 @@ Continue the review.
     assert "### Landscape Check" in executive
     assert "Discuss the product directly" in executive
     assert "/office-hours" not in executive
-
 
 
 def test_shared_and_root_routing_uses_concrete_supported_actions() -> None:

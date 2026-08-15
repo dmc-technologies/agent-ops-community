@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 from contextlib import suppress
@@ -14,8 +15,13 @@ from pathlib import Path
 import json5
 
 from agent_ops.deployment.models import ProviderPlan
+from agent_ops.deployment.public_skills import PROVIDER_INDEX_PATH
 from agent_ops.deployment.public_skills import build_public_skill_plans as _build_public_skill_plans
-from agent_ops.deployment.transaction import UnsupportedPlatformError, install_provider_plans
+from agent_ops.deployment.transaction import (
+    UnsupportedPlatformError,
+    _preflight_provider_plans_read_only,
+    install_provider_plans,
+)
 from agent_ops.gstack_prime import install_prime_gstack
 from agent_ops.registries.models import Framework, SkillDependency, SkillDependencyInstall
 from agent_ops.show_me_adapter import install_show_me
@@ -909,9 +915,7 @@ def install_skill_dependencies(
         raise ValueError(f"no skill dependencies support framework {framework.value}")
 
     target_home = (home or default_framework_home(framework)).expanduser()
-    cache_root = (
-        cache_dir or Path("~/.cache/agentops/skill-dependencies")
-    ).expanduser()
+    cache_root = (cache_dir or Path("~/.cache/agentops/skill-dependencies")).expanduser()
     captured_cwd = Path.cwd()
     _validate_cache_target_separation(
         cache_root=_captured_absolute_path(cache_root, cwd=captured_cwd),
@@ -952,7 +956,9 @@ def install_skill_dependencies(
         dry_run=dry_run,
     )
     if _use_shared_transaction_engine():
-        if not dry_run:
+        if dry_run:
+            _preflight_provider_plans_read_only(plans)
+        else:
             install_provider_plans(plans)
         return installed
 
@@ -961,11 +967,16 @@ def install_skill_dependencies(
     # has a Windows backend. Multi-bundle application fails before mutation.
     if dry_run:
         return installed
-    if len(selected_dependencies) > 1:
+    if len(selected_dependencies) > 1 or len(plans) > 1:
         raise UnsupportedPlatformError(
             "atomic multi-bundle public skill installation requires the POSIX shared transaction"
         )
     dependency, install = selected_dependencies[0]
+    if install.strategy != "humanlayer-show-me":
+        raise UnsupportedPlatformError(
+            "native public skill application requires a demonstrated rollback transaction; "
+            f"strategy {install.strategy!r} is unsupported until a shared native backend exists"
+        )
     try:
         source = resolved_sources[dependency.id]
     except KeyError as exc:
@@ -1011,11 +1022,7 @@ def _validate_cache_target_separation(*, cache_root: Path, target_home: Path) ->
     with suppress(OSError, RuntimeError):
         candidates.append((cache_root.resolve(strict=False), target_home.resolve(strict=False)))
     for cache, target in candidates:
-        if (
-            cache == target
-            or cache.is_relative_to(target)
-            or target.is_relative_to(cache)
-        ):
+        if cache == target or cache.is_relative_to(target) or target.is_relative_to(cache):
             raise ValueError(
                 "dependency cache and selected target home must not overlap: "
                 f"cache={cache_root}, target={target_home}"
@@ -1030,14 +1037,28 @@ def _installed_dependencies_from_plans(
     target_home: Path,
     dry_run: bool,
 ) -> list[InstalledSkillDependency]:
-    if len(plans) != len(selected_dependencies):
-        raise ValueError(
-            "public skill plan count does not match requested dependencies: "
-            f"expected {len(selected_dependencies)}, got {len(plans)}"
-        )
+    expected_ids = [f"public-skill:{dependency.id}" for dependency, _ in selected_dependencies]
+    by_provider = {plan.provider_id: plan for plan in plans}
+    if len(by_provider) != len(plans) or any(
+        provider_id not in by_provider for provider_id in expected_ids
+    ):
+        raise ValueError("public skill plans do not match requested dependencies")
+    if (
+        len(plans) == len(selected_dependencies)
+        and [plan.provider_id for plan in plans] != expected_ids
+    ):
+        raise ValueError("public skill plan order does not match requested dependencies")
+    index_files = [
+        item for plan in plans for item in plan.files if item.path == PROVIDER_INDEX_PATH
+    ]
+    if index_files:
+        _validate_planned_provider_ownership(plans, index_files[0].content)
+    elif len(plans) != len(selected_dependencies):
+        raise ValueError("extra public skill plan does not have provider ownership")
     expected_target_id = f"public-skills:{framework.value}"
     installed: list[InstalledSkillDependency] = []
-    for plan, (dependency, install) in zip(plans, selected_dependencies, strict=True):
+    for dependency, install in selected_dependencies:
+        plan = by_provider[f"public-skill:{dependency.id}"]
         if (
             plan.target.id != expected_target_id
             or plan.target.framework is not framework
@@ -1058,6 +1079,62 @@ def _installed_dependencies_from_plans(
     return installed
 
 
+def _validate_planned_provider_ownership(plans: tuple[ProviderPlan, ...], content: bytes) -> None:
+    if sum(item.path == PROVIDER_INDEX_PATH for plan in plans for item in plan.files) != 1:
+        raise ValueError("invalid planned public provider ownership index count")
+    try:
+        data = json.loads(content)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid planned public provider ownership") from exc
+    target = plans[0].target
+    if (
+        not isinstance(data, dict)
+        or set(data) != {"schema_version", "target_id", "framework", "providers"}
+        or type(data["schema_version"]) is not int
+        or data["schema_version"] != 1
+        or data["target_id"] != target.id
+        or data["framework"] != target.framework.value
+        or not isinstance(data["providers"], list)
+    ):
+        raise ValueError("invalid planned public provider ownership")
+    expected = {
+        plan.provider_id: sorted(
+            item.path.as_posix() for item in plan.files if item.path != PROVIDER_INDEX_PATH
+        )
+        for plan in plans
+    }
+    observed: dict[str, list[str]] = {}
+    order: list[str] = []
+    for entry in data["providers"]:
+        if (
+            not isinstance(entry, dict)
+            or set(entry)
+            != {"provider_id", "source_revision", "source_descriptor", "paths"}
+            or not isinstance(entry["provider_id"], str)
+            or not isinstance(entry["source_revision"], str)
+            or not entry["source_revision"]
+            or not isinstance(entry["source_descriptor"], dict)
+            or not isinstance(entry["paths"], list)
+            or any(
+                not isinstance(value, str)
+                or not value
+                or "\\" in value
+                or value.startswith("/")
+                or any(part in {"", ".", ".."} for part in value.split("/"))
+                for value in entry["paths"]
+            )
+            or entry["paths"] != sorted(set(entry["paths"]))
+        ):
+            raise ValueError("invalid planned public provider ownership")
+        provider_id = entry["provider_id"]
+        if provider_id in observed:
+            raise ValueError("invalid planned public provider ownership")
+        order.append(provider_id)
+        observed[provider_id] = entry["paths"]
+    if order != sorted(expected) or observed != expected:
+        raise ValueError("planned public provider ownership does not match plans")
+
+
 def _checkout_dependency(dependency: SkillDependency, cache_root: Path) -> Path:
     destination = cache_root / f"{dependency.id}-{dependency.ref[:12]}"
     if cache_root.is_symlink():
@@ -1067,9 +1144,14 @@ def _checkout_dependency(dependency: SkillDependency, cache_root: Path) -> Path:
     if destination.exists() and not destination.is_dir():
         raise ValueError(f"dependency cache destination is not a directory: {destination}")
     git_directory = destination / ".git"
-    if git_directory.is_symlink():
-        raise ValueError(f"dependency checkout metadata is a symbolic link: {git_directory}")
-    if not (destination / ".git").exists():
+    if git_directory.exists() or git_directory.is_symlink():
+        metadata = git_directory.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError(
+                f"dependency checkout metadata must be a no-follow directory: {git_directory}"
+            )
+        _validate_checkout_git_metadata(destination, cache_root)
+    else:
         if destination.exists():
             shutil.rmtree(destination)
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -1079,6 +1161,7 @@ def _checkout_dependency(dependency: SkillDependency, cache_root: Path) -> Path:
             text=True,
             capture_output=True,
         )
+        _validate_checkout_git_metadata(destination, cache_root)
     subprocess.run(
         ["git", "-C", str(destination), "fetch", "--all", "--tags"],
         check=True,
@@ -1094,6 +1177,44 @@ def _checkout_dependency(dependency: SkillDependency, cache_root: Path) -> Path:
     return destination
 
 
+def _validate_checkout_git_metadata(destination: Path, cache_root: Path) -> None:
+    git_directory = destination / ".git"
+    metadata_stat = git_directory.lstat()
+    if stat.S_ISLNK(metadata_stat.st_mode) or not stat.S_ISDIR(metadata_stat.st_mode):
+        raise ValueError(
+            f"dependency checkout metadata must be a no-follow directory: {git_directory}"
+        )
+    captured_cwd = Path.cwd()
+    cache = _captured_absolute_path(cache_root, cwd=captured_cwd).resolve(strict=True)
+    commands = (
+        ["git", "-C", str(destination), "rev-parse", "--absolute-git-dir"],
+        [
+            "git",
+            "-C",
+            str(destination),
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ],
+    )
+    for command in commands:
+        value = subprocess.run(
+            command,
+            check=True,
+            text=True,
+            capture_output=True,
+        ).stdout.strip()
+        metadata = Path(value)
+        if not metadata.is_absolute():
+            raise ValueError("dependency checkout Git metadata path is not absolute")
+        try:
+            resolved = metadata.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise ValueError("dependency checkout Git metadata is unavailable") from exc
+        if not resolved.is_relative_to(cache):
+            raise ValueError(f"dependency checkout Git metadata escapes declared cache: {resolved}")
+
+
 def _install_dependency(
     *,
     framework: Framework,
@@ -1103,12 +1224,13 @@ def _install_dependency(
     source: Path,
     destination: Path,
     install: SkillDependencyInstall,
+    renderer_env: dict[str, str] | None = None,
 ) -> None:
     context_home = context_home or target_home
     if install.strategy == "prime-gstack":
         if dependency_id != "gstack":
             raise ValueError("prime-gstack strategy is only valid for gstack")
-        install_prime_gstack(source, destination)
+        install_prime_gstack(source, destination, renderer_env=renderer_env)
         return
     if install.strategy in {"gstack", "copy-repo"}:
         _replace_tree(source, destination)
