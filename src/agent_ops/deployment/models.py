@@ -10,11 +10,14 @@ from agent_ops.registries.models import Framework
 
 
 def _repository_relative_path(path: Path) -> Path:
+    windows_path = PureWindowsPath(path)
     if (
         path.is_absolute()
-        or PureWindowsPath(path).is_absolute()
+        or windows_path.is_absolute()
+        or windows_path.drive
         or not path.parts
         or any(part == ".." for part in path.parts)
+        or any(part == ".." for part in windows_path.parts)
     ):
         raise ValueError("managed path must be a normalized repository-relative path")
     return path
@@ -209,16 +212,15 @@ class DeploymentReceipt:
 @dataclass(frozen=True)
 class DeploymentAudit:
     target_id: str
-    matches: tuple[Path, ...]
-    missing: tuple[Path, ...]
-    changed: tuple[Path, ...]
-    unexpected: tuple[Path, ...]
-    duplicates: tuple[Path, ...]
-    validation_errors: tuple[str, ...]
+    matches: bool
+    missing: tuple[str, ...] = ()
+    changed: tuple[str, ...] = ()
+    unexpected: tuple[str, ...] = ()
+    duplicates: tuple[str, ...] = ()
+    validation_errors: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _nonempty(self.target_id, "target id")
-        object.__setattr__(self, "matches", tuple(self.matches))
         object.__setattr__(self, "missing", tuple(self.missing))
         object.__setattr__(self, "changed", tuple(self.changed))
         object.__setattr__(self, "unexpected", tuple(self.unexpected))

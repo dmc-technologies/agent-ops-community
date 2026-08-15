@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from agent_ops.deployment import (
+    DeploymentAudit,
     DeploymentRequest,
     ManifestDirectory,
     ManifestFile,
@@ -35,7 +36,16 @@ def test_target_and_planned_file_are_immutable_and_repo_relative() -> None:
         planned.mode = 0o600  # type: ignore[misc]
 
 
-@pytest.mark.parametrize("path", (Path("/managed"), Path("../managed"), Path(".")))
+@pytest.mark.parametrize(
+    "path",
+    (
+        Path("/managed"),
+        Path("../managed"),
+        Path("."),
+        Path("C:managed"),
+        Path(r"managed\..\other"),
+    ),
+)
 def test_managed_paths_reject_unsafe_repository_relative_values(path: Path) -> None:
     with pytest.raises(ValueError, match="repository-relative"):
         PlannedFile(path=path, content=b"example\n", mode=0o644)
@@ -58,7 +68,28 @@ def test_managed_paths_reject_unsafe_repository_relative_values(path: Path) -> N
         )
 
 
+def test_deployment_audit_reports_boolean_match_with_empty_diagnostics() -> None:
+    audit = DeploymentAudit(target_id="codex-dev", matches=True)
+
+    assert audit.matches is True
+    assert audit.missing == ()
+    assert audit.changed == ()
+    assert audit.unexpected == ()
+    assert audit.duplicates == ()
+    assert audit.validation_errors == ()
+
+    with pytest.raises(FrozenInstanceError):
+        audit.matches = False  # type: ignore[misc]
+
+
 def test_deployment_provider_entry_points_are_separate_from_runner_plugins(monkeypatch) -> None:
-    monkeypatch.setattr("agent_ops.deployment.providers.entry_points", lambda group: ())
+    requested_groups: list[str] = []
+
+    def empty_entry_points(*, group: str) -> tuple[()]:
+        requested_groups.append(group)
+        return ()
+
+    monkeypatch.setattr("agent_ops.deployment.providers.entry_points", empty_entry_points)
 
     assert load_deployment_providers() == []
+    assert requested_groups == ["agent_ops.deployment_providers"]
