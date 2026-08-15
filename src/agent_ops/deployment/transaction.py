@@ -45,6 +45,7 @@ _METADATA = Path(".agentops/deployment")
 _LOCK_NAME = ".agentops-deployment.lock"
 _TRANSACTION_PATHS: dict[str, Path] = {}
 _POSIX_SUPPORTED = os.name == "posix" and fcntl is not None
+_CANONICAL_HOME_IDENTITY_ERROR = "deployment canonical home identity changed"
 
 
 class PublicationIndeterminateError(OSError):
@@ -219,24 +220,15 @@ class _HomeFS:
         os.close(self.descriptor)
 
     def verify_lock_identity(self) -> None:
-        if (
-            self._home_identity is None
-            or self._lock_name is None
-            or self._lock_identity is None
-        ):
+        if self._home_identity is None:
             return
         canonical_descriptor: int | None = None
         try:
             canonical_descriptor = _open_absolute_directory(self.home, create=False)
             home_item = os.fstat(canonical_descriptor)
             retained_home = os.fstat(self.descriptor)
-            lock_item = os.stat(
-                self._lock_name,
-                dir_fd=self.descriptor,
-                follow_symlinks=False,
-            )
         except OSError as exc:
-            raise ValueError("deployment home or lock identity changed") from exc
+            raise ValueError(_CANONICAL_HOME_IDENTITY_ERROR) from exc
         finally:
             if canonical_descriptor is not None:
                 os.close(canonical_descriptor)
@@ -245,11 +237,26 @@ class _HomeFS:
             or (home_item.st_dev, home_item.st_ino) != self._home_identity
             or not stat.S_ISDIR(retained_home.st_mode)
             or (retained_home.st_dev, retained_home.st_ino) != self._home_identity
-            or not stat.S_ISREG(lock_item.st_mode)
+        ):
+            raise ValueError(_CANONICAL_HOME_IDENTITY_ERROR)
+        if self._lock_name is None and self._lock_identity is None:
+            return
+        if self._lock_name is None or self._lock_identity is None:
+            raise ValueError("deployment lock identity changed")
+        try:
+            lock_item = os.stat(
+                self._lock_name,
+                dir_fd=self.descriptor,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise ValueError("deployment lock identity changed") from exc
+        if (
+            not stat.S_ISREG(lock_item.st_mode)
             or lock_item.st_nlink != 1
             or (lock_item.st_dev, lock_item.st_ino) != self._lock_identity
         ):
-            raise ValueError("deployment home or lock identity changed")
+            raise ValueError("deployment lock identity changed")
 
     @staticmethod
     def _parts(relative: Path) -> tuple[str, ...]:
@@ -800,6 +807,7 @@ def _read_ownership_manifest_for_audit(
     home_fs: _HomeFS,
     manifest_path: Path,
 ) -> tuple[bytes | None, str | None]:
+    home_fs.verify_lock_identity()
     try:
         manifest_stat = home_fs.stat(manifest_path)
     except FileNotFoundError:
@@ -2379,19 +2387,49 @@ def audit_provider_plans(plans: tuple[ProviderPlan, ...]) -> DeploymentAudit:
     duplicates: list[str] = []
     validation_errors: list[str] = []
     try:
-        home_fs = _HomeFS(target.home, _open_absolute_directory(target.home, create=False))
+        home_descriptor = _open_absolute_directory(target.home, create=False)
     except FileNotFoundError:
         return DeploymentAudit(
             target_id=target.id,
             matches=False,
             missing=tuple(item.path.as_posix() for item in files),
         )
+    except OSError:
+        return DeploymentAudit(
+            target_id=target.id,
+            matches=False,
+            validation_errors=(_CANONICAL_HOME_IDENTITY_ERROR,),
+        )
+    try:
+        opened_home = os.fstat(home_descriptor)
+    except OSError:
+        os.close(home_descriptor)
+        return DeploymentAudit(
+            target_id=target.id,
+            matches=False,
+            validation_errors=(_CANONICAL_HOME_IDENTITY_ERROR,),
+        )
+    except BaseException:
+        os.close(home_descriptor)
+        raise
+    home_fs = _HomeFS(
+        target.home,
+        home_descriptor,
+        home_identity=(opened_home.st_dev, opened_home.st_ino),
+    )
     with home_fs:
         manifest_path = _manifest_path(target)
-        manifest_content, manifest_error = _read_ownership_manifest_for_audit(
-            home_fs,
-            manifest_path,
-        )
+        try:
+            manifest_content, manifest_error = _read_ownership_manifest_for_audit(
+                home_fs,
+                manifest_path,
+            )
+        except (OSError, ValueError):
+            return DeploymentAudit(
+                target_id=target.id,
+                matches=False,
+                validation_errors=(_CANONICAL_HOME_IDENTITY_ERROR,),
+            )
         if manifest_error is not None:
             validation_errors.append(manifest_error)
         else:
@@ -2478,6 +2516,14 @@ def audit_provider_plans(plans: tuple[ProviderPlan, ...]) -> DeploymentAudit:
             for name, paths in sorted(names.items())
             if len(paths) > 1
         ]
+        try:
+            home_fs.verify_lock_identity()
+        except (OSError, ValueError):
+            return DeploymentAudit(
+                target_id=target.id,
+                matches=False,
+                validation_errors=(_CANONICAL_HOME_IDENTITY_ERROR,),
+            )
     return DeploymentAudit(
         target_id=target.id,
         matches=not (missing or changed or unexpected or duplicates or validation_errors),

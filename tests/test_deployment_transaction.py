@@ -2355,3 +2355,95 @@ def test_relative_home_is_bound_before_working_directory_changes(
 
     assert (starting_directory / "relative-home/skills/example/SKILL.md").read_bytes() == b"body\n"
     assert not (other_directory / "relative-home").exists()
+
+
+@pytest.mark.parametrize("ancestor", ["parent", "grandparent"])
+def test_audit_rejects_replaced_canonical_home_ancestor_without_reporting_displaced_data(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    ancestor: str,
+) -> None:
+    root = tmp_path / "root"
+    parent = root / "parent"
+    home = parent / "home"
+    plan = _plan(home, PlannedFile(Path("skills/example/SKILL.md"), b"body\n", 0o644))
+    install_provider_plans((plan,))
+    (home / "skills/example/SKILL.md").write_bytes(b"displaced data\n")
+    replaced = parent if ancestor == "parent" else root
+    displaced = tmp_path / f"displaced-audit-{ancestor}"
+    original_read = transaction_module._read_ownership_manifest_for_audit
+    replaced_once = False
+
+    def replace_ancestor_before_manifest_read(
+        home_fs: object,
+        manifest_path: Path,
+    ) -> tuple[bytes | None, str | None]:
+        nonlocal replaced_once
+        if not replaced_once:
+            replaced_once = True
+            os.replace(replaced, displaced)
+            home.mkdir(parents=True)
+        return original_read(home_fs, manifest_path)
+
+    monkeypatch.setattr(
+        transaction_module,
+        "_read_ownership_manifest_for_audit",
+        replace_ancestor_before_manifest_read,
+    )
+
+    def audit_result() -> tuple[
+        bool,
+        tuple[str, ...],
+        tuple[str, ...],
+        tuple[str, ...],
+        tuple[str, ...],
+        tuple[str, ...],
+    ]:
+        audit = audit_provider_plans((plan,))
+        return (
+            audit.matches,
+            audit.missing,
+            audit.changed,
+            audit.unexpected,
+            audit.duplicates,
+            audit.validation_errors,
+        )
+
+    result = _run_bounded(audit_result)
+
+    assert result == (
+        "returned",
+        (
+            False,
+            (),
+            (),
+            (),
+            (),
+            ("deployment canonical home identity changed",),
+        ),
+    )
+
+
+def test_audit_reports_opened_home_descriptor_race_as_identity_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    plan = _plan(home, PlannedFile(Path("skills/example/SKILL.md"), b"body\n", 0o644))
+    install_provider_plans((plan,))
+    original_fstat = transaction_module.os.fstat
+    failed = False
+
+    def fail_first_fstat(descriptor: int) -> os.stat_result:
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise OSError("descriptor identity unavailable")
+        return original_fstat(descriptor)
+
+    monkeypatch.setattr(transaction_module.os, "fstat", fail_first_fstat)
+
+    audit = audit_provider_plans((plan,))
+
+    assert not audit.matches
+    assert audit.validation_errors == ("deployment canonical home identity changed",)
