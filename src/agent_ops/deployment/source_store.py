@@ -83,17 +83,23 @@ def _git_environment() -> dict[str, str]:
     return environment
 
 
-def _terminate_process_group(process: subprocess.Popen[str]) -> None:
-    if process.poll() is not None:
-        return
+def _terminate_process_group(
+    process: subprocess.Popen[str], process_group: int, *, grace: float = 0.5
+) -> None:
     with suppress(ProcessLookupError):
-        os.killpg(process.pid, signal.SIGTERM)
-    try:
-        process.communicate(timeout=1.0)
-    except subprocess.TimeoutExpired:
-        with suppress(ProcessLookupError):
-            os.killpg(process.pid, signal.SIGKILL)
-        process.communicate()
+        os.killpg(process_group, signal.SIGTERM)
+    with suppress(BaseException):
+        process.communicate(timeout=grace)
+    with suppress(ProcessLookupError):
+        os.killpg(process_group, signal.SIGKILL)
+    with suppress(BaseException):
+        process.communicate(timeout=grace)
+    for pipe in (process.stdout, process.stderr):
+        if pipe is not None:
+            with suppress(OSError):
+                pipe.close()
+    with suppress(BaseException):
+        process.wait(timeout=grace)
 
 
 def _run_git(
@@ -130,15 +136,16 @@ def _run_git(
         text=True,
         start_new_session=True,
     )
+    process_group = process.pid
     try:
         stdout, stderr = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as error:
         with suppress(BaseException):
-            _terminate_process_group(process)
+            _terminate_process_group(process, process_group)
         raise _GitTimeout(f"Git command timed out after {timeout:g} seconds") from error
     except (KeyboardInterrupt, SystemExit):
         with suppress(BaseException):
-            _terminate_process_group(process)
+            _terminate_process_group(process, process_group)
         raise
     completed = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
     if completed.returncode not in accepted_returncodes:
@@ -568,7 +575,7 @@ class SourceStore:
             raise ValueError("Git timeout must be a finite positive number")
         if not math.isfinite(git_timeout) or git_timeout <= 0:
             raise ValueError("Git timeout must be a finite positive number")
-        self._state_root = Path(state_root)
+        self._state_root = Path(os.path.abspath(Path(state_root).expanduser()))
         self._git_timeout = float(git_timeout)
 
     def fetch(
@@ -977,12 +984,16 @@ class _PinnedEntry:
         relative_path: Path,
         descriptor: int,
         chain: tuple[tuple[int, str, tuple[int, int, int, int, int]], ...],
+        expected_blob: str | None,
+        object_format: str,
     ) -> None:
         self._closure = closure
         self._descriptor = descriptor
         self._chain = chain
         observed = os.fstat(descriptor)
         self._identity = _identity(observed)
+        self._expected_blob = expected_blob
+        self._object_format = object_format
         self.relative_path = relative_path
         self.kind = "directory" if stat.S_ISDIR(observed.st_mode) else "file"
         self.mode = stat.S_IMODE(observed.st_mode)
@@ -1010,6 +1021,10 @@ class _PinnedEntry:
         self._revalidate()
         data = _read_fd_bytes(self._descriptor)
         self._revalidate()
+        if self._expected_blob is None or (
+            _blob_oid(data, self._object_format) != self._expected_blob
+        ):
+            raise RuntimeError("provider data bytes differ from the tracked Git blob")
         return data
 
 
@@ -1039,17 +1054,27 @@ class _PinnedClosure:
                 self._root_identity
             ):
                 raise RuntimeError("snapshot root changed during verification")
+            object_format = _run_git(
+                ("rev-parse", "--show-object-format"),
+                cwd=self._root,
+                timeout=_DEFAULT_GIT_TIMEOUT,
+            ).stdout.strip()
             raw_paths = [str(path) for path in declared]
             if len(raw_paths) != len(set(raw_paths)):
                 raise ValueError("provider data closure contains duplicate paths")
-            entries = [self._open_entry(path, expected) for path in declared]
+            entries = [
+                self._open_entry(path, expected, object_format) for path in declared
+            ]
         except BaseException:
             self.close()
             raise
         self.entries = tuple(entries)
 
     def _open_entry(
-        self, path: Path, expected: dict[str, _HeadEntry]
+        self,
+        path: Path,
+        expected: dict[str, _HeadEntry],
+        object_format: str,
     ) -> _PinnedEntry:
         if not isinstance(path, Path):
             raise ValueError("provider data closure entries must be Path values")
@@ -1093,7 +1118,15 @@ class _PinnedClosure:
             observed = os.fstat(next_fd)
             chain.append((current_fd, part, _identity(observed)))
             current_fd = next_fd
-        return _PinnedEntry(self, path, current_fd, tuple(chain))
+        expected_blob = expected[raw].object_id if raw in expected else None
+        return _PinnedEntry(
+            self,
+            path,
+            current_fd,
+            tuple(chain),
+            expected_blob,
+            object_format,
+        )
 
     def _revalidate_root(self) -> None:
         if self.closed or self._root_identity is None:

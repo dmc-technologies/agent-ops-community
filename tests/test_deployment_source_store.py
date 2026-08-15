@@ -6,6 +6,7 @@ import multiprocessing
 import os
 import subprocess
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -906,6 +907,28 @@ def test_descriptor_closure_pins_entry_and_rejects_replacement(
     assert closure.closed
 
 
+def test_descriptor_closure_rejects_in_place_equal_length_byte_change(
+    git_remote: Path, tmp_path: Path
+) -> None:
+    snapshot = SourceStore(tmp_path / "state").fetch(
+        _source(git_remote), "refs/heads/main"
+    )
+    target = snapshot.root / "catalog/skill.txt"
+    with _open_provider_data_closure(
+        snapshot, (Path("catalog/skill.txt"),)
+    ) as closure:
+        entry = closure.entries[0]
+        before = target.stat()
+        target.write_bytes(b"evil")
+        os.utime(
+            target,
+            ns=(before.st_atime_ns, before.st_mtime_ns),
+            follow_symlinks=False,
+        )
+        with pytest.raises(RuntimeError, match="tracked Git blob"):
+            entry.read_bytes()
+
+
 def test_descriptor_closure_binds_root_before_verification_returns(
     git_remote: Path,
     tmp_path: Path,
@@ -1006,6 +1029,44 @@ def test_git_timeout_kills_complete_process_group(
     assert state in {"gone", "Z"}
 
 
+def test_git_timeout_kills_descendant_after_leader_exits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    binary = tmp_path / "bin"
+    binary.mkdir()
+    marker = tmp_path / "descendant-pid"
+    fake_git = binary / "git"
+    descendant = (
+        "import os,signal;"
+        "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
+        f"open({str(marker)!r},'w').write(str(os.getpid()));"
+        "os.write(4,b'x');"
+        "signal.pause()"
+    )
+    fake_git.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os,subprocess,sys\n"
+        "read_fd,write_fd=os.pipe()\n"
+        f"subprocess.Popen([sys.executable,'-c',{descendant!r}],pass_fds=(write_fd,))\n"
+        "os.close(write_fd)\n"
+        "os.read(read_fd,1)\n"
+        "os._exit(0)\n"
+    )
+    fake_git.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{binary}{os.pathsep}{os.environ['PATH']}")
+    started = time.monotonic()
+    with pytest.raises(_GitTimeout, match="timed out"):
+        _run_git(("version",), timeout=0.2)
+    assert time.monotonic() - started < 2.0
+    descendant_pid = int(marker.read_text())
+    process_state = Path(f"/proc/{descendant_pid}/stat")
+    try:
+        state = process_state.read_text().split()[2]
+    except (FileNotFoundError, ProcessLookupError):
+        state = "gone"
+    assert state in {"gone", "Z"}
+
+
 def test_git_runner_preserves_process_control_when_cleanup_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1073,3 +1134,35 @@ def test_cross_process_same_source_creation_is_coherent(
     observed = [results.get(timeout=5) for _ in processes]
     assert {status for status, _ in observed} == {"ok"}
     assert len({commit for _, commit in observed}) == 1
+
+
+def test_relative_state_root_is_stable_after_chdir(
+    git_remote: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    starting = tmp_path / "starting"
+    later = tmp_path / "later"
+    starting.mkdir()
+    later.mkdir()
+    monkeypatch.chdir(starting)
+    observed_paths: list[Path] = []
+    original = source_store_module._run_git
+
+    def observe_paths(*args: object, **kwargs: object) -> object:
+        git_args = args[0]
+        for argument in git_args:
+            if "relative-state" in str(argument):
+                observed_paths.append(Path(argument))
+        if kwargs.get("cwd") is not None:
+            observed_paths.append(Path(kwargs["cwd"]))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(source_store_module, "_run_git", observe_paths)
+    store = SourceStore(Path("relative-state"))
+    snapshot = store.fetch(_source(git_remote), "refs/heads/main")
+    assert snapshot.root.is_absolute()
+    monkeypatch.chdir(later)
+    loaded = store.snapshot("example", snapshot.commit)
+    assert loaded.root == snapshot.root
+    assert observed_paths and all(path.is_absolute() for path in observed_paths)
