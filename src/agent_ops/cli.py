@@ -12,6 +12,7 @@ from agent_ops.bootstrap import SUPPORTED_BOOTSTRAPS, write_all_bootstraps, writ
 from agent_ops.context import build_context_pack
 from agent_ops.contracts.job import load_job
 from agent_ops.contracts.result import RunResult
+from agent_ops.deployment.transaction import UnsupportedPlatformError
 from agent_ops.frameworks import ADAPTERS, get_adapter
 from agent_ops.harness import check_harness, default_verification, init_harness
 from agent_ops.plugins import run_with_plugins
@@ -250,7 +251,12 @@ def install_skills(
             cache_dir=cache_dir,
             dry_run=dry_run,
         )
-    except (FileNotFoundError, ValueError, subprocess.CalledProcessError) as exc:
+    except (
+        FileNotFoundError,
+        UnsupportedPlatformError,
+        ValueError,
+        subprocess.CalledProcessError,
+    ) as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(1) from exc
 

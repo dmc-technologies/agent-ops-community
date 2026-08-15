@@ -12,6 +12,9 @@ from pathlib import Path
 
 import json5
 
+from agent_ops.deployment.models import ProviderPlan
+from agent_ops.deployment.public_skills import build_public_skill_plans as _build_public_skill_plans
+from agent_ops.deployment.transaction import UnsupportedPlatformError, install_provider_plans
 from agent_ops.gstack_prime import install_prime_gstack
 from agent_ops.registries.models import Framework, SkillDependency, SkillDependencyInstall
 from agent_ops.show_me_adapter import install_show_me
@@ -25,6 +28,46 @@ class InstalledSkillDependency:
     destination: Path
     strategy: str
     dry_run: bool = False
+
+    @classmethod
+    def from_plan(
+        cls,
+        plan: ProviderPlan,
+        *,
+        install: SkillDependencyInstall,
+        dry_run: bool = False,
+    ) -> InstalledSkillDependency:
+        prefix = "public-skill:"
+        if not plan.provider_id.startswith(prefix) or plan.provider_id == prefix:
+            raise ValueError(f"not a public skill provider plan: {plan.provider_id}")
+        return cls(
+            id=plan.provider_id.removeprefix(prefix),
+            framework=plan.target.framework,
+            destination=plan.target.home / install.destination,
+            strategy=install.strategy,
+            dry_run=dry_run,
+        )
+
+
+def build_public_skill_plans(
+    *,
+    framework: Framework,
+    dependencies: list[SkillDependency],
+    target_home: Path,
+    cache_root: Path,
+):
+    return _build_public_skill_plans(
+        framework=framework,
+        dependencies=dependencies,
+        target_home=target_home,
+        cache_root=cache_root,
+        checkout_dependency=_checkout_dependency,
+        install_dependency=_install_dependency,
+    )
+
+
+def _use_shared_transaction_engine() -> bool:
+    return os.name == "posix"
 
 
 def default_framework_home(framework: Framework) -> Path:
@@ -830,7 +873,7 @@ def install_skill_dependencies(
 
     target_home = (home or default_framework_home(framework)).expanduser()
     cache_root = (cache_dir or Path("~/.cache/agentops/skill-dependencies")).expanduser()
-    installed: list[InstalledSkillDependency] = []
+    selected_dependencies: list[tuple[SkillDependency, SkillDependencyInstall]] = []
 
     show_me_selected = any(
         dependency.id == "humanlayer-show-me"
@@ -847,25 +890,59 @@ def install_skill_dependencies(
         install = dependency.install.get(framework.value)
         if install is None:
             continue
-        destination = target_home / install.destination
-        installed.append(
-            InstalledSkillDependency(
-                id=dependency.id,
-                framework=framework,
-                destination=destination,
-                strategy=install.strategy,
-                dry_run=dry_run,
-            )
+        selected_dependencies.append((dependency, install))
+
+    installed = [
+        InstalledSkillDependency(
+            id=dependency.id,
+            framework=framework,
+            destination=target_home / install.destination,
+            strategy=install.strategy,
+            dry_run=dry_run,
         )
-        if dry_run:
-            continue
+        for dependency, install in selected_dependencies
+    ]
+
+    if _use_shared_transaction_engine():
+        plans = build_public_skill_plans(
+            framework=framework,
+            dependencies=[dependency for dependency, _install in selected_dependencies],
+            target_home=target_home,
+            cache_root=cache_root,
+        )
+        installed = [
+            InstalledSkillDependency.from_plan(plan, install=install, dry_run=dry_run)
+            for plan, (_dependency, install) in zip(
+                plans, selected_dependencies, strict=True
+            )
+        ]
+        if not dry_run:
+            install_provider_plans(plans)
+        return installed
+
+    # The shared descriptor-bound transaction is POSIX-only. Render first, then
+    # keep the verified single-bundle native Windows adapters explicit until it
+    # has a Windows backend. Multi-bundle application fails before mutation.
+    build_public_skill_plans(
+        framework=framework,
+        dependencies=[dependency for dependency, _install in selected_dependencies],
+        target_home=target_home,
+        cache_root=cache_root,
+    )
+    if dry_run:
+        return installed
+    if len(selected_dependencies) > 1:
+        raise UnsupportedPlatformError(
+            "atomic multi-bundle public skill installation requires the POSIX shared transaction"
+        )
+    for dependency, install in selected_dependencies:
         source = _checkout_dependency(dependency, cache_root)
         _install_dependency(
             framework=framework,
             target_home=target_home,
             dependency_id=dependency.id,
             source=source,
-            destination=destination,
+            destination=target_home / install.destination,
             install=install,
         )
 
@@ -874,6 +951,15 @@ def install_skill_dependencies(
 
 def _checkout_dependency(dependency: SkillDependency, cache_root: Path) -> Path:
     destination = cache_root / f"{dependency.id}-{dependency.ref[:12]}"
+    if cache_root.is_symlink():
+        raise ValueError(f"dependency cache root is a symbolic link: {cache_root}")
+    if destination.is_symlink():
+        raise ValueError(f"dependency cache destination is a symbolic link: {destination}")
+    if destination.exists() and not destination.is_dir():
+        raise ValueError(f"dependency cache destination is not a directory: {destination}")
+    git_directory = destination / ".git"
+    if git_directory.is_symlink():
+        raise ValueError(f"dependency checkout metadata is a symbolic link: {git_directory}")
     if not (destination / ".git").exists():
         if destination.exists():
             shutil.rmtree(destination)
@@ -903,11 +989,13 @@ def _install_dependency(
     *,
     framework: Framework,
     target_home: Path,
+    context_home: Path | None = None,
     dependency_id: str,
     source: Path,
     destination: Path,
     install: SkillDependencyInstall,
 ) -> None:
+    context_home = context_home or target_home
     if install.strategy == "prime-gstack":
         if dependency_id != "gstack":
             raise ValueError("prime-gstack strategy is only valid for gstack")
@@ -928,12 +1016,12 @@ def _install_dependency(
         collision_allowed_symlink_targets: tuple[Path, ...] = ()
         if framework is Framework.OPENCLAW:
             collision_limits, collision_allowed_symlink_targets = _openclaw_collision_options(
-                target_home
+                context_home
             )
         install_show_me(
             source,
             destination / "show-me",
-            collision_roots=_show_me_collision_roots(framework, target_home),
+            collision_roots=_show_me_collision_roots(framework, context_home),
             flat_markdown=framework is Framework.OPENCODE,
             collision_policy=_show_me_collision_policy(framework),
             collision_limits=collision_limits,

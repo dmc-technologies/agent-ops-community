@@ -1,0 +1,469 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import shutil
+import stat
+import subprocess
+import tempfile
+from collections.abc import Callable
+from dataclasses import replace
+from pathlib import Path, PurePosixPath
+
+from agent_ops.deployment.models import PlannedFile, ProviderPlan, TargetSpec
+from agent_ops.registries.models import Framework, SkillDependency, SkillDependencyInstall
+from agent_ops.show_me_adapter import ShowMeCollisionError
+
+CheckoutDependency = Callable[[SkillDependency, Path], Path]
+InstallDependency = Callable[..., None]
+
+_SHADOW_PATHS = (
+    Path("skills"),
+    Path("dependencies"),
+    Path(".agentops/gstack-prime-manifest.json"),
+    Path(".agentops/runtime/gstack"),
+    Path(".agentops/skill-dependencies"),
+)
+
+
+def build_public_skill_plans(
+    *,
+    framework: Framework,
+    dependencies: list[SkillDependency],
+    target_home: Path,
+    cache_root: Path,
+    checkout_dependency: CheckoutDependency,
+    install_dependency: InstallDependency | None = None,
+) -> tuple[ProviderPlan, ...]:
+    """Resolve and render every public bundle before returning immutable plans."""
+
+    if install_dependency is None:
+        install_dependency = _default_install_dependency
+    target_home = target_home.expanduser()
+    target = TargetSpec(
+        id=f"public-skills:{framework.value}",
+        framework=framework,
+        home=target_home,
+        channel="public",
+    )
+    source_revision = _combined_revision(dependencies, framework)
+    _validate_target_ancestors(
+        target_home,
+        show_me=any(dependency.id == "humanlayer-show-me" for dependency in dependencies),
+    )
+    prior_files = _prior_shared_files(target)
+    _validate_prior_shared_files(
+        target,
+        prior_files,
+        show_me=any(dependency.id == "humanlayer-show-me" for dependency in dependencies),
+    )
+    prior_paths = set(prior_files)
+    plans: list[ProviderPlan] = []
+    for dependency in dependencies:
+        install = dependency.install[framework.value]
+        source = checkout_dependency(dependency, cache_root)
+        _validate_checkout(dependency, source, install)
+        plan = _render_dependency(
+            framework=framework,
+            dependency=dependency,
+            install=install,
+            source=source,
+            target=target,
+            prior_paths=prior_paths,
+            install_dependency=install_dependency,
+        )
+        plans.append(replace(plan, source_revision=source_revision))
+
+    desired = {item.path for plan in plans for item in plan.files}
+    stale = tuple(sorted(prior_paths - desired, key=lambda path: path.as_posix()))
+    if stale:
+        plans[0] = replace(plans[0], removals=stale)
+    return tuple(plans)
+
+
+def _combined_revision(
+    dependencies: list[SkillDependency], framework: Framework
+) -> str:
+    inputs = [
+        {
+            "id": dependency.id,
+            "repo": dependency.repo,
+            "ref": dependency.ref,
+            "install": dependency.install[framework.value].model_dump(mode="json"),
+        }
+        for dependency in dependencies
+    ]
+    return "public-skills:" + json.dumps(inputs, separators=(",", ":"), sort_keys=True)
+
+
+def _source_closure(source: Path, install: SkillDependencyInstall) -> tuple[Path, ...]:
+    if install.strategy in {"copy-skills", "prime-superpowers"}:
+        if install.source is None:
+            raise ValueError(f"{install.strategy} dependency install requires a source path")
+        return (source / install.source,)
+    if install.strategy == "humanlayer-show-me":
+        return (source / "plugins/show-me/skills/show-me", source / "LICENSE")
+    return (source,)
+
+
+def _validate_checkout(
+    dependency: SkillDependency,
+    source: Path,
+    install: SkillDependencyInstall,
+) -> None:
+    source = Path(source)
+    if not source.is_dir() or source.is_symlink():
+        raise ValueError(f"dependency source is not a regular directory: {source}")
+    if (source / ".git").exists():
+        head = subprocess.run(
+            ["git", "-C", str(source), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        if head != dependency.ref:
+            raise ValueError(
+                f"pinned {dependency.id} checkout is at {head}, expected {dependency.ref}"
+            )
+        status_output = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(source),
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--ignored=matching",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        if status_output:
+            raise ValueError(
+                f"pinned {dependency.id} checkout contains changed or untracked files"
+            )
+    for closure in _source_closure(source, install):
+        _validate_regular_closure(closure)
+
+
+def _validate_regular_closure(root: Path) -> None:
+    if root.is_symlink() or (not root.is_file() and not root.is_dir()):
+        raise ValueError(f"unsupported source entry: {root}")
+    if root.is_file():
+        return
+    for directory, names, files in os.walk(root, followlinks=False):
+        current = Path(directory)
+        names[:] = [name for name in names if name not in {".git", "node_modules"}]
+        for name in [*names, *files]:
+            item = current / name
+            mode = item.lstat().st_mode
+            if stat.S_ISLNK(mode):
+                try:
+                    resolved = item.resolve(strict=True)
+                    resolved.relative_to(root.resolve())
+                except (FileNotFoundError, RuntimeError, ValueError) as exc:
+                    raise ValueError(f"unsupported source entry: {item}") from exc
+                if not (resolved.is_file() or resolved.is_dir()):
+                    raise ValueError(f"unsupported source entry: {item}")
+                continue
+            if not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)):
+                raise ValueError(f"unsupported source entry: {item}")
+
+
+def _render_dependency(
+    *,
+    framework: Framework,
+    dependency: SkillDependency,
+    install: SkillDependencyInstall,
+    source: Path,
+    target: TargetSpec,
+    prior_paths: set[Path],
+    install_dependency: InstallDependency,
+) -> ProviderPlan:
+    with tempfile.TemporaryDirectory(prefix=f"agentops-public-{dependency.id}-") as temporary:
+        temporary_root = Path(temporary)
+        shadow_home = temporary_root / "home"
+        _copy_shadow_state(target.home, shadow_home)
+        _remove_prior_shared_files(shadow_home, prior_paths)
+        if prior_paths:
+            _remove_superseded_legacy_state(shadow_home, dependency.id)
+        destination = shadow_home / install.destination
+        install_dependency(
+            framework=framework,
+            target_home=shadow_home,
+            context_home=target.home,
+            dependency_id=dependency.id,
+            source=source,
+            destination=destination,
+            install=install,
+        )
+        files = _managed_files(
+            dependency=dependency,
+            install=install,
+            source=source,
+            shadow_home=shadow_home,
+            target_home=target.home,
+        )
+        return ProviderPlan(
+            provider_id=f"public-skill:{dependency.id}",
+            source_revision=dependency.ref,
+            target=target,
+            files=files,
+        )
+
+
+def _copy_shadow_state(target_home: Path, shadow_home: Path) -> None:
+    for relative in _SHADOW_PATHS:
+        source = target_home / relative
+        if not source.exists() and not source.is_symlink():
+            continue
+        destination = shadow_home / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if source.is_dir() and not source.is_symlink():
+            shutil.copytree(source, destination, symlinks=True)
+        elif source.is_file() and not source.is_symlink():
+            shutil.copy2(source, destination)
+        else:
+            destination.symlink_to(os.readlink(source), target_is_directory=source.is_dir())
+
+
+def _remove_prior_shared_files(shadow_home: Path, prior_paths: set[Path]) -> None:
+    for relative in sorted(prior_paths, key=lambda path: len(path.parts), reverse=True):
+        path = shadow_home / relative
+        if path.is_file() and not path.is_symlink():
+            path.unlink()
+        cursor = path.parent
+        while cursor != shadow_home:
+            try:
+                cursor.rmdir()
+            except OSError:
+                break
+            cursor = cursor.parent
+
+
+def _remove_superseded_legacy_state(shadow_home: Path, dependency_id: str) -> None:
+    known: list[Path] = []
+    if dependency_id == "gstack":
+        known.append(shadow_home / ".agentops/gstack-prime-manifest.json")
+    elif dependency_id == "superpowers":
+        known.extend(
+            (
+                shadow_home / ".agentops/skill-dependencies/superpowers.json",
+                shadow_home / "skills/.agentops-superpowers-manifest.json",
+            )
+        )
+    elif dependency_id == "humanlayer-show-me":
+        state = shadow_home / ".agentops/skill-dependencies"
+        known.extend(
+            (
+                state / "humanlayer-show-me.json",
+                state / "humanlayer-show-me-transaction.json",
+                state / "humanlayer-show-me.lock",
+            )
+        )
+        if state.is_dir():
+            known.extend(state.glob(".humanlayer-show-me-stage-*"))
+            known.extend(state.glob(".humanlayer-show-me-backup-*"))
+            known.extend(state.glob(".humanlayer-show-me-preserved-*"))
+    for path in known:
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        elif path.exists() or path.is_symlink():
+            path.unlink()
+
+
+def _managed_files(
+    *,
+    dependency: SkillDependency,
+    install: SkillDependencyInstall,
+    source: Path,
+    shadow_home: Path,
+    target_home: Path,
+) -> tuple[PlannedFile, ...]:
+    roots: list[Path]
+    exact_paths: list[Path] | None = None
+    if install.strategy in {"gstack", "copy-repo"}:
+        roots = [shadow_home / install.destination]
+    elif install.strategy == "copy-skills":
+        assert install.source is not None
+        children = sorted(child.name for child in (source / install.source).iterdir())
+        roots = [shadow_home / install.destination / child for child in children]
+    elif install.strategy == "humanlayer-show-me":
+        roots = [shadow_home / install.destination / "show-me"]
+    elif install.strategy == "prime-superpowers":
+        manifest_path = shadow_home / ".agentops/skill-dependencies/superpowers.json"
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        roots = [shadow_home / install.destination / name for name in sorted(data["skills"])]
+    elif install.strategy == "prime-gstack":
+        manifest_path = shadow_home / ".agentops/gstack-prime-manifest.json"
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        exact_paths = [shadow_home / relative for relative in sorted(data["files"])]
+        roots = []
+    else:
+        raise ValueError(f"unsupported skill dependency install strategy {install.strategy!r}")
+
+    planned: list[PlannedFile] = []
+    candidates = exact_paths or [item for root in roots for item in _regular_files(root)]
+    shadow_marker = shadow_home.resolve().as_posix().encode()
+    target_marker = target_home.expanduser().resolve().as_posix().encode()
+    for item in sorted(candidates, key=lambda path: path.as_posix()):
+        if item.is_symlink() or not item.is_file():
+            raise ValueError(f"rendered bundle contains unsupported entry: {item}")
+        relative = item.relative_to(shadow_home)
+        content = item.read_bytes()
+        if install.strategy in {"prime-gstack", "prime-superpowers"} and b"\0" not in content:
+            content = content.replace(shadow_marker, target_marker)
+        planned.append(
+            PlannedFile(relative, content, stat.S_IMODE(item.stat().st_mode))
+        )
+    return tuple(planned)
+
+
+def _regular_files(root: Path) -> list[Path]:
+    if root.is_symlink() or not root.exists():
+        raise ValueError(f"rendered bundle contains unsupported entry: {root}")
+    if root.is_file():
+        return [root]
+    result: list[Path] = []
+    for directory, names, files in os.walk(root, followlinks=False):
+        current = Path(directory)
+        for name in names:
+            child = current / name
+            if child.is_symlink():
+                raise ValueError(f"rendered bundle contains unsupported entry: {child}")
+        for name in files:
+            child = current / name
+            if child.is_symlink() or not child.is_file():
+                raise ValueError(f"rendered bundle contains unsupported entry: {child}")
+            result.append(child)
+    return result
+
+
+def _prior_shared_files(target: TargetSpec) -> dict[Path, tuple[str, int]]:
+    key = hashlib.sha256(target.id.encode()).hexdigest()
+    manifest = target.home / ".agentops/deployment/manifests" / f"{key}.json"
+    if not manifest.exists():
+        return {}
+    if manifest.is_symlink() or not manifest.is_file():
+        raise ValueError("shared ownership manifest is not a regular file")
+    data = json.loads(manifest.read_text(encoding="utf-8"))
+    if data.get("target_id") != target.id or data.get("framework") != target.framework.value:
+        raise ValueError("shared ownership manifest does not match public skill target")
+    files: dict[Path, tuple[str, int]] = {}
+    for item in data.get("files", []):
+        value = item.get("path") if isinstance(item, dict) else None
+        fingerprint = item.get("fingerprint") if isinstance(item, dict) else None
+        mode = item.get("mode") if isinstance(item, dict) else None
+        if (
+            not isinstance(value, str)
+            or PurePosixPath(value).as_posix() != value
+            or not isinstance(fingerprint, str)
+            or not isinstance(mode, int)
+        ):
+            raise ValueError("shared ownership manifest contains an unsafe path")
+        files[Path(value)] = (fingerprint, mode)
+    return files
+
+
+def _validate_prior_shared_files(
+    target: TargetSpec,
+    files: dict[Path, tuple[str, int]],
+    *,
+    show_me: bool,
+) -> None:
+    for relative, (fingerprint, mode) in files.items():
+        path = target.home / relative
+        valid = False
+        try:
+            item = path.lstat()
+            valid = (
+                stat.S_ISREG(item.st_mode)
+                and stat.S_IMODE(item.st_mode) == mode
+                and hashlib.sha256(path.read_bytes()).hexdigest() == fingerprint
+            )
+        except OSError:
+            pass
+        if valid:
+            continue
+        message = f"prior managed file changed: {relative}"
+        if show_me and relative.parts[:2] == ("skills", "show-me"):
+            raise ShowMeCollisionError(message)
+        raise ValueError(message)
+
+
+def _validate_target_ancestors(target_home: Path, *, show_me: bool) -> None:
+    absolute = Path(os.path.abspath(target_home.expanduser()))
+    cursor = Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        cursor /= part
+        try:
+            item = cursor.lstat()
+        except FileNotFoundError:
+            return
+        if stat.S_ISLNK(item.st_mode) or not stat.S_ISDIR(item.st_mode):
+            message = (
+                "selected profile path contains a symbolic link or non-directory: "
+                f"{target_home}"
+            )
+            if show_me:
+                raise ShowMeCollisionError(message)
+            raise ValueError(message)
+
+
+def _default_install_dependency(
+    *,
+    framework: Framework,
+    target_home: Path,
+    context_home: Path,
+    dependency_id: str,
+    source: Path,
+    destination: Path,
+    install: SkillDependencyInstall,
+) -> None:
+    del framework, context_home
+    if install.strategy in {"gstack", "copy-repo"}:
+        _remove_shadow_path(destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(
+            source,
+            destination,
+            ignore=shutil.ignore_patterns(".git", "node_modules"),
+        )
+        return
+    if install.strategy == "copy-skills":
+        if install.source is None:
+            raise ValueError("copy-skills dependency install requires a source path")
+        destination.mkdir(parents=True, exist_ok=True)
+        for child in sorted((source / install.source).iterdir(), key=lambda item: item.name):
+            target = destination / child.name
+            _remove_shadow_path(target)
+            if child.is_dir():
+                shutil.copytree(child, target)
+            else:
+                shutil.copy2(child, target)
+        return
+    if install.strategy == "humanlayer-show-me":
+        from agent_ops.show_me_adapter import install_show_me
+
+        install_show_me(source, destination / "show-me")
+        return
+    if install.strategy == "prime-superpowers":
+        from agent_ops.superpowers_adapter import install_prime_superpowers
+
+        install_prime_superpowers(source, destination)
+        return
+    if install.strategy == "prime-gstack":
+        from agent_ops.gstack_prime import install_prime_gstack
+
+        install_prime_gstack(source, target_home)
+        return
+    raise ValueError(f"unsupported skill dependency install strategy {install.strategy!r}")
+
+
+def _remove_shadow_path(path: Path) -> None:
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    elif path.exists() or path.is_symlink():
+        path.unlink()

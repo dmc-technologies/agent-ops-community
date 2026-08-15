@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from agent_ops import show_me_adapter
+from agent_ops.deployment.models import ProviderPlan, TargetSpec
 from agent_ops.registries import load_skill_dependencies
 from agent_ops.registries.models import Framework, SkillDependency, SkillDependencyInstall
 from agent_ops.show_me_adapter import (
@@ -17,7 +18,7 @@ from agent_ops.show_me_adapter import (
 )
 from agent_ops.show_me_adapter import ShowMeCollisionError
 from agent_ops.skill_installer import default_framework_home, install_skill_dependencies
-from agent_ops.superpowers_adapter import OWNERSHIP_MANIFEST_RELATIVE, SUPERPOWERS_SKILLS
+from agent_ops.superpowers_adapter import SUPERPOWERS_SKILLS
 
 
 def _git_repo(path: Path) -> str:
@@ -57,6 +58,12 @@ def _commit(path: Path) -> str:
         text=True,
     )
     return result.stdout.strip()
+
+
+def _shared_ownership_manifest(home: Path) -> Path:
+    manifests = list((home / ".agentops/deployment/manifests").glob("*.json"))
+    assert len(manifests) == 1
+    return manifests[0]
 
 
 def test_install_gstack_dependency_copies_full_bundle(tmp_path: Path) -> None:
@@ -234,12 +241,18 @@ def test_copy_skills_dependency_removes_stale_manifest_entries(tmp_path: Path) -
         cache_dir=cache,
     )
 
-    assert not (home / "skills" / "old-skill").exists()
+    assert not (home / "skills" / "old-skill" / "SKILL.md").exists()
     assert (home / "skills" / "new-skill" / "SKILL.md").exists()
     assert (home / "skills" / "gstack").exists()
 
 
-def test_install_skill_dependencies_dry_run_does_not_clone(tmp_path: Path) -> None:
+def test_install_skill_dependencies_dry_run_plans_without_target_mutation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "SKILL.md").write_text("body\n", encoding="utf-8")
     dependency = SkillDependency(
         id="gstack",
         name="GStack",
@@ -248,6 +261,13 @@ def test_install_skill_dependencies_dry_run_does_not_clone(tmp_path: Path) -> No
         install={"codex": SkillDependencyInstall(strategy="gstack", destination="skills/gstack")},
     )
 
+    checkouts: list[str] = []
+
+    def checkout(selected: SkillDependency, _cache: Path) -> Path:
+        checkouts.append(selected.id)
+        return source
+
+    monkeypatch.setattr("agent_ops.skill_installer._checkout_dependency", checkout)
     rows = install_skill_dependencies(
         framework=Framework.CODEX,
         dependencies=[dependency],
@@ -258,7 +278,54 @@ def test_install_skill_dependencies_dry_run_does_not_clone(tmp_path: Path) -> No
 
     assert rows[0].dry_run is True
     assert rows[0].destination == tmp_path / "home" / "skills" / "gstack"
+    assert checkouts == ["gstack"]
+    assert not (tmp_path / "home").exists()
     assert not (tmp_path / "cache").exists()
+
+
+def test_dependency_checkout_rejects_symbolic_link_cache_destination(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path / "outside"
+    repo_url = _git_repo(outside)
+    (outside / "SKILL.md").write_text("body\n", encoding="utf-8")
+    ref = _commit(outside)
+    dependency = SkillDependency(
+        id="gstack",
+        name="GStack",
+        repo=repo_url,
+        ref=ref,
+        install={"codex": SkillDependencyInstall(strategy="gstack", destination="skills/gstack")},
+    )
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    (cache / f"gstack-{ref[:12]}").symlink_to(outside, target_is_directory=True)
+    before = subprocess.run(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+        cwd=outside,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+    with pytest.raises(ValueError, match="cache destination.*symbolic link"):
+        install_skill_dependencies(
+            framework=Framework.CODEX,
+            dependencies=[dependency],
+            home=tmp_path / "home",
+            cache_dir=cache,
+            dry_run=True,
+        )
+
+    after = subprocess.run(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+        cwd=outside,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert after == before
+    assert not (tmp_path / "home").exists()
 
 
 def test_install_skill_dependencies_fails_when_framework_has_no_default_support(
@@ -390,7 +457,7 @@ def test_humanlayer_show_me_installs_adapted_skill_with_ownership(
     assert (tmp_path / "home" / "skills" / "show-me" / "LICENSE").read_text(encoding="utf-8") == (
         source / "LICENSE"
     ).read_text(encoding="utf-8")
-    assert (tmp_path / "home" / SHOW_ME_OWNERSHIP_MANIFEST_RELATIVE).is_file()
+    assert _shared_ownership_manifest(tmp_path / "home").is_file()
 
 
 def test_humanlayer_show_me_refuses_user_owned_collision(
@@ -443,7 +510,7 @@ def test_humanlayer_show_me_updates_only_unchanged_managed_copy(
     try:
         install_skill_dependencies(**arguments)
     except ShowMeCollisionError as exc:
-        assert "changed since installation" in str(exc)
+        assert "prior managed file changed" in str(exc)
     else:
         raise AssertionError("expected changed managed show-me skill to fail")
 
@@ -502,7 +569,7 @@ def test_humanlayer_show_me_refuses_logical_name_collision(
         raise AssertionError("expected logical show-me collision to fail")
 
 
-def test_humanlayer_show_me_preserves_changed_crash_recovery_target(
+def test_shared_show_me_rejects_changed_target_and_preserves_legacy_evidence(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -518,34 +585,21 @@ def test_humanlayer_show_me_preserves_changed_crash_recovery_target(
     install_skill_dependencies(**arguments)
     home = tmp_path / "home"
     destination = home / "skills" / "show-me"
-    manifest_path = home / SHOW_ME_OWNERSHIP_MANIFEST_RELATIVE
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    backup = manifest_path.parent / ".humanlayer-show-me-backup-crash"
+    legacy_state = home / SHOW_ME_OWNERSHIP_MANIFEST_RELATIVE.parent
+    legacy_state.mkdir(parents=True)
+    backup = legacy_state / ".humanlayer-show-me-backup-crash"
     shutil.copytree(destination, backup)
     (destination / "SKILL.md").write_text(
         (destination / "SKILL.md").read_text(encoding="utf-8") + "user edit\n",
         encoding="utf-8",
     )
-    transaction = manifest_path.with_name("humanlayer-show-me-transaction.json")
-    transaction.write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "phase": "prepared",
-                "stage": ".humanlayer-show-me-stage-crash",
-                "backup": backup.name,
-                "had_destination": True,
-                "old_manifest": manifest,
-                "new_manifest": manifest,
-            }
-        ),
-        encoding="utf-8",
-    )
+    transaction = legacy_state / "humanlayer-show-me-transaction.json"
+    transaction.write_text("legacy transaction evidence\n", encoding="utf-8")
 
     try:
         install_skill_dependencies(**arguments)
     except ShowMeCollisionError as exc:
-        assert "preserving transaction data" in str(exc)
+        assert "prior managed file changed" in str(exc)
     else:
         raise AssertionError("expected changed crash-recovery target to fail")
 
@@ -1521,7 +1575,7 @@ def test_show_me_stage_is_outside_host_discovery_root(
     assert not list((home / "skills").glob(".humanlayer-show-me-stage-*"))
 
 
-def test_show_me_retries_partial_unjournaled_garbage_cleanup(
+def test_shared_show_me_install_preserves_unknown_legacy_garbage(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -1542,7 +1596,7 @@ def test_show_me_retries_partial_unjournaled_garbage_cleanup(
         home=home,
     )
 
-    assert not garbage.exists()
+    assert garbage.exists()
     assert (home / "skills" / "show-me" / "SKILL.md").is_file()
 
 
@@ -1857,7 +1911,7 @@ def test_humanlayer_show_me_recovers_interrupted_update(
         raise AssertionError("expected simulated update interruption")
 
     assert installed.read_bytes() == before
-    assert (tmp_path / "home" / SHOW_ME_OWNERSHIP_MANIFEST_RELATIVE).is_file()
+    assert _shared_ownership_manifest(tmp_path / "home").is_file()
 
 
 def test_humanlayer_show_me_refuses_flat_root_skill_name_collision(
@@ -2020,6 +2074,23 @@ def test_prime_agent_uses_native_home_and_pinned_bundle_mappings(
         ),
     ]
 
+    planned: list[Path] = []
+
+    def build_plans(**kwargs):
+        planned.append(kwargs["target_home"])
+        target = TargetSpec(
+            "public-skills:prime-agent",
+            Framework.PRIME_AGENT,
+            kwargs["target_home"],
+            "public",
+        )
+        return tuple(
+            ProviderPlan(f"public-skill:{dependency.id}", "revision", target, ())
+            for dependency in kwargs["dependencies"]
+        )
+
+    monkeypatch.setattr("agent_ops.skill_installer.build_public_skill_plans", build_plans)
+
     rows = install_skill_dependencies(
         framework=Framework.PRIME_AGENT,
         dependencies=dependencies,
@@ -2033,6 +2104,7 @@ def test_prime_agent_uses_native_home_and_pinned_bundle_mappings(
         ".",
         "skills",
     ]
+    assert planned == [tmp_path / "prime-home"]
 
 
 def test_prime_agent_home_treats_empty_native_environment_variable_as_unset(
@@ -2113,7 +2185,7 @@ def test_prime_superpowers_strategy_installs_adapted_namespaced_skills(
     )
 
     installed = tmp_path / "home" / "skills"
-    assert (installed.parent / OWNERSHIP_MANIFEST_RELATIVE).is_file()
+    assert _shared_ownership_manifest(installed.parent).is_file()
     assert not (installed / ".agentops-superpowers-manifest.json").exists()
     assert not (installed / "writing-plans").exists()
     skill = installed / "agentops-superpowers-writing-plans" / "SKILL.md"
@@ -2121,7 +2193,7 @@ def test_prime_superpowers_strategy_installs_adapted_namespaced_skills(
     assert "agentops-superpowers-writing-plans" in skill.read_text()
 
 
-def test_prime_gstack_strategy_receives_the_profile_root(
+def test_prime_gstack_plan_receives_the_profile_root(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -2134,15 +2206,19 @@ def test_prime_gstack_strategy_receives_the_profile_root(
         ref="74895062fb8a3acbf9f66cd088a83359aaaa56cd",
         install={"prime-agent": SkillDependencyInstall(strategy="prime-gstack", destination=".")},
     )
-    calls: list[tuple[Path, Path]] = []
-    monkeypatch.setattr(
-        "agent_ops.skill_installer._checkout_dependency",
-        lambda dependency, cache: source,
-    )
-    monkeypatch.setattr(
-        "agent_ops.skill_installer.install_prime_gstack",
-        lambda checkout, coding_agent_dir: calls.append((checkout, coding_agent_dir)),
-    )
+    calls: list[Path] = []
+
+    def build_plans(**kwargs):
+        calls.append(kwargs["target_home"])
+        target = TargetSpec(
+            "public-skills:prime-agent",
+            Framework.PRIME_AGENT,
+            kwargs["target_home"],
+            "public",
+        )
+        return (ProviderPlan("public-skill:gstack", "revision", target, ()),)
+
+    monkeypatch.setattr("agent_ops.skill_installer.build_public_skill_plans", build_plans)
 
     install_skill_dependencies(
         framework=Framework.PRIME_AGENT,
@@ -2151,7 +2227,7 @@ def test_prime_gstack_strategy_receives_the_profile_root(
         cache_dir=tmp_path / "cache",
     )
 
-    assert calls == [(source, tmp_path / "home")]
+    assert calls == [tmp_path / "home"]
 
 
 def test_openclaw_configured_root_ignores_undiscoverable_entries(
@@ -2512,7 +2588,7 @@ def test_opencode_personal_active_account_without_organization_is_allowed(
     assert len(installed) == 1
 
 
-def test_show_me_update_allows_other_unchanged_agentops_managed_copy(
+def test_show_me_update_allows_other_unchanged_shared_managed_copy(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -2526,13 +2602,6 @@ def test_show_me_update_allows_other_unchanged_agentops_managed_copy(
         framework=Framework.CLAUDE_CODE,
         dependencies=[_show_me_dependency(Framework.CLAUDE_CODE)],
     )
-    claude_license = os_home / ".claude" / "skills" / "show-me" / "LICENSE"
-    claude_license.unlink()
-    manifest = os_home / ".claude" / SHOW_ME_OWNERSHIP_MANIFEST_RELATIVE
-    value = json.loads(manifest.read_text(encoding="utf-8"))
-    value["installed_fingerprint"] = show_me_adapter._tree_fingerprint(claude_license.parent)
-    manifest.write_text(json.dumps(value), encoding="utf-8")
-
     install_skill_dependencies(
         framework=Framework.OPENCODE,
         dependencies=[_show_me_dependency(Framework.OPENCODE)],
