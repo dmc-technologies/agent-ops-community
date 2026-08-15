@@ -36,6 +36,7 @@ __all__ = (
 _SCHEMA_VERSION = 1
 _TRANSACTION_SCHEMA_VERSION = 2
 _DIRECTORY_EVIDENCE_SCHEMA_VERSION = 1
+_OWNERSHIP_MANIFEST_MODE = 0o600
 _METADATA = Path(".agentops/deployment")
 _TRANSACTION_PATHS: dict[str, Path] = {}
 
@@ -537,6 +538,17 @@ def _valid_directory_mode(value: object) -> bool:
     return _valid_permission_mode(value) and value & 0o700 == 0o700
 
 
+def _valid_ownership_manifest_mode(value: object) -> bool:
+    return type(value) is int and value == _OWNERSHIP_MANIFEST_MODE
+
+
+def _validate_ownership_manifest_stat(item: os.stat_result) -> None:
+    if not stat.S_ISREG(item.st_mode):
+        raise ValueError("ownership manifest is not a regular file")
+    if not _valid_ownership_manifest_mode(stat.S_IMODE(item.st_mode)):
+        raise ValueError("ownership manifest mode must be 0o600")
+
+
 def _validated_manifest_path(value: str, *, kind: str) -> Path:
     path = _safe_relative(Path(value))
     if path.as_posix() != value:
@@ -757,11 +769,10 @@ def install_provider_plans(
             prior_data = None
             prior_manifest_mode = None
             if prior_manifest_content is not None:
-                prior_data = _validated_manifest_data(prior_manifest_content, target=target)
                 prior_manifest_stat = home_fs.stat(manifest_path)
-                if not stat.S_ISREG(prior_manifest_stat.st_mode):
-                    raise ValueError("deployment manifest is not a regular file")
+                _validate_ownership_manifest_stat(prior_manifest_stat)
                 prior_manifest_mode = stat.S_IMODE(prior_manifest_stat.st_mode)
+                prior_data = _validated_manifest_data(prior_manifest_content, target=target)
             managed = {
                 Path(item["path"]): (item["fingerprint"], item["mode"])
                 for item in prior_data["files"]
@@ -959,7 +970,11 @@ def install_provider_plans(
                                 f"new unmanaged destination appeared: {destination}"
                             ) from exc
                 manifest_content = _manifest_bytes(manifest)
-                home_fs.write_file(manifest_temp, manifest_content, 0o600)
+                home_fs.write_file(
+                    manifest_temp,
+                    manifest_content,
+                    _OWNERSHIP_MANIFEST_MODE,
+                )
                 try:
                     _before_manifest_replace(
                         home_fs,
@@ -1119,7 +1134,7 @@ def _decode_record(
         except ValueError as exc:
             raise ValueError("invalid transaction record prior manifest") from exc
         prior_data = _validated_manifest_data(prior_content, target=target)
-        if record.get("prior_manifest_mode") not in (0o600,):
+        if not _valid_ownership_manifest_mode(record.get("prior_manifest_mode")):
             raise ValueError("invalid transaction record prior manifest mode")
     elif record.get("prior_manifest_mode") is not None:
         raise ValueError("invalid transaction record prior manifest mode")
@@ -1353,6 +1368,15 @@ def _validate_transaction_evidence(
 
 
 def _rollback_record(home_fs: _HomeFS, record: dict[str, Any], record_path: Path) -> None:
+    prior_manifest = _prior_manifest_content(record)
+    prior_manifest_mode = record.get("prior_manifest_mode")
+    if (
+        prior_manifest is None
+        and prior_manifest_mode is not None
+        or prior_manifest is not None
+        and not _valid_ownership_manifest_mode(prior_manifest_mode)
+    ):
+        raise IncompleteRollbackError("rollback incomplete: invalid prior manifest mode")
     _validate_transaction_evidence(
         home_fs,
         record,
@@ -1360,7 +1384,6 @@ def _rollback_record(home_fs: _HomeFS, record: dict[str, Any], record_path: Path
         missing_backup_error=IncompleteRollbackError,
     )
     expected_manifest = base64.b64decode(record["manifest_content"], validate=True)
-    prior_manifest = _prior_manifest_content(record)
     manifest_path = Path(record["manifest_path"])
     current_manifest = home_fs.read_optional(manifest_path)
     if current_manifest not in {expected_manifest, prior_manifest, None}:
@@ -1422,7 +1445,7 @@ def _rollback_record(home_fs: _HomeFS, record: dict[str, Any], record_path: Path
                 home_fs.unlink(manifest_path)
         elif current_manifest != prior_manifest:
             prior_temp = record_path.parent / "prior-manifest.tmp"
-            home_fs.write_file(prior_temp, prior_manifest, record["prior_manifest_mode"])
+            home_fs.write_file(prior_temp, prior_manifest, _OWNERSHIP_MANIFEST_MODE)
             if current_manifest is None:
                 home_fs.publish_new(prior_temp, manifest_path)
             else:
@@ -1554,7 +1577,7 @@ def recover_transaction(path: Path) -> DeploymentManifest:
                     f"transaction removal is incomplete; evidence retained: {destination}"
                 )
         recovery_temp = relative.parent / "recovery-manifest.tmp"
-        home_fs.write_file(recovery_temp, expected_manifest, 0o600)
+        home_fs.write_file(recovery_temp, expected_manifest, _OWNERSHIP_MANIFEST_MODE)
         if current_manifest is None:
             home_fs.publish_new(recovery_temp, manifest_path)
         else:
@@ -1588,11 +1611,13 @@ def audit_provider_plans(plans: tuple[ProviderPlan, ...]) -> DeploymentAudit:
             missing=tuple(item.path.as_posix() for item in files),
         )
     with home_fs:
-        manifest_content = home_fs.read_optional(_manifest_path(target))
+        manifest_path = _manifest_path(target)
+        manifest_content = home_fs.read_optional(manifest_path)
         if manifest_content is None:
             validation_errors.append("deployment manifest is missing")
         else:
             try:
+                _validate_ownership_manifest_stat(home_fs.stat(manifest_path))
                 manifest_data = _validated_manifest_data(manifest_content, target=target)
                 if manifest_data["source_revision"] != group.source_revision:
                     validation_errors.append(

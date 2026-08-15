@@ -1081,3 +1081,67 @@ def test_owner_auditable_managed_directory_modes_round_trip(
     rollback_manifests(manifests)
     assert directory.stat().st_ino == original_inode
     assert stat.S_IMODE(directory.stat().st_mode) == mode
+
+
+def test_wrong_ownership_manifest_mode_is_rejected_without_mutation(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    destination = home / "skills/example/SKILL.md"
+    initial = _plan(
+        home,
+        PlannedFile(Path("skills/example/SKILL.md"), b"before\n", 0o644),
+    )
+    install_provider_plans((initial,))
+    manifest_path = next((home / ".agentops/deployment/manifests").glob("*.json"))
+    manifest_path.chmod(0o644)
+    transaction_root = home / ".agentops/deployment/transactions"
+
+    def transaction_snapshot() -> dict[Path, tuple[bool, int, bytes | None]]:
+        return {
+            path.relative_to(transaction_root): (
+                path.is_dir(),
+                stat.S_IMODE(path.stat().st_mode),
+                None if path.is_dir() else path.read_bytes(),
+            )
+            for path in transaction_root.rglob("*")
+        }
+
+    destination_before = (
+        destination.read_bytes(),
+        destination.stat().st_ino,
+        stat.S_IMODE(destination.stat().st_mode),
+        destination.stat().st_mtime_ns,
+    )
+    manifest_before = (
+        manifest_path.read_bytes(),
+        manifest_path.stat().st_ino,
+        stat.S_IMODE(manifest_path.stat().st_mode),
+        manifest_path.stat().st_mtime_ns,
+    )
+    transactions_before = transaction_snapshot()
+    replacement = _plan(
+        home,
+        PlannedFile(Path("skills/example/SKILL.md"), b"after\n", 0o600),
+        revision="2" * 40,
+    )
+
+    with pytest.raises(ValueError, match="ownership manifest mode"):
+        install_provider_plans((replacement,))
+
+    audit = audit_provider_plans((initial,))
+    assert not audit.matches
+    assert audit.validation_errors == ("ownership manifest mode must be 0o600",)
+    assert (
+        destination.read_bytes(),
+        destination.stat().st_ino,
+        stat.S_IMODE(destination.stat().st_mode),
+        destination.stat().st_mtime_ns,
+    ) == destination_before
+    assert (
+        manifest_path.read_bytes(),
+        manifest_path.stat().st_ino,
+        stat.S_IMODE(manifest_path.stat().st_mode),
+        manifest_path.stat().st_mtime_ns,
+    ) == manifest_before
+    assert transaction_snapshot() == transactions_before
