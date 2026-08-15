@@ -34,6 +34,8 @@ __all__ = (
 )
 
 _SCHEMA_VERSION = 1
+_TRANSACTION_SCHEMA_VERSION = 2
+_DIRECTORY_EVIDENCE_SCHEMA_VERSION = 1
 _METADATA = Path(".agentops/deployment")
 _TRANSACTION_PATHS: dict[str, Path] = {}
 
@@ -563,7 +565,7 @@ def _validate_and_group(
         planned_removals = removals.setdefault(key, set())
         for item in plan.files:
             path = _safe_relative(item.path)
-            if not isinstance(item.content, bytes) or item.mode not in (0o600, 0o644, 0o755):
+            if not isinstance(item.content, bytes) or not _valid_permission_mode(item.mode):
                 raise ValueError(f"invalid planned file: {path}")
             prior = files.get(path)
             if prior is not None and prior != item:
@@ -636,12 +638,27 @@ def _operation(
         "expected_mode": item.mode,
         "prior_fingerprint": None,
         "prior_mode": None,
+        "prior_exists": False,
         "index": index,
     }
 
 
 def _record_bytes(record: dict[str, Any]) -> bytes:
     return (json.dumps(record, indent=2, sort_keys=True) + "\n").encode()
+
+
+def _directory_evidence_path(transaction: Path, directory: Path) -> Path:
+    key = hashlib.sha256(directory.as_posix().encode()).hexdigest()
+    return transaction / "prestate" / "directories" / f"{key}.json"
+
+
+def _directory_evidence_bytes(directory: Path, mode: int) -> bytes:
+    evidence = {
+        "schema_version": _DIRECTORY_EVIDENCE_SCHEMA_VERSION,
+        "path": directory.as_posix(),
+        "mode": mode,
+    }
+    return (json.dumps(evidence, indent=2, sort_keys=True) + "\n").encode()
 
 
 def _file_matches(
@@ -744,6 +761,7 @@ def install_provider_plans(
                     ).as_posix()
                     operation["prior_fingerprint"] = prior[0]
                     operation["prior_mode"] = prior[1]
+                    operation["prior_exists"] = True
                 operations.append(operation)
             for index, removal in enumerate(group.removals, start=len(operations)):
                 prior = managed.get(removal)
@@ -760,6 +778,7 @@ def install_provider_plans(
                     "expected_mode": None,
                     "prior_fingerprint": prior[0],
                     "prior_mode": prior[1],
+                    "prior_exists": False,
                 }
                 if home_fs.exists(removal):
                     removal_stat = home_fs.stat(removal)
@@ -773,10 +792,16 @@ def install_provider_plans(
                     operation["backup"] = (
                         _METADATA / "transactions" / transaction_id / "backups" / f"{index:04d}"
                     ).as_posix()
+                    operation["prior_exists"] = True
+                else:
+                    operation["prior_fingerprint"] = None
+                    operation["prior_mode"] = None
                 operations.append(operation)
             transaction = _METADATA / "transactions" / transaction_id
             rendered = transaction / "rendered"
             backups = transaction / "backups"
+            prestate = transaction / "prestate"
+            directory_prestate = prestate / "directories"
             manifest_temp = transaction / "manifest.tmp"
             record_path = transaction / "record.json"
             metadata_directories = (
@@ -785,6 +810,8 @@ def install_provider_plans(
                 transaction,
                 rendered,
                 backups,
+                prestate,
+                directory_prestate,
             )
             for metadata_dir in metadata_directories:
                 _ensure_directory(home_fs, metadata_dir, 0o700)
@@ -799,13 +826,29 @@ def install_provider_plans(
                         raise ValueError(f"managed directory is not a directory: {directory.path}")
                     directory_mode = stat.S_IMODE(directory_stat.st_mode)
                 actual_directories.append(ManifestDirectory(directory.path, directory_mode))
+                evidence_path = (
+                    _directory_evidence_path(transaction, directory.path)
+                    if exists
+                    else None
+                )
                 directory_records.append(
                     {
                         "path": directory.path.as_posix(),
                         "created": not exists,
                         "mode": directory_mode,
+                        "prestate_evidence": (
+                            evidence_path.as_posix()
+                            if evidence_path is not None
+                            else None
+                        ),
                     }
                 )
+                if evidence_path is not None:
+                    home_fs.write_file(
+                        evidence_path,
+                        _directory_evidence_bytes(directory.path, directory_mode),
+                        0o600,
+                    )
             manifest = DeploymentManifest(
                 schema_version=manifest.schema_version,
                 target_id=manifest.target_id,
@@ -817,7 +860,7 @@ def install_provider_plans(
                 transaction_id=manifest.transaction_id,
             )
             record = {
-                "schema_version": _SCHEMA_VERSION,
+                "schema_version": _TRANSACTION_SCHEMA_VERSION,
                 "state": "prepared",
                 "manifest": _manifest_to_dict(manifest),
                 "manifest_path": manifest_path.as_posix(),
@@ -1001,7 +1044,8 @@ def _decode_record(
         raise ValueError(f"invalid transaction record JSON: {exc}") from exc
     if (
         not isinstance(record, dict)
-        or record.get("schema_version") != _SCHEMA_VERSION
+        or type(record.get("schema_version")) is not int
+        or record["schema_version"] != _TRANSACTION_SCHEMA_VERSION
         or record.get("state") not in {"prepared", "committed", "indeterminate"}
         or not isinstance(record.get("manifest"), dict)
     ):
@@ -1060,7 +1104,7 @@ def _decode_record(
             not isinstance(expected_fingerprint, str)
             or len(expected_fingerprint) != 64
             or any(character not in "0123456789abcdef" for character in expected_fingerprint)
-            or expected_mode not in (0o600, 0o644, 0o755)
+            or not _valid_permission_mode(expected_mode)
         ):
             raise ValueError("invalid transaction expected file")
         staged = operation.get("staged")
@@ -1083,11 +1127,14 @@ def _decode_record(
             backup_paths.add(backup_path)
         prior_fingerprint = operation.get("prior_fingerprint")
         prior_mode = operation.get("prior_mode")
+        prior_exists = operation.get("prior_exists")
+        if not isinstance(prior_exists, bool):
+            raise ValueError("invalid transaction prior existence")
         if prior_fingerprint is not None and (
             not isinstance(prior_fingerprint, str)
             or len(prior_fingerprint) != 64
             or any(character not in "0123456789abcdef" for character in prior_fingerprint)
-            or prior_mode not in (0o600, 0o644, 0o755)
+            or not _valid_permission_mode(prior_mode)
         ):
             raise ValueError("invalid transaction prior file")
         if prior_fingerprint is None and prior_mode is not None:
@@ -1111,27 +1158,32 @@ def _decode_record(
                 != (operation["expected_fingerprint"], operation["expected_mode"])
                 or kind == "adopted"
                 and (
-                    operation["backup"] is not None
+                    operation["prior_exists"]
+                    or operation["backup"] is not None
                     or operation["prior_fingerprint"] is not None
                     or operation["prior_mode"] is not None
                 )
             ):
                 raise ValueError("transaction operations do not match manifest")
-            if operation["backup"] is not None and (
-                prior_files.get(destination)
+        if operation["prior_exists"]:
+            if (
+                kind == "adopted"
+                or operation["backup"] is None
+                or prior_files.get(destination)
                 != (operation["prior_fingerprint"], operation["prior_mode"])
             ):
-                raise ValueError("transaction operations do not match prior manifest")
-            if operation["backup"] is None and (
-                operation["prior_fingerprint"] is not None
-                or operation["prior_mode"] is not None
-            ):
-                raise ValueError("transaction operations do not match prior manifest")
+                raise ValueError(
+                    "transaction operations prior existence does not match prior manifest"
+                )
         elif (
-            destination in manifest_files
-            or prior_files.get(destination)
-            != (operation["prior_fingerprint"], operation["prior_mode"])
+            operation["backup"] is not None
+            or operation["prior_fingerprint"] is not None
+            or operation["prior_mode"] is not None
         ):
+            raise ValueError(
+                "transaction operations prior existence does not match prior manifest"
+            )
+        if kind == "removal" and destination not in prior_files:
             raise ValueError("transaction operations do not match manifests")
     if installed_destinations != set(manifest_files):
         raise ValueError("transaction operations do not match manifest")
@@ -1141,15 +1193,22 @@ def _decode_record(
             not isinstance(directory, dict)
             or not isinstance(directory.get("path"), str)
             or not isinstance(directory.get("created"), bool)
-            or not isinstance(directory.get("mode"), int)
-            or directory["mode"] < 0
-            or directory["mode"] > 0o777
+            or not _valid_permission_mode(directory.get("mode"))
         ):
             raise ValueError("invalid transaction record directory")
         directory_path = _safe_relative(Path(directory["path"]))
         if directory_path in directory_paths:
             raise ValueError("transaction directories do not match manifest")
         directory_paths.add(directory_path)
+        evidence = directory.get("prestate_evidence")
+        expected_evidence = _directory_evidence_path(transaction, directory_path).as_posix()
+        if (
+            directory["created"]
+            and evidence is not None
+            or not directory["created"]
+            and evidence != expected_evidence
+        ):
+            raise ValueError("transaction directory pre-state evidence is incoherent")
     manifest_directories = {
         Path(item["path"]): item["mode"] for item in record["manifest"]["directories"]
     }
@@ -1174,7 +1233,73 @@ def _prior_manifest_content(record: dict[str, Any]) -> bytes | None:
     return base64.b64decode(encoded, validate=True) if encoded is not None else None
 
 
+def _evidence_files(home_fs: _HomeFS, root: Path) -> set[Path]:
+    try:
+        return {root / path for path in home_fs.scan_tree(root)}
+    except FileNotFoundError:
+        return set()
+    except OSError as exc:
+        raise ValueError(f"invalid transaction evidence directory: {root}") from exc
+
+
+def _validate_transaction_evidence(
+    home_fs: _HomeFS,
+    record: dict[str, Any],
+    record_path: Path,
+    *,
+    missing_backup_error: type[Exception] = ValueError,
+) -> None:
+    transaction = record_path.parent
+    backup_root = transaction / "backups"
+    expected_backups = {
+        Path(operation["backup"])
+        for operation in record["operations"]
+        if operation["backup"] is not None
+    }
+    actual_backups = _evidence_files(home_fs, backup_root)
+    missing_backups = expected_backups - actual_backups
+    if missing_backups:
+        missing = min(missing_backups, key=str)
+        raise missing_backup_error(
+            f"rollback incomplete: backup evidence is missing: {missing}"
+        )
+    if actual_backups - expected_backups:
+        raise ValueError("transaction backup evidence has orphan entries")
+
+    directory_root = transaction / "prestate" / "directories"
+    expected_directories = {
+        Path(directory["prestate_evidence"])
+        for directory in record["directories"]
+        if directory["prestate_evidence"] is not None
+    }
+    actual_directories = _evidence_files(home_fs, directory_root)
+    if actual_directories != expected_directories:
+        raise ValueError("transaction directory pre-state evidence is not one-to-one")
+    for directory in record["directories"]:
+        evidence_text = directory["prestate_evidence"]
+        if evidence_text is None:
+            continue
+        evidence_path = Path(evidence_text)
+        expected_content = _directory_evidence_bytes(
+            Path(directory["path"]),
+            directory["mode"],
+        )
+        evidence_stat = home_fs.stat(evidence_path)
+        if (
+            not stat.S_ISREG(evidence_stat.st_mode)
+            or stat.S_IMODE(evidence_stat.st_mode) != 0o600
+            or home_fs.read_file(evidence_path) != expected_content
+        ):
+            raise ValueError("transaction directory pre-state evidence is invalid")
+
+
 def _rollback_record(home_fs: _HomeFS, record: dict[str, Any], record_path: Path) -> None:
+    _validate_transaction_evidence(
+        home_fs,
+        record,
+        record_path,
+        missing_backup_error=IncompleteRollbackError,
+    )
     expected_manifest = base64.b64decode(record["manifest_content"], validate=True)
     prior_manifest = _prior_manifest_content(record)
     manifest_path = Path(record["manifest_path"])
@@ -1268,6 +1393,10 @@ def _rollback_record(home_fs: _HomeFS, record: dict[str, Any], record_path: Path
                         f"rollback incomplete: staged file changed: {staged}"
                     )
                 home_fs.unlink(staged)
+        for directory in record["directories"]:
+            evidence = directory["prestate_evidence"]
+            if evidence is not None:
+                home_fs.unlink(Path(evidence))
         home_fs.unlink(record_path)
         _prune_transaction_directories(home_fs, record_path.parent, record)
     except IncompleteRollbackError:
@@ -1282,6 +1411,12 @@ def _prune_transaction_directories(
     record: dict[str, Any],
 ) -> None:
     candidates = {transaction / "rendered", transaction / "backups", transaction}
+    candidates.update(
+        {
+            transaction / "prestate/directories",
+            transaction / "prestate",
+        }
+    )
     for operation in record["operations"]:
         if operation["staged"]:
             current = Path(operation["staged"]).parent
@@ -1329,6 +1464,7 @@ def recover_transaction(path: Path) -> DeploymentManifest:
             home=home,
             transaction_id=manifest.transaction_id,
         )
+        _validate_transaction_evidence(home_fs, record, relative)
         expected_manifest = base64.b64decode(record["manifest_content"], validate=True)
         manifest_path = Path(record["manifest_path"])
         current_manifest = home_fs.read_optional(manifest_path)

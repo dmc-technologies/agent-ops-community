@@ -760,3 +760,172 @@ def test_install_strictly_validates_existing_manifest_before_mutation(
     assert stat.S_IMODE(destination.stat().st_mode) == 0o644
     assert manifest_path.read_bytes() == tampered_manifest
     assert set((home / ".agentops/deployment/transactions").glob("*/record.json")) == record_paths
+
+
+def test_record_rejects_erased_existing_file_prestate(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    original = _plan(
+        home,
+        PlannedFile(Path("skills/example/SKILL.md"), b"old\n", 0o600),
+    )
+    install_provider_plans((original,))
+    replacement = _plan(
+        home,
+        PlannedFile(Path("skills/example/SKILL.md"), b"new\n", 0o644),
+        revision="2" * 40,
+    )
+    manifests = install_provider_plans((replacement,))
+    destination = home / "skills/example/SKILL.md"
+    manifest_path = next((home / ".agentops/deployment/manifests").glob("*.json"))
+    record_path = next((home / ".agentops/deployment/transactions").glob("*/record.json"))
+    record = json.loads(record_path.read_text())
+    operation = record["operations"][0]
+    operation["backup"] = None
+    operation["prior_fingerprint"] = None
+    operation["prior_mode"] = None
+    record_path.write_text(json.dumps(record))
+    installed_before = destination.read_bytes()
+    manifest_before = manifest_path.read_bytes()
+
+    with pytest.raises(ValueError, match="prior existence"):
+        rollback_manifests(manifests)
+
+    assert destination.read_bytes() == installed_before
+    assert manifest_path.read_bytes() == manifest_before
+    assert record_path.exists()
+
+
+def test_record_rejects_flipped_preexisting_directory_state(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    directory = home / "skills/example"
+    directory.mkdir(parents=True)
+    directory.chmod(0o755)
+    directory_inode = directory.stat().st_ino
+    plan = _plan(home, PlannedFile(Path("skills/example/SKILL.md"), b"body\n", 0o644))
+    manifests = install_provider_plans((plan,))
+    destination = directory / "SKILL.md"
+    manifest_path = next((home / ".agentops/deployment/manifests").glob("*.json"))
+    record_path = next((home / ".agentops/deployment/transactions").glob("*/record.json"))
+    record = json.loads(record_path.read_text())
+    directory_record = next(
+        item for item in record["directories"] if item["path"] == "skills/example"
+    )
+    assert directory_record["created"] is False
+    directory_record["created"] = True
+    record_path.write_text(json.dumps(record))
+    manifest_before = manifest_path.read_bytes()
+
+    with pytest.raises(ValueError, match="directory pre-state"):
+        rollback_manifests(manifests)
+
+    assert directory.exists()
+    assert directory.stat().st_ino == directory_inode
+    assert destination.read_bytes() == b"body\n"
+    assert manifest_path.read_bytes() == manifest_before
+    assert record_path.exists()
+
+
+@pytest.mark.parametrize("case", ["missing", "orphan", "duplicate"])
+def test_directory_prestate_evidence_is_one_to_one(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    home = tmp_path / "home"
+    directory = home / "skills/example"
+    directory.mkdir(parents=True)
+    directory.chmod(0o755)
+    plan = _plan(home, PlannedFile(Path("skills/example/SKILL.md"), b"body\n", 0o644))
+    manifests = install_provider_plans((plan,))
+    record_path = next((home / ".agentops/deployment/transactions").glob("*/record.json"))
+    evidence_directory = record_path.parent / "prestate/directories"
+    markers = sorted(evidence_directory.glob("*.json"))
+    assert markers, "install must retain independent directory pre-state evidence"
+    if case == "missing":
+        markers[0].unlink()
+    elif case == "orphan":
+        (evidence_directory / "orphan.json").write_text("{}\n")
+    else:
+        (evidence_directory / "duplicate.json").write_bytes(markers[0].read_bytes())
+
+    with pytest.raises(ValueError, match="directory pre-state evidence"):
+        rollback_manifests(manifests)
+
+    assert (home / "skills/example/SKILL.md").read_bytes() == b"body\n"
+    assert record_path.exists()
+
+
+def test_record_rejects_orphan_backup_evidence(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    plan = _plan(home, PlannedFile(Path("skills/example/SKILL.md"), b"body\n", 0o644))
+    manifests = install_provider_plans((plan,))
+    record_path = next((home / ".agentops/deployment/transactions").glob("*/record.json"))
+    backup_directory = record_path.parent / "backups"
+    (backup_directory / "orphan").write_bytes(b"orphan\n")
+
+    with pytest.raises(ValueError, match="backup evidence"):
+        rollback_manifests(manifests)
+
+    assert (home / "skills/example/SKILL.md").read_bytes() == b"body\n"
+    assert record_path.exists()
+
+
+def test_recovery_rejects_boolean_transaction_schema_before_mutation(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    plan = _plan(home, PlannedFile(Path("skills/example/SKILL.md"), b"body\n", 0o644))
+    install_provider_plans((plan,))
+    record_path = next((home / ".agentops/deployment/transactions").glob("*/record.json"))
+    record = json.loads(record_path.read_text())
+    record["schema_version"] = True
+    record_path.write_text(json.dumps(record))
+
+    with pytest.raises(ValueError, match="transaction record schema"):
+        recover_transaction(record_path)
+
+    assert (home / "skills/example/SKILL.md").read_bytes() == b"body\n"
+    assert record_path.exists()
+
+
+def test_mode_0777_install_and_rollback_round_trip(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    destination = home / "skills/example/run"
+    plan = _plan(home, PlannedFile(Path("skills/example/run"), b"#!/bin/sh\n", 0o777))
+
+    manifests = install_provider_plans((plan,))
+
+    assert destination.read_bytes() == b"#!/bin/sh\n"
+    assert stat.S_IMODE(destination.stat().st_mode) == 0o777
+    rollback_manifests(manifests)
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize("mode", [True, 0o1000])
+def test_planned_file_rejects_boolean_and_special_modes_before_mutation(
+    tmp_path: Path,
+    mode: int,
+) -> None:
+    home = tmp_path / "home"
+    plan = _plan(home, PlannedFile(Path("skills/example/SKILL.md"), b"body\n", mode))
+
+    with pytest.raises(ValueError, match="invalid planned file"):
+        install_provider_plans((plan,))
+
+    assert not home.exists()
+
+
+@pytest.mark.parametrize("mode", [True, 0o1000])
+def test_recovery_rejects_boolean_and_special_directory_modes(
+    tmp_path: Path,
+    mode: int,
+) -> None:
+    home = tmp_path / "home"
+    plan = _plan(home, PlannedFile(Path("skills/example/SKILL.md"), b"body\n", 0o644))
+    install_provider_plans((plan,))
+    record_path = next((home / ".agentops/deployment/transactions").glob("*/record.json"))
+    record = json.loads(record_path.read_text())
+    record["directories"][0]["mode"] = mode
+    record_path.write_text(json.dumps(record))
+
+    with pytest.raises(ValueError, match="invalid transaction record directory"):
+        recover_transaction(record_path)
+
+    assert (home / "skills/example/SKILL.md").read_bytes() == b"body\n"
