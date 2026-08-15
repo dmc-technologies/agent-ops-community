@@ -2060,7 +2060,7 @@ def test_replaced_home_identity_fails_closed_before_publication(
 
     monkeypatch.setattr(transaction_module, "_before_manifest_replace", replace_home)
 
-    with pytest.raises(IncompleteRollbackError, match="identity|evidence retained"):
+    with pytest.raises(PublicationIndeterminateError, match="evidence retained"):
         install_provider_plans((plan,))
 
     assert not list(home.rglob("*.json"))
@@ -2203,3 +2203,155 @@ def test_first_home_creation_rejects_unsafe_race_replacement(
 
     assert list(outside.iterdir()) == []
     assert not list(tmp_path.rglob("record.json"))
+
+
+@pytest.mark.parametrize("ancestor", ["parent", "grandparent"])
+def test_install_rejects_replaced_canonical_home_ancestor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    ancestor: str,
+) -> None:
+    root = tmp_path / "root"
+    parent = root / "parent"
+    home = parent / "home"
+    parent.mkdir(parents=True)
+    plan = _plan(home, PlannedFile(Path("skills/example/SKILL.md"), b"body\n", 0o644))
+    replaced = parent if ancestor == "parent" else root
+    displaced = tmp_path / f"displaced-{ancestor}"
+    displaced_home = displaced / "home" if ancestor == "parent" else displaced / "parent/home"
+
+    def replace_ancestor(*_args: object) -> None:
+        os.replace(replaced, displaced)
+        home.mkdir(parents=True)
+
+    monkeypatch.setattr(transaction_module, "_before_manifest_replace", replace_ancestor)
+
+    with pytest.raises(PublicationIndeterminateError, match="evidence retained"):
+        install_provider_plans((plan,))
+
+    assert not list(home.rglob("*.json"))
+    assert not list((displaced_home / ".agentops/deployment/manifests").glob("*.json"))
+    records = list(
+        (displaced_home / ".agentops/deployment/transactions").glob("*/record.json")
+    )
+    assert len(records) == 1
+    assert json.loads(records[0].read_text())["state"] == "prepared"
+
+
+def test_rollback_rejects_replaced_canonical_home_ancestor_before_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path / "root/parent"
+    home = parent / "home"
+    original = _plan(home, PlannedFile(Path("skills/example/SKILL.md"), b"old\n", 0o600))
+    install_provider_plans((original,))
+    replacement = _plan(
+        home,
+        PlannedFile(Path("skills/example/SKILL.md"), b"new\n", 0o644),
+        revision="2" * 40,
+    )
+    manifests = install_provider_plans((replacement,))
+    manifest_path = next((home / ".agentops/deployment/manifests").glob("*.json"))
+    replacement_manifest = manifest_path.read_bytes()
+    record_path = transaction_module._TRANSACTION_PATHS[manifests[0].transaction_id]
+    record_relative = record_path.relative_to(home)
+    displaced_parent = tmp_path / "displaced-parent"
+    original_verify = transaction_module._HomeFS.verify_lock_identity
+    replaced = False
+
+    def replace_before_identity_check(home_fs: object) -> None:
+        nonlocal replaced
+        if not replaced:
+            replaced = True
+            os.replace(parent, displaced_parent)
+            home.mkdir(parents=True)
+        original_verify(home_fs)
+
+    monkeypatch.setattr(
+        transaction_module._HomeFS,
+        "verify_lock_identity",
+        replace_before_identity_check,
+    )
+
+    with pytest.raises(ValueError, match="identity"):
+        rollback_manifests(manifests)
+
+    displaced_home = displaced_parent / "home"
+    assert (displaced_home / "skills/example/SKILL.md").read_bytes() == b"new\n"
+    assert (displaced_home / manifest_path.relative_to(home)).read_bytes() == replacement_manifest
+    assert (displaced_home / record_relative).exists()
+    assert not list(home.rglob("*.json"))
+
+
+def test_recovery_rejects_replaced_canonical_home_ancestor_before_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path / "root/parent"
+    home = parent / "home"
+    plan = _plan(home, PlannedFile(Path("skills/example/SKILL.md"), b"body\n", 0o644))
+    record_path, _lost_manifest = _install_indeterminate_transaction(
+        home,
+        plan,
+        monkeypatch,
+    )
+    record_relative = record_path.relative_to(home)
+    record_before = record_path.read_bytes()
+    record = json.loads(record_before)
+    manifest_relative = Path(record["manifest_path"])
+    displaced_parent = tmp_path / "displaced-parent"
+    original_verify = transaction_module._HomeFS.verify_lock_identity
+    replaced = False
+
+    def replace_before_identity_check(home_fs: object) -> None:
+        nonlocal replaced
+        if not replaced:
+            replaced = True
+            os.replace(parent, displaced_parent)
+            home.mkdir(parents=True)
+        original_verify(home_fs)
+
+    monkeypatch.setattr(
+        transaction_module._HomeFS,
+        "verify_lock_identity",
+        replace_before_identity_check,
+    )
+
+    with pytest.raises(ValueError, match="identity"):
+        recover_transaction(record_path)
+
+    displaced_home = displaced_parent / "home"
+    assert not (displaced_home / manifest_relative).exists()
+    assert (displaced_home / record_relative).read_bytes() == record_before
+    assert not list(home.rglob("*.json"))
+
+
+def test_relative_home_is_bound_before_working_directory_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    starting_directory = tmp_path / "starting"
+    other_directory = tmp_path / "other"
+    starting_directory.mkdir()
+    other_directory.mkdir()
+    monkeypatch.chdir(starting_directory)
+    relative_home = Path("relative-home")
+    plan = _plan(
+        relative_home,
+        PlannedFile(Path("skills/example/SKILL.md"), b"body\n", 0o644),
+    )
+
+    def change_working_directory(*_args: object) -> None:
+        os.chdir(other_directory)
+
+    monkeypatch.setattr(
+        transaction_module,
+        "_before_manifest_replace",
+        change_working_directory,
+    )
+
+    install_provider_plans((plan,))
+
+    assert (starting_directory / "relative-home/skills/example/SKILL.md").read_bytes() == b"body\n"
+    assert not (other_directory / "relative-home").exists()

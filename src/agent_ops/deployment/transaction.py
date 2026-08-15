@@ -111,10 +111,14 @@ def _canonical_relative_text(value: object, *, label: str) -> Path:
     return path
 
 
-def _absolute_home(path: Path) -> Path:
+def _absolute_home(path: Path, *, base: Path | None = None) -> Path:
     raw = os.fspath(path.expanduser())
     if raw in ("", "."):
         raise ValueError(f"unsafe target home: {path}")
+    if not os.path.isabs(raw):
+        if base is None:
+            base = Path.cwd()
+        raw = os.path.join(os.fspath(base), raw)
     home = Path(os.path.normcase(os.path.abspath(raw)))
     if home == Path("/"):
         raise ValueError(f"unsafe target home: {path}")
@@ -198,16 +202,12 @@ class _HomeFS:
         home: Path,
         descriptor: int,
         *,
-        canonical_parent: int | None = None,
-        canonical_home_name: str | None = None,
         home_identity: tuple[int, int] | None = None,
         lock_name: str | None = None,
         lock_identity: tuple[int, int] | None = None,
     ) -> None:
         self.home = home
         self.descriptor = descriptor
-        self._canonical_parent = canonical_parent
-        self._canonical_home_name = canonical_home_name
         self._home_identity = home_identity
         self._lock_name = lock_name
         self._lock_identity = lock_identity
@@ -220,19 +220,16 @@ class _HomeFS:
 
     def verify_lock_identity(self) -> None:
         if (
-            self._canonical_parent is None
-            or self._canonical_home_name is None
-            or self._home_identity is None
+            self._home_identity is None
             or self._lock_name is None
             or self._lock_identity is None
         ):
             return
+        canonical_descriptor: int | None = None
         try:
-            home_item = os.stat(
-                self._canonical_home_name,
-                dir_fd=self._canonical_parent,
-                follow_symlinks=False,
-            )
+            canonical_descriptor = _open_absolute_directory(self.home, create=False)
+            home_item = os.fstat(canonical_descriptor)
+            retained_home = os.fstat(self.descriptor)
             lock_item = os.stat(
                 self._lock_name,
                 dir_fd=self.descriptor,
@@ -240,9 +237,14 @@ class _HomeFS:
             )
         except OSError as exc:
             raise ValueError("deployment home or lock identity changed") from exc
+        finally:
+            if canonical_descriptor is not None:
+                os.close(canonical_descriptor)
         if (
             not stat.S_ISDIR(home_item.st_mode)
             or (home_item.st_dev, home_item.st_ino) != self._home_identity
+            or not stat.S_ISDIR(retained_home.st_mode)
+            or (retained_home.st_dev, retained_home.st_ino) != self._home_identity
             or not stat.S_ISREG(lock_item.st_mode)
             or lock_item.st_nlink != 1
             or (lock_item.st_dev, lock_item.st_ino) != self._lock_identity
@@ -588,8 +590,6 @@ def _target_lock(home: Path) -> Iterator[_HomeFS]:
                 yield _HomeFS(
                     home,
                     home_descriptor,
-                    canonical_parent=parent,
-                    canonical_home_name=home.name,
                     home_identity=(home_stat.st_dev, home_stat.st_ino),
                     lock_name=lock_name,
                     lock_identity=(lock_stat.st_dev, lock_stat.st_ino),
@@ -865,10 +865,9 @@ def _validate_and_group(
     removals: dict[tuple[str, Framework, Path, str, str], set[Path]] = {}
     target_keys: dict[str, tuple[str, Framework, Path, str, str]] = {}
     home_targets: dict[Path, str] = {}
+    preflight_cwd = Path.cwd()
     for plan in plans:
-        home = _absolute_home(plan.target.home)
-        if home != plan.target.home:
-            raise ValueError(f"target home must be absolute and normalized: {plan.target.home}")
+        home = _absolute_home(plan.target.home, base=preflight_cwd)
         key = (
             plan.target.id,
             plan.target.framework,
@@ -1174,6 +1173,7 @@ def _publication_outcome(
     expected_content: bytes,
 ) -> str:
     try:
+        home_fs.verify_lock_identity()
         if home_fs.exists(manifest_temp):
             return "not-published"
         published = home_fs.matches_exact_file(
@@ -1181,7 +1181,7 @@ def _publication_outcome(
             expected_content,
             _OWNERSHIP_MANIFEST_MODE,
         )
-    except OSError:
+    except (OSError, ValueError):
         return "indeterminate"
     if published:
         return "committed"
@@ -1462,8 +1462,20 @@ def install_provider_plans(
                         raise
                     if outcome == "indeterminate":
                         record["state"] = "indeterminate"
-                        home_fs.write_atomic(record_path, _record_bytes(record), 0o600)
                         _TRANSACTION_PATHS[transaction_id] = target.home / record_path
+                        try:
+                            home_fs.write_atomic(record_path, _record_bytes(record), 0o600)
+                        except BaseException as evidence_error:
+                            if not isinstance(publication_error, Exception):
+                                publication_error.add_note(
+                                    "publication indeterminate; prepared recovery evidence "
+                                    "retained on the pinned deployment home"
+                                )
+                                raise publication_error from evidence_error
+                            raise PublicationIndeterminateError(
+                                "manifest publication is indeterminate; prepared recovery "
+                                "evidence retained on the pinned deployment home"
+                            ) from evidence_error
                         if not isinstance(publication_error, Exception):
                             publication_error.add_note(
                                 "publication indeterminate; evidence retained at "
@@ -1479,6 +1491,7 @@ def install_provider_plans(
                 record["state"] = "committed"
                 home_fs.write_atomic(record_path, _record_bytes(record), 0o600)
                 _TRANSACTION_PATHS[transaction_id] = target.home / record_path
+                home_fs.verify_lock_identity()
             except BaseException as install_error:
                 if record.get("state") == "indeterminate":
                     raise
@@ -2031,6 +2044,7 @@ def _rollback_record(
             raise IncompleteRollbackError(
                 "rollback cleanup incomplete; evidence retained"
             ) from exc
+        home_fs.verify_lock_identity()
         return
     _validate_transaction_evidence(
         home_fs,
@@ -2105,6 +2119,7 @@ def _rollback_record(
             if not retain_completed:
                 home_fs.unlink(record_path)
                 _prune_transaction_directories(home_fs, record_path.parent, record)
+            home_fs.verify_lock_identity()
             return
         for operation in reversed(record["operations"]):
             destination = Path(operation["destination"])
@@ -2188,6 +2203,7 @@ def _rollback_record(
         if not retain_completed:
             home_fs.unlink(record_path)
             _prune_transaction_directories(home_fs, record_path.parent, record)
+        home_fs.verify_lock_identity()
     except IncompleteRollbackError:
         raise
     except OSError as exc:
@@ -2263,6 +2279,7 @@ def recover_transaction(path: Path) -> DeploymentManifest:
         if record["state"] == "rolled-back":
             _rollback_record(home_fs, record, relative, retain_completed=True)
             _TRANSACTION_PATHS[manifest.transaction_id] = path
+            home_fs.verify_lock_identity()
             return manifest
         _validate_transaction_evidence(home_fs, record, relative)
         expected_manifest = base64.b64decode(record["manifest_content"], validate=True)
@@ -2293,6 +2310,7 @@ def recover_transaction(path: Path) -> DeploymentManifest:
                 record["state"] = "committed"
                 home_fs.write_atomic(relative, _record_bytes(record), 0o600)
             _TRANSACTION_PATHS[manifest.transaction_id] = path
+            home_fs.verify_lock_identity()
             return manifest
         prior_manifest = _prior_manifest_content(record)
         if current_manifest not in {None, prior_manifest}:
@@ -2341,6 +2359,7 @@ def recover_transaction(path: Path) -> DeploymentManifest:
         record["state"] = "committed"
         home_fs.write_atomic(relative, _record_bytes(record), 0o600)
         _TRANSACTION_PATHS[manifest.transaction_id] = path
+        home_fs.verify_lock_identity()
         return manifest
 
 
