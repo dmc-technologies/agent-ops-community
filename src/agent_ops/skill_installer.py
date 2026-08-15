@@ -8,6 +8,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import tempfile
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -1143,76 +1144,230 @@ def _checkout_dependency(dependency: SkillDependency, cache_root: Path) -> Path:
         raise ValueError(f"dependency cache destination is a symbolic link: {destination}")
     if destination.exists() and not destination.is_dir():
         raise ValueError(f"dependency cache destination is not a directory: {destination}")
-    git_directory = destination / ".git"
-    if git_directory.exists() or git_directory.is_symlink():
-        metadata = git_directory.lstat()
+    existing_git_directory = destination / ".git"
+    if existing_git_directory.exists() or existing_git_directory.is_symlink():
+        metadata = existing_git_directory.lstat()
         if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
             raise ValueError(
-                f"dependency checkout metadata must be a no-follow directory: {git_directory}"
+                "dependency checkout metadata must be a no-follow directory: "
+                f"{existing_git_directory}"
             )
-        _validate_checkout_git_metadata(destination, cache_root)
-    else:
-        if destination.exists():
-            shutil.rmtree(destination)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.run(
-            ["git", "clone", dependency.repo, str(destination)],
-            check=True,
-            text=True,
-            capture_output=True,
+
+    cache_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix=f".{dependency.id}-stage-", dir=cache_root
+    ) as temporary:
+        workspace = Path(temporary)
+        staged = workspace / "checkout"
+        environment = _dependency_git_environment(workspace)
+        reusable = False
+        if destination.exists() and existing_git_directory.is_dir():
+            try:
+                _validate_checkout_git_metadata(
+                    destination,
+                    cache_root,
+                    environment=environment,
+                    require_self_contained=False,
+                )
+            except (OSError, ValueError, subprocess.SubprocessError):
+                reusable = False
+            else:
+                reusable = True
+
+        clone_source = destination if reusable else dependency.repo
+        _run_dependency_git(
+            ["clone", "--no-hardlinks", "--no-checkout", str(clone_source), str(staged)],
+            environment=environment,
         )
-        _validate_checkout_git_metadata(destination, cache_root)
-    subprocess.run(
-        ["git", "-C", str(destination), "fetch", "--all", "--tags"],
-        check=True,
-        text=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "-C", str(destination), "checkout", "--detach", dependency.ref],
-        check=True,
-        text=True,
-        capture_output=True,
-    )
+        _run_dependency_git(
+            ["-C", str(staged), "remote", "set-url", "origin", dependency.repo],
+            environment=environment,
+        )
+        has_revision = _run_dependency_git(
+            ["-C", str(staged), "cat-file", "-e", f"{dependency.ref}^{{commit}}"],
+            environment=environment,
+            check=False,
+        )
+        if has_revision.returncode:
+            _run_dependency_git(
+                ["-C", str(staged), "fetch", "--force", "--tags", dependency.repo],
+                environment=environment,
+            )
+        _run_dependency_git(
+            ["-C", str(staged), "checkout", "--detach", dependency.ref],
+            environment=environment,
+        )
+        _validate_checkout_git_metadata(
+            staged,
+            cache_root,
+            environment=environment,
+            require_self_contained=True,
+        )
+        _promote_dependency_checkout(staged, destination, cache_root)
     return destination
 
 
-def _validate_checkout_git_metadata(destination: Path, cache_root: Path) -> None:
+def _dependency_git_environment(workspace: Path) -> dict[str, str]:
+    inherited = (
+        "PATH",
+        "PATHEXT",
+        "SYSTEMROOT",
+        "COMSPEC",
+        "WINDIR",
+        "LANG",
+        "LC_ALL",
+        "TZ",
+    )
+    environment = {name: os.environ[name] for name in inherited if name in os.environ}
+    locations = {
+        "HOME": workspace / "home",
+        "XDG_CONFIG_HOME": workspace / "xdg-config",
+        "TMPDIR": workspace / "tmp",
+        "TMP": workspace / "tmp",
+        "TEMP": workspace / "tmp",
+    }
+    for path in set(locations.values()):
+        path.mkdir(parents=True, exist_ok=True)
+    hooks = workspace / "hooks"
+    hooks.mkdir()
+    global_config = workspace / "global-config"
+    global_config.write_bytes(b"")
+    environment.update({name: str(path) for name, path in locations.items()})
+    environment.update(
+        {
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": str(global_config),
+            "GIT_CONFIG_COUNT": "2",
+            "GIT_CONFIG_KEY_0": "core.hooksPath",
+            "GIT_CONFIG_VALUE_0": str(hooks),
+            "GIT_CONFIG_KEY_1": "protocol.file.allow",
+            "GIT_CONFIG_VALUE_1": "always",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+    )
+    return environment
+
+
+def _run_dependency_git(
+    arguments: list[str],
+    *,
+    environment: dict[str, str],
+    check: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", *arguments],
+        check=check,
+        text=True,
+        capture_output=True,
+        env=environment,
+    )
+
+
+def _validate_checkout_git_metadata(
+    destination: Path,
+    cache_root: Path,
+    *,
+    environment: dict[str, str],
+    require_self_contained: bool,
+) -> None:
     git_directory = destination / ".git"
     metadata_stat = git_directory.lstat()
     if stat.S_ISLNK(metadata_stat.st_mode) or not stat.S_ISDIR(metadata_stat.st_mode):
         raise ValueError(
             f"dependency checkout metadata must be a no-follow directory: {git_directory}"
         )
-    captured_cwd = Path.cwd()
-    cache = _captured_absolute_path(cache_root, cwd=captured_cwd).resolve(strict=True)
-    commands = (
-        ["git", "-C", str(destination), "rev-parse", "--absolute-git-dir"],
-        [
-            "git",
-            "-C",
-            str(destination),
-            "rev-parse",
-            "--path-format=absolute",
-            "--git-common-dir",
-        ],
+    cache = _captured_absolute_path(cache_root, cwd=Path.cwd()).resolve(strict=True)
+    checkout = destination.resolve(strict=True)
+    if not checkout.is_relative_to(cache):
+        raise ValueError(f"dependency checkout escapes declared cache: {checkout}")
+    cache_device = cache.stat().st_dev
+    for current, directories, files in os.walk(git_directory, followlinks=False):
+        for name in [*directories, *files]:
+            path = Path(current) / name
+            path_stat = path.lstat()
+            if stat.S_ISLNK(path_stat.st_mode) or not (
+                stat.S_ISDIR(path_stat.st_mode) or stat.S_ISREG(path_stat.st_mode)
+            ):
+                raise ValueError(
+                    f"dependency checkout Git metadata contains a nonregular entry: {path}"
+                )
+            if path_stat.st_dev != cache_device:
+                raise ValueError(
+                    f"dependency checkout Git metadata crosses a filesystem boundary: {path}"
+                )
+            resolved = path.resolve(strict=True)
+            if not resolved.is_relative_to(cache):
+                raise ValueError(
+                    f"dependency checkout Git metadata escapes declared cache: {resolved}"
+                )
+            if (
+                require_self_contained
+                and stat.S_ISREG(path_stat.st_mode)
+                and path_stat.st_nlink != 1
+            ):
+                raise ValueError(
+                    f"dependency checkout Git metadata contains an aliased file: {path}"
+                )
+
+    forbidden_metadata = (
+        git_directory / "commondir",
+        git_directory / "gitdir",
+        git_directory / "config.worktree",
+        git_directory / "objects/info/alternates",
+        git_directory / "objects/info/http-alternates",
     )
-    for command in commands:
-        value = subprocess.run(
-            command,
-            check=True,
-            text=True,
-            capture_output=True,
-        ).stdout.strip()
-        metadata = Path(value)
-        if not metadata.is_absolute():
-            raise ValueError("dependency checkout Git metadata path is not absolute")
-        try:
-            resolved = metadata.resolve(strict=True)
-        except (OSError, RuntimeError) as exc:
-            raise ValueError("dependency checkout Git metadata is unavailable") from exc
-        if not resolved.is_relative_to(cache):
-            raise ValueError(f"dependency checkout Git metadata escapes declared cache: {resolved}")
+    if any(path.exists() or path.is_symlink() for path in forbidden_metadata):
+        raise ValueError("dependency checkout uses redirected Git metadata")
+    if (git_directory / "worktrees").exists():
+        raise ValueError("dependency checkout uses linked Git worktree metadata")
+
+    config = git_directory / "config"
+    configured = _run_dependency_git(
+        ["config", "--file", str(config), "--no-includes", "--get-regexp", "."],
+        environment=environment,
+        check=False,
+    )
+    if configured.returncode not in {0, 1}:
+        raise ValueError("dependency checkout Git configuration is unreadable")
+    dangerous_exact = {
+        "core.attributesfile",
+        "core.fsmonitor",
+        "core.hookspath",
+        "core.sshcommand",
+        "core.worktree",
+        "extensions.worktreeconfig",
+    }
+    for line in configured.stdout.splitlines():
+        key = line.split(maxsplit=1)[0].lower()
+        if (
+            key in dangerous_exact
+            or key.startswith(("include.", "includeif."))
+            or key.startswith("filter.")
+            and key.rsplit(".", 1)[-1] in {"clean", "smudge", "process"}
+            or key == "credential.helper"
+            or key.startswith("credential.")
+            and key.endswith(".helper")
+            or key.startswith("remote.")
+            and key.endswith(".uploadpack")
+        ):
+            raise ValueError(f"dependency checkout Git configuration is unsafe: {key}")
+
+
+def _promote_dependency_checkout(staged: Path, destination: Path, cache_root: Path) -> None:
+    quarantine: Path | None = None
+    if destination.exists():
+        quarantine = Path(
+            tempfile.mkdtemp(prefix=f".{destination.name}.quarantine-", dir=cache_root)
+        )
+        quarantine.rmdir()
+        os.replace(destination, quarantine)
+    try:
+        os.replace(staged, destination)
+    except BaseException:
+        if quarantine is not None and not destination.exists():
+            os.replace(quarantine, destination)
+        raise
 
 
 def _install_dependency(

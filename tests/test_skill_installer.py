@@ -63,6 +63,23 @@ def _commit(path: Path) -> str:
     return result.stdout.strip()
 
 
+def _tree_snapshot(root: Path) -> dict[str, tuple[str, int, bytes | str | None]]:
+    snapshot: dict[str, tuple[str, int, bytes | str | None]] = {}
+    for current, directories, files in os.walk(root, followlinks=False):
+        current_path = Path(current)
+        for name in sorted([*directories, *files]):
+            path = current_path / name
+            relative = path.relative_to(root).as_posix()
+            mode = path.lstat().st_mode & 0o777
+            if path.is_symlink():
+                snapshot[relative] = ("link", mode, os.readlink(path))
+            elif path.is_dir():
+                snapshot[relative] = ("directory", mode, None)
+            else:
+                snapshot[relative] = ("file", mode, path.read_bytes())
+    return snapshot
+
+
 def _shared_ownership_manifest(home: Path) -> Path:
     manifests = list((home / ".agentops/deployment/manifests").glob("*.json"))
     assert len(manifests) == 1
@@ -805,6 +822,150 @@ def test_dependency_checkout_rejects_external_gitdir_before_git_mutation(
         text=True,
     ).stdout.strip()
     assert head == second_ref
+    assert not (tmp_path / "home").exists()
+
+
+@pytest.mark.parametrize(
+    "attack",
+    ["linked-objects", "linked-refs", "redirected-worktree", "escaped-common-dir", "hook"],
+)
+def test_dependency_checkout_bypasses_nested_external_git_metadata_without_mutation(
+    tmp_path: Path, attack: str
+) -> None:
+    origin = tmp_path / "origin"
+    repo_url = _git_repo(origin)
+    (origin / "SKILL.md").write_text("first\n", encoding="utf-8")
+    first_ref = _commit(origin)
+    cache = tmp_path / "cache"
+    checkout = cache / f"gstack-{first_ref[:12]}"
+    subprocess.run(
+        ["git", "clone", repo_url, str(checkout)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(checkout), "checkout", "--detach", first_ref],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (origin / "SKILL.md").write_text("second\n", encoding="utf-8")
+    _commit(origin)
+    external = tmp_path / "external"
+    external.mkdir()
+
+    if attack in {"linked-objects", "linked-refs"}:
+        name = attack.removeprefix("linked-")
+        shutil.move(checkout / ".git" / name, external / name)
+        (checkout / ".git" / name).symlink_to(external / name, target_is_directory=True)
+    elif attack == "redirected-worktree":
+        (external / "sentinel.txt").write_bytes(b"outside\n")
+        subprocess.run(
+            [
+                "git",
+                "config",
+                "--file",
+                str(checkout / ".git/config"),
+                "core.worktree",
+                str(external),
+            ],
+            check=True,
+        )
+    elif attack == "escaped-common-dir":
+        shutil.copytree(checkout / ".git", external / "common")
+        (checkout / ".git/commondir").write_text(
+            str(external / "common") + "\n", encoding="utf-8"
+        )
+    else:
+        hooks = external / "hooks"
+        hooks.mkdir()
+        marker = external / "executed"
+        hook = hooks / "post-checkout"
+        hook.write_text(f"#!/bin/sh\nprintf executed > {marker}\n", encoding="utf-8")
+        hook.chmod(0o755)
+        subprocess.run(
+            [
+                "git",
+                "config",
+                "--file",
+                str(checkout / ".git/config"),
+                "core.hooksPath",
+                str(hooks),
+            ],
+            check=True,
+        )
+
+    before = _tree_snapshot(external)
+    dependency = SkillDependency(
+        id="gstack",
+        name="GStack",
+        repo=repo_url,
+        ref=first_ref,
+        install={
+            "codex": SkillDependencyInstall(strategy="gstack", destination="skills/gstack")
+        },
+    )
+    home = tmp_path / "home"
+
+    rows = install_skill_dependencies(
+        framework=Framework.CODEX,
+        dependencies=[dependency],
+        home=home,
+        cache_dir=cache,
+        dry_run=True,
+    )
+
+    assert rows[0].id == "gstack"
+    assert _tree_snapshot(external) == before
+    assert not home.exists()
+    assert (checkout / ".git").is_dir()
+    assert not (checkout / ".git/objects").is_symlink()
+    assert not (checkout / ".git/refs").is_symlink()
+    assert not (checkout / ".git/commondir").exists()
+    quarantines = list(cache.glob(f".{checkout.name}.quarantine-*"))
+    assert len(quarantines) == 1
+
+
+def test_dependency_checkout_validation_ignores_ambient_git_execution_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    origin = tmp_path / "origin"
+    repo_url = _git_repo(origin)
+    (origin / "SKILL.md").write_text("managed\n", encoding="utf-8")
+    ref = _commit(origin)
+    external = tmp_path / "external"
+    external.mkdir()
+    marker = external / "executed"
+    monitor = external / "fsmonitor"
+    monitor.write_text(f"#!/bin/sh\nprintf executed > {marker}\n", encoding="utf-8")
+    monitor.chmod(0o755)
+    ambient_config = external / "config"
+    subprocess.run(
+        ["git", "config", "--file", str(ambient_config), "core.fsmonitor", str(monitor)],
+        check=True,
+    )
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(ambient_config))
+    before = _tree_snapshot(external)
+    dependency = SkillDependency(
+        id="gstack",
+        name="GStack",
+        repo=repo_url,
+        ref=ref,
+        install={
+            "codex": SkillDependencyInstall(strategy="gstack", destination="skills/gstack")
+        },
+    )
+
+    install_skill_dependencies(
+        framework=Framework.CODEX,
+        dependencies=[dependency],
+        home=tmp_path / "home",
+        cache_dir=tmp_path / "cache",
+        dry_run=True,
+    )
+
+    assert _tree_snapshot(external) == before
     assert not (tmp_path / "home").exists()
 
 

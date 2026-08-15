@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import re
@@ -116,15 +117,12 @@ def _extract_pinned_checkout(checkout: Path, destination: Path) -> None:
         ["git", "-C", str(checkout), "archive", "--format=tar", PINNED_GSTACK_REF]
     ).stdout
     destination.mkdir()
-    with tempfile.NamedTemporaryFile(suffix=".tar") as archive_file:
-        archive_file.write(archive)
-        archive_file.flush()
-        with tarfile.open(archive_file.name) as tar:
-            for member in tar.getmembers():
-                member_path = PurePosixPath(member.name)
-                if member_path.is_absolute() or ".." in member_path.parts:
-                    raise GstackPrimeSourceError("pinned archive contains an unsafe path")
-            tar.extractall(destination, filter="data")
+    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as tar:
+        for member in tar.getmembers():
+            member_path = PurePosixPath(member.name)
+            if member_path.is_absolute() or ".." in member_path.parts:
+                raise GstackPrimeSourceError("pinned archive contains an unsafe path")
+        tar.extractall(destination, filter="data")
 
 
 def _add_prime_host(source: Path) -> None:

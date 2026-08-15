@@ -275,11 +275,13 @@ def _validate_checkout(
     if not source.is_dir() or source.is_symlink():
         raise ValueError(f"dependency source is not a regular directory: {source}")
     if (source / ".git").exists():
+        git_environment = _read_only_git_environment(source)
         head = subprocess.run(
             ["git", "-C", str(source), "rev-parse", "HEAD"],
             check=True,
             capture_output=True,
             text=True,
+            env=git_environment,
         ).stdout.strip()
         if head != dependency.ref:
             raise ValueError(
@@ -298,11 +300,46 @@ def _validate_checkout(
             check=True,
             capture_output=True,
             text=True,
+            env=git_environment,
         ).stdout
         if status_output:
             raise ValueError(f"pinned {dependency.id} checkout contains changed or untracked files")
     for closure in _source_closure(source, install):
         _validate_regular_closure(closure, source_root=source)
+
+
+def _read_only_git_environment(source: Path) -> dict[str, str]:
+    inherited = (
+        "PATH",
+        "PATHEXT",
+        "SYSTEMROOT",
+        "COMSPEC",
+        "WINDIR",
+        "LANG",
+        "LC_ALL",
+        "TZ",
+    )
+    environment = {name: os.environ[name] for name in inherited if name in os.environ}
+    confined = source.parent
+    environment.update(
+        {
+            "HOME": str(confined),
+            "XDG_CONFIG_HOME": str(confined),
+            "TMPDIR": str(confined),
+            "TMP": str(confined),
+            "TEMP": str(confined),
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_COUNT": "2",
+            "GIT_CONFIG_KEY_0": "core.hooksPath",
+            "GIT_CONFIG_VALUE_0": str(source / ".git/.agentops-disabled-hooks"),
+            "GIT_CONFIG_KEY_1": "core.fsmonitor",
+            "GIT_CONFIG_VALUE_1": "false",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+    )
+    return environment
 
 
 def _validate_regular_closure(root: Path, *, source_root: Path) -> None:

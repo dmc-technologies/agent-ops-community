@@ -226,6 +226,26 @@ def test_install_uses_explicit_renderer_environment_for_bun(
     assert all((Path(value) / "renderer-write").is_file() for value in recorded.values())
 
 
+def test_install_extracts_archive_without_ambient_temporary_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    upstream, bun, ref = _upstream_repo(tmp_path / "upstream")
+    monkeypatch.setattr(gstack_prime, "PINNED_GSTACK_REF", ref)
+
+    def refuse_ambient_archive(*_args, **_kwargs):
+        raise AssertionError("ambient archive temporary file was created")
+
+    monkeypatch.setattr(gstack_prime.tempfile, "NamedTemporaryFile", refuse_ambient_archive)
+
+    result = gstack_prime.install_prime_gstack(
+        upstream,
+        tmp_path / "prime-agent",
+        bun=bun,
+    )
+
+    assert result.upstream_ref == ref
+
+
 def test_install_refuses_colliding_user_file_without_partial_writes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
