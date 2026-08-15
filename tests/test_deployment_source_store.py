@@ -1073,24 +1073,40 @@ def test_git_runner_preserves_process_control_when_cleanup_fails(
     class StopGit(KeyboardInterrupt):
         pass
 
-    stop = StopGit()
+    payload = {"operation": "git version"}
+    stop = StopGit("stop requested", payload)
+    original_args = stop.args
+    communicate_calls = 0
+    cleanup_operations: list[str] = []
+    cleanup_failure = RuntimeError("cleanup failed")
 
     class FailingProcess:
         pid = 987654321
         returncode = None
+        stdout = None
+        stderr = None
 
         def communicate(self, timeout: float) -> tuple[str, str]:
-            if timeout == 1.0:
-                raise RuntimeError("cleanup failed")
-            raise stop
+            nonlocal communicate_calls
+            communicate_calls += 1
+            if communicate_calls == 1:
+                raise stop
+            cleanup_operations.append("communicate")
+            raise cleanup_failure
 
-        def poll(self) -> None:
-            return None
+        def wait(self, timeout: float) -> int:
+            cleanup_operations.append("wait")
+            raise cleanup_failure
 
     monkeypatch.setattr(source_store_module.subprocess, "Popen", lambda *a, **k: FailingProcess())
     with pytest.raises(StopGit) as caught:
         _run_git(("version",), timeout=0.2)
     assert caught.value is stop
+    assert caught.value.args == original_args
+    assert caught.value.args[1] is payload
+    assert communicate_calls > 1
+    assert "communicate" in cleanup_operations
+    assert "wait" in cleanup_operations
 
 
 def test_source_store_passes_configured_git_timeout(
