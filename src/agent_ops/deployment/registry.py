@@ -100,30 +100,13 @@ class RegistryConfig:
     targets: tuple[TargetSpec, ...]
 
     def __post_init__(self) -> None:
-        if type(self.schema_version) is not int or self.schema_version != 1:
-            raise ValueError("registry schema version must be integer 1")
+        object.__setattr__(self, "sources", tuple(self.sources))
+        object.__setattr__(self, "channels", tuple(self.channels))
+        object.__setattr__(self, "targets", tuple(self.targets))
+        _validate_config_fields(self, require_nonempty=False)
         object.__setattr__(self, "sources", tuple(sorted(self.sources, key=lambda item: item.id)))
         object.__setattr__(self, "channels", tuple(sorted(self.channels, key=lambda item: item.id)))
         object.__setattr__(self, "targets", tuple(sorted(self.targets, key=lambda item: item.id)))
-        _validate_unique(self.sources, "source")
-        _validate_unique(self.channels, "channel")
-        _validate_unique(self.targets, "target")
-        source_ids = {source.id for source in self.sources}
-        channel_ids = {channel.id for channel in self.channels}
-        for source in self.sources:
-            _validate_id(source.id, "source id")
-            _require_string(source.url, "source URL")
-            _validate_ref(source.stable_ref)
-        for channel in self.channels:
-            if channel.source not in source_ids:
-                raise ValueError(f"channel {channel.id!r} refers to an unknown source")
-        for target in self.targets:
-            _validate_id(target.id, "target id")
-            if not isinstance(target.framework, Framework):
-                raise ValueError(f"target {target.id!r} has an invalid framework")
-            _validate_id(target.channel, "target channel")
-            if target.channel not in channel_ids:
-                raise ValueError(f"target {target.id!r} refers to an unknown channel")
 
 
 class DeploymentRegistry:
@@ -162,6 +145,7 @@ class DeploymentRegistry:
         _require_secure_platform()
         _validate_config(config, require_nonempty=True)
         content = _dump_registry(config)
+        _parse_registry(content)
         parent = _open_directory_chain(self.path.parent)
         temporary = f".{self.path.name}.{uuid.uuid4().hex}.tmp"
         descriptor: int | None = None
@@ -419,35 +403,85 @@ def _validate_absolute_normal_path(path: Path, label: str) -> None:
         raise ValueError(f"{label} must be an absolute lexically normalized host path")
 
 
-def _validate_home(path: Path, label: str) -> None:
+def _validate_home(path: Path, label: str) -> tuple[tuple[int, int] | None, str]:
     _validate_absolute_normal_path(path, label)
+    normalized = os.path.abspath(os.path.normpath(os.fspath(path)))
+    if os.sep == "/" and normalized.startswith("//"):
+        normalized = f"/{normalized.lstrip('/')}"
+    normalized = os.path.normcase(normalized)
     current = Path(path.anchor)
     for part in path.parts[1:]:
         current /= part
         try:
             item = current.lstat()
         except FileNotFoundError:
-            return
+            return None, normalized
         if stat.S_ISLNK(item.st_mode):
             raise ValueError(f"{label} contains a symlink ancestor")
         if current != path and not stat.S_ISDIR(item.st_mode):
             raise ValueError(f"{label} has a non-directory ancestor")
         if current == path and not stat.S_ISDIR(item.st_mode):
             raise ValueError(f"{label} must be a directory when it exists")
+    descriptor = _open_directory_chain(path)
+    try:
+        opened = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    if _identity(opened) != _identity(item):
+        raise RuntimeError(f"{label} changed while it was opened")
+    return _identity(opened), normalized
+
+
+def _validate_config_fields(config: RegistryConfig, *, require_nonempty: bool) -> None:
+    if type(config.schema_version) is not int or config.schema_version != 1:
+        raise ValueError("registry schema version must be integer 1")
+    collections = (
+        (config.sources, SourceSpec, "source"),
+        (config.channels, ChannelSpec, "channel"),
+        (config.targets, TargetSpec, "target"),
+    )
+    for values, expected, label in collections:
+        if type(values) is not tuple or any(type(value) is not expected for value in values):
+            raise ValueError(f"registry {label}s must contain exact {label} values")
+        if require_nonempty and not values:
+            raise ValueError("registry sources, channels, and targets must be nonempty mappings")
+        _validate_unique(values, label)
+    source_ids = {source.id for source in config.sources}
+    channel_ids = {channel.id for channel in config.channels}
+    for source in config.sources:
+        _validate_id(source.id, "source id")
+        _require_string(source.url, "source URL")
+        _validate_ref(source.stable_ref)
+    for channel in config.channels:
+        _validate_id(channel.id, "channel id")
+        _validate_id(channel.source, "channel source")
+        _validate_ref(channel.ref)
+        if channel.source not in source_ids:
+            raise ValueError(f"channel {channel.id!r} refers to an unknown source")
+    for target in config.targets:
+        _validate_id(target.id, "target id")
+        if type(target.framework) is not Framework:
+            raise ValueError(f"target {target.id!r} has an invalid framework")
+        if not isinstance(target.home, Path):
+            raise ValueError(f"target {target.id!r} home must be a Path")
+        _validate_id(target.channel, "target channel")
+        if target.channel not in channel_ids:
+            raise ValueError(f"target {target.id!r} refers to an unknown channel")
 
 
 def _validate_config(config: RegistryConfig, *, require_nonempty: bool) -> None:
-    if not isinstance(config, RegistryConfig):
-        raise TypeError("config must be a RegistryConfig")
-    if require_nonempty and not (config.sources and config.channels and config.targets):
-        raise ValueError("registry sources, channels, and targets must be nonempty mappings")
+    if type(config) is not RegistryConfig:
+        raise ValueError("config must be an exact RegistryConfig")
+    _validate_config_fields(config, require_nonempty=require_nonempty)
     homes: set[str] = set()
+    identities: set[tuple[int, int]] = set()
     for target in config.targets:
-        _validate_home(target.home, f"target {target.id!r} home")
-        key = os.path.normcase(os.fspath(target.home)).casefold()
-        if key in homes:
+        identity, key = _validate_home(target.home, f"target {target.id!r} home")
+        if key in homes or (identity is not None and identity in identities):
             raise ValueError("two targets may not use the same home")
         homes.add(key)
+        if identity is not None:
+            identities.add(identity)
 
 
 def _mapping(value: Any, label: str, *, nonempty: bool = False) -> dict[str, Any]:
@@ -543,15 +577,18 @@ def _parse_registry(content: bytes) -> RegistryConfig:
 
 
 def _dump_registry(config: RegistryConfig) -> bytes:
+    sources = sorted(config.sources, key=lambda source: source.id)
+    channels = sorted(config.channels, key=lambda channel: channel.id)
+    targets = sorted(config.targets, key=lambda target: target.id)
     document = {
         "schema_version": 1,
         "sources": {
             source.id: {"url": source.url, "stable_ref": source.stable_ref}
-            for source in config.sources
+            for source in sources
         },
         "channels": {
             channel.id: {"source": channel.source, "ref": channel.ref}
-            for channel in config.channels
+            for channel in channels
         },
         "targets": {
             target.id: {
@@ -559,7 +596,7 @@ def _dump_registry(config: RegistryConfig) -> bytes:
                 "home": os.fspath(target.home),
                 "channel": target.channel,
             }
-            for target in config.targets
+            for target in targets
         },
     }
     return yaml.safe_dump(

@@ -22,6 +22,38 @@ from agent_ops.deployment.registry import ChannelSpec, DeploymentRegistry, Regis
 from agent_ops.registries.models import Framework
 
 
+class _SourceLike:
+    id = "example"
+    url = "https://example.invalid/source.git"
+    stable_ref = "refs/heads/main"
+
+
+class _ChannelLike:
+    id = "stable"
+    source = "example"
+    ref = "refs/heads/main"
+
+
+class _TargetLike:
+    def __init__(self, home: Path) -> None:
+        self.id = "codex-stable"
+        self.framework = Framework.CODEX
+        self.home = home
+        self.channel = "stable"
+
+
+class _SourceSubclass(SourceSpec):
+    pass
+
+
+class _ChannelSubclass(ChannelSpec):
+    pass
+
+
+class _TargetSubclass(TargetSpec):
+    pass
+
+
 def _config(tmp_path: Path, *, channel: str = "stable") -> RegistryConfig:
     home = tmp_path / "homes" / channel
     ref = "refs/heads/feature/example" if channel == "feature" else "refs/heads/main"
@@ -232,6 +264,88 @@ def test_registry_canonicalizes_mapping_order_and_rejects_duplicate_typed_ids(
         )
 
 
+@pytest.mark.parametrize("wrong_kind", ("source", "channel", "target"))
+def test_registry_config_rejects_duck_typed_nested_values(
+    tmp_path: Path, wrong_kind: str
+) -> None:
+    sources: tuple[object, ...] = (
+        _SourceLike() if wrong_kind == "source" else SourceSpec("example", "https://example.invalid"),
+    )
+    channels: tuple[object, ...] = (
+        _ChannelLike()
+        if wrong_kind == "channel"
+        else ChannelSpec("stable", "example", "refs/heads/main"),
+    )
+    targets: tuple[object, ...] = (
+        _TargetLike(tmp_path / "home")
+        if wrong_kind == "target"
+        else TargetSpec("codex-stable", Framework.CODEX, tmp_path / "home", "stable"),
+    )
+
+    with pytest.raises(ValueError, match=f"exact {wrong_kind}"):
+        RegistryConfig(
+            1,
+            sources=sources,  # type: ignore[arg-type]
+            channels=channels,  # type: ignore[arg-type]
+            targets=targets,  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize("wrong_kind", ("source", "channel", "target"))
+def test_registry_config_rejects_nested_subclasses(tmp_path: Path, wrong_kind: str) -> None:
+    sources = (
+        _SourceSubclass("example", "https://example.invalid")
+        if wrong_kind == "source"
+        else SourceSpec("example", "https://example.invalid"),
+    )
+    channels = (
+        _ChannelSubclass("stable", "example", "refs/heads/main")
+        if wrong_kind == "channel"
+        else ChannelSpec("stable", "example", "refs/heads/main"),
+    )
+    targets = (
+        _TargetSubclass("codex-stable", Framework.CODEX, tmp_path / "home", "stable")
+        if wrong_kind == "target"
+        else TargetSpec("codex-stable", Framework.CODEX, tmp_path / "home", "stable"),
+    )
+
+    with pytest.raises(ValueError, match=f"exact {wrong_kind}"):
+        RegistryConfig(1, sources, channels, targets)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "section,field,value",
+    (
+        ("source", "id", "../unsafe"),
+        ("source", "url", 7),
+        ("source", "stable_ref", "main"),
+        ("channel", "source", "absent"),
+        ("channel", "ref", "feature"),
+        ("target", "framework", "codex"),
+        ("target", "home", "/tmp/not-a-path"),
+        ("target", "channel", "absent"),
+    ),
+)
+def test_save_revalidates_nested_fields_without_replacing_registry(
+    tmp_path: Path, section: str, field: str, value: object
+) -> None:
+    registry = _registry(tmp_path)
+    registry.save(_config(tmp_path))
+    original = registry.path.read_bytes()
+    invalid = _config(tmp_path)
+    nested = {
+        "source": invalid.sources[0],
+        "channel": invalid.channels[0],
+        "target": invalid.targets[0],
+    }[section]
+    object.__setattr__(nested, field, value)
+
+    with pytest.raises(ValueError):
+        registry.save(invalid)
+
+    assert registry.path.read_bytes() == original
+
+
 def test_target_homes_reject_relative_non_normal_symlink_and_alias_duplicates(
     tmp_path: Path,
 ) -> None:
@@ -275,14 +389,76 @@ def test_target_homes_reject_relative_non_normal_symlink_and_alias_duplicates(
     with pytest.raises(ValueError, match="same home"):
         registry.save(config)
 
-    malformed = RegistryConfig(
-        1,
-        source,
-        channels,
-        (TargetSpec("target", Framework.CODEX, "/tmp/not-a-path", "stable"),),  # type: ignore[arg-type]
-    )
     with pytest.raises(ValueError, match="home"):
-        registry.save(malformed)
+        RegistryConfig(
+            1,
+            source,
+            channels,
+            (
+                TargetSpec(  # type: ignore[arg-type]
+                    "target", Framework.CODEX, "/tmp/not-a-path", "stable"
+                ),
+            ),
+        )
+
+
+def test_existing_home_identity_rejects_alias_but_preserves_posix_case(
+    tmp_path: Path,
+) -> None:
+    existing = tmp_path / "existing"
+    existing.mkdir()
+    slash_alias = Path(f"//{os.fspath(existing).lstrip('/')}")
+    source = (SourceSpec("example", "https://example.invalid/source.git"),)
+    channels = (ChannelSpec("stable", "example", "refs/heads/main"),)
+    with pytest.raises(ValueError, match="same home"):
+        _registry(tmp_path).save(
+            RegistryConfig(
+                1,
+                source,
+                channels,
+                (
+                    TargetSpec("one", Framework.CODEX, existing, "stable"),
+                    TargetSpec("two", Framework.CODEX, slash_alias, "stable"),
+                ),
+            )
+        )
+
+    upper = tmp_path / "A"
+    lower = tmp_path / "a"
+    upper.mkdir()
+    lower.mkdir()
+    if upper.stat().st_ino == lower.stat().st_ino:
+        pytest.skip("host filesystem is case-insensitive")
+    registry = _registry(tmp_path)
+    registry.save(
+        RegistryConfig(
+            1,
+            source,
+            channels,
+            (
+                TargetSpec("upper", Framework.CODEX, upper, "stable"),
+                TargetSpec("lower", Framework.CODEX, lower, "stable"),
+            ),
+        )
+    )
+    assert {target.home for target in registry.load().targets} == {upper, lower}
+
+
+def test_missing_home_aliases_use_host_lexical_normalization(tmp_path: Path) -> None:
+    missing = tmp_path / "not-created" / "home"
+    slash_alias = Path(f"//{os.fspath(missing).lstrip('/')}")
+    with pytest.raises(ValueError, match="same home"):
+        _registry(tmp_path).save(
+            RegistryConfig(
+                1,
+                (SourceSpec("example", "https://example.invalid/source.git"),),
+                (ChannelSpec("stable", "example", "refs/heads/main"),),
+                (
+                    TargetSpec("one", Framework.CODEX, missing, "stable"),
+                    TargetSpec("two", Framework.CODEX, slash_alias, "stable"),
+                ),
+            )
+        )
 
 
 def test_registry_load_rejects_permissions_size_and_symlinks(tmp_path: Path) -> None:
