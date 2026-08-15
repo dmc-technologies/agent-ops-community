@@ -60,9 +60,13 @@ def build_public_skill_plans(
 
     if install_dependency is None:
         install_dependency = _default_install_dependency
-    target_home = _absolute_lexical_path(target_home)
-    cache_root = _absolute_lexical_path(cache_root)
-    _validate_cache_target_separation(cache_root=cache_root, target_home=target_home)
+    target_home = target_home.expanduser()
+    cache_root = cache_root.expanduser()
+    captured_cwd = Path.cwd()
+    _validate_cache_target_separation(
+        cache_root=_captured_absolute_path(cache_root, cwd=captured_cwd),
+        target_home=_captured_absolute_path(target_home, cwd=captured_cwd),
+    )
     target = TargetSpec(
         id=f"public-skills:{framework.value}",
         framework=framework,
@@ -104,8 +108,11 @@ def build_public_skill_plans(
     return tuple(plans)
 
 
-def _absolute_lexical_path(path: Path) -> Path:
-    return Path(os.path.normcase(os.path.abspath(os.fspath(path.expanduser()))))
+def _captured_absolute_path(path: Path, *, cwd: Path) -> Path:
+    expanded = path.expanduser()
+    if not expanded.is_absolute():
+        expanded = cwd / expanded
+    return Path(os.path.normcase(os.path.abspath(os.fspath(expanded))))
 
 
 def _validate_cache_target_separation(*, cache_root: Path, target_home: Path) -> None:

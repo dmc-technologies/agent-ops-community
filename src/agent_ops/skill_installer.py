@@ -908,11 +908,15 @@ def install_skill_dependencies(
     ):
         raise ValueError(f"no skill dependencies support framework {framework.value}")
 
-    target_home = _absolute_lexical_path(home or default_framework_home(framework))
-    cache_root = _absolute_lexical_path(
+    target_home = (home or default_framework_home(framework)).expanduser()
+    cache_root = (
         cache_dir or Path("~/.cache/agentops/skill-dependencies")
+    ).expanduser()
+    captured_cwd = Path.cwd()
+    _validate_cache_target_separation(
+        cache_root=_captured_absolute_path(cache_root, cwd=captured_cwd),
+        target_home=_captured_absolute_path(target_home, cwd=captured_cwd),
     )
-    _validate_cache_target_separation(cache_root=cache_root, target_home=target_home)
     selected_dependencies: list[tuple[SkillDependency, SkillDependencyInstall]] = []
 
     show_me_selected = any(
@@ -995,8 +999,11 @@ def install_skill_dependencies(
     return installed
 
 
-def _absolute_lexical_path(path: Path) -> Path:
-    return Path(os.path.normcase(os.path.abspath(os.fspath(path.expanduser()))))
+def _captured_absolute_path(path: Path, *, cwd: Path) -> Path:
+    expanded = path.expanduser()
+    if not expanded.is_absolute():
+        expanded = cwd / expanded
+    return Path(os.path.normcase(os.path.abspath(os.fspath(expanded))))
 
 
 def _validate_cache_target_separation(*, cache_root: Path, target_home: Path) -> None:

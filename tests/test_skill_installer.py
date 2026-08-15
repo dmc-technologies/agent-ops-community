@@ -8,8 +8,10 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from typer.testing import CliRunner
 
 from agent_ops import show_me_adapter
+from agent_ops.cli import app
 from agent_ops.deployment.models import ProviderPlan, TargetSpec
 from agent_ops.registries import load_skill_dependencies
 from agent_ops.registries.models import Framework, SkillDependency, SkillDependencyInstall
@@ -281,6 +283,110 @@ def test_install_skill_dependencies_dry_run_plans_without_target_mutation(
     assert checkouts == ["gstack"]
     assert not (tmp_path / "home").exists()
     assert not (tmp_path / "cache").exists()
+
+
+@pytest.mark.parametrize("dry_run", [True, False])
+def test_install_skill_dependencies_preserves_explicit_relative_home(
+    tmp_path: Path, monkeypatch, dry_run: bool
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "SKILL.md").write_bytes(b"body\n")
+    dependency = SkillDependency(
+        id="gstack",
+        name="GStack",
+        repo="https://example.invalid/gstack.git",
+        ref="abc123",
+        install={
+            "codex": SkillDependencyInstall(
+                strategy="gstack", destination="skills/gstack"
+            )
+        },
+    )
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency",
+        lambda _dependency, _cache: source,
+    )
+
+    rows = install_skill_dependencies(
+        framework=Framework.CODEX,
+        dependencies=[dependency],
+        home=Path("relative-home"),
+        cache_dir=tmp_path / "cache",
+        dry_run=dry_run,
+    )
+
+    assert rows[0].destination == Path("relative-home/skills/gstack")
+    assert rows[0].destination.is_absolute() is False
+    assert (tmp_path / "relative-home/skills/gstack/SKILL.md").exists() is (not dry_run)
+
+
+def test_non_posix_dry_run_pairs_relative_plan_target_without_absolutizing(
+    tmp_path: Path, monkeypatch
+) -> None:
+    dependency = SkillDependency(
+        id="gstack",
+        name="GStack",
+        repo="https://example.invalid/gstack.git",
+        ref="abc123",
+        install={
+            "codex": SkillDependencyInstall(
+                strategy="gstack", destination="skills/gstack"
+            )
+        },
+    )
+    target = TargetSpec(
+        "public-skills:codex", Framework.CODEX, Path("relative-home"), "public"
+    )
+    plan = ProviderPlan("public-skill:gstack", "revision", target, ())
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._use_shared_transaction_engine", lambda: False
+    )
+    monkeypatch.setattr(
+        "agent_ops.skill_installer.build_public_skill_plans", lambda **_kwargs: (plan,)
+    )
+
+    rows = install_skill_dependencies(
+        framework=Framework.CODEX,
+        dependencies=[dependency],
+        home=Path("relative-home"),
+        cache_dir=tmp_path / "cache",
+        dry_run=True,
+    )
+
+    assert rows[0].destination == Path("relative-home/skills/gstack")
+
+
+def test_skills_install_cli_preserves_explicit_relative_home(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "SKILL.md").write_bytes(b"body\n")
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency",
+        lambda _dependency, _cache: source,
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "skills",
+            "install",
+            "codex",
+            "--dependency",
+            "gstack",
+            "--home",
+            "relative-home",
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "would install: gstack -> relative-home/skills/gstack" in result.output
+    assert str(tmp_path / "relative-home") not in result.output
 
 
 def test_dry_run_rejects_cache_inside_target_before_checkout_or_mutation(
