@@ -923,8 +923,8 @@ def test_dependency_checkout_bypasses_nested_external_git_metadata_without_mutat
     assert not (checkout / ".git/objects").is_symlink()
     assert not (checkout / ".git/refs").is_symlink()
     assert not (checkout / ".git/commondir").exists()
-    quarantines = list(cache.glob(f".{checkout.name}.quarantine-*"))
-    assert len(quarantines) == 1
+    assert not list(cache.glob(f".{checkout.name}.quarantine-*"))
+    assert not list(cache.glob(".gstack-stage-*"))
 
 
 def test_dependency_checkout_validation_ignores_ambient_git_execution_config(
@@ -967,6 +967,95 @@ def test_dependency_checkout_validation_ignores_ambient_git_execution_config(
 
     assert _tree_snapshot(external) == before
     assert not (tmp_path / "home").exists()
+
+
+@pytest.mark.parametrize("dry_run", [True, False])
+def test_dependency_checkout_repeated_refresh_has_bounded_cache_lifecycle(
+    tmp_path: Path, dry_run: bool
+) -> None:
+    origin = tmp_path / "origin"
+    repo_url = _git_repo(origin)
+    (origin / "SKILL.md").write_text("managed\n", encoding="utf-8")
+    ref = _commit(origin)
+    dependency = SkillDependency(
+        id="gstack",
+        name="GStack",
+        repo=repo_url,
+        ref=ref,
+        install={
+            "codex": SkillDependencyInstall(strategy="gstack", destination="skills/gstack")
+        },
+    )
+    cache = tmp_path / "cache"
+    home = tmp_path / "home"
+
+    for _ in range(3):
+        install_skill_dependencies(
+            framework=Framework.CODEX,
+            dependencies=[dependency],
+            home=home,
+            cache_dir=cache,
+            dry_run=dry_run,
+        )
+        assert not list(cache.glob(f".gstack-{ref[:12]}.quarantine-*"))
+        assert not list(cache.glob(".gstack-stage-*"))
+
+    if dry_run:
+        assert not home.exists()
+    else:
+        assert (home / "skills/gstack/SKILL.md").read_bytes() == b"managed\n"
+
+
+def test_dependency_checkout_failed_promotion_reports_preserved_cache_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import agent_ops.skill_installer as skill_installer
+
+    origin = tmp_path / "origin"
+    repo_url = _git_repo(origin)
+    (origin / "SKILL.md").write_text("managed\n", encoding="utf-8")
+    ref = _commit(origin)
+    dependency = SkillDependency(
+        id="gstack",
+        name="GStack",
+        repo=repo_url,
+        ref=ref,
+        install={
+            "codex": SkillDependencyInstall(strategy="gstack", destination="skills/gstack")
+        },
+    )
+    cache = tmp_path / "cache"
+    home = tmp_path / "home"
+    install_skill_dependencies(
+        framework=Framework.CODEX,
+        dependencies=[dependency],
+        home=home,
+        cache_dir=cache,
+        dry_run=True,
+    )
+    destination = cache / f"gstack-{ref[:12]}"
+    original_replace = skill_installer.os.replace
+
+    def fail_promotion(source: str | Path, target: str | Path) -> None:
+        if Path(source).name == "checkout" and Path(target) == destination:
+            raise OSError("injected cache promotion failure")
+        original_replace(source, target)
+
+    monkeypatch.setattr(skill_installer.os, "replace", fail_promotion)
+
+    with pytest.raises(ValueError, match="prior checkout preserved at") as raised:
+        install_skill_dependencies(
+            framework=Framework.CODEX,
+            dependencies=[dependency],
+            home=home,
+            cache_dir=cache,
+            dry_run=True,
+        )
+
+    preserved = Path(str(raised.value).rsplit(" at ", 1)[1])
+    assert preserved.parent == cache
+    assert preserved.is_dir()
+    assert not list(cache.glob(".gstack-stage-*"))
 
 
 def test_install_skill_dependencies_fails_when_framework_has_no_default_support(

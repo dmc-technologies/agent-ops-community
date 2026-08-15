@@ -11,6 +11,23 @@ import pytest
 import agent_ops.gstack_prime as gstack_prime
 
 
+def _tree_snapshot(root: Path) -> dict[str, tuple[str, int, bytes | str | None]]:
+    snapshot: dict[str, tuple[str, int, bytes | str | None]] = {}
+    for current, directories, files in os.walk(root, followlinks=False):
+        current_path = Path(current)
+        for name in sorted([*directories, *files]):
+            path = current_path / name
+            relative = path.relative_to(root).as_posix()
+            mode = path.lstat().st_mode & 0o777
+            if path.is_symlink():
+                snapshot[relative] = ("link", mode, os.readlink(path))
+            elif path.is_dir():
+                snapshot[relative] = ("directory", mode, None)
+            else:
+                snapshot[relative] = ("file", mode, path.read_bytes())
+    return snapshot
+
+
 def _upstream_repo(path: Path) -> tuple[Path, Path, str]:
     path.mkdir()
     for directory in ("hosts", "scripts", "bin", "review", "qa/templates", "browse/src"):
@@ -244,6 +261,60 @@ def test_install_extracts_archive_without_ambient_temporary_file(
     )
 
     assert result.upstream_ref == ref
+
+
+def test_install_passes_confined_renderer_environment_to_git(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    upstream, bun, ref = _upstream_repo(tmp_path / "upstream")
+    monkeypatch.setattr(gstack_prime, "PINNED_GSTACK_REF", ref)
+    external = tmp_path / "external"
+    external.mkdir()
+    sentinel = external / "sentinel"
+    sentinel.write_bytes(b"unchanged\n")
+    sentinel.chmod(0o640)
+    ambient_config = external / "ambient-git-config"
+    ambient_config.write_bytes(b"[core]\n\tfilemode = true\n")
+    trace_variables = {
+        "GIT_TRACE": external / "git-trace",
+        "GIT_TRACE2": external / "git-trace2",
+        "GIT_TRACE2_EVENT": external / "git-trace2-event",
+        "GIT_TRACE_SETUP": external / "git-trace-setup",
+        "GIT_TRACE_PERFORMANCE": external / "git-trace-performance",
+    }
+    for name, path in trace_variables.items():
+        monkeypatch.setenv(name, str(path))
+    monkeypatch.setenv("GIT_CURL_VERBOSE", "1")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(ambient_config))
+    renderer_root = tmp_path / "cache/renderer"
+    renderer_env = {
+        "PATH": os.environ["PATH"],
+        "HOME": str(renderer_root / "home"),
+        "XDG_CONFIG_HOME": str(renderer_root / "xdg-config"),
+        "TMPDIR": str(renderer_root / "tmp"),
+        "TMP": str(renderer_root / "tmp"),
+        "TEMP": str(renderer_root / "tmp"),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": str(renderer_root / "git-config"),
+    }
+    for path in (
+        renderer_root / "home",
+        renderer_root / "xdg-config",
+        renderer_root / "tmp",
+    ):
+        path.mkdir(parents=True, exist_ok=True)
+    (renderer_root / "git-config").write_bytes(b"")
+    before = _tree_snapshot(external)
+
+    result = gstack_prime.install_prime_gstack(
+        upstream,
+        tmp_path / "prime-agent",
+        bun=bun,
+        renderer_env=renderer_env,
+    )
+
+    assert result.upstream_ref == ref
+    assert _tree_snapshot(external) == before
 
 
 def test_install_refuses_colliding_user_file_without_partial_writes(

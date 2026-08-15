@@ -103,18 +103,25 @@ def _run(
         ) from exc
 
 
-def _extract_pinned_checkout(checkout: Path, destination: Path) -> None:
+def _extract_pinned_checkout(
+    checkout: Path,
+    destination: Path,
+    *,
+    environment: Mapping[str, str] | None,
+) -> None:
     checkout = checkout.resolve()
     probe = subprocess.run(
         ["git", "-C", str(checkout), "cat-file", "-e", f"{PINNED_GSTACK_REF}^{{commit}}"],
         capture_output=True,
+        env=environment,
     )
     if probe.returncode:
         raise GstackPrimeSourceError(
             f"checkout does not contain pinned gstack commit {PINNED_GSTACK_REF}"
         )
     archive = _run(
-        ["git", "-C", str(checkout), "archive", "--format=tar", PINNED_GSTACK_REF]
+        ["git", "-C", str(checkout), "archive", "--format=tar", PINNED_GSTACK_REF],
+        env=environment,
     ).stdout
     destination.mkdir()
     with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as tar:
@@ -1057,7 +1064,7 @@ def install_prime_gstack(
         pristine = temporary_root / "pristine"
         legacy_expected = temporary_root / "legacy-expected"
         source = temporary_root / "source"
-        _extract_pinned_checkout(checkout, pristine)
+        _extract_pinned_checkout(checkout, pristine, environment=renderer_env)
         shutil.copytree(pristine, legacy_expected)
         shutil.copytree(pristine, source)
         _add_prime_host(source)

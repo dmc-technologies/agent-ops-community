@@ -1364,10 +1364,79 @@ def _promote_dependency_checkout(staged: Path, destination: Path, cache_root: Pa
         os.replace(destination, quarantine)
     try:
         os.replace(staged, destination)
-    except BaseException:
-        if quarantine is not None and not destination.exists():
-            os.replace(quarantine, destination)
-        raise
+    except BaseException as exc:
+        if quarantine is None:
+            raise
+        raise ValueError(
+            f"dependency cache promotion failed; prior checkout preserved at {quarantine}"
+        ) from exc
+    if quarantine is not None:
+        try:
+            _remove_cache_tree_no_follow(quarantine, cache_root)
+        except BaseException as exc:
+            raise ValueError(
+                "dependency cache promotion cleanup failed; prior checkout preserved at "
+                f"{quarantine}"
+            ) from exc
+
+
+def _remove_cache_tree_no_follow(path: Path, cache_root: Path) -> None:
+    captured_cwd = Path.cwd()
+    captured_cache = _captured_absolute_path(cache_root, cwd=captured_cwd)
+    cache = captured_cache.resolve(strict=True)
+    candidate = _captured_absolute_path(path, cwd=captured_cwd)
+    if candidate.parent != captured_cache or path.parent.resolve(strict=True) != cache:
+        raise ValueError(f"cache cleanup path escapes declared cache: {path}")
+    item = path.lstat()
+    if stat.S_ISLNK(item.st_mode) or not stat.S_ISDIR(item.st_mode):
+        raise ValueError(f"cache cleanup path is not a no-follow directory: {path}")
+
+    if os.name != "posix":  # pragma: no cover - exercised on Windows
+        shutil.rmtree(path)
+        return
+
+    cache_descriptor = os.open(
+        cache,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
+    try:
+        descriptor = os.open(
+            path.name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=cache_descriptor,
+        )
+        try:
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino) != (item.st_dev, item.st_ino):
+                raise ValueError(f"cache cleanup directory changed before deletion: {path}")
+            _remove_cache_directory_contents(descriptor, opened.st_dev)
+        finally:
+            os.close(descriptor)
+        os.rmdir(path.name, dir_fd=cache_descriptor)
+    finally:
+        os.close(cache_descriptor)
+
+
+def _remove_cache_directory_contents(descriptor: int, device: int) -> None:
+    with os.scandir(descriptor) as entries:
+        names = sorted(entry.name for entry in entries)
+    for name in names:
+        item = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        if stat.S_ISDIR(item.st_mode):
+            if item.st_dev != device:
+                raise ValueError(f"cache cleanup directory crosses a filesystem boundary: {name}")
+            child = os.open(
+                name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=descriptor,
+            )
+            try:
+                _remove_cache_directory_contents(child, device)
+            finally:
+                os.close(child)
+            os.rmdir(name, dir_fd=descriptor)
+        else:
+            os.unlink(name, dir_fd=descriptor)
 
 
 def _install_dependency(
