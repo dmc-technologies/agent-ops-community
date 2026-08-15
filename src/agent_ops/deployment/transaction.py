@@ -435,7 +435,11 @@ def _validated_manifest_data(content: bytes, *, target: TargetSpec) -> dict[str,
         data = json.loads(content.decode())
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError(f"invalid deployment manifest JSON: {exc}") from exc
-    if not isinstance(data, dict) or data.get("schema_version") != _SCHEMA_VERSION:
+    if (
+        not isinstance(data, dict)
+        or type(data.get("schema_version")) is not int
+        or data["schema_version"] != _SCHEMA_VERSION
+    ):
         raise ValueError("invalid deployment manifest schema")
     if data.get("target_id") != target.id or data.get("framework") != target.framework.value:
         raise ValueError("deployment manifest target does not match plan")
@@ -448,11 +452,17 @@ def _validated_manifest_data(content: bytes, *, target: TargetSpec) -> dict[str,
         or data["provider_ids"] != sorted(set(data["provider_ids"]))
     ):
         raise ValueError("invalid deployment manifest providers")
-    if not isinstance(data.get("transaction_id"), str) or not data["transaction_id"]:
+    transaction_id = data.get("transaction_id")
+    if (
+        not isinstance(transaction_id, str)
+        or len(transaction_id) != 32
+        or any(character not in "0123456789abcdef" for character in transaction_id)
+    ):
         raise ValueError("invalid deployment manifest transaction")
     for key in ("files", "directories"):
         if not isinstance(data.get(key), list):
             raise ValueError(f"invalid deployment manifest {key}")
+    file_paths: set[Path] = set()
     for item in data["files"]:
         if (
             not isinstance(item, dict)
@@ -460,19 +470,45 @@ def _validated_manifest_data(content: bytes, *, target: TargetSpec) -> dict[str,
             or not isinstance(item.get("fingerprint"), str)
             or len(item["fingerprint"]) != 64
             or any(character not in "0123456789abcdef" for character in item["fingerprint"])
-            or not isinstance(item.get("mode"), int)
+            or not _valid_permission_mode(item.get("mode"))
         ):
             raise ValueError("invalid deployment manifest file")
-        _safe_relative(Path(item["path"]))
+        file_path = _validated_manifest_path(item["path"], kind="file")
+        if file_path in file_paths:
+            raise ValueError("invalid deployment manifest duplicate file path")
+        file_paths.add(file_path)
+    directory_paths: set[Path] = set()
     for item in data["directories"]:
         if (
             not isinstance(item, dict)
             or not isinstance(item.get("path"), str)
-            or not isinstance(item.get("mode"), int)
+            or not _valid_permission_mode(item.get("mode"))
         ):
             raise ValueError("invalid deployment manifest directory")
-        _safe_relative(Path(item["path"]))
+        directory_path = _validated_manifest_path(item["path"], kind="directory")
+        if directory_path in directory_paths:
+            raise ValueError("invalid deployment manifest duplicate directory path")
+        directory_paths.add(directory_path)
+    expected_directories: set[Path] = set()
+    for file_path in file_paths:
+        current = file_path.parent
+        while current != Path("."):
+            expected_directories.add(current)
+            current = current.parent
+    if directory_paths != expected_directories:
+        raise ValueError("invalid deployment manifest directory closure")
     return data
+
+
+def _valid_permission_mode(value: object) -> bool:
+    return type(value) is int and 0 <= value <= 0o777
+
+
+def _validated_manifest_path(value: str, *, kind: str) -> Path:
+    path = _safe_relative(Path(value))
+    if path.as_posix() != value:
+        raise ValueError(f"invalid deployment manifest non-normalized {kind} path")
+    return path
 
 
 def _frontmatter_name(content: bytes) -> str | None:
@@ -883,6 +919,12 @@ def install_provider_plans(
                     _rollback_record(home_fs, record, record_path)
                 except BaseException as rollback_error:
                     _TRANSACTION_PATHS[transaction_id] = target.home / record_path
+                    if not isinstance(install_error, Exception):
+                        install_error.add_note(
+                            "rollback failed; recovery evidence retained at "
+                            f"{target.home / record_path}"
+                        )
+                        raise install_error from rollback_error
                     raise IncompleteRollbackError(
                         f"installation failed: {install_error}; rollback incomplete; "
                         f"evidence retained at {target.home / record_path}"
@@ -977,6 +1019,7 @@ def _decode_record(
     if manifest_content != _manifest_bytes(manifest):
         raise ValueError("transaction record manifest content does not match manifest")
     prior_encoded = record.get("prior_manifest_content")
+    prior_data: dict[str, Any] | None = None
     if prior_encoded is not None:
         if not isinstance(prior_encoded, str):
             raise ValueError("invalid transaction record prior manifest")
@@ -984,7 +1027,7 @@ def _decode_record(
             prior_content = base64.b64decode(prior_encoded, validate=True)
         except ValueError as exc:
             raise ValueError("invalid transaction record prior manifest") from exc
-        _validated_manifest_data(prior_content, target=target)
+        prior_data = _validated_manifest_data(prior_content, target=target)
         if record.get("prior_manifest_mode") not in (0o600,):
             raise ValueError("invalid transaction record prior manifest mode")
     elif record.get("prior_manifest_mode") is not None:
@@ -994,6 +1037,7 @@ def _decode_record(
     if not isinstance(operations, list) or not isinstance(directories, list):
         raise ValueError("invalid transaction record operations")
     destinations: set[Path] = set()
+    backup_paths: set[Path] = set()
     for operation in operations:
         if not isinstance(operation, dict) or operation.get("kind") not in {
             "installed",
@@ -1034,6 +1078,9 @@ def _decode_record(
             backup_path = _safe_relative(Path(backup))
             if backup_path.parent != transaction / "backups":
                 raise ValueError("unsafe transaction backup path")
+            if backup_path in backup_paths:
+                raise ValueError("invalid duplicate transaction backup")
+            backup_paths.add(backup_path)
         prior_fingerprint = operation.get("prior_fingerprint")
         prior_mode = operation.get("prior_mode")
         if prior_fingerprint is not None and (
@@ -1045,6 +1092,49 @@ def _decode_record(
             raise ValueError("invalid transaction prior file")
         if prior_fingerprint is None and prior_mode is not None:
             raise ValueError("invalid transaction prior mode")
+    manifest_files = {
+        Path(item["path"]): (item["fingerprint"], item["mode"])
+        for item in record["manifest"]["files"]
+    }
+    prior_files = {
+        Path(item["path"]): (item["fingerprint"], item["mode"])
+        for item in prior_data["files"]
+    } if prior_data is not None else {}
+    installed_destinations: set[Path] = set()
+    for operation in operations:
+        destination = Path(operation["destination"])
+        kind = operation["kind"]
+        if kind in {"installed", "adopted"}:
+            installed_destinations.add(destination)
+            if (
+                manifest_files.get(destination)
+                != (operation["expected_fingerprint"], operation["expected_mode"])
+                or kind == "adopted"
+                and (
+                    operation["backup"] is not None
+                    or operation["prior_fingerprint"] is not None
+                    or operation["prior_mode"] is not None
+                )
+            ):
+                raise ValueError("transaction operations do not match manifest")
+            if operation["backup"] is not None and (
+                prior_files.get(destination)
+                != (operation["prior_fingerprint"], operation["prior_mode"])
+            ):
+                raise ValueError("transaction operations do not match prior manifest")
+            if operation["backup"] is None and (
+                operation["prior_fingerprint"] is not None
+                or operation["prior_mode"] is not None
+            ):
+                raise ValueError("transaction operations do not match prior manifest")
+        elif (
+            destination in manifest_files
+            or prior_files.get(destination)
+            != (operation["prior_fingerprint"], operation["prior_mode"])
+        ):
+            raise ValueError("transaction operations do not match manifests")
+    if installed_destinations != set(manifest_files):
+        raise ValueError("transaction operations do not match manifest")
     directory_paths: set[Path] = set()
     for directory in directories:
         if (
@@ -1058,8 +1148,16 @@ def _decode_record(
             raise ValueError("invalid transaction record directory")
         directory_path = _safe_relative(Path(directory["path"]))
         if directory_path in directory_paths:
-            raise ValueError("invalid duplicate transaction directory")
+            raise ValueError("transaction directories do not match manifest")
         directory_paths.add(directory_path)
+    manifest_directories = {
+        Path(item["path"]): item["mode"] for item in record["manifest"]["directories"]
+    }
+    recorded_directories = {
+        Path(item["path"]): item["mode"] for item in directories
+    }
+    if recorded_directories != manifest_directories:
+        raise ValueError("transaction directories do not match manifest")
     return record, manifest
 
 
@@ -1112,15 +1210,20 @@ def _rollback_record(home_fs: _HomeFS, record: dict[str, Any], record_path: Path
             raise IncompleteRollbackError(
                 f"rollback incomplete: removed destination changed: {destination}"
             )
-        if backup is not None and home_fs.exists(backup) and not _file_matches(
-            home_fs,
-            backup,
-            operation["prior_fingerprint"],
-            operation["prior_mode"],
-        ):
-            raise IncompleteRollbackError(
-                f"rollback incomplete: backup changed: {backup}"
-            )
+        if backup is not None:
+            if not home_fs.exists(backup):
+                raise IncompleteRollbackError(
+                    f"rollback incomplete: backup is missing: {backup}"
+                )
+            if not _file_matches(
+                home_fs,
+                backup,
+                operation["prior_fingerprint"],
+                operation["prior_mode"],
+            ):
+                raise IncompleteRollbackError(
+                    f"rollback incomplete: backup changed: {backup}"
+                )
     try:
         for operation in reversed(record["operations"]):
             destination = Path(operation["destination"])
@@ -1273,8 +1376,9 @@ def audit_provider_plans(plans: tuple[ProviderPlan, ...]) -> DeploymentAudit:
         return DeploymentAudit(target_id="none", matches=True)
     if len(groups) != 1:
         raise ValueError("audit requires plans for exactly one target")
-    target = groups[0].target
-    files = groups[0].files
+    group = groups[0]
+    target = group.target
+    files = group.files
     missing: list[str] = []
     changed: list[str] = []
     unexpected: set[str] = set()
@@ -1295,6 +1399,12 @@ def audit_provider_plans(plans: tuple[ProviderPlan, ...]) -> DeploymentAudit:
         else:
             try:
                 manifest_data = _validated_manifest_data(manifest_content, target=target)
+                if manifest_data["source_revision"] != group.source_revision:
+                    validation_errors.append(
+                        "deployment manifest source revision does not match plan"
+                    )
+                if manifest_data["provider_ids"] != list(group.provider_ids):
+                    validation_errors.append("deployment manifest providers do not match plan")
                 expected_files = {
                     item.path.as_posix(): (item.fingerprint, item.mode) for item in files
                 }
@@ -1304,6 +1414,30 @@ def audit_provider_plans(plans: tuple[ProviderPlan, ...]) -> DeploymentAudit:
                 }
                 if recorded_files != expected_files:
                     validation_errors.append("deployment manifest files do not match plan")
+                expected_directory_paths = {
+                    item.path.as_posix() for item in _directories(files)
+                }
+                installed_directories: dict[str, int] = {}
+                for directory_path in expected_directory_paths:
+                    try:
+                        directory_stat = home_fs.stat(Path(directory_path))
+                    except OSError:
+                        continue
+                    if stat.S_ISDIR(directory_stat.st_mode):
+                        installed_directories[directory_path] = stat.S_IMODE(
+                            directory_stat.st_mode
+                        )
+                recorded_directories = {
+                    item["path"]: item["mode"]
+                    for item in manifest_data["directories"]
+                }
+                if (
+                    set(installed_directories) != expected_directory_paths
+                    or recorded_directories != installed_directories
+                ):
+                    validation_errors.append(
+                        "deployment manifest directories do not match installed directories"
+                    )
             except ValueError as exc:
                 validation_errors.append(str(exc))
         names: dict[str, list[str]] = {}
