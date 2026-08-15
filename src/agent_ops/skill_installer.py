@@ -7,6 +7,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -19,6 +20,16 @@ from agent_ops.gstack_prime import install_prime_gstack
 from agent_ops.registries.models import Framework, SkillDependency, SkillDependencyInstall
 from agent_ops.show_me_adapter import install_show_me
 from agent_ops.superpowers_adapter import install_prime_superpowers
+
+_SOURCE_METADATA_DIRECTORIES = {
+    ".cache",
+    ".git",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    "__pycache__",
+    "node_modules",
+}
 
 
 @dataclass(frozen=True)
@@ -35,13 +46,26 @@ class InstalledSkillDependency:
         plan: ProviderPlan,
         *,
         install: SkillDependencyInstall,
+        expected_dependency: SkillDependency | None = None,
+        expected_target: Path | None = None,
         dry_run: bool = False,
     ) -> InstalledSkillDependency:
         prefix = "public-skill:"
         if not plan.provider_id.startswith(prefix) or plan.provider_id == prefix:
             raise ValueError(f"not a public skill provider plan: {plan.provider_id}")
+        dependency_id = plan.provider_id.removeprefix(prefix)
+        if expected_dependency is not None and dependency_id != expected_dependency.id:
+            raise ValueError(
+                "public skill plan does not match requested dependency: "
+                f"expected {expected_dependency.id}, got {dependency_id}"
+            )
+        if expected_target is not None and plan.target.home != expected_target:
+            raise ValueError(
+                "public skill plan does not match requested dependency target: "
+                f"expected {expected_target}, got {plan.target.home}"
+            )
         return cls(
-            id=plan.provider_id.removeprefix(prefix),
+            id=dependency_id,
             framework=plan.target.framework,
             destination=plan.target.home / install.destination,
             strategy=install.strategy,
@@ -55,19 +79,32 @@ def build_public_skill_plans(
     dependencies: list[SkillDependency],
     target_home: Path,
     cache_root: Path,
+    _resolved_sources: dict[str, Path] | None = None,
 ):
+    def checkout(dependency: SkillDependency, cache: Path) -> Path:
+        source = _checkout_dependency(dependency, cache)
+        if _resolved_sources is not None:
+            if dependency.id in _resolved_sources:
+                raise ValueError(f"duplicate public skill dependency: {dependency.id}")
+            _resolved_sources[dependency.id] = source
+        return source
+
     return _build_public_skill_plans(
         framework=framework,
         dependencies=dependencies,
         target_home=target_home,
         cache_root=cache_root,
-        checkout_dependency=_checkout_dependency,
+        checkout_dependency=checkout,
         install_dependency=_install_dependency,
     )
 
 
 def _use_shared_transaction_engine() -> bool:
     return os.name == "posix"
+
+
+def _before_native_public_skill_apply(**_context: object) -> None:
+    """Test boundary immediately before native single-bundle revalidation."""
 
 
 def default_framework_home(framework: Framework) -> Path:
@@ -871,8 +908,11 @@ def install_skill_dependencies(
     ):
         raise ValueError(f"no skill dependencies support framework {framework.value}")
 
-    target_home = (home or default_framework_home(framework)).expanduser()
-    cache_root = (cache_dir or Path("~/.cache/agentops/skill-dependencies")).expanduser()
+    target_home = _absolute_lexical_path(home or default_framework_home(framework))
+    cache_root = _absolute_lexical_path(
+        cache_dir or Path("~/.cache/agentops/skill-dependencies")
+    )
+    _validate_cache_target_separation(cache_root=cache_root, target_home=target_home)
     selected_dependencies: list[tuple[SkillDependency, SkillDependencyInstall]] = []
 
     show_me_selected = any(
@@ -892,30 +932,22 @@ def install_skill_dependencies(
             continue
         selected_dependencies.append((dependency, install))
 
-    installed = [
-        InstalledSkillDependency(
-            id=dependency.id,
-            framework=framework,
-            destination=target_home / install.destination,
-            strategy=install.strategy,
-            dry_run=dry_run,
-        )
-        for dependency, install in selected_dependencies
-    ]
-
+    resolved_sources: dict[str, Path] = {}
+    plans = build_public_skill_plans(
+        framework=framework,
+        dependencies=[dependency for dependency, _install in selected_dependencies],
+        target_home=target_home,
+        cache_root=cache_root,
+        _resolved_sources=resolved_sources,
+    )
+    installed = _installed_dependencies_from_plans(
+        plans=plans,
+        selected_dependencies=selected_dependencies,
+        framework=framework,
+        target_home=target_home,
+        dry_run=dry_run,
+    )
     if _use_shared_transaction_engine():
-        plans = build_public_skill_plans(
-            framework=framework,
-            dependencies=[dependency for dependency, _install in selected_dependencies],
-            target_home=target_home,
-            cache_root=cache_root,
-        )
-        installed = [
-            InstalledSkillDependency.from_plan(plan, install=install, dry_run=dry_run)
-            for plan, (_dependency, install) in zip(
-                plans, selected_dependencies, strict=True
-            )
-        ]
         if not dry_run:
             install_provider_plans(plans)
         return installed
@@ -923,29 +955,99 @@ def install_skill_dependencies(
     # The shared descriptor-bound transaction is POSIX-only. Render first, then
     # keep the verified single-bundle native Windows adapters explicit until it
     # has a Windows backend. Multi-bundle application fails before mutation.
-    build_public_skill_plans(
-        framework=framework,
-        dependencies=[dependency for dependency, _install in selected_dependencies],
-        target_home=target_home,
-        cache_root=cache_root,
-    )
     if dry_run:
         return installed
     if len(selected_dependencies) > 1:
         raise UnsupportedPlatformError(
             "atomic multi-bundle public skill installation requires the POSIX shared transaction"
         )
-    for dependency, install in selected_dependencies:
-        source = _checkout_dependency(dependency, cache_root)
-        _install_dependency(
-            framework=framework,
-            target_home=target_home,
-            dependency_id=dependency.id,
-            source=source,
-            destination=target_home / install.destination,
-            install=install,
-        )
+    dependency, install = selected_dependencies[0]
+    try:
+        source = resolved_sources[dependency.id]
+    except KeyError as exc:
+        raise ValueError(
+            f"public skill plan did not retain source for dependency: {dependency.id}"
+        ) from exc
+    _before_native_public_skill_apply(
+        dependency=dependency,
+        source=source,
+        target_home=target_home,
+    )
+    revalidated = _build_public_skill_plans(
+        framework=framework,
+        dependencies=[dependency],
+        target_home=target_home,
+        cache_root=cache_root,
+        checkout_dependency=lambda _dependency, _cache: source,
+        install_dependency=_install_dependency,
+    )
+    if revalidated != plans:
+        raise ValueError(f"public skill source changed after planning: {dependency.id}")
+    _install_dependency(
+        framework=framework,
+        target_home=target_home,
+        dependency_id=dependency.id,
+        source=source,
+        destination=target_home / install.destination,
+        install=install,
+    )
 
+    return installed
+
+
+def _absolute_lexical_path(path: Path) -> Path:
+    return Path(os.path.normcase(os.path.abspath(os.fspath(path.expanduser()))))
+
+
+def _validate_cache_target_separation(*, cache_root: Path, target_home: Path) -> None:
+    candidates = [(cache_root, target_home)]
+    with suppress(OSError, RuntimeError):
+        candidates.append((cache_root.resolve(strict=False), target_home.resolve(strict=False)))
+    for cache, target in candidates:
+        if (
+            cache == target
+            or cache.is_relative_to(target)
+            or target.is_relative_to(cache)
+        ):
+            raise ValueError(
+                "dependency cache and selected target home must not overlap: "
+                f"cache={cache_root}, target={target_home}"
+            )
+
+
+def _installed_dependencies_from_plans(
+    *,
+    plans: tuple[ProviderPlan, ...],
+    selected_dependencies: list[tuple[SkillDependency, SkillDependencyInstall]],
+    framework: Framework,
+    target_home: Path,
+    dry_run: bool,
+) -> list[InstalledSkillDependency]:
+    if len(plans) != len(selected_dependencies):
+        raise ValueError(
+            "public skill plan count does not match requested dependencies: "
+            f"expected {len(selected_dependencies)}, got {len(plans)}"
+        )
+    expected_target_id = f"public-skills:{framework.value}"
+    installed: list[InstalledSkillDependency] = []
+    for plan, (dependency, install) in zip(plans, selected_dependencies, strict=True):
+        if (
+            plan.target.id != expected_target_id
+            or plan.target.framework is not framework
+            or plan.target.channel != "public"
+        ):
+            raise ValueError(
+                f"public skill plan target does not match requested dependency: {dependency.id}"
+            )
+        installed.append(
+            InstalledSkillDependency.from_plan(
+                plan,
+                install=install,
+                expected_dependency=dependency,
+                expected_target=target_home,
+                dry_run=dry_run,
+            )
+        )
     return installed
 
 
@@ -1035,7 +1137,11 @@ def _install_dependency(
         if not skill_source.exists():
             raise FileNotFoundError(skill_source)
         destination.mkdir(parents=True, exist_ok=True)
-        children = sorted(child.name for child in skill_source.iterdir())
+        children = sorted(
+            child.name
+            for child in skill_source.iterdir()
+            if child.name not in _SOURCE_METADATA_DIRECTORIES
+        )
         for stale in sorted(set(_read_manifest(destination, dependency_id)) - set(children)):
             _remove_path(destination / stale)
         for child_name in children:
@@ -1058,7 +1164,7 @@ def _replace_tree(source: Path, destination: Path) -> None:
     shutil.copytree(
         source,
         destination,
-        ignore=shutil.ignore_patterns(".git", "node_modules"),
+        ignore=shutil.ignore_patterns(*sorted(_SOURCE_METADATA_DIRECTORIES)),
     )
 
 

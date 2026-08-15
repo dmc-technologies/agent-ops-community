@@ -283,6 +283,207 @@ def test_install_skill_dependencies_dry_run_plans_without_target_mutation(
     assert not (tmp_path / "cache").exists()
 
 
+def test_dry_run_rejects_cache_inside_target_before_checkout_or_mutation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    home = tmp_path / "home"
+    cache = home / ".cache/dependencies"
+    dependency = SkillDependency(
+        id="gstack",
+        name="GStack",
+        repo="https://example.invalid/gstack.git",
+        ref="abc123",
+        install={
+            "codex": SkillDependencyInstall(
+                strategy="gstack", destination="skills/gstack"
+            )
+        },
+    )
+    checkout_called = False
+
+    def checkout(_dependency: SkillDependency, _cache: Path) -> Path:
+        nonlocal checkout_called
+        checkout_called = True
+        raise AssertionError("overlapping cache reached checkout")
+
+    monkeypatch.setattr("agent_ops.skill_installer._checkout_dependency", checkout)
+
+    with pytest.raises(ValueError, match="cache.*target"):
+        install_skill_dependencies(
+            framework=Framework.CODEX,
+            dependencies=[dependency],
+            home=home,
+            cache_dir=cache,
+            dry_run=True,
+        )
+
+    assert checkout_called is False
+    assert not home.exists()
+
+
+def test_planning_excludes_source_cache_metadata_from_materialized_files(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "SKILL.md").write_bytes(b"managed\n")
+    generated = source / ".cache/generated.txt"
+    generated.parent.mkdir()
+    generated.write_bytes(b"temporary\n")
+    dependency = SkillDependency(
+        id="gstack",
+        name="GStack",
+        repo="https://example.invalid/gstack.git",
+        ref="abc123",
+        install={
+            "codex": SkillDependencyInstall(
+                strategy="gstack", destination="skills/gstack"
+            )
+        },
+    )
+    captured: list[tuple[ProviderPlan, ...]] = []
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency",
+        lambda _dependency, _cache: source,
+    )
+    monkeypatch.setattr(
+        "agent_ops.skill_installer.install_provider_plans",
+        lambda plans: captured.append(plans),
+    )
+
+    install_skill_dependencies(
+        framework=Framework.CODEX,
+        dependencies=[dependency],
+        home=tmp_path / "home",
+    )
+
+    paths = {item.path for item in captured[0][0].files}
+    assert Path("skills/gstack/SKILL.md") in paths
+    assert Path("skills/gstack/.cache/generated.txt") not in paths
+
+
+@pytest.mark.parametrize("shape", ["empty", "reordered", "extra", "identity"])
+def test_non_posix_dry_run_rejects_plan_dependency_mismatch(
+    tmp_path: Path, monkeypatch, shape: str
+) -> None:
+    dependencies = [
+        SkillDependency(
+            id="gstack",
+            name="GStack",
+            repo="https://example.invalid/gstack.git",
+            ref="1" * 40,
+            install={
+                "codex": SkillDependencyInstall(
+                    strategy="gstack", destination="skills/gstack"
+                )
+            },
+        ),
+        SkillDependency(
+            id="superpowers",
+            name="Superpowers",
+            repo="https://example.invalid/superpowers.git",
+            ref="2" * 40,
+            install={
+                "codex": SkillDependencyInstall(
+                    strategy="copy-skills",
+                    source="skills",
+                    destination="skills",
+                )
+            },
+        ),
+    ]
+    target = TargetSpec(
+        "public-skills:codex", Framework.CODEX, tmp_path / "home", "public"
+    )
+    valid = [
+        ProviderPlan("public-skill:gstack", "revision", target, ()),
+        ProviderPlan("public-skill:superpowers", "revision", target, ()),
+    ]
+    if shape == "empty":
+        plans = ()
+    elif shape == "reordered":
+        plans = tuple(reversed(valid))
+    elif shape == "extra":
+        plans = (*valid, valid[0])
+    else:
+        plans = (
+            ProviderPlan("public-skill:other", "revision", target, ()),
+            valid[1],
+        )
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._use_shared_transaction_engine", lambda: False
+    )
+    monkeypatch.setattr(
+        "agent_ops.skill_installer.build_public_skill_plans", lambda **_kwargs: plans
+    )
+
+    with pytest.raises(ValueError, match="plan.*dependenc"):
+        install_skill_dependencies(
+            framework=Framework.CODEX,
+            dependencies=dependencies,
+            home=target.home,
+            dry_run=True,
+        )
+
+
+def test_non_posix_single_bundle_revalidates_planned_checkout_before_native_apply(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import agent_ops.skill_installer as skill_installer
+
+    source = tmp_path / "source"
+    source.mkdir()
+    skill = source / "SKILL.md"
+    skill.write_bytes(b"planned\n")
+    dependency = SkillDependency(
+        id="gstack",
+        name="GStack",
+        repo="https://example.invalid/gstack.git",
+        ref="1" * 40,
+        install={
+            "codex": SkillDependencyInstall(
+                strategy="gstack", destination="skills/gstack"
+            )
+        },
+    )
+    native_calls: list[Path] = []
+    home = tmp_path / "home"
+    original_install = skill_installer._install_dependency
+
+    def change_source(**_kwargs) -> None:
+        skill.write_bytes(b"changed after planning\n")
+
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._use_shared_transaction_engine", lambda: False
+    )
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency",
+        lambda _dependency, _cache: source,
+    )
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._before_native_public_skill_apply",
+        change_source,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._install_dependency",
+        lambda **kwargs: (
+            native_calls.append(kwargs["source"])
+            if kwargs["target_home"] == home
+            else original_install(**kwargs)
+        ),
+    )
+
+    with pytest.raises(ValueError, match="changed after planning"):
+        install_skill_dependencies(
+            framework=Framework.CODEX,
+            dependencies=[dependency],
+            home=home,
+        )
+
+    assert native_calls == []
+
+
 def test_dependency_checkout_rejects_symbolic_link_cache_destination(
     tmp_path: Path,
 ) -> None:

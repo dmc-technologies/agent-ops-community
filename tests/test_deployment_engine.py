@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import stat
 import subprocess
 from pathlib import Path
 
@@ -160,6 +162,31 @@ def test_public_plan_builder_renders_over_shadow_without_mutating_existing_targe
     assert installed.read_bytes() == b"old\n"
 
 
+def test_public_plan_builder_rejects_cache_overlap_before_checkout(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    dependency = _dependency(
+        "gstack", ref="1" * 40, strategy="gstack", destination="skills/gstack"
+    )
+    checkout_called = False
+
+    def checkout(_dependency: SkillDependency, _cache: Path) -> Path:
+        nonlocal checkout_called
+        checkout_called = True
+        raise AssertionError("overlapping cache reached checkout")
+
+    with pytest.raises(ValueError, match="cache.*target"):
+        build_public_skill_plans(
+            framework=Framework.CODEX,
+            dependencies=[dependency],
+            target_home=home,
+            cache_root=home / "cache",
+            checkout_dependency=checkout,
+        )
+
+    assert checkout_called is False
+    assert not home.exists()
+
+
 def test_all_bundles_plan_before_one_shared_transaction(tmp_path: Path, monkeypatch) -> None:
     dependencies = [
         _dependency("gstack", ref="1" * 40, strategy="gstack", destination="skills/gstack"),
@@ -309,6 +336,8 @@ def test_installed_dependency_report_is_derived_from_its_plan(tmp_path: Path) ->
 def test_non_posix_multi_bundle_route_fails_before_native_application(
     tmp_path: Path, monkeypatch
 ) -> None:
+    import agent_ops.skill_installer as skill_installer
+
     dependencies = [
         _dependency("gstack", ref="1" * 40, strategy="gstack", destination="skills/gstack"),
         _dependency(
@@ -319,39 +348,56 @@ def test_non_posix_multi_bundle_route_fails_before_native_application(
             destination="skills",
         ),
     ]
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "SKILL.md").write_bytes(b"gstack\n")
+    home = tmp_path / "home"
     planned: list[tuple[str, ...]] = []
     applied: list[str] = []
+    original_build = skill_installer.build_public_skill_plans
+    original_install = skill_installer._install_dependency
+
+    def build(**kwargs):
+        planned.append(tuple(item.id for item in kwargs["dependencies"]))
+        if len(kwargs["dependencies"]) == 1:
+            return original_build(**kwargs)
+        target = TargetSpec(
+            "public-skills:codex", Framework.CODEX, kwargs["target_home"], "public"
+        )
+        return tuple(
+            ProviderPlan(f"public-skill:{item.id}", "revision", target, ())
+            for item in kwargs["dependencies"]
+        )
+
+    def install(**kwargs) -> None:
+        if kwargs["target_home"] == home:
+            applied.append(kwargs["dependency_id"])
+        else:
+            original_install(**kwargs)
+
     monkeypatch.setattr("agent_ops.skill_installer._use_shared_transaction_engine", lambda: False)
+    monkeypatch.setattr("agent_ops.skill_installer.build_public_skill_plans", build)
+    monkeypatch.setattr("agent_ops.skill_installer._install_dependency", install)
     monkeypatch.setattr(
-        "agent_ops.skill_installer.build_public_skill_plans",
-        lambda **kwargs: planned.append(tuple(item.id for item in kwargs["dependencies"])) or (),
-    )
-    monkeypatch.setattr(
-        "agent_ops.skill_installer._install_dependency",
-        lambda **kwargs: applied.append(kwargs["dependency_id"]),
+        "agent_ops.skill_installer._checkout_dependency",
+        lambda _dependency, _cache: source,
     )
 
     with pytest.raises(UnsupportedPlatformError, match="atomic multi-bundle"):
         install_skill_dependencies(
             framework=Framework.CODEX,
             dependencies=dependencies,
-            home=tmp_path / "home",
+            home=home,
         )
 
     assert planned == [("gstack", "superpowers")]
     assert applied == []
-    assert not (tmp_path / "home").exists()
+    assert not home.exists()
 
-    source = tmp_path / "source"
-    source.mkdir()
-    monkeypatch.setattr(
-        "agent_ops.skill_installer._checkout_dependency",
-        lambda _dependency, _cache: source,
-    )
     install_skill_dependencies(
         framework=Framework.CODEX,
         dependencies=[dependencies[0]],
-        home=tmp_path / "home",
+        home=home,
     )
 
     assert planned[-1] == ("gstack",)
@@ -391,6 +437,82 @@ def test_shared_manifest_removes_stale_owned_files_and_preserves_unknowns(
     assert len(manifests) == 1
     data = json.loads(manifests[0].read_text(encoding="utf-8"))
     assert data["provider_ids"] == ["public-skill:gstack"]
+
+
+@pytest.mark.parametrize("owned_path", ["{absolute}", "../outside.txt"])
+def test_shared_manifest_rejects_unsafe_owned_paths_before_shadow_removal(
+    tmp_path: Path, monkeypatch, owned_path: str
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "SKILL.md").write_bytes(b"managed\n")
+    dependency = _dependency(
+        "gstack", ref="1" * 40, strategy="gstack", destination="skills/gstack"
+    )
+    home = tmp_path / "home"
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency",
+        lambda _dependency, _cache: source,
+    )
+    install_skill_dependencies(framework=Framework.CODEX, dependencies=[dependency], home=home)
+    outside = tmp_path / "outside.txt"
+    outside.write_bytes(b"unknown\n")
+    outside.chmod(0o640)
+    manifest = next((home / ".agentops/deployment/manifests").glob("*.json"))
+    data = json.loads(manifest.read_text(encoding="utf-8"))
+    data["files"] = [
+        {
+            "path": str(outside) if owned_path == "{absolute}" else owned_path,
+            "fingerprint": hashlib.sha256(outside.read_bytes()).hexdigest(),
+            "mode": 0o640,
+        }
+    ]
+    manifest.write_text(json.dumps(data), encoding="utf-8")
+
+    error: ValueError | None = None
+    try:
+        install_skill_dependencies(
+            framework=Framework.CODEX,
+            dependencies=[dependency],
+            home=home,
+            dry_run=True,
+        )
+    except ValueError as exc:
+        error = exc
+
+    assert outside.read_bytes() == b"unknown\n"
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o640
+    assert error is not None
+    assert "manifest" in str(error)
+
+
+def test_shared_manifest_rejects_duplicate_json_members(tmp_path: Path, monkeypatch) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "SKILL.md").write_bytes(b"managed\n")
+    dependency = _dependency(
+        "gstack", ref="1" * 40, strategy="gstack", destination="skills/gstack"
+    )
+    home = tmp_path / "home"
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency",
+        lambda _dependency, _cache: source,
+    )
+    install_skill_dependencies(framework=Framework.CODEX, dependencies=[dependency], home=home)
+    manifest = next((home / ".agentops/deployment/manifests").glob("*.json"))
+    content = manifest.read_text(encoding="utf-8")
+    manifest.write_text(
+        content.replace('"target_id":', '"target_id": "duplicate", "target_id":', 1),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="duplicate"):
+        install_skill_dependencies(
+            framework=Framework.CODEX,
+            dependencies=[dependency],
+            home=home,
+            dry_run=True,
+        )
 
 
 def test_exact_legacy_show_me_state_is_adopted_and_no_longer_controls_updates(
@@ -446,6 +568,88 @@ def test_source_closure_rejects_nonregular_entries(tmp_path: Path, kind: str) ->
         )
 
     assert not (tmp_path / "home").exists()
+
+
+@pytest.mark.parametrize("kind", ["directory-symlink", "excluded-file-alias"])
+def test_source_closure_rejects_unsafe_materialized_aliases(
+    tmp_path: Path, kind: str
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "SKILL.md").write_text("body", encoding="utf-8")
+    if kind == "directory-symlink":
+        real = source / "real"
+        real.mkdir()
+        (real / "nested.txt").write_bytes(b"nested\n")
+        (real / "cycle").symlink_to(real, target_is_directory=True)
+        (source / "alias").symlink_to(real, target_is_directory=True)
+    else:
+        excluded = source / "node_modules/package"
+        excluded.mkdir(parents=True)
+        (excluded / "secret.txt").write_bytes(b"secret\n")
+        (source / "alias.txt").symlink_to(excluded / "secret.txt")
+    dependency = _dependency(
+        "gstack", ref="1" * 40, strategy="gstack", destination="skills/gstack"
+    )
+
+    with pytest.raises(ValueError, match="unsupported source entry"):
+        build_public_skill_plans(
+            framework=Framework.CODEX,
+            dependencies=[dependency],
+            target_home=tmp_path / "home",
+            cache_root=tmp_path / "cache",
+            checkout_dependency=lambda _dependency, _cache: source,
+        )
+
+    assert not (tmp_path / "home").exists()
+
+
+def test_source_closure_materializes_confined_regular_file_alias(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    regular = source / "regular.txt"
+    regular.write_bytes(b"aliased\n")
+    regular.chmod(0o640)
+    (source / "alias.txt").symlink_to(regular)
+    dependency = _dependency(
+        "gstack", ref="1" * 40, strategy="gstack", destination="skills/gstack"
+    )
+
+    plan = build_public_skill_plans(
+        framework=Framework.CODEX,
+        dependencies=[dependency],
+        target_home=tmp_path / "home",
+        cache_root=tmp_path / "cache",
+        checkout_dependency=lambda _dependency, _cache: source,
+    )[0]
+
+    assert PlannedFile(Path("skills/gstack/alias.txt"), b"aliased\n", 0o640) in plan.files
+
+
+def test_source_closure_materializes_fully_validated_directory_alias(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    regular = source / "regular"
+    regular.mkdir()
+    skill = regular / "SKILL.md"
+    skill.write_bytes(b"aliased directory\n")
+    skill.chmod(0o640)
+    (source / "alias").symlink_to(regular, target_is_directory=True)
+    dependency = _dependency(
+        "gstack", ref="1" * 40, strategy="gstack", destination="skills/gstack"
+    )
+
+    plan = build_public_skill_plans(
+        framework=Framework.CODEX,
+        dependencies=[dependency],
+        target_home=tmp_path / "home",
+        cache_root=tmp_path / "cache",
+        checkout_dependency=lambda _dependency, _cache: source,
+    )[0]
+
+    assert PlannedFile(
+        Path("skills/gstack/alias/SKILL.md"), b"aliased directory\n", 0o640
+    ) in plan.files
 
 
 def test_checkout_rejects_untracked_output_before_rendering(tmp_path: Path) -> None:

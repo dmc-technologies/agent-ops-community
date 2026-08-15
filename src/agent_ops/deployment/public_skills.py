@@ -8,8 +8,9 @@ import stat
 import subprocess
 import tempfile
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import replace
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from agent_ops.deployment.models import PlannedFile, ProviderPlan, TargetSpec
 from agent_ops.registries.models import Framework, SkillDependency, SkillDependencyInstall
@@ -25,6 +26,25 @@ _SHADOW_PATHS = (
     Path(".agentops/runtime/gstack"),
     Path(".agentops/skill-dependencies"),
 )
+_SOURCE_METADATA_DIRECTORIES = {
+    ".cache",
+    ".git",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    "__pycache__",
+    "node_modules",
+}
+_MANIFEST_KEYS = {
+    "schema_version",
+    "target_id",
+    "framework",
+    "source_revision",
+    "provider_ids",
+    "transaction_id",
+    "directories",
+    "files",
+}
 
 
 def build_public_skill_plans(
@@ -40,7 +60,9 @@ def build_public_skill_plans(
 
     if install_dependency is None:
         install_dependency = _default_install_dependency
-    target_home = target_home.expanduser()
+    target_home = _absolute_lexical_path(target_home)
+    cache_root = _absolute_lexical_path(cache_root)
+    _validate_cache_target_separation(cache_root=cache_root, target_home=target_home)
     target = TargetSpec(
         id=f"public-skills:{framework.value}",
         framework=framework,
@@ -80,6 +102,22 @@ def build_public_skill_plans(
     if stale:
         plans[0] = replace(plans[0], removals=stale)
     return tuple(plans)
+
+
+def _absolute_lexical_path(path: Path) -> Path:
+    return Path(os.path.normcase(os.path.abspath(os.fspath(path.expanduser()))))
+
+
+def _validate_cache_target_separation(*, cache_root: Path, target_home: Path) -> None:
+    candidates = [(cache_root, target_home)]
+    with suppress(OSError, RuntimeError):
+        candidates.append((cache_root.resolve(strict=False), target_home.resolve(strict=False)))
+    for cache, target in candidates:
+        if cache == target or cache.is_relative_to(target) or target.is_relative_to(cache):
+            raise ValueError(
+                "dependency cache and selected target home must not overlap: "
+                f"cache={cache_root}, target={target_home}"
+            )
 
 
 def _combined_revision(
@@ -145,31 +183,48 @@ def _validate_checkout(
                 f"pinned {dependency.id} checkout contains changed or untracked files"
             )
     for closure in _source_closure(source, install):
-        _validate_regular_closure(closure)
+        _validate_regular_closure(closure, source_root=source)
 
 
-def _validate_regular_closure(root: Path) -> None:
-    if root.is_symlink() or (not root.is_file() and not root.is_dir()):
-        raise ValueError(f"unsupported source entry: {root}")
-    if root.is_file():
+def _validate_regular_closure(root: Path, *, source_root: Path) -> None:
+    source_root = source_root.resolve()
+    _validate_materialized_source_entry(root, source_root=source_root, active_directories=set())
+
+
+def _validate_materialized_source_entry(
+    item: Path,
+    *,
+    source_root: Path,
+    active_directories: set[tuple[int, int]],
+) -> None:
+    try:
+        mode = item.lstat().st_mode
+        resolved = item.resolve(strict=True) if stat.S_ISLNK(mode) else item.resolve()
+        relative = resolved.relative_to(source_root)
+    except (FileNotFoundError, OSError, RuntimeError, ValueError) as exc:
+        raise ValueError(f"unsupported source entry: {item}") from exc
+    if any(part in _SOURCE_METADATA_DIRECTORIES for part in relative.parts):
+        raise ValueError(f"unsupported source entry: {item}")
+    resolved_mode = resolved.stat().st_mode
+    if stat.S_ISREG(resolved_mode):
         return
-    for directory, names, files in os.walk(root, followlinks=False):
-        current = Path(directory)
-        names[:] = [name for name in names if name not in {".git", "node_modules"}]
-        for name in [*names, *files]:
-            item = current / name
-            mode = item.lstat().st_mode
-            if stat.S_ISLNK(mode):
-                try:
-                    resolved = item.resolve(strict=True)
-                    resolved.relative_to(root.resolve())
-                except (FileNotFoundError, RuntimeError, ValueError) as exc:
-                    raise ValueError(f"unsupported source entry: {item}") from exc
-                if not (resolved.is_file() or resolved.is_dir()):
-                    raise ValueError(f"unsupported source entry: {item}")
+    if not stat.S_ISDIR(resolved_mode):
+        raise ValueError(f"unsupported source entry: {item}")
+    identity = (resolved.stat().st_dev, resolved.stat().st_ino)
+    if identity in active_directories:
+        raise ValueError(f"unsupported source entry: {item}")
+    active_directories.add(identity)
+    try:
+        for child in sorted(resolved.iterdir(), key=lambda path: path.name):
+            if child.name in _SOURCE_METADATA_DIRECTORIES:
                 continue
-            if not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)):
-                raise ValueError(f"unsupported source entry: {item}")
+            _validate_materialized_source_entry(
+                child,
+                source_root=source_root,
+                active_directories=active_directories,
+            )
+    finally:
+        active_directories.remove(identity)
 
 
 def _render_dependency(
@@ -231,7 +286,7 @@ def _copy_shadow_state(target_home: Path, shadow_home: Path) -> None:
 
 def _remove_prior_shared_files(shadow_home: Path, prior_paths: set[Path]) -> None:
     for relative in sorted(prior_paths, key=lambda path: len(path.parts), reverse=True):
-        path = shadow_home / relative
+        path = _confined_shadow_path(shadow_home, relative)
         if path.is_file() and not path.is_symlink():
             path.unlink()
         cursor = path.parent
@@ -241,6 +296,25 @@ def _remove_prior_shared_files(shadow_home: Path, prior_paths: set[Path]) -> Non
             except OSError:
                 break
             cursor = cursor.parent
+
+
+def _confined_shadow_path(shadow_home: Path, relative: Path) -> Path:
+    shadow = Path(os.path.abspath(shadow_home))
+    candidate = Path(os.path.abspath(shadow / relative))
+    if candidate == shadow or not candidate.is_relative_to(shadow):
+        raise ValueError(f"shared ownership manifest path escapes staging: {relative}")
+    cursor = shadow
+    for part in relative.parts[:-1]:
+        cursor /= part
+        try:
+            item = cursor.lstat()
+        except FileNotFoundError:
+            break
+        if stat.S_ISLNK(item.st_mode):
+            raise ValueError(
+                f"shared ownership manifest path traverses a staging symlink: {relative}"
+            )
+    return candidate
 
 
 def _remove_superseded_legacy_state(shadow_home: Path, dependency_id: str) -> None:
@@ -348,23 +422,131 @@ def _prior_shared_files(target: TargetSpec) -> dict[Path, tuple[str, int]]:
         return {}
     if manifest.is_symlink() or not manifest.is_file():
         raise ValueError("shared ownership manifest is not a regular file")
-    data = json.loads(manifest.read_text(encoding="utf-8"))
-    if data.get("target_id") != target.id or data.get("framework") != target.framework.value:
-        raise ValueError("shared ownership manifest does not match public skill target")
+    data = _decode_shared_manifest(manifest.read_bytes(), target=target)
     files: dict[Path, tuple[str, int]] = {}
-    for item in data.get("files", []):
-        value = item.get("path") if isinstance(item, dict) else None
-        fingerprint = item.get("fingerprint") if isinstance(item, dict) else None
-        mode = item.get("mode") if isinstance(item, dict) else None
-        if (
-            not isinstance(value, str)
-            or PurePosixPath(value).as_posix() != value
-            or not isinstance(fingerprint, str)
-            or not isinstance(mode, int)
-        ):
-            raise ValueError("shared ownership manifest contains an unsafe path")
-        files[Path(value)] = (fingerprint, mode)
+    for item in data["files"]:
+        files[Path(item["path"])] = (item["fingerprint"], item["mode"])
     return files
+
+
+def _decode_shared_manifest(content: bytes, *, target: TargetSpec) -> dict:
+    def reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate JSON key in shared ownership manifest: {key}")
+            result[key] = value
+        return result
+
+    try:
+        data = json.loads(content.decode(), object_pairs_hook=reject_duplicates)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid shared ownership manifest JSON: {exc}") from exc
+    if not isinstance(data, dict) or set(data) != _MANIFEST_KEYS:
+        raise ValueError("invalid shared ownership manifest schema")
+    if type(data["schema_version"]) is not int or data["schema_version"] != 1:
+        raise ValueError("invalid shared ownership manifest schema")
+    if data["target_id"] != target.id or data["framework"] != target.framework.value:
+        raise ValueError("shared ownership manifest does not match public skill target")
+    if not isinstance(data["source_revision"], str) or not data["source_revision"]:
+        raise ValueError("invalid shared ownership manifest source revision")
+    providers = data["provider_ids"]
+    if (
+        not isinstance(providers, list)
+        or not providers
+        or any(not isinstance(item, str) or not item for item in providers)
+        or providers != sorted(set(providers))
+    ):
+        raise ValueError("invalid shared ownership manifest providers")
+    transaction_id = data["transaction_id"]
+    if (
+        not isinstance(transaction_id, str)
+        or len(transaction_id) != 32
+        or any(character not in "0123456789abcdef" for character in transaction_id)
+    ):
+        raise ValueError("invalid shared ownership manifest transaction")
+    if not isinstance(data["files"], list) or not isinstance(data["directories"], list):
+        raise ValueError("invalid shared ownership manifest entries")
+
+    file_paths: set[Path] = set()
+    for item in data["files"]:
+        if not isinstance(item, dict) or set(item) != {"path", "fingerprint", "mode"}:
+            raise ValueError("invalid shared ownership manifest file")
+        path = _manifest_relative_path(item["path"], kind="file")
+        fingerprint = item["fingerprint"]
+        mode = item["mode"]
+        if (
+            not isinstance(fingerprint, str)
+            or len(fingerprint) != 64
+            or any(character not in "0123456789abcdef" for character in fingerprint)
+            or not _valid_manifest_file_mode(mode)
+        ):
+            raise ValueError("invalid shared ownership manifest file")
+        if path in file_paths:
+            raise ValueError("invalid shared ownership manifest duplicate file path")
+        file_paths.add(path)
+
+    directory_paths: set[Path] = set()
+    for item in data["directories"]:
+        if not isinstance(item, dict) or set(item) != {"path", "mode"}:
+            raise ValueError("invalid shared ownership manifest directory")
+        path = _manifest_relative_path(item["path"], kind="directory")
+        if not _valid_manifest_directory_mode(item["mode"]):
+            raise ValueError("invalid shared ownership manifest directory")
+        if path in directory_paths:
+            raise ValueError("invalid shared ownership manifest duplicate directory path")
+        directory_paths.add(path)
+
+    expected_directories: set[Path] = set()
+    for path in file_paths:
+        parent = path.parent
+        while parent != Path("."):
+            expected_directories.add(parent)
+            parent = parent.parent
+    if directory_paths != expected_directories:
+        raise ValueError("invalid shared ownership manifest directory closure")
+    if [item["path"] for item in data["files"]] != sorted(
+        item["path"] for item in data["files"]
+    ):
+        raise ValueError("shared ownership manifest files are not in canonical order")
+    if [item["path"] for item in data["directories"]] != sorted(
+        item["path"] for item in data["directories"]
+    ):
+        raise ValueError("shared ownership manifest directories are not in canonical order")
+    return data
+
+
+def _manifest_relative_path(value: object, *, kind: str) -> Path:
+    if (
+        not isinstance(value, str)
+        or not value
+        or "\\" in value
+        or value.startswith("/")
+        or value.endswith("/")
+        or "//" in value
+        or any(part in {"", ".", ".."} for part in value.split("/"))
+    ):
+        raise ValueError(f"unsafe shared ownership manifest {kind} path")
+    posix = PurePosixPath(value)
+    windows = PureWindowsPath(value)
+    if (
+        posix.is_absolute()
+        or windows.is_absolute()
+        or windows.drive
+        or windows.root
+        or posix.as_posix() != value
+        or posix.parts[:2] == (".agentops", "deployment")
+    ):
+        raise ValueError(f"unsafe shared ownership manifest {kind} path")
+    return Path(*posix.parts)
+
+
+def _valid_manifest_file_mode(value: object) -> bool:
+    return type(value) is int and 0 <= value <= 0o777 and bool(value & 0o400)
+
+
+def _valid_manifest_directory_mode(value: object) -> bool:
+    return type(value) is int and 0 <= value <= 0o777 and value & 0o700 == 0o700
 
 
 def _validate_prior_shared_files(
@@ -429,7 +611,7 @@ def _default_install_dependency(
         shutil.copytree(
             source,
             destination,
-            ignore=shutil.ignore_patterns(".git", "node_modules"),
+            ignore=shutil.ignore_patterns(*sorted(_SOURCE_METADATA_DIRECTORIES)),
         )
         return
     if install.strategy == "copy-skills":
@@ -437,6 +619,8 @@ def _default_install_dependency(
             raise ValueError("copy-skills dependency install requires a source path")
         destination.mkdir(parents=True, exist_ok=True)
         for child in sorted((source / install.source).iterdir(), key=lambda item: item.name):
+            if child.name in _SOURCE_METADATA_DIRECTORIES:
+                continue
             target = destination / child.name
             _remove_shadow_path(target)
             if child.is_dir():
