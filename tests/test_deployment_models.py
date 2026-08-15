@@ -43,6 +43,7 @@ def test_target_and_planned_file_are_immutable_and_repo_relative() -> None:
         Path("../managed"),
         Path("."),
         Path("C:managed"),
+        Path(r"\managed"),
         Path(r"managed\..\other"),
     ),
 )

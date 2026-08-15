@@ -15,6 +15,7 @@ def _repository_relative_path(path: Path) -> Path:
         path.is_absolute()
         or windows_path.is_absolute()
         or windows_path.drive
+        or windows_path.root
         or not path.parts
         or any(part == ".." for part in path.parts)
         or any(part == ".." for part in windows_path.parts)
