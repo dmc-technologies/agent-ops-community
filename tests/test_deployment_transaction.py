@@ -39,18 +39,18 @@ def _plan(
     )
 
 
-def _run_bounded(function: Callable[[], object]) -> tuple[str, str]:
+def _run_bounded(function: Callable[[], object]) -> tuple[str, object]:
     context = multiprocessing.get_context("fork")
     receiver, sender = context.Pipe(duplex=False)
 
     def invoke() -> None:
         receiver.close()
         try:
-            function()
+            function_result = function()
         except BaseException as exc:
             sender.send((type(exc).__name__, str(exc)))
         else:
-            sender.send(("returned", ""))
+            sender.send(("returned", function_result))
         finally:
             sender.close()
 
@@ -1343,3 +1343,45 @@ def test_recovery_rejects_fifo_manifest_without_blocking(
     assert json.loads(record_path.read_text())["state"] == "indeterminate"
     assert stat.S_ISFIFO(manifest_path.stat().st_mode)
     assert stat.S_IMODE(manifest_path.stat().st_mode) == 0o600
+
+
+@pytest.mark.parametrize(
+    ("kind", "expected_error"),
+    [
+        ("fifo", "ownership manifest is not a regular file"),
+        ("symlink", "ownership manifest is a symbolic link"),
+    ],
+)
+def test_audit_reports_invalid_manifest_entries_without_blocking(
+    tmp_path: Path,
+    kind: str,
+    expected_error: str,
+) -> None:
+    home = tmp_path / "home"
+    plan = _plan(home, PlannedFile(Path("skills/example/SKILL.md"), b"body\n", 0o644))
+    install_provider_plans((plan,))
+    manifest_path = next((home / ".agentops/deployment/manifests").glob("*.json"))
+    manifest_content = manifest_path.read_bytes()
+    manifest_path.unlink()
+    if kind == "fifo":
+        os.mkfifo(manifest_path, 0o600)
+        manifest_path.chmod(0o600)
+    else:
+        outside = tmp_path / "outside-manifest.json"
+        outside.write_bytes(manifest_content)
+        outside.chmod(0o600)
+        manifest_path.symlink_to(outside)
+
+    def audit_result() -> tuple[bool, tuple[str, ...]]:
+        audit = audit_provider_plans((plan,))
+        return audit.matches, audit.validation_errors
+
+    result = _run_bounded(audit_result)
+
+    assert result == ("returned", (False, (expected_error,)))
+    if kind == "fifo":
+        assert stat.S_ISFIFO(manifest_path.stat().st_mode)
+        assert stat.S_IMODE(manifest_path.stat().st_mode) == 0o600
+    else:
+        assert manifest_path.is_symlink()
+        assert manifest_path.readlink() == outside

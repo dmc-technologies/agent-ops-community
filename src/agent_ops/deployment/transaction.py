@@ -574,6 +574,32 @@ def _validate_ownership_manifest_stat(item: os.stat_result) -> None:
         raise ValueError("ownership manifest mode must be 0o600")
 
 
+def _read_ownership_manifest_for_audit(
+    home_fs: _HomeFS,
+    manifest_path: Path,
+) -> tuple[bytes | None, str | None]:
+    try:
+        manifest_stat = home_fs.stat(manifest_path)
+    except FileNotFoundError:
+        return None, "deployment manifest is missing"
+    except OSError:
+        return None, "ownership manifest metadata could not be read safely"
+    if stat.S_ISLNK(manifest_stat.st_mode):
+        return None, "ownership manifest is a symbolic link"
+    if not stat.S_ISREG(manifest_stat.st_mode):
+        return None, "ownership manifest is not a regular file"
+    try:
+        _validate_ownership_manifest_stat(manifest_stat)
+    except ValueError as exc:
+        return None, str(exc)
+    try:
+        return home_fs.read_file(manifest_path), None
+    except FileNotFoundError:
+        return None, "ownership manifest disappeared during audit"
+    except OSError:
+        return None, "ownership manifest could not be read safely"
+
+
 def _validated_manifest_path(value: str, *, kind: str) -> Path:
     path = _safe_relative(Path(value))
     if path.as_posix() != value:
@@ -1660,12 +1686,15 @@ def audit_provider_plans(plans: tuple[ProviderPlan, ...]) -> DeploymentAudit:
         )
     with home_fs:
         manifest_path = _manifest_path(target)
-        manifest_content = home_fs.read_optional(manifest_path)
-        if manifest_content is None:
-            validation_errors.append("deployment manifest is missing")
+        manifest_content, manifest_error = _read_ownership_manifest_for_audit(
+            home_fs,
+            manifest_path,
+        )
+        if manifest_error is not None:
+            validation_errors.append(manifest_error)
         else:
+            assert manifest_content is not None
             try:
-                _validate_ownership_manifest_stat(home_fs.stat(manifest_path))
                 manifest_data = _validated_manifest_data(manifest_content, target=target)
                 if manifest_data["source_revision"] != group.source_revision:
                     validation_errors.append(
