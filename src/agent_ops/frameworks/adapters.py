@@ -4,6 +4,7 @@ from pathlib import Path
 
 from agent_ops.context.models import ContextPack
 from agent_ops.contracts.job import AgentJob
+from agent_ops.deployment.models import TargetReadiness
 from agent_ops.frameworks.base import AdapterCommand, FrameworkAdapter
 from agent_ops.registries.models import Framework
 
@@ -11,6 +12,7 @@ from agent_ops.registries.models import Framework
 class LocalAdapter(FrameworkAdapter):
     framework = Framework.LOCAL
     executable = "sh"
+    home_environment_variable = "AGENT_OPS_LOCAL_HOME"
 
     def build_command(self, job: AgentJob, context_pack: ContextPack, cwd: Path) -> AdapterCommand:
         command = job.verification[0].command if job.verification else "true"
@@ -27,6 +29,7 @@ class LocalAdapter(FrameworkAdapter):
 class ClaudeCodeAdapter(FrameworkAdapter):
     framework = Framework.CLAUDE_CODE
     executable = "claude"
+    home_environment_variable = "CLAUDE_HOME"
 
     def build_command(self, job: AgentJob, context_pack: ContextPack, cwd: Path) -> AdapterCommand:
         prompt = context_pack.to_markdown()
@@ -44,6 +47,13 @@ class ClaudeCodeAdapter(FrameworkAdapter):
 class CodexAdapter(FrameworkAdapter):
     framework = Framework.CODEX
     executable = "codex"
+    home_environment_variable = "CODEX_HOME"
+
+    def target_readiness(self, home: Path) -> TargetReadiness:
+        return self.native_file_readiness(
+            home / "auth.json",
+            f"CODEX_HOME={home} codex login",
+        )
 
     def build_command(self, job: AgentJob, context_pack: ContextPack, cwd: Path) -> AdapterCommand:
         prompt = (
@@ -62,6 +72,7 @@ class CodexAdapter(FrameworkAdapter):
 class CursorAdapter(FrameworkAdapter):
     framework = Framework.CURSOR
     executable = "cursor"
+    home_environment_variable = "CURSOR_HOME"
 
     def build_command(self, job: AgentJob, context_pack: ContextPack, cwd: Path) -> AdapterCommand:
         return AdapterCommand(
@@ -78,6 +89,7 @@ class CursorAdapter(FrameworkAdapter):
 class OpenCodeAdapter(FrameworkAdapter):
     framework = Framework.OPENCODE
     executable = "opencode"
+    home_environment_variable = "OPENCODE_CONFIG_DIR"
 
     def build_command(self, job: AgentJob, context_pack: ContextPack, cwd: Path) -> AdapterCommand:
         prompt = context_pack.to_markdown()
@@ -96,6 +108,7 @@ class OpenCodeAdapter(FrameworkAdapter):
 class PrimeAgentAdapter(FrameworkAdapter):
     framework = Framework.PRIME_AGENT
     executable = "prime-agent"
+    home_environment_variable = "PRIME_AGENT_CODING_AGENT_DIR"
 
     def build_command(self, job: AgentJob, context_pack: ContextPack, cwd: Path) -> AdapterCommand:
         prompt = context_pack.to_markdown()
@@ -114,6 +127,7 @@ class PrimeAgentAdapter(FrameworkAdapter):
 class OpenClawAdapter(FrameworkAdapter):
     framework = Framework.OPENCLAW
     executable = "openclaw"
+    home_environment_variable = "OPENCLAW_HOME"
 
     def build_command(self, job: AgentJob, context_pack: ContextPack, cwd: Path) -> AdapterCommand:
         return AdapterCommand(

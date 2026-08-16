@@ -95,3 +95,48 @@ def test_prime_agent_handoff_uses_print_mode_and_explicit_cwd() -> None:
     assert command.cwd == str(cwd)
     assert {skill.id for skill in context_pack.skills} >= {"gstack", "superpowers"}
     assert {tool.id for tool in context_pack.tools} >= {"github", "prime-agent-cli"}
+
+
+def test_framework_target_environments_are_exact_and_isolated(tmp_path: Path) -> None:
+    expected = {
+        Framework.CLAUDE_CODE: "CLAUDE_HOME",
+        Framework.CODEX: "CODEX_HOME",
+        Framework.CURSOR: "CURSOR_HOME",
+        Framework.OPENCLAW: "OPENCLAW_HOME",
+        Framework.OPENCODE: "OPENCODE_CONFIG_DIR",
+        Framework.PRIME_AGENT: "PRIME_AGENT_CODING_AGENT_DIR",
+        Framework.LOCAL: "AGENT_OPS_LOCAL_HOME",
+    }
+
+    for framework, variable in expected.items():
+        home = tmp_path / framework.value
+        assert get_adapter(framework).target_environment(home) == {variable: str(home)}
+
+
+def test_codex_readiness_checks_native_auth_state_without_reading_it(
+    tmp_path: Path, monkeypatch
+) -> None:
+    home = tmp_path / "codex"
+    home.mkdir()
+    auth = home / "auth.json"
+    auth.write_text("do-not-read", encoding="utf-8")
+
+    def refuse_read(*_args, **_kwargs):
+        raise AssertionError("credential contents must not be read")
+
+    monkeypatch.setattr(Path, "read_bytes", refuse_read)
+    monkeypatch.setattr(Path, "read_text", refuse_read)
+
+    readiness = get_adapter(Framework.CODEX).target_readiness(home)
+
+    assert readiness.ready is True
+    assert readiness.prerequisite is None
+
+
+def test_codex_readiness_reports_native_login_command(tmp_path: Path) -> None:
+    home = tmp_path / "codex"
+
+    readiness = get_adapter(Framework.CODEX).target_readiness(home)
+
+    assert readiness.ready is False
+    assert readiness.prerequisite == f"CODEX_HOME={home} codex login"
