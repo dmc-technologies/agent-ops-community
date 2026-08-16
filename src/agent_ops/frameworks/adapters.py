@@ -56,11 +56,11 @@ class CodexAdapter(FrameworkAdapter):
         return self.native_file_readiness(
             home,
             home / "auth.json",
-            f"CODEX_HOME={home} codex login",
+            self.target_setup_command(home),
         )
 
-    def target_setup_command(self, home: Path) -> str:
-        return f"CODEX_HOME={home} codex login"
+    def target_setup_arguments(self) -> tuple[str, ...]:
+        return ("codex", "login")
 
     def build_command(self, job: AgentJob, context_pack: ContextPack, cwd: Path) -> AdapterCommand:
         prompt = (
@@ -81,8 +81,8 @@ class CursorAdapter(FrameworkAdapter):
     executable = "cursor-agent"
     home_environment_variable = "CURSOR_HOME"
 
-    def target_setup_command(self, home: Path) -> str:
-        return f"CURSOR_HOME={home} cursor-agent login"
+    def target_setup_arguments(self) -> tuple[str, ...]:
+        return ("cursor-agent", "login")
 
     def build_command(self, job: AgentJob, context_pack: ContextPack, cwd: Path) -> AdapterCommand:
         return AdapterCommand(
@@ -101,8 +101,8 @@ class OpenCodeAdapter(FrameworkAdapter):
     executable = "opencode"
     home_environment_variable = "OPENCODE_CONFIG_DIR"
 
-    def target_setup_command(self, home: Path) -> str:
-        return f"OPENCODE_CONFIG_DIR={home} opencode auth login"
+    def target_setup_arguments(self) -> tuple[str, ...]:
+        return ("opencode", "auth", "login")
 
     def build_command(self, job: AgentJob, context_pack: ContextPack, cwd: Path) -> AdapterCommand:
         prompt = context_pack.to_markdown()
@@ -142,8 +142,8 @@ class OpenClawAdapter(FrameworkAdapter):
     executable = "openclaw"
     home_environment_variable = "OPENCLAW_HOME"
 
-    def target_setup_command(self, home: Path) -> str:
-        return f"OPENCLAW_HOME={home} openclaw onboard"
+    def target_setup_arguments(self) -> tuple[str, ...]:
+        return ("openclaw", "onboard")
 
     def build_command(self, job: AgentJob, context_pack: ContextPack, cwd: Path) -> AdapterCommand:
         return AdapterCommand(

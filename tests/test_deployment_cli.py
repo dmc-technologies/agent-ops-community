@@ -321,10 +321,6 @@ def test_missing_ref_json_uses_stable_error_envelope(tmp_path: Path, monkeypatch
             ["channel", "launch", "demo", "--json"],
             "--framework is required",
         ),
-        (
-            ["channel", "launch", "demo", "--framework", "unknown", "--json"],
-            "unknown framework: unknown",
-        ),
     ],
 )
 def test_json_usage_failures_use_one_stable_envelope(
@@ -478,7 +474,6 @@ def test_channel_launch_prints_identity_and_execs_with_only_target_overlay(
     [
         ["--json", "--quiet"],
         ["--json", "--", "--quiet"],
-        ["--", "--json", "--quiet"],
     ],
 )
 def test_channel_launch_json_is_authorization_only_and_never_execs(
@@ -524,12 +519,117 @@ def test_channel_launch_json_is_authorization_only_and_never_execs(
     assert engine.calls == [("launch_authorization", "codex-demo")]
 
 
+def test_channel_launch_forwards_every_token_after_delimiter_in_human_mode(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from agent_ops.deployment import cli as deployment_cli
+
+    _, engine = _runtime(monkeypatch, tmp_path)
+    observed: dict[str, object] = {}
+    home = tmp_path / "codex-demo"
+    home.mkdir()
+    (home / "auth.json").write_text("do-not-read", encoding="utf-8")
+    monkeypatch.setattr(
+        deployment_cli.os,
+        "execvpe",
+        lambda executable, arguments, environment: observed.update(
+            executable=executable,
+            arguments=arguments,
+            environment=environment,
+        ),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "channel",
+            "launch",
+            "demo",
+            "--framework",
+            "codex",
+            "--",
+            "--json",
+            "quoted value",
+            "--unknown=value",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert result.output == f"channel=demo commit={COMMIT}\n"
+    assert observed["arguments"] == [
+        "codex",
+        "--json",
+        "quoted value",
+        "--unknown=value",
+    ]
+    assert engine.calls == [("launch_authorization", "codex-demo")]
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["deployment", "status", "--json", "--unknown"],
+        ["deployment", "status", "--unknown", "--json"],
+    ],
+)
+def test_deployment_json_boundary_converts_unknown_option_parse_errors(
+    arguments: list[str],
+) -> None:
+    result = runner.invoke(app, arguments)
+
+    assert result.exit_code == 2
+    assert json.loads(result.output) == {
+        "ok": False,
+        "error": {"category": "usage", "message": "No such option: --unknown"},
+        "exit_status": 2,
+    }
+
+
+def test_deployment_json_boundary_converts_missing_option_value_parse_error() -> None:
+    result = runner.invoke(app, ["deployment", "status", "--json", "--registry"])
+
+    assert result.exit_code == 2
+    assert json.loads(result.output) == {
+        "ok": False,
+        "error": {
+            "category": "usage",
+            "message": "Option '--registry' requires an argument.",
+        },
+        "exit_status": 2,
+    }
+
+
+def test_channel_json_boundary_converts_invalid_enum_parse_error() -> None:
+    result = runner.invoke(
+        app,
+        ["channel", "launch", "demo", "--framework", "unknown", "--json"],
+    )
+
+    assert result.exit_code == 2
+    payload = json.loads(result.output)
+    assert payload["ok"] is False
+    assert payload["error"]["category"] == "usage"
+    assert payload["error"]["message"].startswith("Invalid value for '--framework'")
+    assert payload["exit_status"] == 2
+
+
+def test_json_after_delimiter_does_not_change_parse_error_format() -> None:
+    result = runner.invoke(
+        app,
+        ["deployment", "status", "--unknown", "--", "--json"],
+    )
+
+    assert result.exit_code == 2
+    assert result.output.startswith("Usage:")
+    assert "No such option: --unknown" in result.output
+
+
 def test_channel_launch_refuses_unready_target(tmp_path: Path, monkeypatch) -> None:
     _, engine = _runtime(monkeypatch, tmp_path)
 
     unready = runner.invoke(app, ["channel", "launch", "demo", "--framework", "codex"])
     assert unready.exit_code == 1
-    assert f"CODEX_HOME={tmp_path / 'codex-demo'} codex login" in unready.output
+    assert f"env CODEX_HOME={tmp_path / 'codex-demo'} codex login" in unready.output
     assert engine.calls == [("launch_authorization", "codex-demo")]
 
 
@@ -555,7 +655,7 @@ def test_channel_launch_json_reports_unready_target_without_exec(
         "ok": False,
         "error": {
             "category": "not-ready",
-            "message": f"CODEX_HOME={tmp_path / 'codex-demo'} codex login",
+            "message": f"env CODEX_HOME={tmp_path / 'codex-demo'} codex login",
         },
         "exit_status": 1,
     }

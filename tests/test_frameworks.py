@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shlex
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,28 @@ GENERIC_PRIVATE_FRAMEWORKS = {
     Framework.OPENCLAW,
     Framework.LOCAL,
 }
+
+
+SETUP_ARGUMENTS = {
+    Framework.CLAUDE_CODE: ("claude",),
+    Framework.CODEX: ("codex", "login"),
+    Framework.CURSOR: ("cursor-agent", "login"),
+    Framework.OPENCODE: ("opencode", "auth", "login"),
+    Framework.PRIME_AGENT: ("prime-agent",),
+    Framework.OPENCLAW: ("openclaw", "onboard"),
+    Framework.LOCAL: ("sh",),
+}
+
+
+def _setup_prerequisite(framework: Framework, home: Path) -> str:
+    adapter = get_adapter(framework)
+    return shlex.join(
+        [
+            "env",
+            f"{adapter.home_environment_variable}={home}",
+            *SETUP_ARGUMENTS[framework],
+        ]
+    )
 
 
 def make_job() -> AgentJob:
@@ -146,7 +169,7 @@ def test_codex_readiness_reports_native_login_command(
     readiness = get_adapter(Framework.CODEX).target_readiness(home)
 
     assert readiness.ready is False
-    assert readiness.prerequisite == f"CODEX_HOME={home} codex login"
+    assert readiness.prerequisite == _setup_prerequisite(Framework.CODEX, home)
 
 
 @pytest.mark.parametrize("marker_kind", ["directory", "symlink", "unreadable"])
@@ -174,21 +197,21 @@ def test_codex_readiness_rejects_unsafe_or_uninspectable_auth_marker(
     readiness = get_adapter(Framework.CODEX).target_readiness(home)
 
     assert readiness.ready is False
-    assert readiness.prerequisite == f"CODEX_HOME={home} codex login"
+    assert readiness.prerequisite == _setup_prerequisite(Framework.CODEX, home)
 
 
 @pytest.mark.parametrize(
-    ("framework", "command"),
+    "framework",
     [
-        (Framework.CLAUDE_CODE, "claude"),
-        (Framework.CURSOR, "cursor-agent login"),
-        (Framework.OPENCODE, "opencode auth login"),
-        (Framework.PRIME_AGENT, "prime-agent"),
-        (Framework.OPENCLAW, "openclaw onboard"),
+        Framework.CLAUDE_CODE,
+        Framework.CURSOR,
+        Framework.OPENCODE,
+        Framework.PRIME_AGENT,
+        Framework.OPENCLAW,
     ],
 )
 def test_authenticated_frameworks_fail_closed_without_safe_native_proof(
-    tmp_path: Path, monkeypatch, framework: Framework, command: str
+    tmp_path: Path, monkeypatch, framework: Framework
 ) -> None:
     home = tmp_path / framework.value
     home.mkdir()
@@ -198,9 +221,7 @@ def test_authenticated_frameworks_fail_closed_without_safe_native_proof(
     readiness = adapter.target_readiness(home)
 
     assert readiness.ready is False
-    assert readiness.prerequisite == (
-        f"{adapter.home_environment_variable}={home} {command}"
-    )
+    assert readiness.prerequisite == _setup_prerequisite(framework, home)
 
 
 def test_local_readiness_requires_safe_home_and_executable(
@@ -228,4 +249,25 @@ def test_readiness_checks_executable_before_accepting_native_marker(
     readiness = get_adapter(Framework.CODEX).target_readiness(home)
 
     assert readiness.ready is False
-    assert readiness.prerequisite == f"CODEX_HOME={home} codex login"
+    assert readiness.prerequisite == _setup_prerequisite(Framework.CODEX, home)
+
+
+@pytest.mark.parametrize(
+    "home_name",
+    [
+        "space home",
+        "single'quote",
+        'double"quote;$HOME',
+        "line\nbreak",
+    ],
+)
+@pytest.mark.parametrize("framework", sorted(GENERIC_PRIVATE_FRAMEWORKS, key=str))
+def test_setup_prerequisites_quote_every_home_as_one_inert_argument(
+    tmp_path: Path, framework: Framework, home_name: str
+) -> None:
+    home = tmp_path / home_name
+
+    readiness = get_adapter(framework).target_readiness(home)
+
+    assert readiness.ready is False
+    assert readiness.prerequisite == _setup_prerequisite(framework, home)

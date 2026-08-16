@@ -31,6 +31,14 @@ verification:
     assert "valid: cli-job" in result.output
 
 
+def test_deployment_json_parse_boundary_does_not_change_unrelated_commands() -> None:
+    result = runner.invoke(app, ["bootstrap", "--unknown", "--json"])
+
+    assert result.exit_code == 2
+    assert result.output.startswith("Usage:")
+    assert "No such option: --unknown" in result.output
+
+
 def test_verify_command_returns_nonzero_on_failure(tmp_path: Path) -> None:
     job = tmp_path / "job.yaml"
     job.write_text(

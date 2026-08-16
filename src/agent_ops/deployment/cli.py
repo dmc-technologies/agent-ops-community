@@ -37,6 +37,19 @@ _COMMIT = re.compile(r"[0-9a-fA-F]{40}\Z")
 _JSON_OUTPUT: ContextVar[bool] = ContextVar("deployment_cli_json_output", default=False)
 
 
+@contextmanager
+def json_output_scope(enabled: bool) -> Iterator[None]:
+    token = _JSON_OUTPUT.set(enabled)
+    try:
+        yield
+    finally:
+        _JSON_OUTPUT.reset(token)
+
+
+def emit_json_usage_error(message: str) -> None:
+    _fail(message, usage=True)
+
+
 def _state_root(state_home: Path | None) -> Path:
     if state_home is not None:
         return state_home.expanduser().absolute()
@@ -430,22 +443,15 @@ def switch_channel_command(
 def launch_channel_command(
     context: typer.Context,
     channel: Annotated[str | None, typer.Argument()] = None,
-    framework: Annotated[str | None, typer.Option("--framework")] = None,
+    framework: Annotated[Framework | None, typer.Option("--framework")] = None,
     json_output: Annotated[bool, typer.Option("--json")] = False,
     registry_path: Annotated[Path | None, typer.Option("--registry")] = None,
     state_home: Annotated[Path | None, typer.Option("--state-home")] = None,
 ) -> None:
-    agent_arguments = [argument for argument in context.args if argument != "--json"]
-    if len(agent_arguments) != len(context.args):
-        json_output = True
-        _JSON_OUTPUT.set(True)
     channel = _required_channel(channel)
     if framework is None:
         _fail("--framework is required", usage=True)
-    try:
-        selected_framework = Framework(framework)
-    except ValueError:
-        _fail(f"unknown framework: {framework}", usage=True)
+    selected_framework = framework
     registry, engine = _command_runtime(registry_path, state_home)
     registry_snapshot = _call(registry.load_snapshot)
     config = registry_snapshot.config
@@ -521,10 +527,15 @@ def launch_channel_command(
             typer.echo(f"channel={target.channel} commit={status.commit}")
             environment = dict(os.environ)
             environment.update(adapter.target_environment(target.home))
-            arguments = [adapter.executable, *agent_arguments]
+            arguments = [adapter.executable, *context.args]
             _call(lambda: os.execvpe(adapter.executable, arguments, environment))
     if authorized_json is not None:
         typer.echo(json.dumps(authorized_json, indent=2))
 
 
-__all__ = ["channel_app", "deployment_app"]
+__all__ = [
+    "channel_app",
+    "deployment_app",
+    "emit_json_usage_error",
+    "json_output_scope",
+]

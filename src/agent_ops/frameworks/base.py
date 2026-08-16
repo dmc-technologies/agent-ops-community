@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shlex
 import shutil
 import stat
 from abc import ABC, abstractmethod
@@ -38,10 +39,18 @@ class FrameworkAdapter(ABC):
     def target_setup_command(self, home: Path) -> str:
         if self.executable is None:
             return f"framework {self.framework.value} has no executable"
-        return (
-            f"{self.home_environment_variable}={home} "
-            f"{self.executable}"
+        return shlex.join(
+            [
+                "env",
+                f"{self.home_environment_variable}={home}",
+                *self.target_setup_arguments(),
+            ]
         )
+
+    def target_setup_arguments(self) -> tuple[str, ...]:
+        if self.executable is None:
+            return ()
+        return (self.executable,)
 
     def native_home_readiness(self, home: Path) -> TargetReadiness:
         prerequisite = self.target_setup_command(home)
