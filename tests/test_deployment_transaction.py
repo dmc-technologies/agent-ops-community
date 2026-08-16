@@ -864,7 +864,12 @@ def test_rollback_requires_every_recorded_backup_before_mutation(tmp_path: Path)
     )
     manifests = install_provider_plans((replacement,))
     manifest_path = next((home / ".agentops/deployment/manifests").glob("*.json"))
-    record_path = next((home / ".agentops/deployment/transactions").glob("*/record.json"))
+    record_path = (
+        home
+        / ".agentops/deployment/transactions"
+        / manifests[0].transaction_id
+        / "record.json"
+    )
     record = json.loads(record_path.read_text())
     backup_path = home / record["operations"][0]["backup"]
     backup_path.unlink()
@@ -952,7 +957,12 @@ def test_record_rejects_reused_backup_path_before_rollback(tmp_path: Path) -> No
         revision="2" * 40,
     )
     manifests = install_provider_plans((replacement,))
-    record_path = next((home / ".agentops/deployment/transactions").glob("*/record.json"))
+    record_path = (
+        home
+        / ".agentops/deployment/transactions"
+        / manifests[0].transaction_id
+        / "record.json"
+    )
     record = json.loads(record_path.read_text())
     record["operations"][1]["backup"] = record["operations"][0]["backup"]
     record_path.write_text(json.dumps(record))

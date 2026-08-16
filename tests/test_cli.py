@@ -32,7 +32,7 @@ verification:
 
 
 def test_deployment_json_parse_boundary_does_not_change_unrelated_commands() -> None:
-    result = runner.invoke(app, ["bootstrap", "--unknown", "--json"])
+    result = runner.invoke(app, ["bootstrap", "--unknown", "--json"], color=False)
 
     assert result.exit_code == 2
     assert result.output.startswith("Usage:")

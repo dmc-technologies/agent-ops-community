@@ -138,6 +138,10 @@ def _config(home: Path = Path("/tmp/codex-demo")) -> RegistryConfig:
 def _runtime(monkeypatch, tmp_path: Path, *, state: TargetState = TargetState.BRANCH):
     from agent_ops.deployment import cli as deployment_cli
 
+    monkeypatch.setattr(
+        "agent_ops.frameworks.base.shutil.which",
+        lambda executable: f"/test-bin/{executable}",
+    )
     status = TargetStatus("codex-demo", state, "demo", COMMIT)
     engine = FakeEngine(status)
     engine.home = tmp_path / "codex-demo"
