@@ -8,8 +8,8 @@ import os
 import re
 import stat
 import uuid
-from collections.abc import Callable
-from contextlib import suppress
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -148,6 +148,56 @@ class ReceiptRecord:
         _receipt_to_data(self.receipt)
 
 
+class _RegistrySnapshotAuthority:
+    """Retained shared-lock authority for one immutable registry snapshot."""
+
+    def __init__(
+        self,
+        registry: DeploymentRegistry,
+        snapshot: RegistrySnapshot,
+        parent: int,
+        parent_identities: tuple[tuple[int, int], ...],
+        lock: int,
+    ) -> None:
+        self._registry = registry
+        self.snapshot = snapshot
+        self._parent = parent
+        self._parent_identities = parent_identities
+        self._lock = lock
+        self._lock_identity = _identity(os.fstat(lock))
+        os.set_inheritable(parent, False)
+        os.set_inheritable(lock, False)
+
+    def verify(self) -> None:
+        if os.get_inheritable(self._parent) or os.get_inheritable(self._lock):
+            raise RuntimeError("retained registry authority descriptors must be close-on-exec")
+        _require_current_snapshot(
+            self._parent,
+            self._registry.path.name,
+            self.snapshot,
+        )
+        try:
+            canonical_lock = os.stat(
+                self._registry.lock_path.name,
+                dir_fd=self._parent,
+                follow_symlinks=False,
+            )
+            retained_lock = os.fstat(self._lock)
+        except OSError as error:
+            raise RuntimeError("retained registry lock identity changed") from error
+        if (
+            not stat.S_ISREG(canonical_lock.st_mode)
+            or _identity(canonical_lock) != self._lock_identity
+            or _identity(retained_lock) != self._lock_identity
+        ):
+            raise RuntimeError("retained registry lock identity changed")
+        _verify_canonical_parent(
+            self._registry.path.parent,
+            self._parent,
+            self._parent_identities,
+        )
+
+
 class DeploymentRegistry:
     """A host-local deployment registry with private append-only receipts."""
 
@@ -181,6 +231,34 @@ class DeploymentRegistry:
             snapshot = _snapshot_from_parent(parent, self.path.name)
             _verify_canonical_parent(self.path.parent, parent, identities)
             return snapshot
+        finally:
+            _close_registry_lock(lock)
+            os.close(parent)
+
+    @contextmanager
+    def retain_snapshot(
+        self, snapshot: RegistrySnapshot
+    ) -> Iterator[_RegistrySnapshotAuthority]:
+        """Retain shared authority for an exact registry snapshot."""
+        _require_secure_platform(require_locking=True)
+        if type(snapshot) is not RegistrySnapshot:
+            raise TypeError("snapshot must be an exact RegistrySnapshot")
+        parent, identities, lock = _open_locked_parent(
+            self.path.parent,
+            self.lock_path.name,
+            exclusive=False,
+            create_lock=False,
+        )
+        try:
+            authority = _RegistrySnapshotAuthority(
+                self,
+                snapshot,
+                parent,
+                identities,
+                lock,
+            )
+            authority.verify()
+            yield authority
         finally:
             _close_registry_lock(lock)
             os.close(parent)

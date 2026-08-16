@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from agent_ops.bootstrap import SUPPORTED_BOOTSTRAPS, bootstrap_text, write_all_bootstraps
 from agent_ops.context import build_context_pack
 from agent_ops.contracts.job import AgentJob, JobMode, VerificationCommand
@@ -126,6 +128,7 @@ def test_codex_readiness_checks_native_auth_state_without_reading_it(
 
     monkeypatch.setattr(Path, "read_bytes", refuse_read)
     monkeypatch.setattr(Path, "read_text", refuse_read)
+    monkeypatch.setattr("agent_ops.frameworks.base.shutil.which", lambda _name: "/bin/tool")
 
     readiness = get_adapter(Framework.CODEX).target_readiness(home)
 
@@ -133,8 +136,94 @@ def test_codex_readiness_checks_native_auth_state_without_reading_it(
     assert readiness.prerequisite is None
 
 
-def test_codex_readiness_reports_native_login_command(tmp_path: Path) -> None:
+def test_codex_readiness_reports_native_login_command(
+    tmp_path: Path, monkeypatch
+) -> None:
     home = tmp_path / "codex"
+    home.mkdir()
+    monkeypatch.setattr("agent_ops.frameworks.base.shutil.which", lambda _name: "/bin/codex")
+
+    readiness = get_adapter(Framework.CODEX).target_readiness(home)
+
+    assert readiness.ready is False
+    assert readiness.prerequisite == f"CODEX_HOME={home} codex login"
+
+
+@pytest.mark.parametrize("marker_kind", ["directory", "symlink", "unreadable"])
+def test_codex_readiness_rejects_unsafe_or_uninspectable_auth_marker(
+    tmp_path: Path, monkeypatch, marker_kind: str
+) -> None:
+    home = tmp_path / "codex"
+    home.mkdir()
+    marker = home / "auth.json"
+    if marker_kind == "directory":
+        marker.mkdir()
+    elif marker_kind == "symlink":
+        marker.symlink_to(tmp_path / "credential-outside-home")
+    else:
+        original_lstat = Path.lstat
+
+        def fail_marker_lstat(path: Path):
+            if path == marker:
+                raise PermissionError("marker cannot be inspected")
+            return original_lstat(path)
+
+        monkeypatch.setattr(Path, "lstat", fail_marker_lstat)
+    monkeypatch.setattr("agent_ops.frameworks.base.shutil.which", lambda _name: "/bin/codex")
+
+    readiness = get_adapter(Framework.CODEX).target_readiness(home)
+
+    assert readiness.ready is False
+    assert readiness.prerequisite == f"CODEX_HOME={home} codex login"
+
+
+@pytest.mark.parametrize(
+    ("framework", "command"),
+    [
+        (Framework.CLAUDE_CODE, "claude"),
+        (Framework.CURSOR, "cursor-agent login"),
+        (Framework.OPENCODE, "opencode auth login"),
+        (Framework.PRIME_AGENT, "prime-agent"),
+        (Framework.OPENCLAW, "openclaw onboard"),
+    ],
+)
+def test_authenticated_frameworks_fail_closed_without_safe_native_proof(
+    tmp_path: Path, monkeypatch, framework: Framework, command: str
+) -> None:
+    home = tmp_path / framework.value
+    home.mkdir()
+    adapter = get_adapter(framework)
+    monkeypatch.setattr("agent_ops.frameworks.base.shutil.which", lambda _name: "/bin/tool")
+
+    readiness = adapter.target_readiness(home)
+
+    assert readiness.ready is False
+    assert readiness.prerequisite == (
+        f"{adapter.home_environment_variable}={home} {command}"
+    )
+
+
+def test_local_readiness_requires_safe_home_and_executable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    home = tmp_path / "local"
+    home.mkdir()
+    adapter = get_adapter(Framework.LOCAL)
+    monkeypatch.setattr("agent_ops.frameworks.base.shutil.which", lambda _name: "/bin/sh")
+
+    assert adapter.target_readiness(home).ready is True
+
+    home.rename(tmp_path / "moved")
+    assert adapter.target_readiness(home).ready is False
+
+
+def test_readiness_checks_executable_before_accepting_native_marker(
+    tmp_path: Path, monkeypatch
+) -> None:
+    home = tmp_path / "codex"
+    home.mkdir()
+    (home / "auth.json").write_text("do-not-read", encoding="utf-8")
+    monkeypatch.setattr("agent_ops.frameworks.base.shutil.which", lambda _name: None)
 
     readiness = get_adapter(Framework.CODEX).target_readiness(home)
 

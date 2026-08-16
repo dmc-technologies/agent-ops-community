@@ -742,6 +742,108 @@ def test_engine_audit_reports_exact_installed_target_as_stable(tmp_path: Path) -
     assert registry.receipts()[-1] == receipt
 
 
+def test_launch_authorization_retains_exact_audit_and_revalidates_home(
+    tmp_path: Path,
+) -> None:
+    engine, registry, home = _engine_fixture(tmp_path)
+    refreshed = engine.refresh(("codex",))
+
+    with engine.launch_authorization("codex") as authorization:
+        assert authorization.target == registry.load().targets[0]
+        assert authorization.status == TargetStatus(
+            "codex", TargetState.STABLE, "stable", refreshed.commits[0]
+        )
+        assert authorization.receipt.operation == "audit"
+        assert authorization.plan.provider_plans[0].target == authorization.target
+        authorization.verify()
+
+    assert registry.receipts()[-1] == authorization.receipt
+
+
+@pytest.mark.parametrize("operation", ["refresh", "switch", "save"])
+def test_launch_authorization_blocks_cooperative_target_or_registry_changes(
+    tmp_path: Path, operation: str
+) -> None:
+    engine, registry, _home = _engine_fixture(tmp_path)
+    engine.refresh(("codex",))
+    if operation == "switch":
+        source = tmp_path / "source"
+        _create_branch(source, "feature", b"feature\n")
+        current = registry.load()
+        registry.save(
+            RegistryConfig(
+                1,
+                current.sources,
+                current.channels
+                + (ChannelSpec("feature", "community", "refs/heads/feature"),),
+                current.targets,
+            )
+        )
+    entered = threading.Event()
+    completed = threading.Event()
+    errors: list[BaseException] = []
+
+    def change() -> None:
+        entered.set()
+        try:
+            if operation == "refresh":
+                engine.refresh(("codex",))
+            elif operation == "switch":
+                engine.switch("feature", ("codex",))
+            else:
+                snapshot = registry.load_snapshot()
+                registry.save(snapshot.config, expected_snapshot=snapshot)
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            completed.set()
+
+    with engine.launch_authorization("codex") as authorization:
+        worker = threading.Thread(target=change)
+        worker.start()
+        assert entered.wait(timeout=5)
+        assert completed.wait(timeout=0.1) is False
+        authorization.verify()
+    worker.join(timeout=5)
+
+    assert worker.is_alive() is False
+    assert errors == []
+
+
+def test_launch_authorization_rejects_renamed_home_before_handoff(
+    tmp_path: Path,
+) -> None:
+    engine, _registry, home = _engine_fixture(tmp_path)
+    engine.refresh(("codex",))
+    displaced = tmp_path / "displaced-home"
+
+    with engine.launch_authorization("codex") as authorization:
+        os.replace(home, displaced)
+        home.mkdir()
+        with pytest.raises(ValueError, match="canonical home identity changed"):
+            authorization.verify()
+
+
+def test_launch_authorization_rejects_inheritable_target_authority_descriptor(
+    tmp_path: Path,
+) -> None:
+    import agent_ops.deployment.transaction as transaction
+
+    engine, _registry, home = _engine_fixture(tmp_path)
+    engine.refresh(("codex",))
+
+    with engine.launch_authorization("codex") as authorization:
+        active = transaction._GROUP_HOME_LOCKS.get()
+        assert active is not None
+        descriptor = active[home].descriptor
+        os.set_inheritable(descriptor, True)
+        try:
+            with pytest.raises(RuntimeError, match="close-on-exec"):
+                authorization.verify()
+        finally:
+            os.set_inheritable(descriptor, False)
+
+
 def test_engine_status_is_conservative_and_does_not_fetch(tmp_path: Path) -> None:
     engine, registry, home = _engine_fixture(tmp_path)
     engine.refresh(("codex",))

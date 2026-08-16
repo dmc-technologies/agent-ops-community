@@ -33,13 +33,36 @@ class FrameworkAdapter(ABC):
         return {self.home_environment_variable: str(home)}
 
     def target_readiness(self, home: Path) -> TargetReadiness:
+        return TargetReadiness(ready=False, prerequisite=self.target_setup_command(home))
+
+    def target_setup_command(self, home: Path) -> str:
+        if self.executable is None:
+            return f"framework {self.framework.value} has no executable"
+        return (
+            f"{self.home_environment_variable}={home} "
+            f"{self.executable}"
+        )
+
+    def native_home_readiness(self, home: Path) -> TargetReadiness:
+        prerequisite = self.target_setup_command(home)
+        if not self.available():
+            return TargetReadiness(ready=False, prerequisite=prerequisite)
+        try:
+            item = home.lstat()
+        except OSError:
+            return TargetReadiness(ready=False, prerequisite=prerequisite)
+        if not stat.S_ISDIR(item.st_mode):
+            return TargetReadiness(ready=False, prerequisite=prerequisite)
         return TargetReadiness(ready=True, prerequisite=None)
 
-    @staticmethod
-    def native_file_readiness(path: Path, prerequisite: str) -> TargetReadiness:
+    def native_file_readiness(
+        self, home: Path, path: Path, prerequisite: str
+    ) -> TargetReadiness:
+        if not self.native_home_readiness(home).ready:
+            return TargetReadiness(ready=False, prerequisite=prerequisite)
         try:
             item = path.lstat()
-        except FileNotFoundError:
+        except OSError:
             return TargetReadiness(ready=False, prerequisite=prerequisite)
         if not stat.S_ISREG(item.st_mode):
             return TargetReadiness(ready=False, prerequisite=prerequisite)

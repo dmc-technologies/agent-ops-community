@@ -207,12 +207,14 @@ class _HomeFS:
         home_identity: tuple[int, int] | None = None,
         lock_name: str | None = None,
         lock_identity: tuple[int, int] | None = None,
+        lock_descriptor: int | None = None,
     ) -> None:
         self.home = home
         self.descriptor = descriptor
         self._home_identity = home_identity
         self._lock_name = lock_name
         self._lock_identity = lock_identity
+        self._lock_descriptor = lock_descriptor
 
     def __enter__(self) -> _HomeFS:
         return self
@@ -221,6 +223,14 @@ class _HomeFS:
         os.close(self.descriptor)
 
     def verify_lock_identity(self) -> None:
+        descriptors = (self.descriptor, self._lock_descriptor)
+        if any(
+            descriptor is not None and os.get_inheritable(descriptor)
+            for descriptor in descriptors
+        ):
+            raise RuntimeError(
+                "retained deployment authority descriptors must be close-on-exec"
+            )
         if self._home_identity is None:
             return
         canonical_descriptor: int | None = None
@@ -570,6 +580,7 @@ def _target_lock(home: Path) -> Iterator[_HomeFS]:
             mode=0o700,
         )
         try:
+            os.set_inheritable(home_descriptor, False)
             home_stat = os.fstat(home_descriptor)
             fcntl.flock(home_descriptor, fcntl.LOCK_EX)
             canonical_home = os.stat(
@@ -591,6 +602,7 @@ def _target_lock(home: Path) -> Iterator[_HomeFS]:
                 dir_fd=home_descriptor,
             )
             try:
+                os.set_inheritable(lock, False)
                 lock_stat = os.fstat(lock)
                 if not stat.S_ISREG(lock_stat.st_mode) or lock_stat.st_nlink != 1:
                     raise ValueError("deployment lock is not a regular file")
@@ -612,6 +624,7 @@ def _target_lock(home: Path) -> Iterator[_HomeFS]:
                     home_identity=(home_stat.st_dev, home_stat.st_ino),
                     lock_name=lock_name,
                     lock_identity=(lock_stat.st_dev, lock_stat.st_ino),
+                    lock_descriptor=lock,
                 )
             finally:
                 fcntl.flock(lock, fcntl.LOCK_UN)

@@ -5,9 +5,13 @@ from __future__ import annotations
 import json
 import os
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, contextmanager
+from contextvars import ContextVar
 from dataclasses import asdict
 from enum import Enum
+from functools import wraps
+from inspect import signature
 from pathlib import Path
 from typing import Annotated, Any, TypeVar
 
@@ -30,6 +34,7 @@ deployment_app = typer.Typer(help="Inspect, plan, refresh, and audit managed dep
 channel_app = typer.Typer(help="Deploy and launch isolated Agent Ops channels.")
 _T = TypeVar("_T")
 _COMMIT = re.compile(r"[0-9a-fA-F]{40}\Z")
+_JSON_OUTPUT: ContextVar[bool] = ContextVar("deployment_cli_json_output", default=False)
 
 
 def _state_root(state_home: Path | None) -> Path:
@@ -134,9 +139,30 @@ def _emit_receipt(receipt: DeploymentReceipt, json_output: bool) -> None:
     _emit_statuses(receipt.targets, False)
 
 
-def _fail(message: str, *, usage: bool = False) -> None:
-    typer.echo(message, err=True)
-    raise typer.Exit(2 if usage else 1)
+def _fail(
+    message: str,
+    *,
+    usage: bool = False,
+    category: str | None = None,
+) -> None:
+    exit_status = 2 if usage else 1
+    if _JSON_OUTPUT.get():
+        typer.echo(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": {
+                        "category": category or ("usage" if usage else "operation"),
+                        "message": message,
+                    },
+                    "exit_status": exit_status,
+                },
+                indent=2,
+            )
+        )
+    else:
+        typer.echo(message, err=True)
+    raise typer.Exit(exit_status)
 
 
 def _call(operation: Callable[[], _T]) -> _T:
@@ -145,6 +171,35 @@ def _call(operation: Callable[[], _T]) -> _T:
     except Exception as error:
         _fail(str(error))
     raise AssertionError("unreachable")
+
+
+@contextmanager
+def _call_context(
+    operation: Callable[[], AbstractContextManager[_T]],
+) -> Iterator[_T]:
+    try:
+        with operation() as result:
+            yield result
+        return
+    except typer.Exit:
+        raise
+    except Exception as error:
+        _fail(str(error))
+
+
+def _json_command(command: Callable[..., _T]) -> Callable[..., _T]:
+    command_signature = signature(command)
+
+    @wraps(command)
+    def wrapped(*args: object, **kwargs: object) -> _T:
+        arguments = command_signature.bind(*args, **kwargs).arguments
+        token = _JSON_OUTPUT.set(bool(arguments.get("json_output", False)))
+        try:
+            return command(*args, **kwargs)
+        finally:
+            _JSON_OUTPUT.reset(token)
+
+    return wrapped
 
 
 def _command_runtime(
@@ -199,7 +254,14 @@ def _channel(config: RegistryConfig, channel: str):
     return found
 
 
+def _required_channel(channel: str | None) -> str:
+    if channel is None:
+        _fail("channel is required", usage=True)
+    return channel
+
+
 @deployment_app.command("status")
+@_json_command
 def status_command(
     targets: Annotated[str | None, typer.Option("--targets")] = None,
     target: Annotated[list[str] | None, typer.Option("--target")] = None,
@@ -220,6 +282,7 @@ def status_command(
 
 
 @deployment_app.command("plan")
+@_json_command
 def plan_command(
     targets: Annotated[str | None, typer.Option("--targets")] = None,
     target: Annotated[list[str] | None, typer.Option("--target")] = None,
@@ -259,6 +322,7 @@ def _refresh_common(
 
 
 @deployment_app.command("refresh")
+@_json_command
 def refresh_command(
     targets: Annotated[str | None, typer.Option("--targets")] = None,
     target: Annotated[list[str] | None, typer.Option("--target")] = None,
@@ -282,6 +346,7 @@ def refresh_command(
 
 
 @deployment_app.command("audit")
+@_json_command
 def audit_command(
     targets: Annotated[str | None, typer.Option("--targets")] = None,
     target: Annotated[list[str] | None, typer.Option("--target")] = None,
@@ -298,9 +363,10 @@ def audit_command(
 
 
 @channel_app.command("deploy")
+@_json_command
 def deploy_channel_command(
-    channel: str,
-    ref: Annotated[str, typer.Option("--ref")],
+    channel: Annotated[str | None, typer.Argument()] = None,
+    ref: Annotated[str | None, typer.Option("--ref")] = None,
     targets: Annotated[str | None, typer.Option("--targets")] = None,
     target: Annotated[list[str] | None, typer.Option("--target")] = None,
     accept_rewrite_old: Annotated[str | None, typer.Option("--accept-rewrite-old")] = None,
@@ -309,6 +375,9 @@ def deploy_channel_command(
     registry_path: Annotated[Path | None, typer.Option("--registry")] = None,
     state_home: Annotated[Path | None, typer.Option("--state-home")] = None,
 ) -> None:
+    channel = _required_channel(channel)
+    if ref is None:
+        _fail("--ref is required", usage=True)
     _registry, engine = _command_runtime(registry_path, state_home)
     selected = _split_targets(targets, target)
     rewrite = _rewrite(accept_rewrite_old, accept_rewrite_new)
@@ -319,12 +388,14 @@ def deploy_channel_command(
 
 
 @channel_app.command("refresh")
+@_json_command
 def refresh_channel_command(
-    channel: str,
+    channel: Annotated[str | None, typer.Argument()] = None,
     json_output: Annotated[bool, typer.Option("--json")] = False,
     registry_path: Annotated[Path | None, typer.Option("--registry")] = None,
     state_home: Annotated[Path | None, typer.Option("--state-home")] = None,
 ) -> None:
+    channel = _required_channel(channel)
     registry, engine = _command_runtime(registry_path, state_home)
     config = _call(registry.load)
     _channel(config, channel)
@@ -335,14 +406,16 @@ def refresh_channel_command(
 
 
 @channel_app.command("switch")
+@_json_command
 def switch_channel_command(
-    channel: str,
+    channel: Annotated[str | None, typer.Argument()] = None,
     targets: Annotated[str | None, typer.Option("--targets")] = None,
     target: Annotated[list[str] | None, typer.Option("--target")] = None,
     json_output: Annotated[bool, typer.Option("--json")] = False,
     registry_path: Annotated[Path | None, typer.Option("--registry")] = None,
     state_home: Annotated[Path | None, typer.Option("--state-home")] = None,
 ) -> None:
+    channel = _required_channel(channel)
     registry, engine = _command_runtime(registry_path, state_home)
     _channel(_call(registry.load), channel)
     selected = _split_targets(targets, target)
@@ -353,86 +426,105 @@ def switch_channel_command(
     "launch",
     context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
 )
+@_json_command
 def launch_channel_command(
     context: typer.Context,
-    channel: str,
-    framework: Annotated[Framework, typer.Option("--framework")],
+    channel: Annotated[str | None, typer.Argument()] = None,
+    framework: Annotated[str | None, typer.Option("--framework")] = None,
     json_output: Annotated[bool, typer.Option("--json")] = False,
     registry_path: Annotated[Path | None, typer.Option("--registry")] = None,
     state_home: Annotated[Path | None, typer.Option("--state-home")] = None,
 ) -> None:
+    agent_arguments = [argument for argument in context.args if argument != "--json"]
+    if len(agent_arguments) != len(context.args):
+        json_output = True
+        _JSON_OUTPUT.set(True)
+    channel = _required_channel(channel)
+    if framework is None:
+        _fail("--framework is required", usage=True)
+    try:
+        selected_framework = Framework(framework)
+    except ValueError:
+        _fail(f"unknown framework: {framework}", usage=True)
     registry, engine = _command_runtime(registry_path, state_home)
     registry_snapshot = _call(registry.load_snapshot)
     config = registry_snapshot.config
     candidates = tuple(
         target
         for target in config.targets
-        if target.channel == channel and target.framework is framework
+        if target.channel == channel and target.framework is selected_framework
     )
     if len(candidates) != 1:
         message = (
-            f"channel {channel} requires exactly one {framework.value} target; "
+            f"channel {channel} requires exactly one {selected_framework.value} target; "
             f"found {len(candidates)}"
         )
         _fail(
             message,
             usage=True,
         )
-    target = candidates[0]
-    receipt = _call(lambda: engine.audit((target.id,)))
-    current_snapshot = _call(registry.load_snapshot)
-    snapshot_changed = (
-        current_snapshot.fingerprint != registry_snapshot.fingerprint
-        or current_snapshot.registry_identity != registry_snapshot.registry_identity
-        or current_snapshot.config != registry_snapshot.config
-    )
-    if snapshot_changed:
-        _fail("registry changed during launch audit")
-    current_targets = {item.id: item for item in current_snapshot.config.targets}
-    if current_targets.get(target.id) != target:
-        _fail("registry target changed during launch audit")
-    if receipt.operation != "audit" or len(receipt.targets) != 1:
-        _fail("launch requires fresh audit evidence for exactly one target")
-    status = receipt.targets[0]
-    evidence_matches = (
-        status.target_id == target.id
-        and status.channel == channel
-        and status.commit is not None
-        and _COMMIT.fullmatch(status.commit) is not None
-        and status.commit in receipt.commits
-    )
-    if not evidence_matches:
-        _fail("audit evidence does not match the selected target channel")
-    if status.state not in {TargetState.STABLE, TargetState.BRANCH} or status.commit is None:
-        _fail(f"target state {status.state.value} is not launchable")
-    adapter = get_adapter(framework)
-    readiness = adapter.target_readiness(target.home)
-    launch_data = {
-        "channel": channel,
-        "commit": status.commit,
-        "target_id": target.id,
-        "framework": framework.value,
-        "home": str(target.home),
-        "readiness": {
-            "ready": readiness.ready,
-            "prerequisite": readiness.prerequisite,
-        },
-    }
-    if not readiness.ready:
+    selected_target = candidates[0]
+    authorized_json: dict[str, object] | None = None
+    with _call_context(
+        lambda: engine.launch_authorization(selected_target.id)
+    ) as authorization:
+        target = authorization.target
+        receipt = authorization.receipt
+        status = authorization.status
+        if (
+            target.id != selected_target.id
+            or target.channel != channel
+            or target.framework is not selected_framework
+        ):
+            _fail("launch authority does not match the selected target")
+        if receipt.operation != "audit" or len(receipt.targets) != 1:
+            _fail("launch requires fresh audit evidence for exactly one target")
+        evidence_matches = (
+            receipt.targets[0] == status
+            and status.target_id == target.id
+            and status.channel == target.channel
+            and status.commit is not None
+            and _COMMIT.fullmatch(status.commit) is not None
+            and status.commit in receipt.commits
+        )
+        if not evidence_matches:
+            _fail("audit evidence does not match the selected target channel")
+        if status.state not in {TargetState.STABLE, TargetState.BRANCH}:
+            _fail(f"target state {status.state.value} is not launchable")
+        adapter = get_adapter(selected_framework)
+        readiness = adapter.target_readiness(target.home)
+        launch_data = {
+            "ok": True,
+            "channel": target.channel,
+            "commit": status.commit,
+            "target_id": target.id,
+            "framework": target.framework.value,
+            "home": str(target.home),
+            "readiness": {
+                "ready": readiness.ready,
+                "prerequisite": readiness.prerequisite,
+            },
+            "executed": False,
+            "authorization_only": True,
+        }
+        if not readiness.ready:
+            _fail(
+                readiness.prerequisite or "framework target is not ready",
+                category="not-ready",
+            )
+        if adapter.executable is None:
+            _fail(f"framework {selected_framework.value} has no executable")
+        _call(authorization.verify)
         if json_output:
-            typer.echo(json.dumps(launch_data, indent=2))
-            raise typer.Exit(1)
-        _fail(readiness.prerequisite or "framework target is not ready")
-    if adapter.executable is None:
-        _fail(f"framework {framework.value} has no executable")
-    if json_output:
-        typer.echo(json.dumps(launch_data, indent=2))
-    else:
-        typer.echo(f"channel={channel} commit={status.commit}")
-    environment = dict(os.environ)
-    environment.update(adapter.target_environment(target.home))
-    arguments = [adapter.executable, *context.args]
-    _call(lambda: os.execvpe(adapter.executable, arguments, environment))
+            authorized_json = launch_data
+        else:
+            typer.echo(f"channel={target.channel} commit={status.commit}")
+            environment = dict(os.environ)
+            environment.update(adapter.target_environment(target.home))
+            arguments = [adapter.executable, *agent_arguments]
+            _call(lambda: os.execvpe(adapter.executable, arguments, environment))
+    if authorized_json is not None:
+        typer.echo(json.dumps(authorized_json, indent=2))
 
 
 __all__ = ["channel_app", "deployment_app"]

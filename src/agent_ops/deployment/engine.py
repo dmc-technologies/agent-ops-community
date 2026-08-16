@@ -5,8 +5,9 @@ from __future__ import annotations
 import os
 import stat
 import tempfile
-from collections.abc import Iterable
-from dataclasses import replace
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from agent_ops.deployment.models import (
@@ -34,6 +35,7 @@ from agent_ops.deployment.registry import (
     RegistryConfig,
     RegistrySnapshot,
     _is_preview_channel,
+    _RegistrySnapshotAuthority,
 )
 from agent_ops.deployment.source_store import (
     SourceStore,
@@ -60,6 +62,22 @@ class DeploymentAuditError(DeploymentEngineError):
 
 class DeploymentRecoveryError(DeploymentEngineError):
     """A failed operation could not restore every affected authority."""
+
+
+@dataclass(frozen=True)
+class LaunchAuthorization:
+    """Exact audited launch evidence held under deployment authorities."""
+
+    target: TargetSpec
+    status: TargetStatus
+    receipt: DeploymentReceipt
+    plan: DeploymentPlan
+    registry_snapshot: RegistrySnapshot
+    _registry_authority: _RegistrySnapshotAuthority
+
+    def verify(self) -> None:
+        _verify_locked_provider_plan_targets(self.plan.provider_plans)
+        self._registry_authority.verify()
 
 
 class DeploymentEngine:
@@ -196,6 +214,39 @@ class DeploymentEngine:
             _verify_locked_provider_plan_targets(plan.provider_plans)
             self._registry.append_receipt(receipt, snapshot=registry_snapshot)
         return receipt
+
+    @contextmanager
+    def launch_authorization(
+        self, target_id: str
+    ) -> Iterator[LaunchAuthorization]:
+        registry_snapshot = self._registry.load_snapshot()
+        targets = self._select_targets(registry_snapshot.config, (target_id,))
+        snapshots = self._fetch_snapshots(registry_snapshot.config, targets)
+        plan = self._build_plan(registry_snapshot.config, targets, snapshots)
+        with _locked_provider_plan_targets(plan.provider_plans):
+            plan = self._build_plan(registry_snapshot.config, targets, snapshots)
+            audits = self._audit_plans(plan.provider_plans, require_matches=False)
+            receipt = self._receipt(
+                "audit",
+                registry_snapshot,
+                targets,
+                snapshots,
+                manifests=(),
+                audits=audits,
+            )
+            _verify_locked_provider_plan_targets(plan.provider_plans)
+            self._registry.append_receipt(receipt, snapshot=registry_snapshot)
+            with self._registry.retain_snapshot(registry_snapshot) as registry_authority:
+                authorization = LaunchAuthorization(
+                    targets[0],
+                    receipt.targets[0],
+                    receipt,
+                    plan,
+                    registry_snapshot,
+                    registry_authority,
+                )
+                authorization.verify()
+                yield authorization
 
     def switch(
         self, channel: str, target_ids: tuple[str, ...]

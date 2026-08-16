@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -41,6 +42,18 @@ class FakeRegistry:
         return RegistrySnapshot(self.config, self.fingerprint, self.identity)
 
 
+@dataclass
+class FakeLaunchAuthorization:
+    target: TargetSpec
+    status: TargetStatus
+    receipt: DeploymentReceipt
+    verify_error: BaseException | None = None
+
+    def verify(self) -> None:
+        if self.verify_error is not None:
+            raise self.verify_error
+
+
 class FakeEngine:
     def __init__(self, status: TargetStatus) -> None:
         self.result_status = status
@@ -75,6 +88,13 @@ class FakeEngine:
         self.calls.append(("audit", target_ids))
         return DeploymentReceipt("audit", (COMMIT,), (self.result_status,))
 
+    @contextmanager
+    def launch_authorization(self, target_id):
+        self.calls.append(("launch_authorization", target_id))
+        target = next(target for target in _config(self.home).targets if target.id == target_id)
+        receipt = DeploymentReceipt("audit", (COMMIT,), (self.result_status,))
+        yield FakeLaunchAuthorization(target, self.result_status, receipt)
+
     def deploy(self, channel, ref, target_ids, *, rewrite=None):
         self.calls.append(("deploy", channel, ref, target_ids, rewrite))
         return DeploymentReceipt("deploy", (COMMIT,), (self.result_status,))
@@ -101,6 +121,7 @@ def _runtime(monkeypatch, tmp_path: Path, *, state: TargetState = TargetState.BR
 
     status = TargetStatus("codex-demo", state, "demo", COMMIT)
     engine = FakeEngine(status)
+    engine.home = tmp_path / "codex-demo"
     registry = FakeRegistry(_config(tmp_path / "codex-demo"))
     monkeypatch.setattr(
         deployment_cli, "_load_runtime", lambda *_args, **_kwargs: (registry, engine)
@@ -260,6 +281,67 @@ def test_missing_ref_is_reported_without_traceback(tmp_path: Path, monkeypatch) 
     assert deployment_cli is not None
 
 
+def test_missing_ref_json_uses_stable_error_envelope(tmp_path: Path, monkeypatch) -> None:
+    _, engine = _runtime(monkeypatch, tmp_path)
+
+    def missing(_targets, *, rewrite=None):
+        raise FileNotFoundError("remote ref does not exist: refs/heads/gone")
+
+    engine.refresh = missing
+    result = runner.invoke(app, ["deployment", "refresh", "--all", "--json"])
+
+    assert result.exit_code == 1
+    assert json.loads(result.output) == {
+        "ok": False,
+        "error": {
+            "category": "operation",
+            "message": "remote ref does not exist: refs/heads/gone",
+        },
+        "exit_status": 1,
+    }
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        (["channel", "deploy", "demo", "--json"], "--ref is required"),
+        (
+            [
+                "channel",
+                "deploy",
+                "--ref",
+                "refs/heads/demo",
+                "--targets",
+                "codex-demo",
+                "--json",
+            ],
+            "channel is required",
+        ),
+        (
+            ["channel", "launch", "demo", "--json"],
+            "--framework is required",
+        ),
+        (
+            ["channel", "launch", "demo", "--framework", "unknown", "--json"],
+            "unknown framework: unknown",
+        ),
+    ],
+)
+def test_json_usage_failures_use_one_stable_envelope(
+    tmp_path: Path, monkeypatch, arguments: list[str], message: str
+) -> None:
+    _runtime(monkeypatch, tmp_path)
+
+    result = runner.invoke(app, arguments)
+
+    assert result.exit_code == 2
+    assert json.loads(result.output) == {
+        "ok": False,
+        "error": {"category": "usage", "message": message},
+        "exit_status": 2,
+    }
+
+
 def test_runtime_configuration_error_is_reported_without_traceback(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -388,22 +470,28 @@ def test_channel_launch_prints_identity_and_execs_with_only_target_overlay(
     assert observed["executable"] == "codex"
     assert observed["argv"] == ["codex", "--quiet"]
     assert observed["environment"] == {"PATH": "/bin", "CODEX_HOME": str(tmp_path / "codex-demo")}
-    assert engine.calls == [("audit", ("codex-demo",))]
+    assert engine.calls == [("launch_authorization", "codex-demo")]
 
 
-@pytest.mark.parametrize("separator", [[], ["--"]])
-def test_channel_launch_json_is_consumed_and_never_forwarded(
-    tmp_path: Path, monkeypatch, separator: list[str]
+@pytest.mark.parametrize(
+    "json_arguments",
+    [
+        ["--json", "--quiet"],
+        ["--json", "--", "--quiet"],
+        ["--", "--json", "--quiet"],
+    ],
+)
+def test_channel_launch_json_is_authorization_only_and_never_execs(
+    tmp_path: Path, monkeypatch, json_arguments: list[str]
 ) -> None:
     from agent_ops.deployment import cli as deployment_cli
 
     _, engine = _runtime(monkeypatch, tmp_path)
-    observed = {}
-
-    def fake_exec(executable, argv, environment):
-        observed.update(executable=executable, argv=argv, environment=environment)
-
-    monkeypatch.setattr(deployment_cli.os, "execvpe", fake_exec)
+    monkeypatch.setattr(
+        deployment_cli.os,
+        "execvpe",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("JSON launch must not exec")),
+    )
     monkeypatch.setattr(deployment_cli.os, "environ", {"PATH": "/bin"})
     home = tmp_path / "codex-demo"
     home.mkdir()
@@ -417,24 +505,23 @@ def test_channel_launch_json_is_consumed_and_never_forwarded(
             "demo",
             "--framework",
             "codex",
-            "--json",
-            *separator,
-            "--quiet",
+            *json_arguments,
         ],
     )
 
     assert result.exit_code == 0
     assert json.loads(result.output) == {
+        "ok": True,
         "channel": "demo",
         "commit": COMMIT,
         "target_id": "codex-demo",
         "framework": "codex",
         "home": str(home),
         "readiness": {"ready": True, "prerequisite": None},
+        "executed": False,
+        "authorization_only": True,
     }
-    assert observed["argv"] == ["codex", "--quiet"]
-    assert "--json" not in observed["argv"]
-    assert engine.calls == [("audit", ("codex-demo",))]
+    assert engine.calls == [("launch_authorization", "codex-demo")]
 
 
 def test_channel_launch_refuses_unready_target(tmp_path: Path, monkeypatch) -> None:
@@ -443,7 +530,7 @@ def test_channel_launch_refuses_unready_target(tmp_path: Path, monkeypatch) -> N
     unready = runner.invoke(app, ["channel", "launch", "demo", "--framework", "codex"])
     assert unready.exit_code == 1
     assert f"CODEX_HOME={tmp_path / 'codex-demo'} codex login" in unready.output
-    assert engine.calls == [("audit", ("codex-demo",))]
+    assert engine.calls == [("launch_authorization", "codex-demo")]
 
 
 def test_channel_launch_json_reports_unready_target_without_exec(
@@ -465,17 +552,47 @@ def test_channel_launch_json_reports_unready_target_without_exec(
 
     assert result.exit_code == 1
     assert json.loads(result.output) == {
-        "channel": "demo",
-        "commit": COMMIT,
-        "target_id": "codex-demo",
-        "framework": "codex",
-        "home": str(tmp_path / "codex-demo"),
-        "readiness": {
-            "ready": False,
-            "prerequisite": f"CODEX_HOME={tmp_path / 'codex-demo'} codex login",
+        "ok": False,
+        "error": {
+            "category": "not-ready",
+            "message": f"CODEX_HOME={tmp_path / 'codex-demo'} codex login",
         },
+        "exit_status": 1,
     }
-    assert engine.calls == [("audit", ("codex-demo",))]
+    assert engine.calls == [("launch_authorization", "codex-demo")]
+
+
+def test_channel_launch_json_emits_no_success_before_authority_release(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _, engine = _runtime(monkeypatch, tmp_path)
+    home = tmp_path / "codex-demo"
+    home.mkdir()
+    (home / "auth.json").write_text("do-not-read", encoding="utf-8")
+
+    @contextmanager
+    def failing_release(target_id):
+        engine.calls.append(("launch_authorization", target_id))
+        receipt = DeploymentReceipt("audit", (COMMIT,), (engine.result_status,))
+        yield FakeLaunchAuthorization(_config(home).targets[0], engine.result_status, receipt)
+        raise RuntimeError("retained authority release failed")
+
+    engine.launch_authorization = failing_release
+
+    result = runner.invoke(
+        app,
+        ["channel", "launch", "demo", "--framework", "codex", "--json"],
+    )
+
+    assert result.exit_code == 1
+    assert json.loads(result.output) == {
+        "ok": False,
+        "error": {
+            "category": "operation",
+            "message": "retained authority release failed",
+        },
+        "exit_status": 1,
+    }
 
 
 @pytest.mark.parametrize(
@@ -500,7 +617,7 @@ def test_channel_launch_refuses_unaccepted_audit_state(
 
     assert result.exit_code == 1
     assert f"target state {state.value} is not launchable" in result.output
-    assert engine.calls == [("audit", ("codex-demo",))]
+    assert engine.calls == [("launch_authorization", "codex-demo")]
 
 
 def test_channel_launch_rejects_audit_evidence_for_another_channel(
@@ -515,32 +632,35 @@ def test_channel_launch_rejects_audit_evidence_for_another_channel(
     assert "audit evidence does not match the selected target channel" in result.output
 
 
-def test_channel_launch_rejects_registry_home_change_during_audit(
-    tmp_path: Path, monkeypatch
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "registry no longer matches the required snapshot",
+        "deployment canonical home identity changed",
+    ],
+)
+def test_channel_launch_revalidates_retained_authority_before_exec(
+    tmp_path: Path, monkeypatch, failure: str
 ) -> None:
     from agent_ops.deployment import cli as deployment_cli
 
-    registry, engine = _runtime(monkeypatch, tmp_path)
-    old_home = tmp_path / "old-codex"
-    new_home = tmp_path / "new-codex"
-    registry.config = _config(old_home)
-    old_home.mkdir()
-    (old_home / "auth.json").write_text("old-secret", encoding="utf-8")
-    new_home.mkdir()
-    (new_home / "auth.json").write_text("new-secret", encoding="utf-8")
+    _, engine = _runtime(monkeypatch, tmp_path)
+    home = tmp_path / "codex-demo"
+    home.mkdir()
+    (home / "auth.json").write_text("do-not-read", encoding="utf-8")
 
-    def audit_then_change(target_ids):
-        engine.calls.append(("audit", target_ids))
-        registry.config = _config(new_home)
-        registry.fingerprint = "d" * 64
-        registry.identity = (1, 2)
-        return DeploymentReceipt("audit", (COMMIT,), (engine.result_status,))
+    @contextmanager
+    def invalid_authority(target_id):
+        engine.calls.append(("launch_authorization", target_id))
+        receipt = DeploymentReceipt("audit", (COMMIT,), (engine.result_status,))
+        yield FakeLaunchAuthorization(
+            _config(home).targets[0],
+            engine.result_status,
+            receipt,
+            ValueError(failure),
+        )
 
-    def must_not_check_readiness(_framework):
-        raise AssertionError("changed registry target must not reach readiness")
-
-    engine.audit = audit_then_change
-    monkeypatch.setattr(deployment_cli, "get_adapter", must_not_check_readiness)
+    engine.launch_authorization = invalid_authority
     monkeypatch.setattr(
         deployment_cli.os,
         "execvpe",
@@ -550,31 +670,6 @@ def test_channel_launch_rejects_registry_home_change_during_audit(
     result = runner.invoke(app, ["channel", "launch", "demo", "--framework", "codex"])
 
     assert result.exit_code == 1
-    assert "registry changed during launch audit" in result.output
-    assert engine.calls == [("audit", ("codex-demo",))]
-
-
-def test_channel_launch_rejects_registry_aba_save_during_audit(
-    tmp_path: Path, monkeypatch
-) -> None:
-    from agent_ops.deployment import cli as deployment_cli
-
-    registry, engine = _runtime(monkeypatch, tmp_path)
-
-    def audit_during_aba_save(target_ids):
-        engine.calls.append(("audit", target_ids))
-        registry.identity = (1, 9)
-        return DeploymentReceipt("audit", (COMMIT,), (engine.result_status,))
-
-    engine.audit = audit_during_aba_save
-    monkeypatch.setattr(
-        deployment_cli.os,
-        "execvpe",
-        lambda *_args: (_ for _ in ()).throw(AssertionError("must not exec")),
-    )
-
-    result = runner.invoke(app, ["channel", "launch", "demo", "--framework", "codex"])
-
-    assert result.exit_code == 1
-    assert "registry changed during launch audit" in result.output
-    assert engine.calls == [("audit", ("codex-demo",))]
+    assert result.output == f"{failure}\n"
+    assert "channel=demo" not in result.output
+    assert engine.calls == [("launch_authorization", "codex-demo")]

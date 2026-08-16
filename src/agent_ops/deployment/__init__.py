@@ -5,6 +5,7 @@ from agent_ops.deployment.engine import (
     DeploymentEngine,
     DeploymentEngineError,
     DeploymentRecoveryError,
+    LaunchAuthorization,
 )
 from agent_ops.deployment.models import (
     DeploymentAudit,
@@ -42,6 +43,7 @@ __all__ = [
     "DeploymentReceipt",
     "DeploymentRequest",
     "DeploymentRecoveryError",
+    "LaunchAuthorization",
     "ManifestDirectory",
     "ManifestFile",
     "PlannedFile",

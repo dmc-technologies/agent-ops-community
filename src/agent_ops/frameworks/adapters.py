@@ -14,6 +14,9 @@ class LocalAdapter(FrameworkAdapter):
     executable = "sh"
     home_environment_variable = "AGENT_OPS_LOCAL_HOME"
 
+    def target_readiness(self, home: Path) -> TargetReadiness:
+        return self.native_home_readiness(home)
+
     def build_command(self, job: AgentJob, context_pack: ContextPack, cwd: Path) -> AdapterCommand:
         command = job.verification[0].command if job.verification else "true"
         return AdapterCommand(
@@ -51,9 +54,13 @@ class CodexAdapter(FrameworkAdapter):
 
     def target_readiness(self, home: Path) -> TargetReadiness:
         return self.native_file_readiness(
+            home,
             home / "auth.json",
             f"CODEX_HOME={home} codex login",
         )
+
+    def target_setup_command(self, home: Path) -> str:
+        return f"CODEX_HOME={home} codex login"
 
     def build_command(self, job: AgentJob, context_pack: ContextPack, cwd: Path) -> AdapterCommand:
         prompt = (
@@ -71,8 +78,11 @@ class CodexAdapter(FrameworkAdapter):
 
 class CursorAdapter(FrameworkAdapter):
     framework = Framework.CURSOR
-    executable = "cursor"
+    executable = "cursor-agent"
     home_environment_variable = "CURSOR_HOME"
+
+    def target_setup_command(self, home: Path) -> str:
+        return f"CURSOR_HOME={home} cursor-agent login"
 
     def build_command(self, job: AgentJob, context_pack: ContextPack, cwd: Path) -> AdapterCommand:
         return AdapterCommand(
@@ -90,6 +100,9 @@ class OpenCodeAdapter(FrameworkAdapter):
     framework = Framework.OPENCODE
     executable = "opencode"
     home_environment_variable = "OPENCODE_CONFIG_DIR"
+
+    def target_setup_command(self, home: Path) -> str:
+        return f"OPENCODE_CONFIG_DIR={home} opencode auth login"
 
     def build_command(self, job: AgentJob, context_pack: ContextPack, cwd: Path) -> AdapterCommand:
         prompt = context_pack.to_markdown()
@@ -128,6 +141,9 @@ class OpenClawAdapter(FrameworkAdapter):
     framework = Framework.OPENCLAW
     executable = "openclaw"
     home_environment_variable = "OPENCLAW_HOME"
+
+    def target_setup_command(self, home: Path) -> str:
+        return f"OPENCLAW_HOME={home} openclaw onboard"
 
     def build_command(self, job: AgentJob, context_pack: ContextPack, cwd: Path) -> AdapterCommand:
         return AdapterCommand(
