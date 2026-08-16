@@ -15,12 +15,16 @@ Record durable architecture, workflow, and harness decisions here.
 
 - Decision: preview requires an explicit authored checkout, explicit skill selection, and an existing preview-reserved target. Installed providers must bind every requested name exactly once to a canonical skill identity and exclusively owned paths; omit providers that own none of the selection. Permit only the exact internal read-only Git metadata command allowlist with executable configuration disabled. Retain descriptor authority for the selected paths and parents plus Git index and HEAD through provider planning; after target locks, repeat planning and retain shared authority for the exact original registry snapshot through terminal success. Revalidate the target channel, home, framework, registry bytes and identity, source path, mode, byte, tracked state, and commit before installation and after install and audit. Treat any terminal mismatch as a primary failure inside the same reverse recovery boundary, retaining both failures and transaction evidence when recovery is incomplete. Fingerprint the selected closure as SHA-256, mark the result `unreviewed-local`, and apply it through the shared transaction without fetching, publishing, building, importing, or writing a managed source snapshot. Persist the exact target channel in every strict ownership manifest. Preview status takes the established target lock cooperatively and retains descriptor authority for the manifest and every owned path through terminal identity, mode, and content validation without managed fetch or receipts. Reject managed plan, refresh, audit, deploy, switch, and launch treatment of preview targets.
 
-### 2026-08-15: Every transaction authorizes one exact channel pair
-
-- Decision: default grouped installs, refresh, and preview require an existing prior ownership manifest to use the current planned target channel. Switch and deploy must instead supply the original registry target channel and candidate plan channel. Persist and validate both values through grouped apply, rollback, and recovery; reject any other prior manifest, candidate manifest, or transaction-record combination before mutation.
 - Rationale: authors can try local skill edits quickly while the target remains isolated and visibly outside stable or branch review state. The content fingerprint and transaction evidence preserve exact local facts without granting the working tree code authority.
 - Applies to: local preview, managed engine selection, deployment CLI, documentation, and tests.
 - Revisit when: a reviewed promotion workflow can bind an unreviewed preview fingerprint to an immutable committed source without weakening the current boundary.
+
+### 2026-08-15: Every transaction authorizes one exact channel pair
+
+- Decision: default grouped installs, refresh, and preview require an existing prior ownership manifest to use the current planned target channel. Switch and deploy must instead supply the original registry target channel and candidate plan channel. Persist and validate both values through grouped apply, rollback, and recovery; reject any other prior manifest, candidate manifest, or transaction-record combination before mutation.
+- Rationale: a manifest cannot grant itself authority to move a target between stable and branch channels; only the registry-backed engine can authorize that exact transition.
+- Applies to: grouped install, managed refresh, preview, switch, deploy, rollback, recovery, transaction evidence, documentation, and tests.
+- Revisit when: a reviewed promotion operation introduces another registry-authorized channel transition.
 
 ### 2026-08-13: HumanLayer show-me stays an exact pinned dependency
 
