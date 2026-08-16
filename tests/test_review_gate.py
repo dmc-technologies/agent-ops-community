@@ -487,11 +487,11 @@ def test_resolution_state_is_signed_and_rejects_tampering(monkeypatch) -> None:
         ),
     )
 
-    token = review_gate.sign_resolution_state(state)
+    signed_state = review_gate.sign_resolution_state(state)
 
-    assert token
-    assert review_gate.verify_resolution_state(token) == state
-    assert review_gate.verify_resolution_state(token + "tampered") is None
+    assert signed_state
+    assert review_gate.verify_resolution_state(signed_state) == state
+    assert review_gate.verify_resolution_state(signed_state + "tampered") is None
 
 
 def test_resolution_stage_uses_only_a_descendant_fix_delta(monkeypatch, tmp_path: Path) -> None:
