@@ -102,11 +102,14 @@ def _tree_snapshot(root: Path) -> dict[Path, tuple[int, bytes | None]]:
     }
 
 
-def _manifest(target_id: str, revision: str) -> DeploymentManifest:
+def _manifest(
+    target_id: str, revision: str, channel: str = "stable"
+) -> DeploymentManifest:
     return DeploymentManifest(
         schema_version=1,
         target_id=target_id,
         framework=Framework.CODEX,
+        channel=channel,
         source_revision=revision,
         provider_ids=(),
         files=(),
@@ -1344,7 +1347,11 @@ def test_status_classification_table_is_read_only(
 
     result = registry.status(
         target_id,
-        manifest=_manifest(target_id, manifest_revision) if manifest_revision else None,
+        manifest=(
+            _manifest(target_id, manifest_revision, channel)
+            if manifest_revision
+            else None
+        ),
         resolved_commit=resolved,
         audit=DeploymentAudit(target_id, audit) if audit is not None else None,
         failure=failure,

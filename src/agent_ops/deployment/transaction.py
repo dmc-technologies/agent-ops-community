@@ -77,6 +77,18 @@ def _before_manifest_replace(
     """Internal fault-injection boundary immediately before publication."""
 
 
+def _after_preview_status_manifest_open(
+    _home_fs: _HomeFS, _path: Path, _descriptor: int
+) -> None:
+    """Internal fault-injection boundary after the preview manifest is pinned."""
+
+
+def _after_preview_status_owned_open(
+    _path: Path, _kind: str, _descriptor: int
+) -> None:
+    """Internal fault-injection boundary after an owned preview path is pinned."""
+
+
 def _fingerprint(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
@@ -636,6 +648,81 @@ def _target_lock(home: Path) -> Iterator[_HomeFS]:
         os.close(parent)
 
 
+@contextmanager
+def _target_read_lock(home: Path) -> Iterator[_HomeFS]:
+    """Retain the established target lock cooperatively without creating state."""
+    home = _absolute_home(home)
+    parent = _open_absolute_directory(home.parent, create=False)
+    try:
+        assert fcntl is not None
+        home_descriptor = _open_directory_at(
+            parent, home.name, create=False, mode=0o700
+        )
+        try:
+            os.set_inheritable(home_descriptor, False)
+            home_stat = os.fstat(home_descriptor)
+            fcntl.flock(home_descriptor, fcntl.LOCK_SH)
+            canonical_home = os.stat(
+                home.name, dir_fd=parent, follow_symlinks=False
+            )
+            if (
+                not stat.S_ISDIR(canonical_home.st_mode)
+                or (canonical_home.st_dev, canonical_home.st_ino)
+                != (home_stat.st_dev, home_stat.st_ino)
+            ):
+                raise ValueError("deployment home identity changed")
+            lock = os.open(
+                _LOCK_NAME,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                dir_fd=home_descriptor,
+            )
+            try:
+                os.set_inheritable(lock, False)
+                lock_stat = os.fstat(lock)
+                if (
+                    not stat.S_ISREG(lock_stat.st_mode)
+                    or lock_stat.st_nlink != 1
+                    or stat.S_IMODE(lock_stat.st_mode) != 0o600
+                ):
+                    raise ValueError("deployment lock is not valid read authority")
+                fcntl.flock(lock, fcntl.LOCK_SH)
+                canonical_lock = os.stat(
+                    _LOCK_NAME,
+                    dir_fd=home_descriptor,
+                    follow_symlinks=False,
+                )
+                if (
+                    (canonical_lock.st_dev, canonical_lock.st_ino)
+                    != (lock_stat.st_dev, lock_stat.st_ino)
+                    or canonical_lock.st_mode != lock_stat.st_mode
+                ):
+                    raise ValueError("deployment lock identity changed")
+                home_fs = _HomeFS(
+                    home,
+                    home_descriptor,
+                    home_identity=(home_stat.st_dev, home_stat.st_ino),
+                    lock_name=_LOCK_NAME,
+                    lock_identity=(lock_stat.st_dev, lock_stat.st_ino),
+                    lock_descriptor=lock,
+                )
+                yield home_fs
+                home_fs.verify_lock_identity()
+                terminal_lock = os.fstat(lock)
+                if (
+                    terminal_lock.st_mode != lock_stat.st_mode
+                    or terminal_lock.st_nlink != lock_stat.st_nlink
+                ):
+                    raise ValueError("deployment lock authority changed")
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+                os.close(lock)
+        finally:
+            fcntl.flock(home_descriptor, fcntl.LOCK_UN)
+            os.close(home_descriptor)
+    finally:
+        os.close(parent)
+
+
 def _manifest_path(target: TargetSpec) -> Path:
     key = hashlib.sha256(target.id.encode()).hexdigest()
     return _METADATA / "manifests" / f"{key}.json"
@@ -656,6 +743,7 @@ def _manifest_to_dict(manifest: DeploymentManifest) -> dict[str, Any]:
         "schema_version": manifest.schema_version,
         "target_id": manifest.target_id,
         "framework": manifest.framework.value,
+        "channel": manifest.channel,
         "source_revision": manifest.source_revision,
         "provider_ids": list(manifest.provider_ids),
         "transaction_id": manifest.transaction_id,
@@ -723,6 +811,7 @@ def _validated_manifest_data(content: bytes, *, target: TargetSpec) -> dict[str,
             "schema_version",
             "target_id",
             "framework",
+            "channel",
             "source_revision",
             "provider_ids",
             "transaction_id",
@@ -744,7 +833,11 @@ def _validated_manifest_data(content: bytes, *, target: TargetSpec) -> dict[str,
     review_state = data.get("review_state")
     if review_state not in {None, "unreviewed-local"}:
         raise ValueError("invalid deployment manifest review state")
-    if data.get("target_id") != target.id or data.get("framework") != target.framework.value:
+    if (
+        data.get("target_id") != target.id
+        or data.get("framework") != target.framework.value
+        or data.get("channel") != target.channel
+    ):
         raise ValueError("deployment manifest target does not match plan")
     if not isinstance(data.get("source_revision"), str) or not data["source_revision"]:
         raise ValueError("invalid deployment manifest source revision")
@@ -817,6 +910,25 @@ def _validated_manifest_data(content: bytes, *, target: TargetSpec) -> dict[str,
     if directory_order != sorted(directory_order):
         raise ValueError("deployment manifest directories are not in canonical order")
     return data
+
+
+def _validated_prior_manifest_data(
+    content: bytes, *, target: TargetSpec
+) -> dict[str, Any]:
+    raw = _strict_json_loads(content, label="prior deployment manifest")
+    if (
+        not isinstance(raw, dict)
+        or not isinstance(raw.get("channel"), str)
+        or not raw["channel"]
+    ):
+        raise ValueError("invalid prior deployment manifest channel")
+    prior_target = TargetSpec(
+        target.id,
+        target.framework,
+        target.home,
+        raw["channel"],
+    )
+    return _validated_manifest_data(content, target=prior_target)
 
 
 def _valid_permission_mode(value: object) -> bool:
@@ -1327,6 +1439,7 @@ def _install_provider_plan_groups(
             schema_version=_SCHEMA_VERSION,
             target_id=target.id,
             framework=target.framework,
+            channel=target.channel,
             source_revision=group.source_revision,
             provider_ids=group.provider_ids,
             files=tuple(
@@ -1352,7 +1465,9 @@ def _install_provider_plan_groups(
                 prior_manifest_stat = home_fs.stat(manifest_path)
                 _validate_ownership_manifest_stat(prior_manifest_stat)
                 prior_manifest_mode = stat.S_IMODE(prior_manifest_stat.st_mode)
-                prior_data = _validated_manifest_data(prior_manifest_content, target=target)
+                prior_data = _validated_prior_manifest_data(
+                    prior_manifest_content, target=target
+                )
                 _verify_manifest_files_and_directories(
                     home_fs,
                     prior_data,
@@ -1499,6 +1614,7 @@ def _install_provider_plan_groups(
                 schema_version=manifest.schema_version,
                 target_id=manifest.target_id,
                 framework=manifest.framework,
+                channel=manifest.channel,
                 source_revision=manifest.source_revision,
                 provider_ids=manifest.provider_ids,
                 files=manifest.files,
@@ -1654,7 +1770,9 @@ def _validate_group_current_state(home_fs: _HomeFS, group: _PlanGroup) -> None:
     prior_data = None
     if prior_content is not None:
         _validate_ownership_manifest_stat(home_fs.stat(manifest_path))
-        prior_data = _validated_manifest_data(prior_content, target=group.target)
+        prior_data = _validated_prior_manifest_data(
+            prior_content, target=group.target
+        )
         _verify_manifest_files_and_directories(
             home_fs,
             prior_data,
@@ -1746,7 +1864,10 @@ def _manifest_from_data(
         target_id = data["target_id"]
         if not isinstance(target_id, str) or not target_id:
             raise ValueError("invalid target id")
-        target = TargetSpec(target_id, framework, home, "recovery")
+        channel = data["channel"]
+        if not isinstance(channel, str) or not channel:
+            raise ValueError("invalid target channel")
+        target = TargetSpec(target_id, framework, home, channel)
         validated = _validated_manifest_data(
             (json.dumps(data, sort_keys=True) + "\n").encode(),
             target=target,
@@ -1755,6 +1876,7 @@ def _manifest_from_data(
             schema_version=validated["schema_version"],
             target_id=target_id,
             framework=framework,
+            channel=channel,
             source_revision=validated["source_revision"],
             provider_ids=tuple(validated["provider_ids"]),
             files=tuple(
@@ -1848,7 +1970,7 @@ def _decode_record(
             prior_content = base64.b64decode(prior_encoded, validate=True)
         except ValueError as exc:
             raise ValueError("invalid transaction record prior manifest") from exc
-        prior_data = _validated_manifest_data(prior_content, target=target)
+        prior_data = _validated_prior_manifest_data(prior_content, target=target)
         if not _valid_ownership_manifest_mode(record.get("prior_manifest_mode")):
             raise ValueError("invalid transaction record prior manifest mode")
     elif record.get("prior_manifest_mode") is not None:
@@ -2246,11 +2368,22 @@ def _rollback_record(
     ):
         raise IncompleteRollbackError("rollback incomplete: invalid prior manifest mode")
     if prior_manifest is not None:
+        prior_raw = _strict_json_loads(
+            prior_manifest, label="prior deployment manifest"
+        )
+        if (
+            not isinstance(prior_raw, dict)
+            or not isinstance(prior_raw.get("channel"), str)
+            or not prior_raw["channel"]
+        ):
+            raise IncompleteRollbackError(
+                "rollback incomplete: invalid prior manifest channel"
+            )
         recovery_target = TargetSpec(
             record["manifest"]["target_id"],
             Framework(record["manifest"]["framework"]),
             home_fs.home,
-            "recovery",
+            prior_raw["channel"],
         )
         prior_data = _validated_manifest_data(prior_manifest, target=recovery_target)
     expected_manifest = base64.b64decode(record["manifest_content"], validate=True)
@@ -2773,10 +2906,116 @@ def audit_provider_plans(plans: tuple[ProviderPlan, ...]) -> DeploymentAudit:
     )
 
 
+def _status_identity(item: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (
+        item.st_dev,
+        item.st_ino,
+        item.st_mode,
+        item.st_nlink,
+        item.st_size,
+        item.st_mtime_ns,
+    )
+
+
+def _read_status_descriptor(descriptor: int) -> bytes:
+    offset = 0
+    chunks: list[bytes] = []
+    while chunk := os.pread(descriptor, 1024 * 1024, offset):
+        chunks.append(chunk)
+        offset += len(chunk)
+    return b"".join(chunks)
+
+
+class _PinnedStatusFile:
+    def __init__(
+        self,
+        home_fs: _HomeFS,
+        path: Path,
+        *,
+        manifest: bool = False,
+    ) -> None:
+        self._home_fs = home_fs
+        self.path = path
+        with home_fs.parent(path) as (parent, leaf):
+            self.descriptor = os.open(
+                leaf,
+                os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW,
+                dir_fd=parent,
+            )
+        try:
+            os.set_inheritable(self.descriptor, False)
+            observed = os.fstat(self.descriptor)
+            if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
+                raise ValueError(f"preview evidence file is not regular: {path}")
+            if manifest and stat.S_IMODE(observed.st_mode) != _OWNERSHIP_MANIFEST_MODE:
+                raise ValueError("ownership manifest mode must be 0o600")
+            self.identity = _status_identity(observed)
+            if manifest:
+                _after_preview_status_manifest_open(home_fs, path, self.descriptor)
+            else:
+                _after_preview_status_owned_open(path, "file", self.descriptor)
+            self.content = _read_status_descriptor(self.descriptor)
+        except BaseException:
+            os.close(self.descriptor)
+            raise
+
+    def verify(self) -> None:
+        if os.get_inheritable(self.descriptor):
+            raise RuntimeError("preview evidence descriptor must be close-on-exec")
+        try:
+            canonical = self._home_fs.stat(self.path)
+        except OSError as error:
+            raise ValueError(f"preview evidence path changed: {self.path}") from error
+        if (
+            _status_identity(canonical) != self.identity
+            or _status_identity(os.fstat(self.descriptor)) != self.identity
+            or _read_status_descriptor(self.descriptor) != self.content
+        ):
+            raise ValueError(f"preview evidence path changed: {self.path}")
+
+    def close(self) -> None:
+        with suppress(OSError):
+            os.close(self.descriptor)
+
+
+class _PinnedStatusDirectory:
+    def __init__(self, home_fs: _HomeFS, path: Path) -> None:
+        self._home_fs = home_fs
+        self.path = path
+        self.descriptor = home_fs.open_dir(path)
+        try:
+            os.set_inheritable(self.descriptor, False)
+            observed = os.fstat(self.descriptor)
+            if not stat.S_ISDIR(observed.st_mode):
+                raise ValueError(f"preview evidence directory is invalid: {path}")
+            self.identity = _status_identity(observed)
+            _after_preview_status_owned_open(path, "directory", self.descriptor)
+        except BaseException:
+            os.close(self.descriptor)
+            raise
+
+    def verify(self) -> None:
+        if os.get_inheritable(self.descriptor):
+            raise RuntimeError("preview evidence descriptor must be close-on-exec")
+        try:
+            canonical = self._home_fs.stat(self.path)
+        except OSError as error:
+            raise ValueError(f"preview evidence path changed: {self.path}") from error
+        if (
+            _status_identity(canonical) != self.identity
+            or _status_identity(os.fstat(self.descriptor)) != self.identity
+        ):
+            raise ValueError(f"preview evidence path changed: {self.path}")
+
+    def close(self) -> None:
+        with suppress(OSError):
+            os.close(self.descriptor)
+
+
 def _read_preview_status_evidence(
     target: TargetSpec,
 ) -> tuple[DeploymentManifest | None, DeploymentAudit | None]:
-    """Read and audit one preview manifest without fetching or target mutation."""
+    """Read and audit one preview manifest under retained cooperative authority."""
     _require_supported_platform()
     if not (
         target.channel == "preview"
@@ -2785,82 +3024,88 @@ def _read_preview_status_evidence(
     ):
         raise ValueError("preview status evidence requires a preview target")
     try:
-        home_descriptor = _open_absolute_directory(target.home, create=False)
+        with _target_read_lock(target.home) as home_fs:
+            pinned: list[_PinnedStatusFile | _PinnedStatusDirectory] = []
+            try:
+                manifest_pin = _PinnedStatusFile(
+                    home_fs, _manifest_path(target), manifest=True
+                )
+                pinned.append(manifest_pin)
+                data = _validated_manifest_data(manifest_pin.content, target=target)
+                revision = data["source_revision"]
+                if (
+                    data.get("review_state") != "unreviewed-local"
+                    or len(revision) != 64
+                    or any(
+                        character not in "0123456789abcdef"
+                        for character in revision
+                    )
+                ):
+                    raise ValueError(
+                        "invalid preview manifest review state or fingerprint"
+                    )
+                manifest = DeploymentManifest(
+                    schema_version=data["schema_version"],
+                    target_id=target.id,
+                    framework=target.framework,
+                    channel=target.channel,
+                    source_revision=revision,
+                    provider_ids=tuple(data["provider_ids"]),
+                    files=tuple(
+                        ManifestFile(
+                            Path(item["path"]), item["fingerprint"], item["mode"]
+                        )
+                        for item in data["files"]
+                    ),
+                    directories=tuple(
+                        ManifestDirectory(Path(item["path"]), item["mode"])
+                        for item in data["directories"]
+                    ),
+                    transaction_id=data["transaction_id"],
+                    review_state="unreviewed-local",
+                )
+                missing: list[str] = []
+                changed: list[str] = []
+                for item in manifest.files:
+                    try:
+                        evidence = _PinnedStatusFile(home_fs, item.path)
+                    except FileNotFoundError:
+                        missing.append(item.path.as_posix())
+                        continue
+                    except (OSError, ValueError):
+                        changed.append(item.path.as_posix())
+                        continue
+                    pinned.append(evidence)
+                    if (
+                        stat.S_IMODE(os.fstat(evidence.descriptor).st_mode) != item.mode
+                        or hashlib.sha256(evidence.content).hexdigest()
+                        != item.fingerprint
+                    ):
+                        changed.append(item.path.as_posix())
+                for item in manifest.directories:
+                    try:
+                        evidence = _PinnedStatusDirectory(home_fs, item.path)
+                    except FileNotFoundError:
+                        missing.append(item.path.as_posix())
+                        continue
+                    except (OSError, ValueError):
+                        changed.append(item.path.as_posix())
+                        continue
+                    pinned.append(evidence)
+                    if stat.S_IMODE(os.fstat(evidence.descriptor).st_mode) != item.mode:
+                        changed.append(item.path.as_posix())
+                home_fs.verify_lock_identity()
+                for evidence in pinned:
+                    evidence.verify()
+                audit = DeploymentAudit(
+                    target_id=target.id,
+                    matches=not (missing or changed),
+                    missing=tuple(sorted(missing)),
+                    changed=tuple(sorted(changed)),
+                )
+                return manifest, audit
+            finally:
+                for evidence in reversed(pinned):
+                    evidence.close()
     except FileNotFoundError:
         return None, None
-    except OSError as error:
-        raise ValueError("preview target home could not be read safely") from error
-    opened_home = os.fstat(home_descriptor)
-    home_fs = _HomeFS(
-        target.home,
-        home_descriptor,
-        home_identity=(opened_home.st_dev, opened_home.st_ino),
-    )
-    with home_fs:
-        manifest_content, manifest_error = _read_ownership_manifest_for_audit(
-            home_fs, _manifest_path(target)
-        )
-        if manifest_content is None:
-            if manifest_error == "deployment manifest is missing":
-                return None, None
-            raise ValueError(manifest_error or "preview manifest could not be read")
-        data = _validated_manifest_data(manifest_content, target=target)
-        revision = data["source_revision"]
-        if (
-            data.get("review_state") != "unreviewed-local"
-            or len(revision) != 64
-            or any(character not in "0123456789abcdef" for character in revision)
-        ):
-            raise ValueError("invalid preview manifest review state or fingerprint")
-        manifest = DeploymentManifest(
-            schema_version=data["schema_version"],
-            target_id=target.id,
-            framework=target.framework,
-            source_revision=revision,
-            provider_ids=tuple(data["provider_ids"]),
-            files=tuple(
-                ManifestFile(Path(item["path"]), item["fingerprint"], item["mode"])
-                for item in data["files"]
-            ),
-            directories=tuple(
-                ManifestDirectory(Path(item["path"]), item["mode"])
-                for item in data["directories"]
-            ),
-            transaction_id=data["transaction_id"],
-            review_state="unreviewed-local",
-        )
-        missing: list[str] = []
-        changed: list[str] = []
-        for item in manifest.files:
-            try:
-                matches = home_fs.matches_fingerprint_file(
-                    item.path, item.fingerprint, item.mode
-                )
-            except FileNotFoundError:
-                missing.append(item.path.as_posix())
-                continue
-            except OSError:
-                matches = False
-            if not matches:
-                changed.append(item.path.as_posix())
-        for item in manifest.directories:
-            try:
-                observed = home_fs.stat(item.path)
-            except FileNotFoundError:
-                missing.append(item.path.as_posix())
-                continue
-            except OSError:
-                changed.append(item.path.as_posix())
-                continue
-            if (
-                not stat.S_ISDIR(observed.st_mode)
-                or stat.S_IMODE(observed.st_mode) != item.mode
-            ):
-                changed.append(item.path.as_posix())
-        home_fs.verify_lock_identity()
-    return manifest, DeploymentAudit(
-        target_id=target.id,
-        matches=not (missing or changed),
-        missing=tuple(sorted(missing)),
-        changed=tuple(sorted(changed)),
-    )

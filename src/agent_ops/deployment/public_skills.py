@@ -39,6 +39,7 @@ _MANIFEST_KEYS = {
     "schema_version",
     "target_id",
     "framework",
+    "channel",
     "source_revision",
     "provider_ids",
     "transaction_id",
@@ -771,7 +772,11 @@ def _decode_shared_manifest(content: bytes, *, target: TargetSpec) -> dict:
         raise ValueError("invalid shared ownership manifest schema")
     if type(data["schema_version"]) is not int or data["schema_version"] != 1:
         raise ValueError("invalid shared ownership manifest schema")
-    if data["target_id"] != target.id or data["framework"] != target.framework.value:
+    if (
+        data["target_id"] != target.id
+        or data["framework"] != target.framework.value
+        or data["channel"] != target.channel
+    ):
         raise ValueError("shared ownership manifest does not match public skill target")
     if not isinstance(data["source_revision"], str) or not data["source_revision"]:
         raise ValueError("invalid shared ownership manifest source revision")

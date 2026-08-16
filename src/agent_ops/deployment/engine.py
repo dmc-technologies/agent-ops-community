@@ -757,6 +757,7 @@ class DeploymentEngine:
                     schema_version=1,
                     target_id=target.id,
                     framework=target.framework,
+                    channel=target.channel,
                     source_revision=resolved,
                     provider_ids=(),
                     files=(),

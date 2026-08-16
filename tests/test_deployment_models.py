@@ -5,6 +5,7 @@ import pytest
 
 from agent_ops.deployment import (
     DeploymentAudit,
+    DeploymentManifest,
     DeploymentPlan,
     DeploymentRequest,
     ManifestDirectory,
@@ -111,6 +112,27 @@ def test_preview_source_closure_binds_provider_skill_aliases_and_paths() -> None
 
     assert closure.provider_id == "public-skills"
     assert closure.skills == (skill,)
+
+
+def test_deployment_manifest_binds_exact_target_channel() -> None:
+    manifest = DeploymentManifest(
+        1,
+        "codex-preview",
+        Framework.CODEX,
+        "preview-author",
+        "a" * 64,
+        ("public-skills",),
+        (),
+        (),
+        "a" * 32,
+        "unreviewed-local",
+    )
+
+    assert manifest.channel == "preview-author"
+    with pytest.raises(ValueError, match="channel"):
+        DeploymentManifest(
+            **{**manifest.__dict__, "channel": ""}
+        )
 
 
 def test_preview_skill_closure_rejects_duplicate_identity_members() -> None:

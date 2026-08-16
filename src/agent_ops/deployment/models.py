@@ -209,6 +209,7 @@ class DeploymentManifest:
     schema_version: int
     target_id: str
     framework: Framework
+    channel: str
     source_revision: str
     provider_ids: tuple[str, ...]
     files: tuple[ManifestFile, ...]
@@ -218,6 +219,7 @@ class DeploymentManifest:
 
     def __post_init__(self) -> None:
         _nonempty(self.target_id, "target id")
+        _nonempty(self.channel, "manifest channel")
         _nonempty(self.source_revision, "source revision")
         _nonempty(self.transaction_id, "transaction id")
         if self.review_state not in {None, "unreviewed-local"}:

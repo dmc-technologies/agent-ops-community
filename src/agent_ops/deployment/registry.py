@@ -559,6 +559,8 @@ class DeploymentRegistry:
                 raise ValueError("manifest belongs to a different target")
             if manifest.framework is not target.framework:
                 raise ValueError("manifest framework does not match target")
+            if manifest.channel != target.channel:
+                raise ValueError("manifest channel does not match target")
             if preview_target:
                 _validate_fingerprint(manifest.source_revision)
                 if manifest.review_state != "unreviewed-local":

@@ -996,6 +996,178 @@ def test_engine_status_reads_valid_preview_manifest_without_managed_fetch(
     }
 
 
+@pytest.mark.parametrize("replacement", ("forged-mode", "same-mode-inode"))
+def test_engine_status_rejects_manifest_replacement_races(
+    tmp_path: Path, monkeypatch, replacement: str
+) -> None:
+    from agent_ops.deployment import transaction as transaction_module
+
+    preview, checkout, home = _preview(tmp_path)
+    preview.preview(checkout, ("demo",), "codex-preview")
+    manifest = next((home / ".agentops/deployment/manifests").glob("*.json"))
+
+    def replace_manifest(_home_fs, _path, _descriptor) -> None:
+        data = json.loads(manifest.read_bytes())
+        data["source_revision"] = "b" * 64
+        content = (json.dumps(data, indent=2, sort_keys=True) + "\n").encode()
+        if replacement == "forged-mode":
+            manifest.write_bytes(content)
+            manifest.chmod(0o644)
+        else:
+            forged = manifest.with_name("forged.json")
+            forged.write_bytes(content)
+            forged.chmod(0o600)
+            os.replace(forged, manifest)
+
+    monkeypatch.setattr(
+        transaction_module,
+        "_after_preview_status_manifest_open",
+        replace_manifest,
+    )
+    engine = DeploymentEngine(
+        preview._registry,
+        SourceStore((tmp_path / "managed-sources").absolute()),
+        providers=(_SelectedSkillProvider(),),
+    )
+
+    status = engine.status(("codex-preview",))[0]
+
+    assert status.state is TargetState.FAILED
+    assert status.commit is None
+
+
+@pytest.mark.parametrize("kind", ("file", "directory"))
+def test_engine_status_rejects_owned_path_replacement_races(
+    tmp_path: Path, monkeypatch, kind: str
+) -> None:
+    from agent_ops.deployment import transaction as transaction_module
+
+    preview, checkout, home = _preview(tmp_path)
+    preview.preview(checkout, ("demo",), "codex-preview")
+    selected_file = home / "skills/demo/SKILL.md"
+    selected_directory = home / "skills/demo"
+    replaced = False
+
+    def replace_owned(path: Path, observed_kind: str, _descriptor: int) -> None:
+        nonlocal replaced
+        if replaced or observed_kind != kind:
+            return
+        if kind == "file" and path == Path("skills/demo/SKILL.md"):
+            forged = selected_file.with_name("forged")
+            forged.write_bytes(selected_file.read_bytes())
+            forged.chmod(0o644)
+            os.replace(forged, selected_file)
+            replaced = True
+        elif kind == "directory" and path == Path("skills/demo"):
+            displaced = selected_directory.with_name("demo-displaced")
+            selected_directory.rename(displaced)
+            selected_directory.mkdir(mode=0o755)
+            replaced = True
+
+    monkeypatch.setattr(
+        transaction_module,
+        "_after_preview_status_owned_open",
+        replace_owned,
+    )
+    engine = DeploymentEngine(
+        preview._registry,
+        SourceStore((tmp_path / "managed-sources").absolute()),
+        providers=(_SelectedSkillProvider(),),
+    )
+
+    status = engine.status(("codex-preview",))[0]
+
+    assert replaced is True
+    assert status.state is TargetState.FAILED
+    assert status.commit is None
+
+
+def test_engine_status_preserves_process_control_during_evidence_read(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from agent_ops.deployment import transaction as transaction_module
+
+    preview, checkout, _home = _preview(tmp_path)
+    preview.preview(checkout, ("demo",), "codex-preview")
+    control = KeyboardInterrupt("operator stop")
+
+    def interrupt(*_args) -> None:
+        raise control
+
+    monkeypatch.setattr(
+        transaction_module,
+        "_after_preview_status_manifest_open",
+        interrupt,
+    )
+    engine = DeploymentEngine(
+        preview._registry,
+        SourceStore((tmp_path / "managed-sources").absolute()),
+        providers=(_SelectedSkillProvider(),),
+    )
+
+    with pytest.raises(KeyboardInterrupt) as caught:
+        engine.status(("codex-preview",))
+
+    assert caught.value is control
+
+
+def test_preview_manifest_records_exact_target_channel(tmp_path: Path) -> None:
+    preview, checkout, home = _preview(tmp_path)
+    preview.preview(checkout, ("demo",), "codex-preview")
+    manifest = next((home / ".agentops/deployment/manifests").glob("*.json"))
+
+    assert json.loads(manifest.read_bytes())["channel"] == "preview"
+
+
+def test_engine_status_rejects_preview_channel_alias_change(tmp_path: Path) -> None:
+    preview, checkout, _home = _preview(tmp_path)
+    preview.preview(checkout, ("demo",), "codex-preview")
+    registry = preview._registry
+    config = registry.load()
+    alias = ChannelSpec("preview-other", "community", "refs/heads/main")
+    changed_target = replace(config.targets[0], channel=alias.id)
+    registry.save(
+        RegistryConfig(
+            config.schema_version,
+            config.sources,
+            config.channels + (alias,),
+            (changed_target,),
+        )
+    )
+    engine = DeploymentEngine(
+        registry,
+        SourceStore((tmp_path / "managed-sources").absolute()),
+        providers=(_SelectedSkillProvider(),),
+    )
+
+    status = engine.status(("codex-preview",))[0]
+
+    assert status.state is TargetState.FAILED
+    assert status.commit is None
+
+
+def test_engine_status_rejects_contradictory_preview_manifest_channel(
+    tmp_path: Path,
+) -> None:
+    preview, checkout, home = _preview(tmp_path)
+    preview.preview(checkout, ("demo",), "codex-preview")
+    manifest = next((home / ".agentops/deployment/manifests").glob("*.json"))
+    data = json.loads(manifest.read_bytes())
+    data["channel"] = "preview-other"
+    manifest.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+    manifest.chmod(0o600)
+    engine = DeploymentEngine(
+        preview._registry,
+        SourceStore((tmp_path / "managed-sources").absolute()),
+        providers=(_SelectedSkillProvider(),),
+    )
+
+    status = engine.status(("codex-preview",))[0]
+
+    assert status.state is TargetState.FAILED
+    assert status.commit is None
+
+
 @pytest.mark.parametrize("change", ("content", "mode", "directory"))
 def test_engine_status_reports_modified_preview_owned_state(
     tmp_path: Path, change: str
