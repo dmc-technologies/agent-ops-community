@@ -22,7 +22,12 @@ from agent_ops.deployment.models import (
     TargetState,
     TargetStatus,
 )
-from agent_ops.deployment.registry import ChannelSpec, DeploymentRegistry, RegistryConfig
+from agent_ops.deployment.registry import (
+    ChannelSpec,
+    DeploymentRegistry,
+    RegistryConfig,
+    RegistrySnapshot,
+)
 from agent_ops.registries.models import Framework
 
 
@@ -86,6 +91,16 @@ def _registry(tmp_path: Path) -> DeploymentRegistry:
     return DeploymentRegistry(tmp_path / "deployment-registry.yaml")
 
 
+def _tree_snapshot(root: Path) -> dict[Path, tuple[int, bytes | None]]:
+    return {
+        path.relative_to(root): (
+            path.lstat().st_mode,
+            path.read_bytes() if path.is_file() else None,
+        )
+        for path in root.rglob("*")
+    }
+
+
 def _manifest(target_id: str, revision: str) -> DeploymentManifest:
     return DeploymentManifest(
         schema_version=1,
@@ -102,8 +117,10 @@ def _manifest(target_id: str, revision: str) -> DeploymentManifest:
 def _append_after_signal(path: str, commit: str, start: object, results: object) -> None:
     start.wait()
     try:
-        DeploymentRegistry(Path(path)).append_receipt(
-            DeploymentReceipt("refresh", (commit,), ())
+        registry = DeploymentRegistry(Path(path))
+        registry.append_receipt(
+            DeploymentReceipt("refresh", (commit,), ()),
+            snapshot=registry.load_snapshot(),
         )
     except BaseException as error:
         results.put(f"{type(error).__name__}: {error}")
@@ -145,6 +162,70 @@ def test_registry_save_load_is_typed_canonical_atomic_and_private(tmp_path: Path
         loaded.schema_version = 2  # type: ignore[misc]
 
 
+def test_registry_reads_use_existing_lock_without_filesystem_mutation(tmp_path: Path) -> None:
+    registry = _registry(tmp_path)
+    registry.save(_config(tmp_path))
+    before = _tree_snapshot(tmp_path)
+
+    snapshot = registry.load_snapshot()
+    assert registry.receipt_records() == ()
+    assert registry.receipts() == ()
+    assert registry.status(
+        "codex-stable",
+        manifest=_manifest("codex-stable", "a" * 40),
+        resolved_commit="a" * 40,
+        audit=DeploymentAudit("codex-stable", True),
+    ).state is TargetState.STABLE
+
+    assert snapshot.config == _config(tmp_path)
+    assert _tree_snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize("operation", ("load", "records", "status"))
+def test_registry_reads_fail_closed_when_initialization_lock_is_missing(
+    tmp_path: Path, operation: str
+) -> None:
+    registry = _registry(tmp_path)
+    registry.save(_config(tmp_path))
+    registry.lock_path.unlink()
+
+    with pytest.raises(RuntimeError, match="initializ|lock.*missing"):
+        if operation == "load":
+            registry.load_snapshot()
+        elif operation == "records":
+            registry.receipt_records()
+        else:
+            registry.status(
+                "codex-stable",
+                manifest=None,
+                resolved_commit=None,
+                audit=None,
+            )
+
+    assert not registry.lock_path.exists()
+
+
+@pytest.mark.parametrize("replacement", ("wrong-mode", "symlink"))
+def test_registry_reads_reject_invalid_existing_lock_without_replacing_it(
+    tmp_path: Path, replacement: str
+) -> None:
+    registry = _registry(tmp_path)
+    registry.save(_config(tmp_path))
+    if replacement == "wrong-mode":
+        registry.lock_path.chmod(0o640)
+    else:
+        destination = tmp_path / "lock-target"
+        destination.write_text("not a lock")
+        registry.lock_path.unlink()
+        registry.lock_path.symlink_to(destination)
+    before = _tree_snapshot(tmp_path)
+
+    with pytest.raises((OSError, RuntimeError, PermissionError), match="lock|refus"):
+        registry.load_snapshot()
+
+    assert _tree_snapshot(tmp_path) == before
+
+
 @pytest.mark.parametrize(
     "text, message",
     (
@@ -177,6 +258,7 @@ def test_registry_load_rejects_malformed_yaml(
     tmp_path: Path, text: str, message: str
 ) -> None:
     registry = _registry(tmp_path)
+    registry.save(_config(tmp_path))
     registry.path.write_text(text)
     registry.path.chmod(0o600)
 
@@ -186,6 +268,7 @@ def test_registry_load_rejects_malformed_yaml(
 
 def test_registry_rejects_unknown_nested_keys_and_invalid_references(tmp_path: Path) -> None:
     registry = _registry(tmp_path)
+    registry.save(_config(tmp_path))
     invalid_documents = (
         """schema_version: 1
 sources:
@@ -557,7 +640,7 @@ def test_save_rolls_back_if_canonical_parent_changes_after_publication(
     ) -> None:
         nonlocal calls
         calls += 1
-        if calls == 4:
+        if calls == 6:
             parent.rename(displaced)
             parent.mkdir()
         verify(path, descriptor, identities)
@@ -570,9 +653,66 @@ def test_save_rolls_back_if_canonical_parent_changes_after_publication(
     assert (displaced / registry.path.name).read_bytes() == original
 
 
+def test_save_revalidates_parent_after_backup_deletion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = tmp_path / "root" / "live"
+    parent.mkdir(parents=True)
+    registry = DeploymentRegistry(parent / "deployment-registry.yaml")
+    registry.save(_config(parent))
+    displaced = parent.with_name("displaced")
+    verify = registry_module._verify_canonical_parent
+    calls = 0
+
+    def displace_at_final_verification(
+        path: Path, descriptor: int, identities: tuple[tuple[int, int], ...]
+    ) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 7:
+            parent.rename(displaced)
+            parent.mkdir()
+        verify(path, descriptor, identities)
+
+    monkeypatch.setattr(
+        registry_module, "_verify_canonical_parent", displace_at_final_verification
+    )
+    with pytest.raises(RuntimeError, match="canonical registry parent"):
+        registry.save(_config(parent, channel="feature"))
+
+    assert not registry.path.exists()
+    assert (displaced / registry.path.name).exists()
+
+
+@pytest.mark.parametrize("exception", (KeyboardInterrupt, SystemExit))
+def test_save_preserves_process_control_from_final_parent_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    exception: type[BaseException],
+) -> None:
+    registry = _registry(tmp_path)
+    registry.save(_config(tmp_path))
+    verify = registry_module._verify_canonical_parent
+    calls = 0
+
+    def interrupt_final_check(
+        path: Path, descriptor: int, identities: tuple[tuple[int, int], ...]
+    ) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 7:
+            raise exception("process control")
+        verify(path, descriptor, identities)
+
+    monkeypatch.setattr(registry_module, "_verify_canonical_parent", interrupt_final_check)
+    with pytest.raises(exception, match="process control"):
+        registry.save(_config(tmp_path, channel="feature"))
+
+
 def test_receipts_are_private_strict_append_only_and_stably_ordered(tmp_path: Path) -> None:
     registry = _registry(tmp_path)
     registry.save(_config(tmp_path))
+    snapshot = registry.load_snapshot()
     first = DeploymentReceipt(
         operation="refresh",
         commits=("a" * 40,),
@@ -584,8 +724,8 @@ def test_receipts_are_private_strict_append_only_and_stably_ordered(tmp_path: Pa
         targets=(TargetStatus("codex-stable", TargetState.BRANCH, "stable", "b" * 40),),
     )
 
-    first_path = registry.append_receipt(first)
-    second_path = registry.append_receipt(second)
+    first_path = registry.append_receipt(first, snapshot=snapshot)
+    second_path = registry.append_receipt(second, snapshot=snapshot)
 
     assert registry.receipts() == (first, second)
     assert first_path != second_path
@@ -625,22 +765,178 @@ def test_snapshot_fingerprint_binds_receipts_and_expected_revision(tmp_path: Pat
         snapshot.fingerprint = "0" * 64  # type: ignore[misc]
 
     receipt = DeploymentReceipt("refresh", ("a" * 40,), ())
-    with pytest.raises(ValueError, match="fingerprint"):
-        registry.append_receipt(receipt, expected_fingerprint="0" * 64)
+    registry.append_receipt(receipt, snapshot=snapshot)
+    assert registry.receipts() == (receipt,)
+
+
+def test_append_requires_exact_current_snapshot_even_for_same_registry_bytes(
+    tmp_path: Path,
+) -> None:
+    registry = _registry(tmp_path)
+    registry.save(_config(tmp_path))
+    snapshot = registry.load_snapshot()
+    receipt = DeploymentReceipt("refresh", ("a" * 40,), ())
+
+    with pytest.raises(TypeError, match="snapshot"):
+        registry.append_receipt(receipt)
+
+    registry.save(_config(tmp_path))
+    with pytest.raises(ValueError, match="snapshot|registry"):
+        registry.append_receipt(receipt, snapshot=snapshot)
+
     assert not registry.state_path.exists()
 
-    registry.append_receipt(receipt, expected_fingerprint=snapshot.fingerprint)
-    assert registry.receipts() == (receipt,)
+
+@pytest.mark.parametrize("replacement_check", (3, 4))
+def test_append_rejects_registry_replacement_after_receipt_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replacement_check: int,
+) -> None:
+    registry = _registry(tmp_path)
+    registry.save(_config(tmp_path))
+    snapshot = registry.load_snapshot()
+    require_current = registry_module._require_current_snapshot
+    calls = 0
+
+    def replace_registry_at_check(
+        parent: int, name: str, expected: RegistrySnapshot
+    ) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == replacement_check:
+            replacement = tmp_path / "same-bytes-replacement"
+            replacement.write_bytes(registry.path.read_bytes())
+            replacement.chmod(0o600)
+            os.replace(replacement, registry.path)
+        require_current(parent, name, expected)
+
+    monkeypatch.setattr(
+        registry_module, "_require_current_snapshot", replace_registry_at_check
+    )
+    with pytest.raises(ValueError, match="snapshot"):
+        registry.append_receipt(
+            DeploymentReceipt("refresh", ("a" * 40,), ()), snapshot=snapshot
+        )
+
+    assert (registry.state_path / "receipt-count").read_bytes() == b"0\n"
+    assert not tuple(registry.receipts_path.glob("*.json"))
+
+
+@pytest.mark.parametrize("exception", (KeyboardInterrupt, SystemExit))
+def test_append_preserves_process_control_from_snapshot_checks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    exception: type[BaseException],
+) -> None:
+    registry = _registry(tmp_path)
+    registry.save(_config(tmp_path))
+    snapshot = registry.load_snapshot()
+    require_current = registry_module._require_current_snapshot
+    calls = 0
+
+    def interrupt_third_check(
+        parent: int, name: str, expected: RegistrySnapshot
+    ) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            raise exception("process control")
+        require_current(parent, name, expected)
+
+    monkeypatch.setattr(registry_module, "_require_current_snapshot", interrupt_third_check)
+    with pytest.raises(exception, match="process control"):
+        registry.append_receipt(
+            DeploymentReceipt("refresh", ("a" * 40,), ()), snapshot=snapshot
+        )
+
+    assert (registry.state_path / "receipt-count").read_bytes() == b"0\n"
+    assert not tuple(registry.receipts_path.glob("*.json"))
+
+
+def test_save_recovers_strict_old_fingerprint_orphan_before_new_registry(
+    tmp_path: Path,
+) -> None:
+    registry = _registry(tmp_path)
+    registry.save(_config(tmp_path))
+    old_snapshot = registry.load_snapshot()
+    receipt = DeploymentReceipt("refresh", ("a" * 40,), ())
+    first = registry.append_receipt(receipt, snapshot=old_snapshot)
+    counter = registry.state_path / "receipt-count"
+    counter.write_text("0\n")
+    counter.chmod(0o600)
+
+    registry.save(_config(tmp_path, channel="feature"))
+
+    assert counter.read_bytes() == b"1\n"
+    record = registry.receipt_records()[0]
+    assert record.sequence == 0
+    assert record.registry_fingerprint == old_snapshot.fingerprint
+    assert record.receipt == receipt
+    assert first.exists()
+
+
+def test_save_refuses_corrupt_orphan_without_replacing_registry(tmp_path: Path) -> None:
+    registry = _registry(tmp_path)
+    registry.save(_config(tmp_path))
+    snapshot = registry.load_snapshot()
+    receipt = DeploymentReceipt("refresh", ("a" * 40,), ())
+    first = registry.append_receipt(receipt, snapshot=snapshot)
+    original_registry = registry.path.read_bytes()
+    counter = registry.state_path / "receipt-count"
+    counter.write_text("0\n")
+    counter.chmod(0o600)
+    wrapper = json.loads(first.read_bytes())
+    wrapper["registry_fingerprint"] = "0" * 64
+    first.write_text(json.dumps(wrapper, separators=(",", ":"), sort_keys=True) + "\n")
+    first.chmod(0o600)
+
+    with pytest.raises(RuntimeError, match="fingerprint|orphan|history"):
+        registry.save(_config(tmp_path, channel="feature"))
+
+    assert registry.path.read_bytes() == original_registry
+    assert counter.read_bytes() == b"0\n"
+
+
+def test_receipt_records_preserve_mixed_registry_fingerprints(tmp_path: Path) -> None:
+    registry = _registry(tmp_path)
+    registry.save(_config(tmp_path))
+    stable = registry.load_snapshot()
+    first = DeploymentReceipt("refresh", ("a" * 40,), ())
+    registry.append_receipt(first, snapshot=stable)
+    registry.save(_config(tmp_path, channel="feature"))
+    feature = registry.load_snapshot()
+    second = DeploymentReceipt("refresh", ("b" * 40,), ())
+    registry.append_receipt(second, snapshot=feature)
+
+    records = registry.receipt_records()
+
+    assert tuple(type(record) for record in records) == (
+        registry_module.ReceiptRecord,
+        registry_module.ReceiptRecord,
+    )
+    assert tuple(record.sequence for record in records) == (0, 1)
+    assert tuple(record.registry_fingerprint for record in records) == (
+        stable.fingerprint,
+        feature.fingerprint,
+    )
+    assert tuple(record.receipt for record in records) == (first, second)
+    assert registry.receipts() == (first, second)
+    with pytest.raises(FrozenInstanceError):
+        records[0].sequence = 2  # type: ignore[misc]
 
 
 def test_append_fully_parses_registry_before_receipt_mutation(tmp_path: Path) -> None:
     registry = _registry(tmp_path)
     registry.save(_config(tmp_path))
+    snapshot = registry.load_snapshot()
     registry.path.write_text("schema_version: 1\ninvalid: true\n")
     registry.path.chmod(0o600)
 
     with pytest.raises(ValueError, match="unknown|missing"):
-        registry.append_receipt(DeploymentReceipt("refresh", ("a" * 40,), ()))
+        registry.append_receipt(
+            DeploymentReceipt("refresh", ("a" * 40,), ()), snapshot=snapshot
+        )
 
     assert not registry.state_path.exists()
 
@@ -652,6 +948,7 @@ def test_append_rejects_displaced_canonical_parent_before_publication(
     parent.mkdir(parents=True)
     registry = DeploymentRegistry(parent / "deployment-registry.yaml")
     registry.save(_config(parent))
+    snapshot = registry.load_snapshot()
     displaced = parent.with_name("displaced")
     moved = False
     verify = registry_module._verify_canonical_parent
@@ -673,7 +970,9 @@ def test_append_rejects_displaced_canonical_parent_before_publication(
         raising=False,
     )
     with pytest.raises(RuntimeError, match="canonical registry parent"):
-        registry.append_receipt(DeploymentReceipt("refresh", ("a" * 40,), ()))
+        registry.append_receipt(
+            DeploymentReceipt("refresh", ("a" * 40,), ()), snapshot=snapshot
+        )
 
     assert not registry.path.exists()
     displaced_receipts = displaced / f"{registry.path.name}.state" / "receipts"
@@ -687,6 +986,7 @@ def test_append_rolls_back_if_canonical_parent_changes_after_publication(
     parent.mkdir(parents=True)
     registry = DeploymentRegistry(parent / "deployment-registry.yaml")
     registry.save(_config(parent))
+    snapshot = registry.load_snapshot()
     displaced = parent.with_name("displaced")
     verify = registry_module._verify_canonical_parent
     moved = False
@@ -706,7 +1006,9 @@ def test_append_rolls_back_if_canonical_parent_changes_after_publication(
 
     monkeypatch.setattr(registry_module, "_verify_canonical_parent", displace_after_publication)
     with pytest.raises(RuntimeError, match="canonical registry parent"):
-        registry.append_receipt(DeploymentReceipt("refresh", ("a" * 40,), ()))
+        registry.append_receipt(
+            DeploymentReceipt("refresh", ("a" * 40,), ()), snapshot=snapshot
+        )
 
     receipts = displaced / f"{registry.path.name}.state" / "receipts"
     assert not tuple(receipts.glob("*.json"))
@@ -716,13 +1018,16 @@ def test_append_rolls_back_if_canonical_parent_changes_after_publication(
 def test_append_rejects_replaced_registry_before_creating_receipt_state(tmp_path: Path) -> None:
     registry = _registry(tmp_path)
     registry.save(_config(tmp_path))
+    snapshot = registry.load_snapshot()
     replacement = tmp_path / "replacement.yaml"
     replacement.write_text("untrusted\n")
     registry.path.unlink()
     registry.path.symlink_to(replacement)
 
     with pytest.raises((OSError, RuntimeError), match="symlink|regular|refus"):
-        registry.append_receipt(DeploymentReceipt("refresh", ("a" * 40,), ()))
+        registry.append_receipt(
+            DeploymentReceipt("refresh", ("a" * 40,), ()), snapshot=snapshot
+        )
 
     assert not registry.state_path.exists()
 
@@ -730,8 +1035,9 @@ def test_append_rejects_replaced_registry_before_creating_receipt_state(tmp_path
 def test_corrupt_receipt_fails_closed(tmp_path: Path) -> None:
     registry = _registry(tmp_path)
     registry.save(_config(tmp_path))
+    snapshot = registry.load_snapshot()
     receipt = DeploymentReceipt("refresh", ("a" * 40,), ())
-    path = registry.append_receipt(receipt)
+    path = registry.append_receipt(receipt, snapshot=snapshot)
 
     path.write_text(
         '{"schema_version":1,"registry_fingerprint":"'
@@ -755,8 +1061,13 @@ def test_corrupt_receipt_fails_closed(tmp_path: Path) -> None:
 def test_receipt_counter_detects_missing_final_and_corrupt_state(tmp_path: Path) -> None:
     registry = _registry(tmp_path)
     registry.save(_config(tmp_path))
-    first = registry.append_receipt(DeploymentReceipt("refresh", ("a" * 40,), ()))
-    final = registry.append_receipt(DeploymentReceipt("refresh", ("b" * 40,), ()))
+    snapshot = registry.load_snapshot()
+    first = registry.append_receipt(
+        DeploymentReceipt("refresh", ("a" * 40,), ()), snapshot=snapshot
+    )
+    final = registry.append_receipt(
+        DeploymentReceipt("refresh", ("b" * 40,), ()), snapshot=snapshot
+    )
     final.unlink()
 
     with pytest.raises(RuntimeError, match="history|missing"):
@@ -775,23 +1086,52 @@ def test_receipt_counter_detects_missing_final_and_corrupt_state(tmp_path: Path)
         registry.receipts()
 
 
+def test_receipt_counter_has_practical_bound_without_expected_name_allocation(
+    tmp_path: Path,
+) -> None:
+    registry = _registry(tmp_path)
+    registry.save(_config(tmp_path))
+    snapshot = registry.load_snapshot()
+    registry.state_path.mkdir(mode=0o700)
+    registry.receipts_path.mkdir(mode=0o700)
+    counter = registry.state_path / "receipt-count"
+    counter.write_text("1000000\n")
+    counter.chmod(0o600)
+
+    assert registry_module._MAX_RECEIPTS == 1_000_000
+    with pytest.raises(RuntimeError, match="history"):
+        registry.receipt_records()
+    with pytest.raises(ValueError, match="bound"):
+        registry.append_receipt(
+            DeploymentReceipt("refresh", ("a" * 40,), ()), snapshot=snapshot
+        )
+
+    counter.write_text("99999999999999999999\n")
+    counter.chmod(0o600)
+    with pytest.raises(ValueError, match="bound"):
+        registry.receipt_records()
+
+
 def test_append_recovers_only_matching_strict_orphan_receipt(tmp_path: Path) -> None:
     registry = _registry(tmp_path)
     registry.save(_config(tmp_path))
+    snapshot = registry.load_snapshot()
     receipt = DeploymentReceipt("refresh", ("a" * 40,), ())
-    first = registry.append_receipt(receipt)
+    first = registry.append_receipt(receipt, snapshot=snapshot)
     counter = registry.state_path / "receipt-count"
     counter.write_text("0\n")
     counter.chmod(0o600)
 
-    assert registry.append_receipt(receipt) == first
+    assert registry.append_receipt(receipt, snapshot=snapshot) == first
     assert registry.receipts() == (receipt,)
     assert counter.read_bytes() == b"1\n"
 
     counter.write_text("0\n")
     counter.chmod(0o600)
     with pytest.raises(RuntimeError, match="orphan"):
-        registry.append_receipt(DeploymentReceipt("refresh", ("b" * 40,), ()))
+        registry.append_receipt(
+            DeploymentReceipt("refresh", ("b" * 40,), ()), snapshot=snapshot
+        )
     assert tuple(registry.receipts_path.glob("*.json")) == (first,)
 
 
@@ -800,15 +1140,16 @@ def test_append_recovers_matching_linked_stage_left_before_counter_advance(
 ) -> None:
     registry = _registry(tmp_path)
     registry.save(_config(tmp_path))
+    snapshot = registry.load_snapshot()
     receipt = DeploymentReceipt("refresh", ("a" * 40,), ())
-    first = registry.append_receipt(receipt)
+    first = registry.append_receipt(receipt, snapshot=snapshot)
     counter = registry.state_path / "receipt-count"
     counter.write_text("0\n")
     counter.chmod(0o600)
     stage = first.with_name(f".{first.name}.interrupted.tmp")
     os.link(first, stage)
 
-    assert registry.append_receipt(receipt) == first
+    assert registry.append_receipt(receipt, snapshot=snapshot) == first
     assert registry.receipts() == (receipt,)
     assert counter.read_bytes() == b"1\n"
     assert not stage.exists()
@@ -819,9 +1160,12 @@ def test_append_does_not_consume_stage_over_noncontiguous_history(
 ) -> None:
     registry = _registry(tmp_path)
     registry.save(_config(tmp_path))
+    snapshot = registry.load_snapshot()
     receipt = DeploymentReceipt("refresh", ("a" * 40,), ())
-    first = registry.append_receipt(receipt)
-    registry.append_receipt(DeploymentReceipt("refresh", ("b" * 40,), ()))
+    first = registry.append_receipt(receipt, snapshot=snapshot)
+    registry.append_receipt(
+        DeploymentReceipt("refresh", ("b" * 40,), ()), snapshot=snapshot
+    )
     counter = registry.state_path / "receipt-count"
     counter.write_text("0\n")
     counter.chmod(0o600)
@@ -829,7 +1173,7 @@ def test_append_does_not_consume_stage_over_noncontiguous_history(
     os.link(first, stage)
 
     with pytest.raises(RuntimeError, match="contiguous"):
-        registry.append_receipt(receipt)
+        registry.append_receipt(receipt, snapshot=snapshot)
 
     assert stage.exists()
     assert len(tuple(registry.receipts_path.iterdir())) == 3
@@ -840,7 +1184,10 @@ def test_append_rejects_counter_replacement_before_publication(
 ) -> None:
     registry = _registry(tmp_path)
     registry.save(_config(tmp_path))
-    registry.append_receipt(DeploymentReceipt("refresh", ("a" * 40,), ()))
+    snapshot = registry.load_snapshot()
+    registry.append_receipt(
+        DeploymentReceipt("refresh", ("a" * 40,), ()), snapshot=snapshot
+    )
     counter = registry.state_path / "receipt-count"
     attacker = tmp_path / "attacker-counter"
     attacker.write_text("unchanged\n")
@@ -854,7 +1201,9 @@ def test_append_rejects_counter_replacement_before_publication(
 
     monkeypatch.setattr(registry_module, "_write_all", replace_counter)
     with pytest.raises(RuntimeError, match="changed|symlink|regular"):
-        registry.append_receipt(DeploymentReceipt("refresh", ("b" * 40,), ()))
+        registry.append_receipt(
+            DeploymentReceipt("refresh", ("b" * 40,), ()), snapshot=snapshot
+        )
 
     assert counter.is_symlink()
     assert attacker.read_text() == "unchanged\n"

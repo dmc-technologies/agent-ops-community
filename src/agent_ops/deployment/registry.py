@@ -8,6 +8,7 @@ import os
 import re
 import stat
 import uuid
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -49,7 +50,7 @@ _RECEIPT_KEYS = frozenset({"operation", "commits", "targets"})
 _STATUS_KEYS = frozenset({"target_id", "state", "channel", "commit"})
 _RECEIPT_WRAPPER_KEYS = frozenset({"schema_version", "registry_fingerprint", "receipt"})
 _RECEIPT_COUNTER = "receipt-count"
-_MAX_RECEIPTS = 10**20 - 1
+_MAX_RECEIPTS = 1_000_000
 
 
 class _StrictLoader(yaml.SafeLoader):
@@ -120,11 +121,31 @@ class RegistryConfig:
 class RegistrySnapshot:
     config: RegistryConfig
     fingerprint: str
+    registry_identity: tuple[int, int]
 
     def __post_init__(self) -> None:
         if type(self.config) is not RegistryConfig:
             raise ValueError("snapshot config must be an exact RegistryConfig")
         _validate_fingerprint(self.fingerprint)
+        if (
+            type(self.registry_identity) is not tuple
+            or len(self.registry_identity) != 2
+            or any(type(value) is not int or value < 0 for value in self.registry_identity)
+        ):
+            raise ValueError("snapshot registry identity must be a device/inode pair")
+
+
+@dataclass(frozen=True)
+class ReceiptRecord:
+    sequence: int
+    registry_fingerprint: str
+    receipt: DeploymentReceipt
+
+    def __post_init__(self) -> None:
+        if type(self.sequence) is not int or not 0 <= self.sequence < _MAX_RECEIPTS:
+            raise ValueError("receipt record sequence exceeds supported bound")
+        _validate_fingerprint(self.registry_fingerprint)
+        _receipt_to_data(self.receipt)
 
 
 class DeploymentRegistry:
@@ -154,7 +175,7 @@ class DeploymentRegistry:
     def load_snapshot(self) -> RegistrySnapshot:
         _require_secure_platform(require_locking=True)
         parent, identities, lock = _open_locked_parent(
-            self.path.parent, self.lock_path.name, exclusive=False
+            self.path.parent, self.lock_path.name, exclusive=False, create_lock=False
         )
         try:
             snapshot = _snapshot_from_parent(parent, self.path.name)
@@ -170,7 +191,7 @@ class DeploymentRegistry:
         content = _dump_registry(config)
         _parse_registry(content)
         parent, identities, lock = _open_locked_parent(
-            self.path.parent, self.lock_path.name, exclusive=True
+            self.path.parent, self.lock_path.name, exclusive=True, create_lock=True
         )
         temporary = f".{self.path.name}.{uuid.uuid4().hex}.tmp"
         backup: str | None = None
@@ -179,6 +200,26 @@ class DeploymentRegistry:
         original: tuple[int, int] | None = None
         try:
             original = _optional_regular_identity(parent, self.path.name, "registry file")
+            if original is not None:
+                old_snapshot = _snapshot_from_parent(parent, self.path.name)
+                if old_snapshot.registry_identity != original:
+                    raise RuntimeError("registry file changed before receipt recovery")
+                _verify_canonical_parent(self.path.parent, parent, identities)
+                _recover_history_before_save(
+                    parent,
+                    self.state_path.name,
+                    old_snapshot.fingerprint,
+                    before_mutation=lambda: _verify_registry_context(
+                        parent,
+                        self.path.name,
+                        old_snapshot,
+                        self.path.parent,
+                        identities,
+                    ),
+                )
+                _verify_canonical_parent(self.path.parent, parent, identities)
+            elif _entry_exists(parent, self.state_path.name):
+                raise RuntimeError("receipt state exists without an initialized registry")
             descriptor = os.open(
                 temporary,
                 os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
@@ -217,6 +258,7 @@ class DeploymentRegistry:
                 os.unlink(backup, dir_fd=parent)
                 backup = None
                 os.fsync(parent)
+            _verify_canonical_parent(self.path.parent, parent, identities)
         except BaseException:
             if descriptor is not None:
                 os.close(descriptor)
@@ -243,14 +285,14 @@ class DeploymentRegistry:
         self,
         receipt: DeploymentReceipt,
         *,
-        expected_fingerprint: str | None = None,
+        snapshot: RegistrySnapshot,
     ) -> Path:
         _require_secure_platform(require_locking=True)
         receipt_data = _receipt_to_data(receipt)
-        if expected_fingerprint is not None:
-            _validate_fingerprint(expected_fingerprint)
+        if type(snapshot) is not RegistrySnapshot:
+            raise TypeError("snapshot must be an exact RegistrySnapshot")
         parent, identities, lock = _open_locked_parent(
-            self.path.parent, self.lock_path.name, exclusive=True
+            self.path.parent, self.lock_path.name, exclusive=True, create_lock=False
         )
         state: int | None = None
         receipts: int | None = None
@@ -259,44 +301,43 @@ class DeploymentRegistry:
         sequence: int | None = None
         published = False
         try:
-            snapshot = _snapshot_from_parent(parent, self.path.name)
-            if (
-                expected_fingerprint is not None
-                and snapshot.fingerprint != expected_fingerprint
-            ):
-                raise ValueError("registry fingerprint does not match expected snapshot")
+            _require_current_snapshot(parent, self.path.name, snapshot)
             state = _open_private_directory(parent, self.state_path.name, create=True)
             receipts = _open_private_directory(state, "receipts", create=True)
             _verify_canonical_parent(self.path.parent, parent, identities)
             sequence = _load_or_initialize_counter(state, receipts)
+            if sequence >= _MAX_RECEIPTS:
+                raise ValueError("receipt counter is at the supported bound")
             destination = f"{sequence:020d}.json"
             content = _dump_receipt_wrapper(receipt_data, snapshot.fingerprint)
             _verify_canonical_parent(self.path.parent, parent, identities)
-            expected_names = tuple(f"{index:020d}.json" for index in range(sequence))
             names = _receipt_names_for_append(
                 receipts,
                 destination=destination,
-                expected_names=expected_names,
+                sequence=sequence,
                 registry_fingerprint=snapshot.fingerprint,
                 receipt=receipt,
+                before_publication=lambda: _require_current_snapshot(
+                    parent, self.path.name, snapshot
+                ),
             )
-            if names == (*expected_names, destination):
+            if names == sequence + 1:
                 orphan_fingerprint, orphan = _read_receipt_wrapper(receipts, destination)
                 if orphan_fingerprint != snapshot.fingerprint or orphan != receipt:
                     raise RuntimeError("orphan receipt does not match append retry")
+                _require_current_snapshot(parent, self.path.name, snapshot)
                 _verify_canonical_parent(self.path.parent, parent, identities)
                 _write_counter(state, sequence + 1)
                 try:
+                    _require_current_snapshot(parent, self.path.name, snapshot)
                     _verify_canonical_parent(self.path.parent, parent, identities)
                 except BaseException:
                     with suppress(BaseException):
                         _write_counter(state, sequence)
                     raise
                 return self.receipts_path / destination
-            if names != expected_names:
+            if names != sequence:
                 raise RuntimeError("receipt history is not contiguous with its counter")
-            if sequence >= _MAX_RECEIPTS:
-                raise ValueError("receipt counter exceeds supported bound")
             temporary = f".{destination}.{uuid.uuid4().hex}.tmp"
             descriptor = os.open(
                 temporary,
@@ -313,6 +354,7 @@ class DeploymentRegistry:
                 os.fsync(descriptor)
             finally:
                 os.close(descriptor)
+            _require_current_snapshot(parent, self.path.name, snapshot)
             _verify_canonical_parent(self.path.parent, parent, identities)
             os.link(
                 temporary,
@@ -325,8 +367,10 @@ class DeploymentRegistry:
             os.unlink(temporary, dir_fd=receipts)
             temporary = None
             os.fsync(receipts)
+            _require_current_snapshot(parent, self.path.name, snapshot)
             _verify_canonical_parent(self.path.parent, parent, identities)
             _write_counter(state, sequence + 1)
+            _require_current_snapshot(parent, self.path.name, snapshot)
             _verify_canonical_parent(self.path.parent, parent, identities)
             return self.receipts_path / destination
         except BaseException:
@@ -349,18 +393,22 @@ class DeploymentRegistry:
             os.close(parent)
 
     def receipts(self) -> tuple[DeploymentReceipt, ...]:
+        return tuple(record.receipt for record in self.receipt_records())
+
+    def receipt_records(self) -> tuple[ReceiptRecord, ...]:
         _require_secure_platform(require_locking=True)
         parent, identities, lock = _open_locked_parent(
-            self.path.parent, self.lock_path.name, exclusive=False
+            self.path.parent, self.lock_path.name, exclusive=False, create_lock=False
         )
         state: int | None = None
         receipts: int | None = None
         try:
-            _snapshot_from_parent(parent, self.path.name)
+            snapshot = _snapshot_from_parent(parent, self.path.name)
             state = _open_private_directory(
                 parent, self.state_path.name, create=False, missing_ok=True
             )
             if state is None:
+                _require_current_snapshot(parent, self.path.name, snapshot)
                 _verify_canonical_parent(self.path.parent, parent, identities)
                 return ()
             receipts = _open_private_directory(state, "receipts", create=False, missing_ok=True)
@@ -371,10 +419,8 @@ class DeploymentRegistry:
             except FileNotFoundError:
                 raise RuntimeError("receipt counter is missing") from None
             names = _receipt_names(receipts)
-            expected_names = tuple(f"{index:020d}.json" for index in range(counter))
-            if names != expected_names:
-                raise RuntimeError("receipt history is missing entries or exceeds its counter")
-            result = tuple(_read_receipt_wrapper(receipts, name)[1] for name in names)
+            result = _read_contiguous_records(receipts, names, counter)
+            _require_current_snapshot(parent, self.path.name, snapshot)
             _verify_canonical_parent(self.path.parent, parent, identities)
             return result
         finally:
@@ -885,13 +931,18 @@ def _verify_canonical_parent(
 
 
 def _open_locked_parent(
-    path: Path, lock_name: str, *, exclusive: bool
+    path: Path, lock_name: str, *, exclusive: bool, create_lock: bool
 ) -> tuple[int, tuple[tuple[int, int], ...], int]:
     parent, identities = _open_directory_chain_with_identity(path)
     lock: int | None = None
     try:
         _verify_canonical_parent(path, parent, identities)
-        lock = _open_private_lock(parent, lock_name)
+        lock = _open_private_lock(
+            parent,
+            lock_name,
+            create=create_lock,
+            writable=exclusive,
+        )
         fcntl.flock(lock, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
         observed_lock = os.stat(lock_name, dir_fd=parent, follow_symlinks=False)
         if _identity(observed_lock) != _identity(os.fstat(lock)):
@@ -913,7 +964,7 @@ def _close_registry_lock(lock: int) -> None:
 
 
 def _snapshot_from_parent(parent: int, name: str) -> RegistrySnapshot:
-    content = _read_regular_file(
+    content, registry_identity = _read_regular_file_with_identity(
         parent,
         name,
         required_mode=0o600,
@@ -921,7 +972,30 @@ def _snapshot_from_parent(parent: int, name: str) -> RegistrySnapshot:
         label="registry file",
     )
     config = _parse_registry(content)
-    return RegistrySnapshot(config=config, fingerprint=hashlib.sha256(content).hexdigest())
+    return RegistrySnapshot(
+        config=config,
+        fingerprint=hashlib.sha256(content).hexdigest(),
+        registry_identity=registry_identity,
+    )
+
+
+def _require_current_snapshot(
+    parent: int, name: str, expected: RegistrySnapshot
+) -> None:
+    current = _snapshot_from_parent(parent, name)
+    if current != expected:
+        raise ValueError("registry no longer matches the required snapshot")
+
+
+def _verify_registry_context(
+    parent: int,
+    name: str,
+    snapshot: RegistrySnapshot,
+    parent_path: Path,
+    parent_identities: tuple[tuple[int, int], ...],
+) -> None:
+    _require_current_snapshot(parent, name, snapshot)
+    _verify_canonical_parent(parent_path, parent, parent_identities)
 
 
 def _identity(item: os.stat_result) -> tuple[int, int]:
@@ -950,6 +1024,23 @@ def _read_regular_file(
     maximum: int,
     label: str,
 ) -> bytes:
+    return _read_regular_file_with_identity(
+        parent,
+        name,
+        required_mode=required_mode,
+        maximum=maximum,
+        label=label,
+    )[0]
+
+
+def _read_regular_file_with_identity(
+    parent: int,
+    name: str,
+    *,
+    required_mode: int,
+    maximum: int,
+    label: str,
+) -> tuple[bytes, tuple[int, int]]:
     before = os.stat(name, dir_fd=parent, follow_symlinks=False)
     if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
         raise RuntimeError(f"{label} must be a non-symlink regular file")
@@ -983,7 +1074,7 @@ def _read_regular_file(
             opened
         ):
             raise RuntimeError(f"{label} changed while it was read")
-        return content
+        return content, _identity(opened)
     finally:
         os.close(descriptor)
 
@@ -1008,6 +1099,14 @@ def _unlink_if_regular(parent: int, name: str) -> None:
         return
     if stat.S_ISREG(item.st_mode) and not stat.S_ISLNK(item.st_mode):
         os.unlink(name, dir_fd=parent)
+
+
+def _entry_exists(parent: int, name: str) -> bool:
+    try:
+        os.stat(name, dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return True
 
 
 def _open_private_directory(
@@ -1044,18 +1143,28 @@ def _open_private_directory(
     return descriptor
 
 
-def _open_private_lock(parent: int, name: str) -> int:
+def _open_private_lock(
+    parent: int, name: str, *, create: bool, writable: bool
+) -> int:
+    access = os.O_RDWR if writable else os.O_RDONLY
     try:
-        descriptor = os.open(
-            name,
-            os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-            0o600,
-            dir_fd=parent,
-        )
-    except FileExistsError:
-        descriptor = os.open(name, os.O_RDWR | os.O_NOFOLLOW, dir_fd=parent)
-    else:
-        os.fchmod(descriptor, 0o600)
+        descriptor = os.open(name, access | os.O_NOFOLLOW, dir_fd=parent)
+    except FileNotFoundError:
+        if not create:
+            raise RuntimeError(
+                "registry lock is missing; initialize the registry with save()"
+            ) from None
+        try:
+            descriptor = os.open(
+                name,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=parent,
+            )
+        except FileExistsError:
+            descriptor = os.open(name, access | os.O_NOFOLLOW, dir_fd=parent)
+        else:
+            os.fchmod(descriptor, 0o600)
     opened = os.fstat(descriptor)
     if not stat.S_ISREG(opened.st_mode):
         os.close(descriptor)
@@ -1084,10 +1193,11 @@ def _receipt_names_for_append(
     directory: int,
     *,
     destination: str,
-    expected_names: tuple[str, ...],
+    sequence: int,
     registry_fingerprint: str,
     receipt: DeploymentReceipt,
-) -> tuple[str, ...]:
+    before_publication: Callable[[], None],
+) -> int:
     receipt_names: list[str] = []
     temporary_names: list[str] = []
     for name in os.listdir(directory):
@@ -1101,10 +1211,9 @@ def _receipt_names_for_append(
         else:
             raise RuntimeError(f"unexpected entry in receipt directory: {name}")
     ordered_names = tuple(sorted(receipt_names))
-    if ordered_names not in (expected_names, (*expected_names, destination)):
-        raise RuntimeError("receipt history is not contiguous with its counter")
+    count = _validate_contiguous_names(ordered_names, sequence, allow_orphan=True)
     if not temporary_names:
-        return ordered_names
+        return count
     if len(temporary_names) != 1:
         raise RuntimeError("receipt history contains multiple interrupted stages")
     temporary = temporary_names[0]
@@ -1121,6 +1230,7 @@ def _receipt_names_for_append(
         if destination_identity != temporary_identity:
             raise RuntimeError("interrupted receipt stage is not linked to orphan receipt")
     else:
+        before_publication()
         os.link(
             temporary,
             destination,
@@ -1131,7 +1241,112 @@ def _receipt_names_for_append(
         receipt_names.append(destination)
     os.unlink(temporary, dir_fd=directory)
     os.fsync(directory)
-    return tuple(sorted(receipt_names))
+    return len(receipt_names)
+
+
+def _validate_contiguous_names(
+    names: tuple[str, ...], counter: int, *, allow_orphan: bool
+) -> int:
+    maximum_count = counter + (1 if allow_orphan else 0)
+    if len(names) > maximum_count:
+        raise RuntimeError("receipt history is not contiguous with its counter")
+    for index, name in enumerate(names):
+        if name != f"{index:020d}.json":
+            raise RuntimeError("receipt history is not contiguous with its counter")
+    if len(names) < counter:
+        raise RuntimeError("receipt history is missing entries or exceeds its counter")
+    return len(names)
+
+
+def _read_contiguous_records(
+    receipts: int, names: tuple[str, ...], counter: int
+) -> tuple[ReceiptRecord, ...]:
+    _validate_contiguous_names(names, counter, allow_orphan=False)
+    records: list[ReceiptRecord] = []
+    for sequence, name in enumerate(names):
+        fingerprint, receipt = _read_receipt_wrapper(receipts, name)
+        records.append(ReceiptRecord(sequence, fingerprint, receipt))
+    return tuple(records)
+
+
+def _recover_history_before_save(
+    parent: int,
+    state_name: str,
+    current_fingerprint: str,
+    *,
+    before_mutation: Callable[[], None],
+) -> None:
+    state = _open_private_directory(parent, state_name, create=False, missing_ok=True)
+    if state is None:
+        return
+    receipts: int | None = None
+    try:
+        receipts = _open_private_directory(state, "receipts", create=False)
+        counter = _read_counter(state)
+        destination = f"{counter:020d}.json"
+        receipt_names: list[str] = []
+        temporary_names: list[str] = []
+        for name in os.listdir(receipts):
+            if _RECEIPT_FILE.fullmatch(name) is not None:
+                receipt_names.append(name)
+            elif (
+                (match := _RECEIPT_TEMP.fullmatch(name)) is not None
+                and match.group("receipt") == destination
+            ):
+                temporary_names.append(name)
+            else:
+                raise RuntimeError(f"unexpected entry in receipt directory: {name}")
+        names = tuple(sorted(receipt_names))
+        count = _validate_contiguous_names(names, counter, allow_orphan=True)
+        parsed = {
+            name: _read_receipt_wrapper(receipts, name)
+            for name in names
+        }
+        if len(temporary_names) > 1:
+            raise RuntimeError("receipt history contains multiple interrupted stages")
+        temporary = temporary_names[0] if temporary_names else None
+        if temporary is not None:
+            staged_fingerprint, _ = _read_receipt_wrapper(receipts, temporary)
+            if staged_fingerprint != current_fingerprint:
+                raise RuntimeError("orphan receipt fingerprint does not match old registry")
+            if count == counter + 1:
+                if parsed[destination][0] != current_fingerprint:
+                    raise RuntimeError("orphan receipt fingerprint does not match old registry")
+                if _optional_regular_identity(
+                    receipts, destination, "orphan receipt"
+                ) != _optional_regular_identity(
+                    receipts, temporary, "receipt temporary file"
+                ):
+                    raise RuntimeError("interrupted receipt stage is not linked to orphan")
+            else:
+                before_mutation()
+                os.link(
+                    temporary,
+                    destination,
+                    src_dir_fd=receipts,
+                    dst_dir_fd=receipts,
+                    follow_symlinks=False,
+                )
+                count += 1
+            before_mutation()
+            os.unlink(temporary, dir_fd=receipts)
+            os.fsync(receipts)
+        if count == counter + 1:
+            orphan_fingerprint = (
+                parsed[destination][0]
+                if destination in parsed
+                else current_fingerprint
+            )
+            if orphan_fingerprint != current_fingerprint:
+                raise RuntimeError("orphan receipt fingerprint does not match old registry")
+            if counter >= _MAX_RECEIPTS:
+                raise ValueError("receipt counter is at the supported bound")
+            before_mutation()
+            _write_counter(state, counter + 1)
+    finally:
+        if receipts is not None:
+            os.close(receipts)
+        os.close(state)
 
 
 def _read_counter(state: int) -> int:
@@ -1231,4 +1446,10 @@ def _audit_is_invalid(audit: DeploymentAudit) -> bool:
     )
 
 
-__all__ = ["ChannelSpec", "DeploymentRegistry", "RegistryConfig", "RegistrySnapshot"]
+__all__ = [
+    "ChannelSpec",
+    "DeploymentRegistry",
+    "ReceiptRecord",
+    "RegistryConfig",
+    "RegistrySnapshot",
+]
