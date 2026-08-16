@@ -16,10 +16,12 @@ from agent_ops.deployment.models import (
     DeploymentAudit,
     PlannedFile,
     ProviderPlan,
+    RewriteAcceptance,
     SourceSnapshot,
     SourceSpec,
     TargetSpec,
     TargetState,
+    TargetStatus,
 )
 from agent_ops.deployment.public_skills import build_public_skill_plans
 from agent_ops.deployment.registry import ChannelSpec, DeploymentRegistry, RegistryConfig
@@ -90,6 +92,309 @@ def _engine_fixture(tmp_path: Path) -> tuple[DeploymentEngine, DeploymentRegistr
         registry,
         home,
     )
+
+
+def _create_branch(source: Path, name: str, content: bytes) -> str:
+    subprocess.run(
+        ["git", "switch", "-c", name],
+        cwd=source,
+        check=True,
+        capture_output=True,
+    )
+    (source / "payload.txt").write_bytes(content)
+    subprocess.run(
+        ["git", "commit", "-am", name],
+        cwd=source,
+        check=True,
+        capture_output=True,
+    )
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=source,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def test_deploy_adds_first_arbitrary_branch_alias_atomically(tmp_path: Path) -> None:
+    engine, registry, home = _engine_fixture(tmp_path)
+    home.mkdir()
+    second_home = tmp_path / "second-home"
+    second_home.mkdir()
+    current = registry.load()
+    registry.save(
+        RegistryConfig(
+            1,
+            current.sources,
+            current.channels,
+            current.targets
+            + (TargetSpec("second", Framework.CODEX, second_home, "stable"),),
+        )
+    )
+    source = tmp_path / "source"
+    commit = _create_branch(source, "feature", b"feature\n")
+
+    receipt = engine.deploy("demo", "refs/heads/feature", ("codex",))
+
+    config = registry.load()
+    assert ChannelSpec("demo", "community", "refs/heads/feature") in config.channels
+    assert config.targets == (
+        TargetSpec("codex", Framework.CODEX, home, "demo"),
+        TargetSpec("second", Framework.CODEX, second_home, "stable"),
+    )
+    assert receipt.operation == "deploy"
+    assert receipt.commits == (commit,)
+    assert receipt.targets == (
+        TargetStatus("codex", TargetState.BRANCH, "demo", commit),
+    )
+    assert (home / "skills/example/payload.txt").read_bytes() == b"feature\n"
+    assert tuple(second_home.iterdir()) == ()
+    assert registry.receipts() == (receipt,)
+
+
+def test_deploy_reuses_exact_existing_alias(tmp_path: Path) -> None:
+    engine, registry, home = _engine_fixture(tmp_path)
+    home.mkdir()
+    source = tmp_path / "source"
+    commit = _create_branch(source, "feature", b"feature\n")
+    current = registry.load()
+    registry.save(
+        RegistryConfig(
+            1,
+            current.sources,
+            current.channels
+            + (ChannelSpec("demo", "community", "refs/heads/feature"),),
+            current.targets,
+        )
+    )
+
+    receipt = engine.deploy("demo", "refs/heads/feature", ("codex",))
+
+    assert receipt.operation == "deploy"
+    assert receipt.commits == (commit,)
+    assert registry.load().targets[0].channel == "demo"
+    assert len([item for item in registry.load().channels if item.id == "demo"]) == 1
+    assert (home / "skills/example/payload.txt").read_bytes() == b"feature\n"
+
+
+def test_deploy_rejects_selected_targets_from_multiple_sources(tmp_path: Path) -> None:
+    engine, registry, first_home = _engine_fixture(tmp_path)
+    second_source = tmp_path / "second-source"
+    second_source.mkdir()
+    subprocess.run(
+        ["git", "init", "-b", "main"],
+        cwd=second_source,
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "agentops@example.com"],
+        cwd=second_source,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Agent Ops"],
+        cwd=second_source,
+        check=True,
+    )
+    (second_source / "payload.txt").write_bytes(b"second\n")
+    subprocess.run(["git", "add", "payload.txt"], cwd=second_source, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "fixture"],
+        cwd=second_source,
+        check=True,
+        capture_output=True,
+    )
+    second_home = tmp_path / "second-home"
+    current = registry.load()
+    registry.save(
+        RegistryConfig(
+            1,
+            current.sources + (SourceSpec("second", str(second_source)),),
+            current.channels
+            + (ChannelSpec("second", "second", "refs/heads/main"),),
+            current.targets
+            + (TargetSpec("second", Framework.CODEX, second_home, "second"),),
+        )
+    )
+    before = registry.load_snapshot()
+
+    with pytest.raises(ValueError, match="exactly one configured source"):
+        engine.deploy("demo", "refs/heads/feature", ("codex", "second"))
+
+    assert registry.load_snapshot() == before
+    assert not first_home.exists()
+    assert not second_home.exists()
+    assert registry.receipts() == ()
+
+
+@pytest.mark.parametrize(
+    ("channel", "ref", "message"),
+    [
+        ("bad/name", "refs/heads/feature", "channel id"),
+        ("demo", "feature", "fully qualified"),
+        ("demo", "refs/heads/main", "stable ref"),
+        ("stable", "refs/heads/feature", "alias.*differs"),
+    ],
+)
+def test_deploy_rejects_invalid_or_conflicting_alias_before_mutation(
+    tmp_path: Path, channel: str, ref: str, message: str
+) -> None:
+    engine, registry, home = _engine_fixture(tmp_path)
+    before = registry.load_snapshot()
+
+    with pytest.raises(ValueError, match=message):
+        engine.deploy(channel, ref, ("codex",))
+
+    assert registry.load_snapshot() == before
+    assert not home.exists()
+    assert registry.receipts() == ()
+
+
+def test_deploy_missing_ref_preserves_registry_target_and_receipts(tmp_path: Path) -> None:
+    engine, registry, home = _engine_fixture(tmp_path)
+    sentinel = home / "operator.txt"
+    sentinel.parent.mkdir()
+    sentinel.write_bytes(b"unchanged\n")
+    before = registry.load_snapshot()
+
+    with pytest.raises(RuntimeError, match="requested Git ref"):
+        engine.deploy("missing", "refs/heads/missing", ("codex",))
+
+    assert registry.load_snapshot() == before
+    assert sentinel.read_bytes() == b"unchanged\n"
+    assert registry.receipts() == ()
+
+
+def test_deploy_rewrite_requires_exact_ref_history_acceptance(tmp_path: Path) -> None:
+    engine, registry, home = _engine_fixture(tmp_path)
+    home.mkdir()
+    source = tmp_path / "source"
+    prior = _create_branch(source, "feature", b"feature\n")
+    first = engine.deploy("demo", "refs/heads/feature", ("codex",))
+    configured = registry.load_snapshot()
+    before_receipts = registry.receipts()
+    subprocess.run(
+        ["git", "switch", "main"],
+        cwd=source,
+        check=True,
+        capture_output=True,
+    )
+    (source / "payload.txt").write_bytes(b"rewritten\n")
+    subprocess.run(
+        ["git", "commit", "-am", "rewritten"],
+        cwd=source,
+        check=True,
+        capture_output=True,
+    )
+    rewritten = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=source,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(["git", "branch", "-f", "feature", rewritten], cwd=source, check=True)
+
+    with pytest.raises(RuntimeError, match="rewrite acceptance"):
+        engine.deploy("demo", "refs/heads/feature", ("codex",))
+
+    assert registry.load_snapshot() == configured
+    assert registry.receipts() == before_receipts == (first,)
+    assert (home / "skills/example/payload.txt").read_bytes() == b"feature\n"
+
+    receipt = engine.deploy(
+        "demo",
+        "refs/heads/feature",
+        ("codex",),
+        rewrite=RewriteAcceptance(prior, rewritten),
+    )
+
+    assert receipt.commits == (rewritten,)
+    assert (home / "skills/example/payload.txt").read_bytes() == b"rewritten\n"
+
+
+def test_deploy_audit_failure_does_not_reassign_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, registry, home = _engine_fixture(tmp_path)
+    home.mkdir()
+    source = tmp_path / "source"
+    _create_branch(source, "feature", b"feature\n")
+    before = registry.load_snapshot()
+
+    def mismatch(plans: tuple[ProviderPlan, ...]) -> DeploymentAudit:
+        return DeploymentAudit(plans[0].target.id, matches=False)
+
+    monkeypatch.setattr("agent_ops.deployment.engine.audit_provider_plans", mismatch)
+
+    with pytest.raises(RuntimeError, match="audit did not match"):
+        engine.deploy("demo", "refs/heads/feature", ("codex",))
+
+    assert registry.load_snapshot() == before
+    assert not (home / "skills/example/payload.txt").exists()
+    assert registry.receipts() == ()
+
+
+def test_deploy_receipt_failure_restores_registry_and_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, registry, home = _engine_fixture(tmp_path)
+    home.mkdir()
+    source = tmp_path / "source"
+    _create_branch(source, "feature", b"feature\n")
+    before = registry.load_snapshot()
+    append_error = OSError("injected deploy receipt failure")
+
+    def fail_append(*_args: object, **_kwargs: object) -> None:
+        raise append_error
+
+    monkeypatch.setattr(registry, "append_receipt", fail_append)
+
+    with pytest.raises(OSError) as caught:
+        engine.deploy("demo", "refs/heads/feature", ("codex",))
+
+    assert caught.value is append_error
+    restored = registry.load_snapshot()
+    assert restored.config == before.config
+    assert restored.fingerprint == before.fingerprint
+    assert not (home / "skills/example/payload.txt").exists()
+    assert registry.receipts() == ()
+
+
+def test_deploy_registry_cas_failure_preserves_concurrent_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, registry, home = _engine_fixture(tmp_path)
+    home.mkdir()
+    source = tmp_path / "source"
+    _create_branch(source, "feature", b"feature\n")
+    original = registry.load()
+    concurrent = RegistryConfig(
+        1,
+        original.sources,
+        original.channels + (ChannelSpec("admin", "community", "refs/heads/main"),),
+        original.targets,
+    )
+    original_save = registry.save
+    injected = False
+
+    def save(config: RegistryConfig, **kwargs: object):
+        nonlocal injected
+        if kwargs.get("expected_snapshot") is not None and not injected:
+            injected = True
+            original_save(concurrent)
+        return original_save(config, **kwargs)
+
+    monkeypatch.setattr(registry, "save", save)
+
+    with pytest.raises(ValueError, match="registry no longer matches"):
+        engine.deploy("demo", "refs/heads/feature", ("codex",))
+
+    assert registry.load() == concurrent
+    assert not (home / "skills/example/payload.txt").exists()
+    assert registry.receipts() == ()
 
 
 def test_deployment_engine_plans_without_mutation_then_refreshes_once(tmp_path: Path) -> None:

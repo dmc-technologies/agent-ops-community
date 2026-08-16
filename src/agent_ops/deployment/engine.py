@@ -28,6 +28,7 @@ from agent_ops.deployment.providers import (
     normalize_deployment_providers,
 )
 from agent_ops.deployment.registry import (
+    ChannelSpec,
     DeploymentRegistry,
     RegistryConfig,
     RegistrySnapshot,
@@ -204,22 +205,105 @@ class DeploymentEngine:
         if channel not in channels:
             raise ValueError(f"unknown channel: {channel}")
         selected = self._select_targets(original_snapshot.config, target_ids)
+        candidate, candidate_targets = self._candidate_config(
+            original_snapshot.config,
+            selected,
+            channel,
+            original_snapshot.config.channels,
+        )
+        return self._deploy_candidate(
+            "switch",
+            original_snapshot,
+            candidate,
+            candidate_targets,
+        )
+
+    def deploy(
+        self,
+        channel: str,
+        ref: str,
+        target_ids: tuple[str, ...],
+        *,
+        rewrite: RewriteAcceptance | None = None,
+    ) -> DeploymentReceipt:
+        original_snapshot = self._registry.load_snapshot()
+        selected = self._select_targets(original_snapshot.config, target_ids)
+        configured_channels = {
+            item.id: item for item in original_snapshot.config.channels
+        }
+        source_ids = {
+            configured_channels[target.channel].source for target in selected
+        }
+        if len(source_ids) != 1:
+            raise ValueError(
+                "deploy targets must resolve to exactly one configured source"
+            )
+        source_id = next(iter(source_ids))
+        sources = {item.id: item for item in original_snapshot.config.sources}
+        source = sources[source_id]
+        requested = ChannelSpec(channel, source_id, ref)
+        if requested.ref == source.stable_ref:
+            raise ValueError("deploy ref must not be the configured stable ref")
+        existing = configured_channels.get(channel)
+        if existing is not None and existing != requested:
+            raise ValueError("existing channel alias source or ref differs")
+        channels = (
+            original_snapshot.config.channels
+            if existing is not None
+            else original_snapshot.config.channels + (requested,)
+        )
+        candidate, candidate_targets = self._candidate_config(
+            original_snapshot.config,
+            selected,
+            channel,
+            channels,
+        )
+        return self._deploy_candidate(
+            "deploy",
+            original_snapshot,
+            candidate,
+            candidate_targets,
+            rewrite=rewrite,
+        )
+
+    @staticmethod
+    def _candidate_config(
+        config: RegistryConfig,
+        selected: tuple[TargetSpec, ...],
+        channel: str,
+        channels: tuple[ChannelSpec, ...],
+    ) -> tuple[RegistryConfig, tuple[TargetSpec, ...]]:
         selected_ids = {target.id for target in selected}
         candidate = RegistryConfig(
-            original_snapshot.config.schema_version,
-            original_snapshot.config.sources,
-            original_snapshot.config.channels,
+            config.schema_version,
+            config.sources,
+            channels,
             tuple(
                 replace(target, channel=channel)
                 if target.id in selected_ids
                 else target
-                for target in original_snapshot.config.targets
+                for target in config.targets
             ),
         )
         candidate_targets = tuple(
             target for target in candidate.targets if target.id in selected_ids
         )
-        snapshots = self._fetch_snapshots(candidate, candidate_targets)
+        return candidate, candidate_targets
+
+    def _deploy_candidate(
+        self,
+        operation: str,
+        original_snapshot: RegistrySnapshot,
+        candidate: RegistryConfig,
+        candidate_targets: tuple[TargetSpec, ...],
+        *,
+        rewrite: RewriteAcceptance | None = None,
+    ) -> DeploymentReceipt:
+        snapshots = self._fetch_snapshots(
+            candidate,
+            candidate_targets,
+            rewrite=rewrite,
+        )
         plan = self._build_plan(candidate, candidate_targets, snapshots)
         _preflight_provider_plans_read_only(plan.provider_plans)
         with _locked_provider_plan_targets(plan.provider_plans):
@@ -239,7 +323,7 @@ class DeploymentEngine:
                     expected_snapshot=original_snapshot,
                 )
                 receipt = self._receipt(
-                    "switch",
+                    operation,
                     candidate_snapshot,
                     candidate_targets,
                     snapshots,
