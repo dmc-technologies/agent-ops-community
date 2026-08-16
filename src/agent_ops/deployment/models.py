@@ -25,6 +25,11 @@ def _repository_relative_path(path: Path) -> Path:
 
 
 def _nonempty(value: str, name: str) -> None:
+    if not value:
+        raise ValueError(f"{name} must be nonempty")
+
+
+def _exact_nonempty(value: str, name: str) -> None:
     if type(value) is not str or not value:
         raise ValueError(f"{name} must be nonempty exact string")
 
@@ -38,7 +43,7 @@ class TargetSpec:
 
     def __post_init__(self) -> None:
         _nonempty(self.id, "target id")
-        _nonempty(self.channel, "target channel")
+        _exact_nonempty(self.channel, "target channel")
 
 
 @dataclass(frozen=True)
@@ -48,9 +53,9 @@ class TargetChannelTransition:
     candidate_channel: str
 
     def __post_init__(self) -> None:
-        _nonempty(self.target_id, "transition target id")
-        _nonempty(self.expected_prior_channel, "expected prior channel")
-        _nonempty(self.candidate_channel, "candidate channel")
+        _exact_nonempty(self.target_id, "transition target id")
+        _exact_nonempty(self.expected_prior_channel, "expected prior channel")
+        _exact_nonempty(self.candidate_channel, "candidate channel")
 
 
 @dataclass(frozen=True)
@@ -231,7 +236,7 @@ class DeploymentManifest:
 
     def __post_init__(self) -> None:
         _nonempty(self.target_id, "target id")
-        _nonempty(self.channel, "manifest channel")
+        _exact_nonempty(self.channel, "manifest channel")
         _nonempty(self.source_revision, "source revision")
         _nonempty(self.transaction_id, "transaction id")
         if self.review_state not in {None, "unreviewed-local"}:
@@ -251,7 +256,7 @@ class TargetSource:
 
     def __post_init__(self) -> None:
         _nonempty(self.target_id, "target id")
-        _nonempty(self.channel, "target channel")
+        _exact_nonempty(self.channel, "target channel")
         _nonempty(self.source_id, "source id")
         _nonempty(self.ref, "source ref")
         _nonempty(self.commit, "source commit")
@@ -320,7 +325,7 @@ class TargetStatus:
 
     def __post_init__(self) -> None:
         _nonempty(self.target_id, "target id")
-        _nonempty(self.channel, "target channel")
+        _exact_nonempty(self.channel, "target channel")
 
 
 @dataclass(frozen=True)
