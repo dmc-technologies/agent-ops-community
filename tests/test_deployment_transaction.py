@@ -359,6 +359,116 @@ def test_later_target_install_failure_rolls_back_every_earlier_target(
     assert not list((second_home / ".agentops/deployment/manifests").glob("*.json"))
 
 
+def test_grouped_recovery_process_control_is_preserved_after_ordinary_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first_home = tmp_path / "a-home"
+    second_home = tmp_path / "b-home"
+    first = ProviderPlan(
+        "fixture",
+        "1" * 40,
+        TargetSpec("first", Framework.CODEX, first_home, "feature"),
+        (PlannedFile(Path("skills/example/SKILL.md"), b"first\n", 0o640),),
+    )
+    second = ProviderPlan(
+        "fixture",
+        "1" * 40,
+        TargetSpec("second", Framework.CODEX, second_home, "feature"),
+        (PlannedFile(Path("skills/example/SKILL.md"), b"second\n", 0o644),),
+    )
+    original_hook = transaction_module._before_manifest_replace
+    control = KeyboardInterrupt("operator stopped recovery")
+
+    def fail_second(home_fs: object, *args: object) -> None:
+        if home_fs.home == second_home:
+            raise OSError("ordinary install failure")
+        original_hook(home_fs, *args)
+
+    def interrupt_recovery(_manifests: tuple[object, ...]) -> None:
+        raise control
+
+    monkeypatch.setattr(transaction_module, "_before_manifest_replace", fail_second)
+    monkeypatch.setattr(transaction_module, "rollback_manifests", interrupt_recovery)
+
+    with pytest.raises(KeyboardInterrupt) as caught:
+        install_provider_plans((first, second))
+
+    assert caught.value is control
+    assert any("recovery incomplete" in note for note in control.__notes__)
+    assert (first_home / "skills/example/SKILL.md").read_bytes() == b"first\n"
+    assert list((first_home / ".agentops/deployment/transactions").glob("*/record.json"))
+
+
+def test_grouped_rollback_failure_retains_evidence_for_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first_home = tmp_path / "a-home"
+    second_home = tmp_path / "b-home"
+    original = ProviderPlan(
+        "fixture",
+        "1" * 40,
+        TargetSpec("first", Framework.CODEX, first_home, "feature"),
+        (PlannedFile(Path("skills/example/SKILL.md"), b"old\n", 0o640),),
+    )
+    install_provider_plans((original,))
+    replacement = ProviderPlan(
+        "fixture",
+        "2" * 40,
+        original.target,
+        (PlannedFile(Path("skills/example/SKILL.md"), b"new\n", 0o644),),
+    )
+    second = ProviderPlan(
+        "fixture",
+        "2" * 40,
+        TargetSpec("second", Framework.CODEX, second_home, "feature"),
+        (PlannedFile(Path("skills/example/SKILL.md"), b"second\n", 0o644),),
+    )
+    original_hook = transaction_module._before_manifest_replace
+    original_write_atomic = transaction_module._HomeFS.write_atomic
+
+    def fail_second(home_fs: object, *args: object) -> None:
+        if home_fs.home == second_home:
+            raise OSError("injected second target failure")
+        original_hook(home_fs, *args)
+
+    def fail_rollback_marker(
+        home_fs: object,
+        relative: Path,
+        content: bytes,
+        mode: int,
+    ) -> None:
+        if (
+            home_fs.home == first_home
+            and relative.name == "record.json"
+            and json.loads(content).get("state") == "rolled-back"
+        ):
+            raise OSError("injected grouped rollback marker failure")
+        original_write_atomic(home_fs, relative, content, mode)
+
+    monkeypatch.setattr(transaction_module, "_before_manifest_replace", fail_second)
+    monkeypatch.setattr(transaction_module._HomeFS, "write_atomic", fail_rollback_marker)
+
+    with pytest.raises(IncompleteRollbackError, match="evidence retained"):
+        install_provider_plans((replacement, second))
+
+    records = [
+        path
+        for path in (first_home / ".agentops/deployment/transactions").glob("*/record.json")
+        if json.loads(path.read_text())["manifest"]["source_revision"] == "2" * 40
+    ]
+    assert len(records) == 1
+    assert json.loads(records[0].read_text())["state"] == "committed"
+    assert stat.S_IMODE(records[0].stat().st_mode) == 0o600
+
+    monkeypatch.setattr(transaction_module._HomeFS, "write_atomic", original_write_atomic)
+    _home, _relative, _record, manifest = transaction_module._read_validated_record(
+        records[0]
+    )
+    rollback_manifests((manifest,))
+
+    assert audit_provider_plans((original,)).matches
+
+
 def test_same_home_operations_are_serialized_without_sleep_polling(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

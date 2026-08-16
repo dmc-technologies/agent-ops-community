@@ -1214,35 +1214,58 @@ def install_provider_plans(
     _require_supported_platform()
     manifests: list[DeploymentManifest] = []
     groups = _validate_and_group(plans)
+    with _locked_provider_plan_targets(plans):
+        try:
+            _install_provider_plan_groups(groups, manifests)
+        except BaseException as install_error:
+            if not manifests:
+                raise
+            try:
+                rollback_manifests(tuple(manifests))
+            except BaseException as rollback_error:
+                if not isinstance(rollback_error, Exception):
+                    rollback_error.add_note(
+                        "grouped deployment recovery incomplete after deployment "
+                        f"failure: {install_error}; transaction evidence retained"
+                    )
+                    raise
+                if not isinstance(install_error, Exception):
+                    install_error.add_note(
+                        "grouped rollback failed; recovery evidence retained for "
+                        "earlier targets"
+                    )
+                    raise install_error from rollback_error
+                raise IncompleteRollbackError(
+                    f"installation failed: {install_error}; grouped rollback "
+                    "incomplete; recovery evidence retained for earlier targets"
+                ) from rollback_error
+            raise
+    return tuple(manifests)
+
+
+@contextmanager
+def _locked_provider_plan_targets(
+    plans: tuple[ProviderPlan, ...],
+) -> Iterator[None]:
+    """Hold one sorted home-lock set for a caller-defined grouped operation."""
+    _require_supported_platform()
+    groups = _validate_and_group(plans)
+    homes = tuple(_absolute_home(group.target.home) for group in groups)
+    active = _GROUP_HOME_LOCKS.get()
+    if active is not None:
+        if any(home not in active for home in homes):
+            raise RuntimeError("active deployment lock set does not cover every target")
+        yield
+        return
     with ExitStack() as locks:
-        grouped_locks: dict[Path, _HomeFS] = {}
-        for group in groups:
-            home = _absolute_home(group.target.home)
-            grouped_locks.setdefault(home, locks.enter_context(_target_lock(home)))
+        grouped_locks = {
+            home: locks.enter_context(_target_lock(home)) for home in homes
+        }
         token = _GROUP_HOME_LOCKS.set(grouped_locks)
         try:
-            try:
-                _install_provider_plan_groups(groups, manifests)
-            except BaseException as install_error:
-                if not manifests:
-                    raise
-                try:
-                    rollback_manifests(tuple(manifests))
-                except BaseException as rollback_error:
-                    if not isinstance(install_error, Exception):
-                        install_error.add_note(
-                            "grouped rollback failed; recovery evidence retained for "
-                            "earlier targets"
-                        )
-                        raise install_error from rollback_error
-                    raise IncompleteRollbackError(
-                        f"installation failed: {install_error}; grouped rollback "
-                        "incomplete; recovery evidence retained for earlier targets"
-                    ) from rollback_error
-                raise
+            yield
         finally:
             _GROUP_HOME_LOCKS.reset(token)
-    return tuple(manifests)
 
 
 def _install_provider_plan_groups(

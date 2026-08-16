@@ -38,6 +38,7 @@ from agent_ops.deployment.source_store import (
     _validate_provider_data_closure,
 )
 from agent_ops.deployment.transaction import (
+    _locked_provider_plan_targets,
     _preflight_provider_plans_read_only,
     audit_provider_plans,
     install_provider_plans,
@@ -146,26 +147,29 @@ class DeploymentEngine:
         )
         plan = self._build_plan(registry_snapshot.config, targets, snapshots)
         _preflight_provider_plans_read_only(plan.provider_plans)
-        plan, manifests = self._apply_with_one_stale_retry(
-            registry_snapshot.config,
-            targets,
-            snapshots,
-            plan,
-        )
-        try:
-            audits = self._audit_plans(plan.provider_plans, require_matches=True)
-            receipt = self._receipt(
-                "refresh",
-                registry_snapshot,
+        with _locked_provider_plan_targets(plan.provider_plans):
+            plan = self._build_plan(registry_snapshot.config, targets, snapshots)
+            _preflight_provider_plans_read_only(plan.provider_plans)
+            plan, manifests = self._apply_with_one_stale_retry(
+                registry_snapshot.config,
                 targets,
                 snapshots,
-                manifests=manifests,
-                audits=audits,
+                plan,
             )
-            self._registry.append_receipt(receipt, snapshot=registry_snapshot)
-        except BaseException as error:
-            self._rollback_after_failure(manifests, error)
-            raise
+            try:
+                audits = self._audit_plans(plan.provider_plans, require_matches=True)
+                receipt = self._receipt(
+                    "refresh",
+                    registry_snapshot,
+                    targets,
+                    snapshots,
+                    manifests=manifests,
+                    audits=audits,
+                )
+                self._registry.append_receipt(receipt, snapshot=registry_snapshot)
+            except BaseException as error:
+                self._rollback_after_failure(manifests, error)
+                raise
         return receipt
 
     def audit(self, target_ids: tuple[str, ...]) -> DeploymentReceipt:
@@ -173,16 +177,18 @@ class DeploymentEngine:
         targets = self._select_targets(registry_snapshot.config, target_ids)
         snapshots = self._fetch_snapshots(registry_snapshot.config, targets)
         plan = self._build_plan(registry_snapshot.config, targets, snapshots)
-        audits = self._audit_plans(plan.provider_plans, require_matches=False)
-        receipt = self._receipt(
-            "audit",
-            registry_snapshot,
-            targets,
-            snapshots,
-            manifests=(),
-            audits=audits,
-        )
-        self._registry.append_receipt(receipt, snapshot=registry_snapshot)
+        with _locked_provider_plan_targets(plan.provider_plans):
+            plan = self._build_plan(registry_snapshot.config, targets, snapshots)
+            audits = self._audit_plans(plan.provider_plans, require_matches=False)
+            receipt = self._receipt(
+                "audit",
+                registry_snapshot,
+                targets,
+                snapshots,
+                manifests=(),
+                audits=audits,
+            )
+            self._registry.append_receipt(receipt, snapshot=registry_snapshot)
         return receipt
 
     def switch(
@@ -213,45 +219,65 @@ class DeploymentEngine:
         snapshots = self._fetch_snapshots(candidate, candidate_targets)
         plan = self._build_plan(candidate, candidate_targets, snapshots)
         _preflight_provider_plans_read_only(plan.provider_plans)
-        plan, manifests = self._apply_with_one_stale_retry(
-            candidate,
-            candidate_targets,
-            snapshots,
-            plan,
-        )
-        candidate_snapshot: RegistrySnapshot | None = None
-        try:
-            audits = self._audit_plans(plan.provider_plans, require_matches=True)
-            candidate_snapshot = self._registry.save(
+        with _locked_provider_plan_targets(plan.provider_plans):
+            plan = self._build_plan(candidate, candidate_targets, snapshots)
+            _preflight_provider_plans_read_only(plan.provider_plans)
+            plan, manifests = self._apply_with_one_stale_retry(
                 candidate,
-                expected_snapshot=original_snapshot,
-            )
-            receipt = self._receipt(
-                "switch",
-                candidate_snapshot,
                 candidate_targets,
                 snapshots,
-                manifests=manifests,
-                audits=audits,
+                plan,
             )
-            self._registry.append_receipt(receipt, snapshot=candidate_snapshot)
-        except BaseException as error:
-            recovery_errors: list[BaseException] = []
-            if candidate_snapshot is not None:
-                try:
-                    self._registry.save(
-                        original_snapshot.config,
-                        expected_snapshot=candidate_snapshot,
-                    )
-                except BaseException as recovery_error:
-                    recovery_errors.append(recovery_error)
+            candidate_snapshot: RegistrySnapshot | None = None
             try:
-                rollback_manifests(manifests)
-            except BaseException as recovery_error:
-                recovery_errors.append(recovery_error)
-            if recovery_errors:
-                self._raise_incomplete_recovery(error, recovery_errors)
-            raise
+                audits = self._audit_plans(plan.provider_plans, require_matches=True)
+                candidate_snapshot = self._registry.save(
+                    candidate,
+                    expected_snapshot=original_snapshot,
+                )
+                receipt = self._receipt(
+                    "switch",
+                    candidate_snapshot,
+                    candidate_targets,
+                    snapshots,
+                    manifests=manifests,
+                    audits=audits,
+                )
+                self._registry.append_receipt(receipt, snapshot=candidate_snapshot)
+            except BaseException as error:
+                recovery_errors: list[BaseException] = []
+                if candidate_snapshot is not None:
+                    try:
+                        self._registry.save(
+                            original_snapshot.config,
+                            expected_snapshot=candidate_snapshot,
+                        )
+                    except BaseException as recovery_error:
+                        if not isinstance(recovery_error, Exception):
+                            recovery_error.add_note(
+                                "deployment recovery incomplete while restoring the "
+                                f"registry; original failure: {error}; target rollback "
+                                "was not attempted"
+                            )
+                            raise
+                        recovery_errors.append(recovery_error)
+                try:
+                    rollback_manifests(manifests)
+                except BaseException as recovery_error:
+                    if not isinstance(recovery_error, Exception):
+                        prior_recovery = "; ".join(
+                            str(item) for item in recovery_errors
+                        )
+                        recovery_error.add_note(
+                            "deployment recovery incomplete while restoring targets; "
+                            f"original failure: {error}; prior recovery failures: "
+                            f"{prior_recovery or 'none'}; transaction evidence retained"
+                        )
+                        raise
+                    recovery_errors.append(recovery_error)
+                if recovery_errors:
+                    self._raise_incomplete_recovery(error, recovery_errors)
+                raise
         return receipt
 
     @staticmethod
@@ -556,6 +582,12 @@ class DeploymentEngine:
         try:
             rollback_manifests(manifests)
         except BaseException as rollback_error:
+            if not isinstance(rollback_error, Exception):
+                rollback_error.add_note(
+                    "deployment recovery incomplete while restoring targets; "
+                    f"original failure: {error}; transaction evidence retained"
+                )
+                raise
             DeploymentEngine._raise_incomplete_recovery(error, [rollback_error])
 
     @staticmethod

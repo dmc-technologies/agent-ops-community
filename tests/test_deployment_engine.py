@@ -5,6 +5,7 @@ import json
 import os
 import stat
 import subprocess
+import threading
 from pathlib import Path
 
 import pytest
@@ -119,6 +120,141 @@ def test_engine_rejects_duplicate_selection_before_source_store_mutation(
     assert not source_store_root.exists()
     assert not home.exists()
     assert registry.receipts() == ()
+
+
+def test_all_selected_targets_finish_provider_planning_before_target_mutation(
+    tmp_path: Path,
+) -> None:
+    class FailingSecondProvider(_FixtureProvider):
+        def plan(self, snapshot: SourceSnapshot, target: TargetSpec) -> ProviderPlan:
+            if target.id == "second":
+                raise ValueError("injected second target planning failure")
+            return super().plan(snapshot, target)
+
+    _engine, registry, first_home = _engine_fixture(tmp_path)
+    second_home = tmp_path / "second-home"
+    config = registry.load()
+    registry.save(
+        RegistryConfig(
+            1,
+            config.sources,
+            config.channels,
+            config.targets
+            + (TargetSpec("second", Framework.CODEX, second_home, "stable"),),
+        )
+    )
+    engine = DeploymentEngine(
+        registry,
+        SourceStore(tmp_path / "other-source-store"),
+        providers=(FailingSecondProvider(),),
+    )
+
+    with pytest.raises(ValueError, match="second target planning failure"):
+        engine.refresh(("codex", "second"))
+
+    assert not first_home.exists()
+    assert not second_home.exists()
+    assert registry.receipts() == ()
+
+
+def test_missing_switch_ref_preserves_registry_target_and_receipts(tmp_path: Path) -> None:
+    engine, registry, home = _engine_fixture(tmp_path)
+    sentinel = home / "operator.txt"
+    sentinel.parent.mkdir(parents=True)
+    sentinel.write_bytes(b"unchanged\n")
+    config = registry.load()
+    registry.save(
+        RegistryConfig(
+            1,
+            config.sources,
+            config.channels
+            + (ChannelSpec("missing", "community", "refs/heads/missing"),),
+            config.targets,
+        )
+    )
+    before = registry.load_snapshot()
+
+    with pytest.raises(RuntimeError):
+        engine.switch("missing", ("codex",))
+
+    assert registry.load_snapshot() == before
+    assert sentinel.read_bytes() == b"unchanged\n"
+    assert registry.receipts() == ()
+
+
+def test_waiting_same_home_refresh_replans_only_after_acquiring_operation_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class CoordinatedProvider(_FixtureProvider):
+        def __init__(self) -> None:
+            self.calls: dict[str, list[bool]] = {}
+            self.guard = threading.Lock()
+
+        def plan(self, snapshot: SourceSnapshot, target: TargetSpec) -> ProviderPlan:
+            name = threading.current_thread().name
+            with self.guard:
+                self.calls.setdefault(name, []).append(receipt_published.is_set())
+                call = len(self.calls[name])
+            if name == "waiting-refresh" and call == 1:
+                waiting_initial_plan.set()
+            return super().plan(snapshot, target)
+
+    _engine, registry, _home = _engine_fixture(tmp_path)
+    provider = CoordinatedProvider()
+    first_engine = DeploymentEngine(
+        registry,
+        SourceStore(tmp_path / "first-store"),
+        providers=(provider,),
+    )
+    waiting_engine = DeploymentEngine(
+        registry,
+        SourceStore(tmp_path / "waiting-store"),
+        providers=(provider,),
+    )
+    first_at_receipt = threading.Event()
+    release_first_receipt = threading.Event()
+    receipt_published = threading.Event()
+    waiting_initial_plan = threading.Event()
+    errors: list[BaseException] = []
+    original_append = registry.append_receipt
+
+    def append_receipt(*args: object, **kwargs: object) -> Path:
+        if threading.current_thread().name == "first-refresh":
+            first_at_receipt.set()
+            assert release_first_receipt.wait(timeout=5)
+            result = original_append(*args, **kwargs)
+            receipt_published.set()
+            return result
+        return original_append(*args, **kwargs)
+
+    def refresh(engine: DeploymentEngine) -> None:
+        try:
+            engine.refresh(("codex",))
+        except BaseException as error:
+            errors.append(error)
+
+    monkeypatch.setattr(registry, "append_receipt", append_receipt)
+    first = threading.Thread(target=refresh, args=(first_engine,), name="first-refresh")
+    waiting = threading.Thread(
+        target=refresh,
+        args=(waiting_engine,),
+        name="waiting-refresh",
+    )
+    first.start()
+    assert first_at_receipt.wait(timeout=5)
+    waiting.start()
+    assert waiting_initial_plan.wait(timeout=5)
+    assert receipt_published.is_set() is False
+    release_first_receipt.set()
+    first.join(timeout=5)
+    waiting.join(timeout=5)
+
+    assert not first.is_alive()
+    assert not waiting.is_alive()
+    assert errors == []
+    assert len(provider.calls["waiting-refresh"]) >= 2
+    assert provider.calls["waiting-refresh"][-1] is True
+    assert len(registry.receipts()) == 2
 
 
 def test_engine_audit_reports_modified_without_repairing_target(tmp_path: Path) -> None:
@@ -323,6 +459,30 @@ def test_refresh_receipt_failure_rolls_back_installed_target(
     assert registry.receipts() == ()
 
 
+def test_engine_recovery_process_control_is_preserved_after_receipt_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, registry, home = _engine_fixture(tmp_path)
+    append_error = OSError("ordinary receipt failure")
+    control = SystemExit(23)
+
+    def fail_append(*_args: object, **_kwargs: object) -> None:
+        raise append_error
+
+    def interrupt_recovery(_manifests: tuple[object, ...]) -> None:
+        raise control
+
+    monkeypatch.setattr(registry, "append_receipt", fail_append)
+    monkeypatch.setattr("agent_ops.deployment.engine.rollback_manifests", interrupt_recovery)
+
+    with pytest.raises(SystemExit) as caught:
+        engine.refresh(("codex",))
+
+    assert caught.value is control
+    assert any("recovery incomplete" in note for note in control.__notes__)
+    assert (home / "skills/example/payload.txt").read_bytes() == b"deployed\n"
+
+
 def test_refresh_process_control_during_audit_is_preserved_after_rollback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -380,6 +540,95 @@ def test_switch_receipt_failure_restores_registry_and_target(
     assert registry.load().targets[0].channel == "stable"
     assert not (home / "skills/example/payload.txt").exists()
     assert registry.receipts() == ()
+
+
+def test_switch_registry_recovery_process_control_is_preserved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, registry, home = _engine_fixture(tmp_path)
+    source = tmp_path / "source"
+    subprocess.run(
+        ["git", "switch", "-c", "feature"], cwd=source, check=True, capture_output=True
+    )
+    (source / "payload.txt").write_bytes(b"feature\n")
+    subprocess.run(
+        ["git", "commit", "-am", "feature"], cwd=source, check=True, capture_output=True
+    )
+    original = registry.load()
+    registry.save(
+        RegistryConfig(
+            1,
+            original.sources,
+            original.channels
+            + (ChannelSpec("feature", "community", "refs/heads/feature"),),
+            original.targets,
+        )
+    )
+    append_error = OSError("ordinary switch receipt failure")
+    control = KeyboardInterrupt("operator stopped registry recovery")
+    original_save = registry.save
+
+    def fail_append(*_args: object, **_kwargs: object) -> None:
+        raise append_error
+
+    def save(config: RegistryConfig, **kwargs: object):
+        if config.targets[0].channel == "stable" and kwargs.get("expected_snapshot"):
+            raise control
+        return original_save(config, **kwargs)
+
+    monkeypatch.setattr(registry, "append_receipt", fail_append)
+    monkeypatch.setattr(registry, "save", save)
+
+    with pytest.raises(KeyboardInterrupt) as caught:
+        engine.switch("feature", ("codex",))
+
+    assert caught.value is control
+    assert any("registry" in note and "recovery incomplete" in note for note in control.__notes__)
+    assert registry.load().targets[0].channel == "feature"
+    assert (home / "skills/example/payload.txt").read_bytes() == b"feature\n"
+
+
+def test_switch_target_recovery_process_control_is_preserved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, registry, home = _engine_fixture(tmp_path)
+    source = tmp_path / "source"
+    subprocess.run(
+        ["git", "switch", "-c", "feature"], cwd=source, check=True, capture_output=True
+    )
+    (source / "payload.txt").write_bytes(b"feature\n")
+    subprocess.run(
+        ["git", "commit", "-am", "feature"], cwd=source, check=True, capture_output=True
+    )
+    original = registry.load()
+    registry.save(
+        RegistryConfig(
+            1,
+            original.sources,
+            original.channels
+            + (ChannelSpec("feature", "community", "refs/heads/feature"),),
+            original.targets,
+        )
+    )
+    append_error = OSError("ordinary switch receipt failure")
+    control = SystemExit(29)
+
+    def fail_append(*_args: object, **_kwargs: object) -> None:
+        raise append_error
+
+    def interrupt_recovery(_manifests: tuple[object, ...]) -> None:
+        raise control
+
+    monkeypatch.setattr(registry, "append_receipt", fail_append)
+    monkeypatch.setattr("agent_ops.deployment.engine.rollback_manifests", interrupt_recovery)
+
+    with pytest.raises(SystemExit) as caught:
+        engine.switch("feature", ("codex",))
+
+    assert caught.value is control
+    assert any("restoring targets" in note for note in control.__notes__)
+    assert registry.load().targets[0].channel == "stable"
+    assert (home / "skills/example/payload.txt").read_bytes() == b"feature\n"
 
 
 def _dependency(
