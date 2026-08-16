@@ -19,6 +19,7 @@ from agent_ops.deployment.models import (
     ProviderPlan,
     RewriteAcceptance,
     SourceSnapshot,
+    TargetSource,
     TargetSpec,
     TargetState,
     TargetStatus,
@@ -447,7 +448,20 @@ class DeploymentEngine:
         ordered_plans = tuple(
             sorted(plans, key=lambda plan: (plan.target.id, plan.provider_id))
         )
-        return DeploymentPlan(ordered_snapshots, ordered_plans)
+        target_sources: list[TargetSource] = []
+        for target in sorted(targets, key=lambda item: item.id):
+            channel = channels[target.channel]
+            snapshot = snapshots[(channel.source, channel.ref)]
+            target_sources.append(
+                TargetSource(
+                    target.id,
+                    target.channel,
+                    channel.source,
+                    snapshot.ref,
+                    snapshot.commit,
+                )
+            )
+        return DeploymentPlan(ordered_snapshots, ordered_plans, tuple(target_sources))
 
     def _plan_provider(
         self,

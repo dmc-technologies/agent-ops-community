@@ -464,6 +464,24 @@ def test_deployment_engine_plans_without_mutation_then_refreshes_once(tmp_path: 
     plan = engine.plan(("codex",))
 
     assert [item.provider_id for item in plan.provider_plans] == ["fixture"]
+    assert [
+        (
+            item.target_id,
+            item.channel,
+            item.source_id,
+            item.ref,
+            item.commit,
+        )
+        for item in plan.target_sources
+    ] == [
+        (
+            "codex",
+            "stable",
+            "community",
+            "refs/heads/main",
+            plan.snapshots[0].commit,
+        )
+    ]
     assert not home.exists()
     assert registry.receipts() == ()
 

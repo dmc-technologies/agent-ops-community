@@ -98,18 +98,18 @@ def _emit_statuses(statuses: tuple[TargetStatus, ...], json_output: bool) -> Non
 
 def _emit_plan(plan: DeploymentPlan, json_output: bool) -> None:
     rows: list[dict[str, object]] = []
-    snapshots = {snapshot.commit: snapshot for snapshot in plan.snapshots}
+    target_sources = {item.target_id: item for item in plan.target_sources}
     target_ids = sorted({provider_plan.target.id for provider_plan in plan.provider_plans})
     for target_id in target_ids:
         plans = tuple(item for item in plan.provider_plans if item.target.id == target_id)
-        commit = plans[0].source_revision
+        source = target_sources[target_id]
         rows.append(
             {
                 "target_id": target_id,
-                "channel": plans[0].target.channel,
-                "source": snapshots[commit].source_id,
-                "ref": snapshots[commit].ref,
-                "commit": commit,
+                "channel": source.channel,
+                "source": source.source_id,
+                "ref": source.ref,
+                "commit": source.commit,
                 "providers": [item.provider_id for item in plans],
                 "files": sum(len(item.files) for item in plans),
                 "removals": sum(len(item.removals) for item in plans),
@@ -229,8 +229,9 @@ def plan_command(
     state_home: Annotated[Path | None, typer.Option("--state-home")] = None,
 ) -> None:
     registry, engine = _command_runtime(registry_path, state_home)
+    config = _call(registry.load)
     selected = _selected_targets(
-        _call(registry.load), targets=targets, target=target, all_targets=all_targets
+        config, targets=targets, target=target, all_targets=all_targets
     )
     _emit_plan(_call(lambda: engine.plan(selected or ())), json_output)
 
@@ -356,11 +357,13 @@ def launch_channel_command(
     context: typer.Context,
     channel: str,
     framework: Annotated[Framework, typer.Option("--framework")],
+    json_output: Annotated[bool, typer.Option("--json")] = False,
     registry_path: Annotated[Path | None, typer.Option("--registry")] = None,
     state_home: Annotated[Path | None, typer.Option("--state-home")] = None,
 ) -> None:
     registry, engine = _command_runtime(registry_path, state_home)
-    config = _call(registry.load)
+    registry_snapshot = _call(registry.load_snapshot)
+    config = registry_snapshot.config
     candidates = tuple(
         target
         for target in config.targets
@@ -377,6 +380,17 @@ def launch_channel_command(
         )
     target = candidates[0]
     receipt = _call(lambda: engine.audit((target.id,)))
+    current_snapshot = _call(registry.load_snapshot)
+    snapshot_changed = (
+        current_snapshot.fingerprint != registry_snapshot.fingerprint
+        or current_snapshot.registry_identity != registry_snapshot.registry_identity
+        or current_snapshot.config != registry_snapshot.config
+    )
+    if snapshot_changed:
+        _fail("registry changed during launch audit")
+    current_targets = {item.id: item for item in current_snapshot.config.targets}
+    if current_targets.get(target.id) != target:
+        _fail("registry target changed during launch audit")
     if receipt.operation != "audit" or len(receipt.targets) != 1:
         _fail("launch requires fresh audit evidence for exactly one target")
     status = receipt.targets[0]
@@ -393,11 +407,28 @@ def launch_channel_command(
         _fail(f"target state {status.state.value} is not launchable")
     adapter = get_adapter(framework)
     readiness = adapter.target_readiness(target.home)
+    launch_data = {
+        "channel": channel,
+        "commit": status.commit,
+        "target_id": target.id,
+        "framework": framework.value,
+        "home": str(target.home),
+        "readiness": {
+            "ready": readiness.ready,
+            "prerequisite": readiness.prerequisite,
+        },
+    }
     if not readiness.ready:
+        if json_output:
+            typer.echo(json.dumps(launch_data, indent=2))
+            raise typer.Exit(1)
         _fail(readiness.prerequisite or "framework target is not ready")
     if adapter.executable is None:
         _fail(f"framework {framework.value} has no executable")
-    typer.echo(f"channel={channel} commit={status.commit}")
+    if json_output:
+        typer.echo(json.dumps(launch_data, indent=2))
+    else:
+        typer.echo(f"channel={channel} commit={status.commit}")
     environment = dict(os.environ)
     environment.update(adapter.target_environment(target.home))
     arguments = [adapter.executable, *context.args]

@@ -161,13 +161,31 @@ class DeploymentManifest:
 
 
 @dataclass(frozen=True)
+class TargetSource:
+    target_id: str
+    channel: str
+    source_id: str
+    ref: str
+    commit: str
+
+    def __post_init__(self) -> None:
+        _nonempty(self.target_id, "target id")
+        _nonempty(self.channel, "target channel")
+        _nonempty(self.source_id, "source id")
+        _nonempty(self.ref, "source ref")
+        _nonempty(self.commit, "source commit")
+
+
+@dataclass(frozen=True)
 class DeploymentPlan:
     snapshots: tuple[SourceSnapshot, ...]
     provider_plans: tuple[ProviderPlan, ...]
+    target_sources: tuple[TargetSource, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "snapshots", tuple(self.snapshots))
         object.__setattr__(self, "provider_plans", tuple(self.provider_plans))
+        object.__setattr__(self, "target_sources", tuple(self.target_sources))
 
 
 class TargetState(StrEnum):

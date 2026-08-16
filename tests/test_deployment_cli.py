@@ -14,11 +14,13 @@ from agent_ops.deployment.models import (
     ProviderPlan,
     RewriteAcceptance,
     SourceSnapshot,
+    SourceSpec,
+    TargetSource,
     TargetSpec,
     TargetState,
     TargetStatus,
 )
-from agent_ops.deployment.registry import ChannelSpec, RegistryConfig
+from agent_ops.deployment.registry import ChannelSpec, RegistryConfig, RegistrySnapshot
 from agent_ops.registries.models import Framework
 
 runner = CliRunner()
@@ -29,9 +31,14 @@ OLD_COMMIT = "b" * 40
 @dataclass
 class FakeRegistry:
     config: RegistryConfig
+    fingerprint: str = "c" * 64
+    identity: tuple[int, int] = (1, 1)
 
     def load(self) -> RegistryConfig:
         return self.config
+
+    def load_snapshot(self) -> RegistrySnapshot:
+        return RegistrySnapshot(self.config, self.fingerprint, self.identity)
 
 
 class FakeEngine:
@@ -49,6 +56,15 @@ class FakeEngine:
         return DeploymentPlan(
             (SourceSnapshot("community", "refs/heads/feat/demo", COMMIT, Path("/snapshot")),),
             (ProviderPlan("skills", COMMIT, target, (), (Path("obsolete"),)),),
+            (
+                TargetSource(
+                    target.id,
+                    target.channel,
+                    "community",
+                    "refs/heads/feat/demo",
+                    COMMIT,
+                ),
+            ),
         )
 
     def refresh(self, target_ids, *, rewrite=None):
@@ -69,8 +85,6 @@ class FakeEngine:
 
 
 def _config(home: Path = Path("/tmp/codex-demo")) -> RegistryConfig:
-    from agent_ops.deployment.models import SourceSpec
-
     return RegistryConfig(
         1,
         (SourceSpec("community", "https://example.invalid/community.git"),),
@@ -118,6 +132,73 @@ def test_deployment_plan_is_read_only_and_reports_commit(tmp_path: Path, monkeyp
     assert result.exit_code == 0
     assert result.output == f"codex-demo: demo {COMMIT} providers=skills files=0 removals=1\n"
     assert engine.calls == [("plan", ("codex-demo",))]
+
+
+def test_deployment_plan_associates_equal_commits_with_exact_channel_refs(
+    tmp_path: Path, monkeypatch
+) -> None:
+    registry, engine = _runtime(monkeypatch, tmp_path)
+    stable = TargetSpec("codex-stable", Framework.CODEX, tmp_path / "stable", "stable")
+    branch = TargetSpec("codex-demo", Framework.CODEX, tmp_path / "demo", "demo")
+    other = TargetSpec("claude-other", Framework.CLAUDE_CODE, tmp_path / "other", "other")
+    registry.config = RegistryConfig(
+        registry.config.schema_version,
+        registry.config.sources
+        + (SourceSpec("other", "https://example.invalid/other.git"),),
+        registry.config.channels
+        + (ChannelSpec("other", "other", "refs/heads/feat/demo"),),
+        (stable, branch, other),
+    )
+
+    def colliding_plan(target_ids):
+        engine.calls.append(("plan", target_ids))
+        return DeploymentPlan(
+            (
+                SourceSnapshot("community", "refs/heads/main", COMMIT, Path("/stable")),
+                SourceSnapshot(
+                    "community", "refs/heads/feat/demo", COMMIT, Path("/branch")
+                ),
+                SourceSnapshot("other", "refs/heads/feat/demo", COMMIT, Path("/other")),
+            ),
+            (
+                ProviderPlan("skills", COMMIT, stable, (), (Path("old-stable"),)),
+                ProviderPlan("skills", COMMIT, branch, (), (Path("old-branch"),)),
+                ProviderPlan("skills", COMMIT, other, (), (Path("old-other"),)),
+            ),
+            (
+                TargetSource(
+                    stable.id,
+                    stable.channel,
+                    "community",
+                    "refs/heads/main",
+                    COMMIT,
+                ),
+                TargetSource(
+                    branch.id,
+                    branch.channel,
+                    "community",
+                    "refs/heads/feat/demo",
+                    COMMIT,
+                ),
+                TargetSource(
+                    other.id,
+                    other.channel,
+                    "other",
+                    "refs/heads/feat/demo",
+                    COMMIT,
+                ),
+            ),
+        )
+
+    engine.plan = colliding_plan
+
+    result = runner.invoke(app, ["deployment", "plan", "--all", "--json"])
+
+    assert result.exit_code == 0
+    rows = {row["target_id"]: row for row in json.loads(result.output)}
+    assert rows["codex-stable"]["ref"] == "refs/heads/main"
+    assert rows["codex-demo"]["ref"] == "refs/heads/feat/demo"
+    assert rows["claude-other"]["source"] == "other"
 
 
 def test_refresh_and_audit_delegate_one_engine_operation(tmp_path: Path, monkeypatch) -> None:
@@ -310,12 +391,90 @@ def test_channel_launch_prints_identity_and_execs_with_only_target_overlay(
     assert engine.calls == [("audit", ("codex-demo",))]
 
 
+@pytest.mark.parametrize("separator", [[], ["--"]])
+def test_channel_launch_json_is_consumed_and_never_forwarded(
+    tmp_path: Path, monkeypatch, separator: list[str]
+) -> None:
+    from agent_ops.deployment import cli as deployment_cli
+
+    _, engine = _runtime(monkeypatch, tmp_path)
+    observed = {}
+
+    def fake_exec(executable, argv, environment):
+        observed.update(executable=executable, argv=argv, environment=environment)
+
+    monkeypatch.setattr(deployment_cli.os, "execvpe", fake_exec)
+    monkeypatch.setattr(deployment_cli.os, "environ", {"PATH": "/bin"})
+    home = tmp_path / "codex-demo"
+    home.mkdir()
+    (home / "auth.json").write_text("secret", encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        [
+            "channel",
+            "launch",
+            "demo",
+            "--framework",
+            "codex",
+            "--json",
+            *separator,
+            "--quiet",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert json.loads(result.output) == {
+        "channel": "demo",
+        "commit": COMMIT,
+        "target_id": "codex-demo",
+        "framework": "codex",
+        "home": str(home),
+        "readiness": {"ready": True, "prerequisite": None},
+    }
+    assert observed["argv"] == ["codex", "--quiet"]
+    assert "--json" not in observed["argv"]
+    assert engine.calls == [("audit", ("codex-demo",))]
+
+
 def test_channel_launch_refuses_unready_target(tmp_path: Path, monkeypatch) -> None:
     _, engine = _runtime(monkeypatch, tmp_path)
 
     unready = runner.invoke(app, ["channel", "launch", "demo", "--framework", "codex"])
     assert unready.exit_code == 1
     assert f"CODEX_HOME={tmp_path / 'codex-demo'} codex login" in unready.output
+    assert engine.calls == [("audit", ("codex-demo",))]
+
+
+def test_channel_launch_json_reports_unready_target_without_exec(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from agent_ops.deployment import cli as deployment_cli
+
+    _, engine = _runtime(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        deployment_cli.os,
+        "execvpe",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("unready target must not exec")),
+    )
+
+    result = runner.invoke(
+        app,
+        ["channel", "launch", "demo", "--framework", "codex", "--json"],
+    )
+
+    assert result.exit_code == 1
+    assert json.loads(result.output) == {
+        "channel": "demo",
+        "commit": COMMIT,
+        "target_id": "codex-demo",
+        "framework": "codex",
+        "home": str(tmp_path / "codex-demo"),
+        "readiness": {
+            "ready": False,
+            "prerequisite": f"CODEX_HOME={tmp_path / 'codex-demo'} codex login",
+        },
+    }
     assert engine.calls == [("audit", ("codex-demo",))]
 
 
@@ -354,3 +513,68 @@ def test_channel_launch_rejects_audit_evidence_for_another_channel(
 
     assert result.exit_code == 1
     assert "audit evidence does not match the selected target channel" in result.output
+
+
+def test_channel_launch_rejects_registry_home_change_during_audit(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from agent_ops.deployment import cli as deployment_cli
+
+    registry, engine = _runtime(monkeypatch, tmp_path)
+    old_home = tmp_path / "old-codex"
+    new_home = tmp_path / "new-codex"
+    registry.config = _config(old_home)
+    old_home.mkdir()
+    (old_home / "auth.json").write_text("old-secret", encoding="utf-8")
+    new_home.mkdir()
+    (new_home / "auth.json").write_text("new-secret", encoding="utf-8")
+
+    def audit_then_change(target_ids):
+        engine.calls.append(("audit", target_ids))
+        registry.config = _config(new_home)
+        registry.fingerprint = "d" * 64
+        registry.identity = (1, 2)
+        return DeploymentReceipt("audit", (COMMIT,), (engine.result_status,))
+
+    def must_not_check_readiness(_framework):
+        raise AssertionError("changed registry target must not reach readiness")
+
+    engine.audit = audit_then_change
+    monkeypatch.setattr(deployment_cli, "get_adapter", must_not_check_readiness)
+    monkeypatch.setattr(
+        deployment_cli.os,
+        "execvpe",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("must not exec")),
+    )
+
+    result = runner.invoke(app, ["channel", "launch", "demo", "--framework", "codex"])
+
+    assert result.exit_code == 1
+    assert "registry changed during launch audit" in result.output
+    assert engine.calls == [("audit", ("codex-demo",))]
+
+
+def test_channel_launch_rejects_registry_aba_save_during_audit(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from agent_ops.deployment import cli as deployment_cli
+
+    registry, engine = _runtime(monkeypatch, tmp_path)
+
+    def audit_during_aba_save(target_ids):
+        engine.calls.append(("audit", target_ids))
+        registry.identity = (1, 9)
+        return DeploymentReceipt("audit", (COMMIT,), (engine.result_status,))
+
+    engine.audit = audit_during_aba_save
+    monkeypatch.setattr(
+        deployment_cli.os,
+        "execvpe",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("must not exec")),
+    )
+
+    result = runner.invoke(app, ["channel", "launch", "demo", "--framework", "codex"])
+
+    assert result.exit_code == 1
+    assert "registry changed during launch audit" in result.output
+    assert engine.calls == [("audit", ("codex-demo",))]
