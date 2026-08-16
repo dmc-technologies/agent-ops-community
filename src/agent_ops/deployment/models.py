@@ -25,8 +25,8 @@ def _repository_relative_path(path: Path) -> Path:
 
 
 def _nonempty(value: str, name: str) -> None:
-    if not value:
-        raise ValueError(f"{name} must be nonempty")
+    if type(value) is not str or not value:
+        raise ValueError(f"{name} must be nonempty exact string")
 
 
 @dataclass(frozen=True)

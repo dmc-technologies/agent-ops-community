@@ -196,6 +196,90 @@ def test_channel_transition_process_control_is_preserved_before_mutation(
     assert not home.exists()
 
 
+class _TransitionStringSubclass(str):
+    pass
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("target_id", True),
+        ("target_id", 1),
+        ("target_id", Path("codex-dev")),
+        ("target_id", _TransitionStringSubclass("codex-dev")),
+        ("expected_prior_channel", True),
+        ("expected_prior_channel", 1),
+        ("expected_prior_channel", Path("stable")),
+        ("expected_prior_channel", _TransitionStringSubclass("stable")),
+        ("candidate_channel", True),
+        ("candidate_channel", 1),
+        ("candidate_channel", Path("feature")),
+        ("candidate_channel", _TransitionStringSubclass("feature")),
+    ],
+)
+def test_invalid_channel_transition_cannot_create_initial_install_state(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    home = tmp_path / "home"
+    plan = ProviderPlan(
+        "fixture",
+        "1" * 40,
+        TargetSpec("codex-dev", Framework.CODEX, home, "feature"),
+        (PlannedFile(Path("skills/example/SKILL.md"), b"body\n", 0o644),),
+    )
+    values: dict[str, object] = {
+        "target_id": "codex-dev",
+        "expected_prior_channel": "stable",
+        "candidate_channel": "feature",
+    }
+    values[field] = value
+
+    with pytest.raises(ValueError, match="nonempty exact string"):
+        transition = TargetChannelTransition(**values)  # type: ignore[arg-type]
+        install_provider_plans((plan,), channel_transitions=(transition,))
+
+    assert not home.exists()
+
+
+@pytest.mark.parametrize(
+    "expected_prior_channel,candidate_channel",
+    [("feature", "feature"), ("stable", "feature")],
+)
+def test_first_install_channel_transition_round_trips_through_recovery_and_rollback(
+    tmp_path: Path, expected_prior_channel: str, candidate_channel: str
+) -> None:
+    home = tmp_path / "home"
+    plan = ProviderPlan(
+        "fixture",
+        "1" * 40,
+        TargetSpec("codex-dev", Framework.CODEX, home, candidate_channel),
+        (PlannedFile(Path("skills/example/SKILL.md"), b"body\n", 0o644),),
+    )
+    transition = TargetChannelTransition(
+        "codex-dev", expected_prior_channel, candidate_channel
+    )
+
+    manifest = install_provider_plans(
+        (plan,), channel_transitions=(transition,)
+    )[0]
+    record_path = (
+        home
+        / ".agentops/deployment/transactions"
+        / manifest.transaction_id
+        / "record.json"
+    )
+    record = json.loads(record_path.read_text())
+    assert record["expected_prior_channel"] == expected_prior_channel
+    assert record["candidate_channel"] == candidate_channel
+    assert record["prior_manifest_content"] is None
+    assert recover_transaction(record_path) == manifest
+
+    rollback_manifests((manifest,))
+
+    assert not (home / "skills/example/SKILL.md").exists()
+    assert not list((home / ".agentops/deployment/manifests").glob("*.json"))
+
+
 @pytest.mark.parametrize("field", ["expected_prior_channel", "candidate_channel"])
 @pytest.mark.parametrize("operation", ["rollback", "recover"])
 def test_rollback_rejects_tampered_channel_transition_record(

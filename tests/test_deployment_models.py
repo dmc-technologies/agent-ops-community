@@ -54,6 +54,41 @@ def test_target_channel_transition_is_explicit_and_immutable() -> None:
         TargetChannelTransition("codex-dev", "", "feature")
 
 
+class _StringSubclass(str):
+    pass
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("target_id", True),
+        ("target_id", 1),
+        ("target_id", Path("codex-dev")),
+        ("target_id", _StringSubclass("codex-dev")),
+        ("expected_prior_channel", True),
+        ("expected_prior_channel", 1),
+        ("expected_prior_channel", Path("stable")),
+        ("expected_prior_channel", _StringSubclass("stable")),
+        ("candidate_channel", True),
+        ("candidate_channel", 1),
+        ("candidate_channel", Path("feature")),
+        ("candidate_channel", _StringSubclass("feature")),
+    ],
+)
+def test_target_channel_transition_rejects_nonexact_string_fields(
+    field: str, value: object
+) -> None:
+    values: dict[str, object] = {
+        "target_id": "codex-dev",
+        "expected_prior_channel": "stable",
+        "candidate_channel": "feature",
+    }
+    values[field] = value
+
+    with pytest.raises(ValueError, match="nonempty exact string"):
+        TargetChannelTransition(**values)  # type: ignore[arg-type]
+
+
 @pytest.mark.parametrize(
     "path",
     (
