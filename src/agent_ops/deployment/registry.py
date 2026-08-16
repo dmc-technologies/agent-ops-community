@@ -853,6 +853,11 @@ def _read_receipt_wrapper(
     )
 
 
+def _read_receipt_fingerprint(receipts: int, name: str) -> str:
+    fingerprint, _receipt = _read_receipt_wrapper(receipts, name)
+    return fingerprint
+
+
 def _validate_fingerprint(value: Any) -> str:
     if type(value) is not str or _FINGERPRINT.fullmatch(value) is None:
         raise ValueError("registry fingerprint must be 64 lowercase hex characters")
@@ -1245,7 +1250,7 @@ def _receipt_names_for_append(
 
 
 def _validate_contiguous_names(
-    names: tuple[str, ...], counter: int, *, allow_orphan: bool
+    names: list[str] | tuple[str, ...], counter: int, *, allow_orphan: bool
 ) -> int:
     maximum_count = counter + (1 if allow_orphan else 0)
     if len(names) > maximum_count:
@@ -1296,21 +1301,22 @@ def _recover_history_before_save(
                 temporary_names.append(name)
             else:
                 raise RuntimeError(f"unexpected entry in receipt directory: {name}")
-        names = tuple(sorted(receipt_names))
-        count = _validate_contiguous_names(names, counter, allow_orphan=True)
-        parsed = {
-            name: _read_receipt_wrapper(receipts, name)
-            for name in names
-        }
+        receipt_names.sort()
+        count = _validate_contiguous_names(receipt_names, counter, allow_orphan=True)
+        orphan_fingerprint: str | None = None
+        for sequence, name in enumerate(receipt_names):
+            fingerprint = _read_receipt_fingerprint(receipts, name)
+            if sequence == counter:
+                orphan_fingerprint = fingerprint
         if len(temporary_names) > 1:
             raise RuntimeError("receipt history contains multiple interrupted stages")
         temporary = temporary_names[0] if temporary_names else None
         if temporary is not None:
-            staged_fingerprint, _ = _read_receipt_wrapper(receipts, temporary)
+            staged_fingerprint = _read_receipt_fingerprint(receipts, temporary)
             if staged_fingerprint != current_fingerprint:
                 raise RuntimeError("orphan receipt fingerprint does not match old registry")
             if count == counter + 1:
-                if parsed[destination][0] != current_fingerprint:
+                if orphan_fingerprint != current_fingerprint:
                     raise RuntimeError("orphan receipt fingerprint does not match old registry")
                 if _optional_regular_identity(
                     receipts, destination, "orphan receipt"
@@ -1328,15 +1334,11 @@ def _recover_history_before_save(
                     follow_symlinks=False,
                 )
                 count += 1
+                orphan_fingerprint = staged_fingerprint
             before_mutation()
             os.unlink(temporary, dir_fd=receipts)
             os.fsync(receipts)
         if count == counter + 1:
-            orphan_fingerprint = (
-                parsed[destination][0]
-                if destination in parsed
-                else current_fingerprint
-            )
             if orphan_fingerprint != current_fingerprint:
                 raise RuntimeError("orphan receipt fingerprint does not match old registry")
             if counter >= _MAX_RECEIPTS:

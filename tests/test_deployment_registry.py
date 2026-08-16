@@ -7,6 +7,7 @@ import os
 import stat
 import subprocess
 import sys
+import weakref
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
@@ -896,6 +897,45 @@ def test_save_refuses_corrupt_orphan_without_replacing_registry(tmp_path: Path) 
 
     assert registry.path.read_bytes() == original_registry
     assert counter.read_bytes() == b"0\n"
+
+
+def test_save_streams_large_historical_receipt_validation_with_constant_retention(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry = _registry(tmp_path)
+    registry.save(_config(tmp_path))
+    snapshot = registry.load_snapshot()
+    registry.state_path.mkdir(mode=0o700)
+    registry.receipts_path.mkdir(mode=0o700)
+    count = 96
+    counter = registry.state_path / "receipt-count"
+    counter.write_text(f"{count}\n")
+    counter.chmod(0o600)
+    payload = b"x" * (32 * 1024)
+    for sequence in range(count):
+        receipt_path = registry.receipts_path / f"{sequence:020d}.json"
+        receipt_path.write_bytes(payload)
+        receipt_path.chmod(0o600)
+
+    alive: weakref.WeakSet[object] = weakref.WeakSet()
+    peak_retained = 0
+
+    class ParsedReceipt:
+        pass
+
+    def track_parse(directory: int, name: str) -> tuple[str, object]:
+        del directory, name
+        nonlocal peak_retained
+        parsed = ParsedReceipt()
+        alive.add(parsed)
+        peak_retained = max(peak_retained, len(alive))
+        return snapshot.fingerprint, parsed
+
+    monkeypatch.setattr(registry_module, "_read_receipt_wrapper", track_parse)
+    registry.save(_config(tmp_path, channel="feature"))
+
+    assert peak_retained <= 2
+    assert len(alive) <= 1
 
 
 def test_receipt_records_preserve_mixed_registry_fingerprints(tmp_path: Path) -> None:
