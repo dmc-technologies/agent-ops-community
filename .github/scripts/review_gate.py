@@ -4,7 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -15,6 +18,8 @@ from pathlib import Path
 
 COMMENT_MARKER = "<!-- review-gate-agent-review -->"
 FINDING_MARKER_PREFIX = "<!-- review-gate-finding:"
+RESOLUTION_STATE_MARKER_PREFIX = "<!-- review-gate-resolution-state:"
+FOLLOW_UP_ISSUE_MARKER_PREFIX = "<!-- review-gate-follow-up:"
 STATUS_CONTEXT_THOROUGH = "Review Gate"
 DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
 REVIEW_EFFORTS = ("low", "medium", "high", "xhigh")
@@ -33,7 +38,14 @@ HIGH_RISK_DOMAINS = {
     "provider_boundary",
     "public_contract",
 }
-MATERIAL_CONSEQUENCE_CLASSES = {
+CRITICAL_CONSEQUENCE_CLASSES = {
+    "acceptance_evidence",
+    "core_behavior",
+    "data_loss",
+    "safety",
+    "security",
+}
+NONCRITICAL_CONSEQUENCE_CLASSES = {
     "compatibility",
     "correctness",
     "data",
@@ -41,6 +53,27 @@ MATERIAL_CONSEQUENCE_CLASSES = {
     "operations",
     "security",
 }
+ALL_CONSEQUENCE_CLASSES = CRITICAL_CONSEQUENCE_CLASSES | NONCRITICAL_CONSEQUENCE_CLASSES
+REVIEW_FAILURE_CODES = {
+    "CODEX_REVIEW_FAILED",
+    "CODEX_REVIEW_UNPARSEABLE",
+    "CODEX_REVIEW_INVALID",
+}
+CRITICAL_PATH_RULES = (
+    ("privileged_workflow", (".github/workflows/", "scripts/release", "scripts/deploy")),
+    (
+        "ci_policy",
+        ("configs/global/agents.md", "review-gate", "branch-protection", "branch_protection"),
+    ),
+    ("authorization", ("/auth/", "authorization", "permission", "access_control")),
+    ("credentials", ("credential", "secret", "token", "keyring")),
+    ("irreversible_state", ("migration", "schema", "database", "storage", "persistence")),
+    ("engineering_source_authority", ("source_authority", "source-authority", "provenance")),
+    ("safety", ("safety", "allowable", "load_case", "load-case", "solver")),
+    ("public_contract", ("openapi", "public_api", "public-api", "/api/", "protocol")),
+    ("provider_boundary", ("provider", "adapter", "connector")),
+    ("concurrency", ("concurrency", "locking", "mutex", "queue", "worker")),
+)
 DEFAULT_REVIEW_PROMPT = """# Review Gate Prompt
 
 Review this PR for necessity, company-policy alignment, architecture, AI safety,
@@ -64,11 +97,27 @@ class Finding:
 
 @dataclass(frozen=True)
 class ReviewProfile:
+    scope: str = "lite"
     effort: str = "xhigh"
     confidence: str = "low"
     risk_domains: tuple[str, ...] = ()
     reasons: tuple[str, ...] = ()
     review_questions: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ResolutionState:
+    sha: str
+    scope: str
+    findings: tuple[Finding, ...]
+
+
+@dataclass(frozen=True)
+class ReviewStage:
+    name: str = "discovery"
+    scope: str | None = None
+    delta_from_sha: str | None = None
+    carried_findings: tuple[Finding, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -249,8 +298,19 @@ def build_profile_section(profile: ReviewProfile | None) -> str:
         "\n".join(f"- {question}" for question in profile.review_questions)
         or "- Apply the repository review prompt to the complete diff."
     )
-    return f"""## Classified review profile
+    if profile.scope == "critical":
+        scope_instruction = (
+            "Review the complete diff and affected trust, data, source-authority, "
+            "public-contract, and operational boundaries."
+        )
+    else:
+        scope_instruction = (
+            "Review changed functions, their direct callers, and affected tests. "
+            "Expand only when concrete evidence points to a critical consequence."
+        )
+    return f"""## Review profile
 
+Scope: {profile.scope}
 Reasoning effort: {profile.effort}
 Risk domains: {domains}
 
@@ -260,9 +320,42 @@ Classification reasons:
 Questions requiring focused review:
 {questions}
 
-The profile focuses the review; it does not narrow the diff and it is not
-authoritative. Report a material defect outside these domains when the evidence
-requires it.
+{scope_instruction}
+
+"""
+
+
+def build_stage_section(
+    stage: str,
+    carried_findings: tuple[Finding, ...],
+) -> str:
+    if stage != "resolution":
+        return """## Discovery review
+
+This is the one discovery review for this pull request head. Find all verified
+defects in the assigned scope in this pass and group instances by root cause.
+
+"""
+    carried = []
+    for finding in carried_findings:
+        files = ", ".join(finding.files) or "no file recorded"
+        carried.append(
+            f"- {finding.title} [root cause: {finding.root_cause or finding.code}; "
+            f"files: {files}]\n  {finding.detail}"
+        )
+    carried_text = "\n".join(carried) or "- No carried critical finding was supplied."
+    return f"""## Targeted resolution check
+
+Do not repeat the discovery review. Check only:
+- whether every carried critical finding below is resolved;
+- the fix delta and directly affected callers or interfaces; and
+- any new critical defect caused by the fix.
+
+Do not search unchanged code for new findings. A verified noncritical defect in
+the fix delta may be a follow-up; it must not block this resolution check.
+
+Carried critical findings:
+{carried_text}
 
 """
 
@@ -276,12 +369,18 @@ def build_codex_prompt(
     base_ref: str,
     base_diff_ref: str,
     profile: ReviewProfile | None = None,
+    stage: str = "discovery",
+    delta_from_sha: str | None = None,
+    carried_findings: tuple[Finding, ...] = (),
 ) -> str:
     consequence_classes = (
-        '"compatibility" | "correctness" | "data" | "engineering" | '
-        '"operations" | "security" | "none"'
+        '"acceptance_evidence" | "compatibility" | "core_behavior" | '
+        '"correctness" | "data" | "data_loss" | "engineering" | '
+        '"operations" | "safety" | "security" | "none"'
     )
     profile_section = build_profile_section(profile)
+    stage_section = build_stage_section(stage, carried_findings)
+    diff_ref = delta_from_sha if stage == "resolution" and delta_from_sha else base_diff_ref
     return f"""You are executing the repository PR review gate.
 
 Repository: {repo}
@@ -291,37 +390,38 @@ Base ref: {base_ref}
 
 Use the local checkout as the source of truth. Review the PR diff with:
 
-git diff {base_diff_ref}...HEAD
+git diff {diff_ref}...HEAD
 
 Apply this review prompt:
 
 {review_prompt}
 
-{profile_section}## Complete material-defect search
+{profile_section}{stage_section}## Finding policy
 
-Enumerate EVERY blocking finding present in the diff scope shown above in this
-one pass. Do not defer or ration findings for a later review round --
-assume there is no cheap later round and that omitted issues ship. Before
-returning:
+Report every verified defect in the assigned scope in this one pass. Before returning:
 - Re-scan the changes under review for additional INSTANCES of every issue class
   you found, but report one finding per root cause and include the affected files
   in that single finding.
-- Investigate broadly in reasoning. A finding is reportable only when the PR
+- A finding is reportable only when the PR
   introduced an implementation defect that exists now, a plausible current path
-  reaches that defect, it has a concrete material consequence, the evidence is
-  specific, confidence is high, and a correction is required before merge.
+  reaches that defect, the consequence and evidence are specific, and confidence
+  is high.
+- Use disposition=block only for a proven critical consequence: security,
+  safety, data loss, broken core behavior, or false acceptance evidence. A
+  sensitive change receives deeper review but does not block by category alone.
+- Use disposition=follow_up for a verified noncritical defect. It will be filed
+  in one follow-up issue and must not fail the gate.
 - A missing test, proof, comment, or documentation is not a current implementation
   defect. Possible future regression is not a current failure path. If current
-  behavior is correct, suppress the observation. If implementation behavior is
+  behavior is correct, ignore the observation. If implementation behavior is
   incorrect, report that behavior as the defect; coverage may be part of the
   correction but never the root cause.
-- Suppress style, naming, formatting, general refactoring, hypothetical future
+- Ignore style, naming, formatting, general refactoring, hypothetical future
   extensions, documentation maintenance without a broken operational path,
   missing coverage without a demonstrated material consequence, pre-existing
   issues, approval prerequisites, and failures already reported by deterministic
   checks or CI.
-- P3 can never block. A P2 finding blocks only when it independently satisfies
-  every materiality field below.
+- Severity does not decide merge authority. The proven consequence does.
 
 Return only valid JSON with this exact shape:
 {{
@@ -330,7 +430,7 @@ Return only valid JSON with this exact shape:
   "findings": [
     {{
       "severity": "P0" | "P1" | "P2" | "P3",
-      "disposition": "block" | "suppress",
+      "disposition": "block" | "follow_up" | "ignore",
       "title": "Short imperative finding title",
       "body": "Specific evidence from the changed code.",
       "files": ["relative/path.ext"],
@@ -342,15 +442,14 @@ Return only valid JSON with this exact shape:
       "confidence": "high" | "medium" | "low",
       "root_cause": "Stable identifier shared by related instances.",
       "already_caught_by": "none" | "CI/check name or explicit prerequisite",
-      "required_correction": "Correction required before merge, or empty when suppressed."
+      "required_correction": "Required correction, follow-up resolution, or empty."
     }}
   ]
 }}
 
-Use disposition=suppress for observations that fail any materiality condition.
-Suppressed observations are retained only for shadow evaluation and are never
-posted to the pull request. If there are no reportable findings, return
-"approve"; the findings array may contain suppressed observations.
+Return request_changes only when at least one finding has disposition=block.
+Return comment when findings contain only follow_up entries. Return approve when
+there are no block or follow_up entries. Ignored observations are never posted.
 Do not include markdown fences or prose outside the JSON object.
 """
 
@@ -374,144 +473,79 @@ def ensure_base_ref(workspace: Path, repo: str, base_ref: str) -> str:
     return target_ref
 
 
-def build_classification_prompt(
-    *,
-    repo: str,
-    pr_number: int,
-    sha: str,
-    base_ref: str,
-    base_diff_ref: str,
-) -> str:
-    return f"""Classify impact and review difficulty for this pull request.
-
-Repository: {repo}
-Pull request: #{pr_number}
-Head SHA: {sha}
-Base ref: {base_ref}
-
-Inspect the complete change with:
-
-git diff {base_diff_ref}...HEAD
-
-This is classification, not code review. Do not report defects and do not
-suggest fixes. Identify the effects that could make a small change consequential
-and choose the lowest Sol reasoning effort that can reliably review them.
-
-Routing rules:
-- low: clearly mechanical, generated, or presentation-only changes whose source
-  authority and behavior are unchanged.
-- medium: contained behavior with familiar local failure modes and no authority,
-  persistence, public-contract, concurrency, or engineering-source change.
-- high: cross-component behavior, persistence, public contracts, provider
-  behavior, concurrency, CI policy, or uncertain scope.
-- xhigh: authorization, credentials, privileged execution, irreversible state,
-  engineering source authority, safety decisions, or difficult novel behavior.
-- Low confidence must route to xhigh. Change size never lowers effort.
-
-Return only valid JSON:
-{{
-  "recommended_effort": "low" | "medium" | "high" | "xhigh",
-  "confidence": "high" | "medium" | "low",
-  "risk_domains": ["lower_snake_case_domain"],
-  "reasons": ["Concrete changed behavior used for routing."],
-  "review_questions": ["Question the full reviewer must answer."]
-}}
-"""
-
-
 def _string_tuple(value: object) -> tuple[str, ...]:
     if not isinstance(value, list):
         return ()
     return tuple(str(item).strip() for item in value if str(item).strip())
 
 
-def review_profile_from_payload(payload: dict) -> ReviewProfile:
-    effort = str(payload.get("recommended_effort") or "").lower()
-    confidence = str(payload.get("confidence") or "").lower()
-    reasons = _string_tuple(payload.get("reasons"))
-    questions = _string_tuple(payload.get("review_questions"))
-    valid = (
-        effort in REVIEW_EFFORTS
-        and confidence in {"high", "medium", "low"}
-        and isinstance(payload.get("risk_domains"), list)
-        and bool(reasons)
-        and bool(questions)
-    )
-    if not valid:
+def classify_review_profile(changed_files: list[str] | None) -> ReviewProfile:
+    """Choose lite or critical scope without spending a separate model call."""
+    if changed_files is None:
         return ReviewProfile(
+            scope="critical",
             effort="xhigh",
             confidence="low",
-            reasons=("Classification output was incomplete; routed fail-closed to xhigh.",),
+            reasons=("Changed paths were unavailable, so review scope expanded.",),
+            review_questions=("What trust, data, or public boundaries does the change affect?",),
         )
-    domains = tuple(
-        domain.lower().replace("-", "_")
-        for domain in _string_tuple(payload.get("risk_domains"))
-    )
-    if confidence == "low" or CRITICAL_RISK_DOMAINS.intersection(domains):
-        effort = "xhigh"
-    elif HIGH_RISK_DOMAINS.intersection(domains) and REVIEW_EFFORTS.index(effort) < 2:
-        effort = "high"
+
+    domains: list[str] = []
+    reasons: list[str] = []
+    normalized = tuple(path.lower().replace("\\", "/") for path in changed_files)
+    for domain, needles in CRITICAL_PATH_RULES:
+        matched = sorted({path for path in normalized if any(needle in path for needle in needles)})
+        if not matched:
+            continue
+        domains.append(domain)
+        reasons.append(f"{domain} path changed: {', '.join(matched[:3])}")
+
+    if domains:
+        return ReviewProfile(
+            scope="critical",
+            effort="xhigh",
+            confidence="high",
+            risk_domains=tuple(domains),
+            reasons=tuple(reasons),
+            review_questions=tuple(
+                f"Can the {domain.replace('_', ' ')} change cause a critical consequence?"
+                for domain in domains
+            ),
+        )
     return ReviewProfile(
-        effort=effort,
-        confidence=confidence,
-        risk_domains=domains,
-        reasons=reasons,
-        review_questions=questions,
+        scope="lite",
+        effort="medium",
+        confidence="high",
+        reasons=("No configured critical path changed.",),
+        review_questions=("Do changed functions and their direct callers behave correctly?",),
     )
 
 
-def run_codex_classification(
+def select_review_stage(
     workspace: Path,
-    *,
-    repo: str,
-    pr_number: int,
-    sha: str,
-    base_ref: str,
-    base_diff_ref: str | None = None,
-) -> ReviewProfile:
-    base_diff_ref = base_diff_ref or ensure_base_ref(workspace, repo, base_ref)
-    output_path = workspace / ".review-gate-classification.json"
-    prompt = build_classification_prompt(
-        repo=repo,
-        pr_number=pr_number,
-        sha=sha,
-        base_ref=base_ref,
-        base_diff_ref=base_diff_ref,
-    )
-    result = run_command(
-        [
-            "codex",
-            "exec",
-            "--skip-git-repo-check",
-            "--ephemeral",
-            "--ignore-rules",
-            "--sandbox",
-            "danger-full-access",
-            "--output-last-message",
-            str(output_path),
-            *codex_model_args(effort="low"),
-        ],
-        cwd=workspace,
-        env=codex_child_env(),
-        input_text=prompt,
-    )
-    raw = output_path.read_text(encoding="utf-8") if output_path.exists() else result.stdout
-    output_path.unlink(missing_ok=True)
-    if result.returncode != 0:
-        return ReviewProfile(
-            effort="xhigh",
-            confidence="low",
-            reasons=("Classification did not complete; routed fail-closed to xhigh.",),
+    head_sha: str,
+    prior_state: ResolutionState | None,
+) -> ReviewStage:
+    if prior_state is None:
+        return ReviewStage()
+    if prior_state.sha == head_sha:
+        return ReviewStage(
+            name="unchanged",
+            scope=prior_state.scope,
+            delta_from_sha=prior_state.sha,
+            carried_findings=prior_state.findings,
         )
-    try:
-        payload = extract_json_object(raw)
-    except (ValueError, json.JSONDecodeError):
-        return ReviewProfile(
-            effort="xhigh",
-            confidence="low",
-            reasons=("Classification was invalid; routed fail-closed to xhigh.",),
-        )
-    return review_profile_from_payload(payload)
+    ancestor = run_command(
+        ["git", "merge-base", "--is-ancestor", prior_state.sha, "HEAD"], cwd=workspace
+    )
+    if ancestor.returncode != 0:
+        return ReviewStage()
+    return ReviewStage(
+        name="resolution",
+        scope=prior_state.scope,
+        delta_from_sha=prior_state.sha,
+        carried_findings=prior_state.findings,
+    )
 
 
 def extract_json_object(text: str) -> dict:
@@ -558,9 +592,9 @@ def _valid_finding_entry(item: object) -> bool:
     if introduced is not None and not isinstance(introduced, bool):
         return False
     disposition = str(item.get("disposition") or "").lower()
-    if disposition not in {"block", "suppress"}:
+    if disposition not in {"block", "follow_up", "ignore"}:
         return False
-    if disposition == "suppress":
+    if disposition == "ignore":
         return True
     required_strings = (
         "severity",
@@ -579,8 +613,9 @@ def _valid_finding_entry(item: object) -> bool:
     )
 
 
-def finding_from_payload(payload: dict, index: int) -> Finding | None:
-    if str(payload.get("disposition") or "").lower() != "block":
+def finding_from_payload(payload: dict, index: int) -> tuple[str, Finding] | None:
+    requested_disposition = str(payload.get("disposition") or "").lower()
+    if requested_disposition == "ignore":
         return None
     severity = str(payload.get("severity") or "P2").upper()
     if severity not in {"P0", "P1", "P2", "P3"}:
@@ -588,15 +623,22 @@ def finding_from_payload(payload: dict, index: int) -> Finding | None:
     consequence_class = str(payload.get("consequence_class") or "none").lower()
     confidence = str(payload.get("confidence") or "low").lower()
     already_caught = str(payload.get("already_caught_by") or "").strip().lower()
-    reportable = (
-        severity != "P3"
-        and payload.get("introduced_by_pr") is True
+    verified = (
+        payload.get("introduced_by_pr") is True
         and confidence == "high"
-        and consequence_class in MATERIAL_CONSEQUENCE_CLASSES
+        and consequence_class in ALL_CONSEQUENCE_CLASSES
         and already_caught == "none"
+        and bool(str(payload.get("current_behavior_defect") or "").strip())
+        and bool(str(payload.get("current_failure_path") or "").strip())
+        and bool(str(payload.get("consequence") or "").strip())
     )
-    if not reportable:
+    if not verified:
         return None
+    disposition = "block" if (
+        requested_disposition == "block"
+        and severity != "P3"
+        and consequence_class in CRITICAL_CONSEQUENCE_CLASSES
+    ) else "follow_up"
     title = str(payload.get("title") or f"Codex finding {index + 1}").strip()
     evidence = str(payload.get("body") or payload.get("detail") or "").strip()
     failure_path = str(payload.get("current_failure_path") or "").strip()
@@ -613,13 +655,16 @@ def finding_from_payload(payload: dict, index: int) -> Finding | None:
     files_payload = payload.get("files") or []
     files = tuple(str(item) for item in files_payload if str(item).strip())
     root_cause = str(payload.get("root_cause") or "").strip()
-    return Finding(
-        severity,
-        f"CODEX_{severity}_{index + 1}",
-        title,
-        detail,
-        files,
-        root_cause,
+    return (
+        disposition,
+        Finding(
+            severity,
+            f"CODEX_{severity}_{index + 1}",
+            title,
+            detail,
+            files,
+            root_cause,
+        ),
     )
 
 
@@ -657,6 +702,9 @@ def run_codex_review(
     base_ref: str,
     profile: ReviewProfile | None = None,
     base_diff_ref: str | None = None,
+    stage: str = "discovery",
+    delta_from_sha: str | None = None,
+    carried_findings: tuple[Finding, ...] = (),
 ) -> ReviewResult:
     base_diff_ref = base_diff_ref or ensure_base_ref(workspace, repo, base_ref)
     output_path = workspace / ".review-gate-codex-output.json"
@@ -668,6 +716,9 @@ def run_codex_review(
         base_ref=base_ref,
         base_diff_ref=base_diff_ref,
         profile=profile,
+        stage=stage,
+        delta_from_sha=delta_from_sha,
+        carried_findings=carried_findings,
     )
     result = run_command(
         [
@@ -755,15 +806,31 @@ def run_codex_review(
             raw_review=raw_review,
         )
     summary = str(payload.get("summary") or "").strip()
-    findings = tuple(
-        finding
+    classified_findings = tuple(
+        classified
         for index, item in enumerate(findings_payload)
-        if (finding := finding_from_payload(item, index)) is not None
+        if (classified := finding_from_payload(item, index)) is not None
     )
-    blocking = group_root_cause_findings(findings)
+    blocking = group_root_cause_findings(
+        tuple(finding for disposition, finding in classified_findings if disposition == "block")
+    )
+    warnings = group_root_cause_findings(
+        tuple(
+            finding
+            for disposition, finding in classified_findings
+            if disposition == "follow_up"
+        )
+    )
+    blocking_root_causes = {finding.root_cause for finding in blocking if finding.root_cause}
+    warnings = tuple(
+        finding
+        for finding in warnings
+        if not finding.root_cause or finding.root_cause not in blocking_root_causes
+    )
     return ReviewResult(
         "codex",
         summary=summary,
+        warnings=warnings,
         blocking=blocking,
         raw_review=raw_review,
         profile=profile,
@@ -778,16 +845,23 @@ def run_routed_codex_review(
     pr_number: int,
     sha: str,
     base_ref: str,
+    changed_files: list[str] | None = None,
+    stage: str = "discovery",
+    delta_from_sha: str | None = None,
+    carried_findings: tuple[Finding, ...] = (),
+    forced_scope: str | None = None,
 ) -> ReviewResult:
     base_diff_ref = ensure_base_ref(workspace, repo, base_ref)
-    profile = run_codex_classification(
-        workspace,
-        repo=repo,
-        pr_number=pr_number,
-        sha=sha,
-        base_ref=base_ref,
-        base_diff_ref=base_diff_ref,
-    )
+    profile = classify_review_profile(changed_files)
+    if forced_scope in {"lite", "critical"} and forced_scope != profile.scope:
+        profile = ReviewProfile(
+            scope=forced_scope,
+            effort="xhigh" if forced_scope == "critical" else "medium",
+            confidence="high",
+            risk_domains=profile.risk_domains,
+            reasons=(f"Review scope was explicitly set to {forced_scope}.", *profile.reasons),
+            review_questions=profile.review_questions,
+        )
     return run_codex_review(
         workspace,
         review_prompt,
@@ -797,6 +871,9 @@ def run_routed_codex_review(
         base_ref=base_ref,
         profile=profile,
         base_diff_ref=base_diff_ref,
+        stage=stage,
+        delta_from_sha=delta_from_sha,
+        carried_findings=carried_findings,
     )
 
 
@@ -826,8 +903,9 @@ def render_structured_summary(result: ReviewResult, review_prompt: str = "") -> 
     if result.profile:
         lines.append("## Review profile")
         lines.append(f"- Model: {DEFAULT_CODEX_MODEL}")
+        lines.append(f"- Scope: {result.profile.scope}")
         lines.append(f"- Reasoning effort: {result.profile.effort}")
-        lines.append(f"- Classifier confidence: {result.profile.confidence}")
+        lines.append(f"- Scope confidence: {result.profile.confidence}")
         domains = ", ".join(result.profile.risk_domains) or "none identified"
         lines.append(f"- Risk domains: {domains}")
         lines.append("")
@@ -840,6 +918,87 @@ def render_structured_summary(result: ReviewResult, review_prompt: str = "") -> 
     return "\n".join(lines)
 
 
+def _state_key() -> bytes | None:
+    key = os.environ.get("REVIEW_GATE_STATE_KEY", "").strip()
+    return key.encode("utf-8") if key else None
+
+
+def _finding_payload(finding: Finding) -> dict:
+    return {
+        "severity": finding.severity,
+        "code": finding.code,
+        "title": finding.title,
+        "detail": finding.detail,
+        "files": list(finding.files),
+        "root_cause": finding.root_cause,
+    }
+
+
+def _encoded_resolution_payload(state: ResolutionState) -> str:
+    payload = json.dumps(
+        {
+            "sha": state.sha,
+            "scope": state.scope,
+            "findings": [_finding_payload(finding) for finding in state.findings],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii")
+
+
+def sign_resolution_state(state: ResolutionState) -> str:
+    encoded = _encoded_resolution_payload(state)
+    key = _state_key()
+    if key is None:
+        return f"unsigned.{encoded}"
+    signature = hmac.new(key, encoded.encode("ascii"), hashlib.sha256).hexdigest()
+    return f"{encoded}.{signature}"
+
+
+def verify_resolution_state(
+    token: str,
+    *,
+    allow_trusted_unsigned: bool = False,
+) -> ResolutionState | None:
+    key = _state_key()
+    if token.startswith("unsigned."):
+        if not allow_trusted_unsigned:
+            return None
+        encoded = token.removeprefix("unsigned.")
+    elif key is None or "." not in token:
+        return None
+    else:
+        encoded, _, signature = token.partition(".")
+        expected = hmac.new(key, encoded.encode("ascii"), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(signature, expected):
+            return None
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(encoded.encode("ascii")).decode("utf-8"))
+        sha = str(payload["sha"]).strip()
+        scope = str(payload["scope"]).strip()
+        raw_findings = payload["findings"]
+        if not sha or scope not in {"lite", "critical"} or not isinstance(raw_findings, list):
+            return None
+        findings = tuple(
+            Finding(
+                severity=str(item["severity"]),
+                code=str(item["code"]),
+                title=str(item["title"]),
+                detail=str(item["detail"]),
+                files=tuple(str(path) for path in item.get("files", [])),
+                root_cause=str(item.get("root_cause") or ""),
+            )
+            for item in raw_findings
+            if isinstance(item, dict)
+        )
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError, binascii.Error):
+        return None
+    if not findings:
+        return None
+    return ResolutionState(sha=sha, scope=scope, findings=findings)
+
+
 def build_review_comment(
     result: ReviewResult,
     *,
@@ -847,8 +1006,12 @@ def build_review_comment(
     run_url: str = "",
     pr_number: int | None = None,
     review_prompt: str = "",
+    resolution_state: ResolutionState | None = None,
 ) -> str:
     header = [COMMENT_MARKER, "# Review Gate agent review"]
+    if resolution_state:
+        signed_state = sign_resolution_state(resolution_state)
+        header.append(f"{RESOLUTION_STATE_MARKER_PREFIX}{signed_state} -->")
     if pr_number is not None:
         header.append(f"**PR:** #{pr_number}")
     if sha:
@@ -918,6 +1081,39 @@ def fetch_issue_comments(repo: str, pr_number: int) -> list[dict]:
     return comments
 
 
+def expected_gate_login() -> str | None:
+    result = run_command(["gh", "api", "user", "-q", ".login"])
+    login = result.stdout.strip() if result.returncode == 0 else ""
+    if login:
+        return login
+    configured = os.environ.get("REVIEW_GATE_BOT_LOGIN", "github-actions[bot]").strip()
+    return configured or None
+
+
+def read_resolution_state(repo: str, pr_number: int) -> ResolutionState | None:
+    try:
+        comments = fetch_issue_comments(repo, pr_number)
+    except RuntimeError:
+        return None
+    expected_login = expected_gate_login()
+    for comment in reversed(comments):
+        body = str(comment.get("body") or "")
+        if COMMENT_MARKER not in body:
+            continue
+        match = re.search(
+            re.escape(RESOLUTION_STATE_MARKER_PREFIX) + r"\s*(\S+?)\s*-->", body
+        )
+        if match:
+            token = match.group(1)
+            if token.startswith("unsigned."):
+                author = str((comment.get("user") or {}).get("login") or "")
+                if expected_login is None or author != expected_login:
+                    continue
+                return verify_resolution_state(token, allow_trusted_unsigned=True)
+            return verify_resolution_state(token)
+    return None
+
+
 def post_or_update_pr_comment(repo: str, pr_number: int, body: str) -> None:
     comment_id = None
     for comment in fetch_issue_comments(repo, pr_number):
@@ -950,6 +1146,103 @@ def post_or_update_pr_comment(repo: str, pr_number: int, body: str) -> None:
         )
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip())
+
+
+def build_follow_up_issue_body(
+    repo: str,
+    pr_number: int,
+    sha: str,
+    findings: tuple[Finding, ...],
+) -> str:
+    marker = f"{FOLLOW_UP_ISSUE_MARKER_PREFIX}{repo}#{pr_number} -->"
+    lines = [
+        marker,
+        f"# Follow-up findings from PR #{pr_number}",
+        "",
+        "These verified findings are noncritical. They did not block merge and "
+        "can be resolved as normal issue work.",
+        "",
+        f"Reviewed head: `{sha}`",
+        "",
+    ]
+    for finding in findings:
+        lines.extend(
+            [
+                f"## {finding.title}",
+                "",
+                finding.detail,
+            ]
+        )
+        if finding.files:
+            lines.extend(["", f"Files: {', '.join(finding.files)}"])
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+def post_or_update_follow_up_issue(
+    repo: str,
+    pr_number: int,
+    sha: str,
+    findings: tuple[Finding, ...],
+) -> str:
+    if not findings:
+        return ""
+    marker = f"{FOLLOW_UP_ISSUE_MARKER_PREFIX}{repo}#{pr_number} -->"
+    list_result = run_command(
+        [
+            "gh",
+            "api",
+            f"repos/{repo}/issues",
+            "--method",
+            "GET",
+            "--paginate",
+            "-f",
+            "state=all",
+        ]
+    )
+    if list_result.returncode != 0:
+        raise RuntimeError(list_result.stderr.strip())
+    raw_issues = json.loads(list_result.stdout or "[]")
+    issues: list[dict] = []
+    for item in raw_issues:
+        if isinstance(item, list):
+            issues.extend(candidate for candidate in item if isinstance(candidate, dict))
+        elif isinstance(item, dict):
+            issues.append(item)
+    existing = next((issue for issue in issues if marker in str(issue.get("body") or "")), None)
+    body = build_follow_up_issue_body(repo, pr_number, sha, findings)
+    title = f"Review follow-up from PR #{pr_number}"
+    if existing:
+        issue_number = existing.get("number")
+        args = [
+            "gh",
+            "api",
+            f"repos/{repo}/issues/{issue_number}",
+            "--method",
+            "PATCH",
+            "-f",
+            f"title={title}",
+            "-f",
+            f"body={body}",
+        ]
+    else:
+        args = [
+            "gh",
+            "api",
+            f"repos/{repo}/issues",
+            "--method",
+            "POST",
+            "-f",
+            f"title={title}",
+            "-f",
+            f"body={body}",
+        ]
+    result = run_command(args)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip())
+    payload = json.loads(result.stdout or "{}")
+    existing_url = existing.get("html_url") if existing else ""
+    return str(payload.get("html_url") or existing_url)
 
 
 def finding_fingerprint(finding: Finding) -> str:
@@ -1072,25 +1365,70 @@ def main() -> None:
     parser.add_argument("--submit-approval", action="store_true")
     parser.add_argument("--run-url", default="")
     parser.add_argument("--base-ref", default=os.environ.get("REVIEW_GATE_BASE_REF", "main"))
+    parser.add_argument(
+        "--scope",
+        choices=("auto", "lite", "critical"),
+        default="auto",
+        help="auto selects scope from changed paths; lite or critical is an explicit override",
+    )
     args = parser.parse_args()
 
     review_prompt = os.environ.get("REVIEW_GATE_PROMPT", "").strip() or DEFAULT_REVIEW_PROMPT
+    workspace = Path(args.workspace).resolve()
+    changed_files = changed_files_for_pr(args.repo, args.pr)
+    profile = classify_review_profile(changed_files)
+    if args.scope in {"lite", "critical"}:
+        profile = ReviewProfile(
+            scope=args.scope,
+            effort="xhigh" if args.scope == "critical" else "medium",
+            confidence="high",
+            risk_domains=profile.risk_domains,
+            reasons=(f"Review scope was explicitly set to {args.scope}.", *profile.reasons),
+            review_questions=profile.review_questions,
+        )
+    prior_state = read_resolution_state(args.repo, args.pr)
+    stage = select_review_stage(workspace, args.sha, prior_state)
+    if stage.scope and args.scope == "auto":
+        profile = ReviewProfile(
+            scope=stage.scope,
+            effort="xhigh" if stage.scope == "critical" else "medium",
+            confidence="high",
+            risk_domains=profile.risk_domains,
+            reasons=("Resolution keeps the discovery review scope.", *profile.reasons),
+            review_questions=profile.review_questions,
+        )
 
-    preflight = analyze_workspace(
-        Path(args.workspace).resolve(),
-        changed_files_for_pr(args.repo, args.pr),
-    )
+    preflight = analyze_workspace(workspace, changed_files)
+    model_follow_ups: tuple[Finding, ...] = ()
     if preflight.blocking:
-        result = preflight
+        result = ReviewResult(
+            preflight.backend,
+            warnings=preflight.warnings,
+            blocking=preflight.blocking,
+            profile=profile,
+        )
+    elif stage.name == "unchanged":
+        result = ReviewResult(
+            "prior-review",
+            summary="The reviewed head is unchanged; prior critical findings still apply.",
+            blocking=stage.carried_findings,
+            profile=profile,
+        )
     else:
         result = run_routed_codex_review(
-            Path(args.workspace).resolve(),
+            workspace,
             review_prompt,
             repo=args.repo,
             pr_number=args.pr,
             sha=args.sha,
             base_ref=args.base_ref,
+            changed_files=changed_files,
+            stage=stage.name,
+            delta_from_sha=stage.delta_from_sha,
+            carried_findings=stage.carried_findings,
+            forced_scope=profile.scope,
         )
+        model_follow_ups = result.warnings
         if preflight.warnings:
             result = ReviewResult(
                 result.backend,
@@ -1100,6 +1438,18 @@ def main() -> None:
                 raw_review=result.raw_review,
                 profile=result.profile,
             )
+
+    review_failed = any(finding.code in REVIEW_FAILURE_CODES for finding in result.blocking)
+    if review_failed:
+        next_state = prior_state
+    elif result.blocking:
+        next_state = ResolutionState(
+            sha=args.sha,
+            scope=result.profile.scope if result.profile else profile.scope,
+            findings=result.blocking,
+        )
+    else:
+        next_state = None
     print(render_structured_summary(result, review_prompt))
 
     if args.post_comment:
@@ -1112,9 +1462,22 @@ def main() -> None:
                 run_url=args.run_url,
                 pr_number=args.pr,
                 review_prompt=review_prompt,
+                resolution_state=next_state,
             ),
         )
         post_finding_comments(args.repo, args.pr, result, sha=args.sha, run_url=args.run_url)
+        if model_follow_ups:
+            try:
+                issue_url = post_or_update_follow_up_issue(
+                    args.repo, args.pr, args.sha, model_follow_ups
+                )
+                if issue_url:
+                    print(f"Recorded noncritical findings in {issue_url}.")
+            except (RuntimeError, ValueError, json.JSONDecodeError) as exc:
+                print(
+                    f"WARNING: noncritical follow-up issue could not be recorded: {exc}",
+                    file=sys.stderr,
+                )
 
     if result.passed and args.submit_approval:
         approved = submit_pr_approval(

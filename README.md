@@ -89,6 +89,8 @@ frameworks:
 See [docs/roadmap.md](docs/roadmap.md) for the remaining generic scope planned
 for the community package.
 
+Pull-request review follows the [bounded Review Gate policy](docs/review-gate-policy.md): one discovery review, proven critical blockers only, one grouped follow-up issue for verified noncritical defects, and targeted checks for critical fixes.
+
 ## Development
 
 ```bash

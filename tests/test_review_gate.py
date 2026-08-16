@@ -12,6 +12,7 @@ WORKFLOW_PATH = ROOT / ".github" / "workflows" / "review-gate.yml"
 REUSABLE_WORKFLOW_PATH = ROOT / ".github" / "workflows" / "review-gate-reusable.yml"
 AUTO_LABEL_WORKFLOW_PATH = ROOT / ".github" / "workflows" / "ai-review-autolabel.yml"
 PROMPT_PATH = ROOT / ".github" / "review-gate-prompt.md"
+POLICY_PATH = ROOT / "docs" / "review-gate-policy.md"
 
 
 def load_review_gate():
@@ -99,12 +100,31 @@ def test_ai_review_label_triggers_review_and_approval() -> None:
     assert "/agent-review" not in workflow
 
 
-def test_ai_review_label_is_only_applied_by_a_person_at_final_review() -> None:
+def test_ai_review_can_be_requested_by_a_person_or_authorized_agent() -> None:
     assert not AUTO_LABEL_WORKFLOW_PATH.exists()
     workflow = WORKFLOW_PATH.read_text()
+    prompt = PROMPT_PATH.read_text()
     assert "types: [labeled]" in workflow
     assert "opened" not in workflow
     assert "synchronize" not in workflow
+    assert "person or authorized agent" in prompt
+    assert "a person applies the label again" not in prompt
+
+
+def test_bounded_review_policy_is_documented_for_callers() -> None:
+    policy = POLICY_PATH.read_text()
+    readme = (ROOT / "README.md").read_text()
+
+    assert "Review once. Block only proven critical defects." in policy
+    assert "File verified noncritical defects in one follow-up issue." in policy
+    assert "Recheck only the critical fixes." in policy
+    assert (
+        "security, safety, data loss, broken core behavior, or false acceptance evidence"
+        in policy
+    )
+    assert "person or authorized agent" in policy
+    assert "`critical`" in policy
+    assert "docs/review-gate-policy.md" in readme
 
 
 def test_review_prompt_includes_harder_architecture_domain_and_security_lenses() -> None:
@@ -243,7 +263,31 @@ def test_review_gate_uses_sol_and_explicit_reasoning_effort() -> None:
     ]
 
 
-def test_classifier_uses_sol_low_and_raises_uncertain_or_critical_changes_to_xhigh(
+def test_scope_classifier_uses_changed_paths_without_a_model_call() -> None:
+    review_gate = load_review_gate()
+
+    lite = review_gate.classify_review_profile(["src/widget.py", "tests/test_widget.py"])
+    critical = review_gate.classify_review_profile(
+        [
+            ".github/workflows/review-gate.yml",
+            "configs/global/AGENTS.md",
+            "src/auth/permissions.py",
+        ]
+    )
+    unknown = review_gate.classify_review_profile(None)
+
+    assert lite.scope == "lite"
+    assert lite.effort == "medium"
+    assert critical.scope == "critical"
+    assert critical.effort == "xhigh"
+    assert "privileged_workflow" in critical.risk_domains
+    assert "ci_policy" in critical.risk_domains
+    assert "authorization" in critical.risk_domains
+    assert unknown.scope == "critical"
+    assert unknown.effort == "xhigh"
+
+
+def test_routed_review_uses_one_model_call_with_deterministic_scope(
     monkeypatch, tmp_path: Path
 ) -> None:
     review_gate = load_review_gate()
@@ -257,70 +301,9 @@ def test_classifier_uses_sol_low_and_raises_uncertain_or_critical_changes_to_xhi
             output_path = Path(args[args.index("--output-last-message") + 1])
             output_path.write_text(
                 json.dumps(
-                    {
-                        "recommended_effort": "medium",
-                        "confidence": "low",
-                        "risk_domains": ["authorization"],
-                        "reasons": ["The change alters approval evaluation."],
-                        "review_questions": ["Can stale approval state authorize a mutation?"],
-                    }
+                    {"verdict": "approve", "summary": "No critical findings.", "findings": []}
                 )
             )
-            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
-        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
-
-    monkeypatch.setattr(review_gate, "run_command", fake_run_command)
-    profile = review_gate.run_codex_classification(
-        tmp_path,
-        repo="example-org/example",
-        pr_number=7,
-        sha="abc123",
-        base_ref="main",
-    )
-
-    codex_args, prompt = next(call for call in calls if call[0][:2] == ["codex", "exec"])
-    assert codex_args[codex_args.index("--model") + 1] == "gpt-5.6-sol"
-    assert 'model_reasoning_effort="low"' in codex_args
-    assert "Classify impact and review difficulty" in prompt
-    assert profile.effort == "xhigh"
-    assert profile.confidence == "low"
-    assert profile.risk_domains == ("authorization",)
-
-
-def test_classifier_routes_incomplete_low_effort_output_to_xhigh() -> None:
-    review_gate = load_review_gate()
-
-    profile = review_gate.review_profile_from_payload(
-        {"recommended_effort": "low", "confidence": "high"}
-    )
-
-    assert profile.effort == "xhigh"
-    assert profile.confidence == "low"
-
-
-def test_routed_review_passes_profile_and_selected_effort_to_full_review(
-    monkeypatch, tmp_path: Path
-) -> None:
-    review_gate = load_review_gate()
-    calls = []
-    responses = [
-        {
-            "recommended_effort": "high",
-            "confidence": "high",
-            "risk_domains": ["concurrency"],
-            "reasons": ["Lock ordering changes."],
-            "review_questions": ["Can two callers enter the mutation concurrently?"],
-        },
-        {"verdict": "approve", "summary": "No material findings.", "findings": []},
-    ]
-
-    def fake_run_command(args, cwd=None, env=None, input_text=None):
-        calls.append((args, input_text))
-        if args[:3] == ["git", "fetch", "--force"]:
-            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
-        if args[:2] == ["codex", "exec"]:
-            output_path = Path(args[args.index("--output-last-message") + 1])
-            output_path.write_text(json.dumps(responses.pop(0)))
             return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
         return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
 
@@ -332,20 +315,23 @@ def test_routed_review_passes_profile_and_selected_effort_to_full_review(
         pr_number=7,
         sha="abc123",
         base_ref="main",
+        changed_files=[".github/workflows/review-gate.yml"],
     )
 
     codex_calls = [call for call in calls if call[0][:2] == ["codex", "exec"]]
-    assert len(codex_calls) == 2
-    full_args, full_prompt = codex_calls[1]
-    assert 'model_reasoning_effort="high"' in full_args
-    assert "concurrency" in full_prompt
-    assert "Can two callers enter the mutation concurrently?" in full_prompt
+    assert len(codex_calls) == 1
+    full_args, full_prompt = codex_calls[0]
+    assert 'model_reasoning_effort="xhigh"' in full_args
+    assert "critical" in full_prompt
+    assert "privileged_workflow" in full_prompt
     assert result.passed
-    assert result.profile.effort == "high"
+    assert result.profile.scope == "critical"
+    assert result.profile.effort == "xhigh"
     rendered = review_gate.render_structured_summary(result)
     assert "## Review profile" in rendered
     assert "- Model: gpt-5.6-sol" in rendered
-    assert "- Reasoning effort: high" in rendered
+    assert "- Scope: critical" in rendered
+    assert "- Reasoning effort: xhigh" in rendered
 
 
 def test_materiality_contract_suppresses_noise_and_groups_one_root_cause(
@@ -362,7 +348,7 @@ def test_materiality_contract_suppresses_noise_and_groups_one_root_cause(
     already_caught = material_finding(title="Repeat the failing CI assertion")
     already_caught["already_caught_by"] = "CI: workflow-policy"
     suppressed = material_finding(title="Rename the helper")
-    suppressed["disposition"] = "suppress"
+    suppressed["disposition"] = "ignore"
 
     def fake_run_command(args, cwd=None, env=None, input_text=None):
         if args[:3] == ["git", "fetch", "--force"]:
@@ -400,6 +386,213 @@ def test_materiality_contract_suppresses_noise_and_groups_one_root_cause(
         ".github/workflows/second.yml",
     }
     assert result.warnings == ()
+
+
+def test_only_proven_critical_findings_block_and_other_defects_become_follow_ups(
+    monkeypatch, tmp_path: Path
+) -> None:
+    review_gate = load_review_gate()
+    critical = material_finding(title="Prevent credential exposure")
+    noncritical = material_finding(
+        severity="P2",
+        title="Preserve the optional display value",
+        root_cause="optional-display-value",
+        files=["src/view.py"],
+    )
+    noncritical["disposition"] = "follow_up"
+    noncritical["consequence_class"] = "correctness"
+    noncritical["consequence"] = "An optional field is omitted from one secondary view."
+    duplicate = dict(noncritical)
+    duplicate["title"] = "Preserve the second optional display value"
+    duplicate["files"] = ["src/other_view.py"]
+    ignored = dict(noncritical)
+    ignored["disposition"] = "ignore"
+    ignored["root_cause"] = "style-only"
+
+    def fake_run_command(args, cwd=None, env=None, input_text=None):
+        if args[:3] == ["git", "fetch", "--force"]:
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        if args[:2] == ["codex", "exec"]:
+            output_path = Path(args[args.index("--output-last-message") + 1])
+            output_path.write_text(
+                json.dumps(
+                    {
+                        "verdict": "request_changes",
+                        "summary": "One critical defect and one follow-up remain.",
+                        "findings": [critical, noncritical, duplicate, ignored],
+                    }
+                )
+            )
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(review_gate, "run_command", fake_run_command)
+    result = review_gate.run_codex_review(
+        tmp_path,
+        "Review strictly.",
+        repo="example-org/example",
+        pr_number=7,
+        sha="abc123",
+        base_ref="main",
+        profile=review_gate.ReviewProfile(scope="critical", effort="xhigh"),
+    )
+
+    assert [finding.title for finding in result.blocking] == ["Prevent credential exposure"]
+    assert len(result.warnings) == 1
+    assert result.warnings[0].title == "Preserve the optional display value"
+    assert set(result.warnings[0].files) == {"src/view.py", "src/other_view.py"}
+
+
+def test_resolution_prompt_checks_prior_blockers_and_fix_delta_without_rediscovery() -> None:
+    review_gate = load_review_gate()
+    blocker = review_gate.Finding(
+        "P1",
+        "CODEX_P1_1",
+        "Prevent credential exposure",
+        "Behavior: a token is printed\nConsequence: credential exposure",
+        ("src/auth.py",),
+        "credential-exposure",
+    )
+
+    prompt = review_gate.build_codex_prompt(
+        "Review strictly.",
+        repo="example-org/example",
+        pr_number=7,
+        sha="def456",
+        base_ref="main",
+        base_diff_ref="refs/remotes/review-gate-base/main",
+        profile=review_gate.ReviewProfile(scope="critical", effort="xhigh"),
+        stage="resolution",
+        delta_from_sha="abc123",
+        carried_findings=(blocker,),
+    )
+
+    assert "git diff abc123...HEAD" in prompt
+    assert "Prevent credential exposure" in prompt
+    assert "credential-exposure" in prompt
+    assert "Do not repeat the discovery review" in prompt
+    assert "new critical defect caused by the fix" in prompt
+
+
+def test_resolution_state_is_signed_and_rejects_tampering(monkeypatch) -> None:
+    review_gate = load_review_gate()
+    monkeypatch.setenv("REVIEW_GATE_STATE_KEY", "gate-key")
+    state = review_gate.ResolutionState(
+        sha="abc123",
+        scope="critical",
+        findings=(
+            review_gate.Finding(
+                "P1", "CODEX_P1_1", "Fix auth", "Specific failure", ("auth.py",), "auth"
+            ),
+        ),
+    )
+
+    token = review_gate.sign_resolution_state(state)
+
+    assert token
+    assert review_gate.verify_resolution_state(token) == state
+    assert review_gate.verify_resolution_state(token + "tampered") is None
+
+
+def test_resolution_stage_uses_only_a_descendant_fix_delta(monkeypatch, tmp_path: Path) -> None:
+    review_gate = load_review_gate()
+    state = review_gate.ResolutionState(
+        sha="abc123",
+        scope="critical",
+        findings=(
+            review_gate.Finding(
+                "P1", "CODEX_P1_1", "Fix auth", "Specific failure", ("auth.py",), "auth"
+            ),
+        ),
+    )
+
+    def fake_run_command(args, cwd=None, env=None, input_text=None):
+        assert args == ["git", "merge-base", "--is-ancestor", "abc123", "HEAD"]
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(review_gate, "run_command", fake_run_command)
+
+    resolution = review_gate.select_review_stage(tmp_path, "def456", state)
+    unchanged = review_gate.select_review_stage(tmp_path, "abc123", state)
+
+    assert resolution.name == "resolution"
+    assert resolution.scope == "critical"
+    assert resolution.delta_from_sha == "abc123"
+    assert resolution.carried_findings == state.findings
+    assert unchanged.name == "unchanged"
+
+
+def test_resolution_state_without_a_key_requires_the_exact_gate_identity(monkeypatch) -> None:
+    review_gate = load_review_gate()
+    monkeypatch.delenv("REVIEW_GATE_STATE_KEY", raising=False)
+    state = review_gate.ResolutionState(
+        sha="abc123",
+        scope="lite",
+        findings=(
+            review_gate.Finding(
+                "P1", "CODEX_P1_1", "Fix auth", "Specific failure", ("auth.py",), "auth"
+            ),
+        ),
+    )
+    body = review_gate.build_review_comment(
+        review_gate.ReviewResult("codex", blocking=state.findings),
+        resolution_state=state,
+    )
+    comments = [
+        {"id": 1, "body": body, "user": {"login": "attacker"}},
+        {"id": 2, "body": body, "user": {"login": "github-actions[bot]"}},
+    ]
+
+    def fake_run_command(args, cwd=None, env=None, input_text=None):
+        if args[:3] == ["gh", "api", "user"]:
+            return subprocess.CompletedProcess(args, 1, stdout="", stderr="unavailable")
+        return subprocess.CompletedProcess(args, 0, stdout=json.dumps(comments), stderr="")
+
+    monkeypatch.setattr(review_gate, "run_command", fake_run_command)
+
+    assert review_gate.read_resolution_state("example-org/example", 7) == state
+
+
+def test_noncritical_findings_are_grouped_into_one_follow_up_issue(monkeypatch) -> None:
+    review_gate = load_review_gate()
+    calls = []
+    findings = (
+        review_gate.Finding(
+            "P2", "CODEX_P2_1", "Preserve display value", "Secondary view omits value.",
+            ("src/view.py",), "display-value"
+        ),
+        review_gate.Finding(
+            "P3", "CODEX_P3_2", "Clarify retry message", "Retry text is misleading.",
+            ("src/retry.py",), "retry-message"
+        ),
+    )
+
+    def fake_run_command(args, cwd=None, env=None, input_text=None):
+        calls.append(args)
+        if args[:3] == ["gh", "api", "repos/example-org/example/issues"] and "--paginate" in args:
+            return subprocess.CompletedProcess(args, 0, stdout="[]", stderr="")
+        if args[:3] == ["gh", "api", "repos/example-org/example/issues"]:
+            return subprocess.CompletedProcess(
+                args,
+                0,
+                stdout='{"html_url":"https://github.com/example-org/example/issues/12"}',
+                stderr="",
+            )
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(review_gate, "run_command", fake_run_command)
+    issue_url = review_gate.post_or_update_follow_up_issue(
+        "example-org/example", 7, "abc123", findings
+    )
+
+    assert issue_url == "https://github.com/example-org/example/issues/12"
+    listing = next(call for call in calls if "--paginate" in call)
+    assert listing[listing.index("--method") + 1] == "GET"
+    create = next(call for call in calls if "--method" in call and "POST" in call)
+    body = next(arg.removeprefix("body=") for arg in create if arg.startswith("body="))
+    assert "Follow-up findings from PR #7" in body
+    assert "Preserve display value" in body
+    assert "Clarify retry message" in body
 
 
 def test_codex_review_failure_reports_tail(monkeypatch, tmp_path: Path) -> None:
@@ -597,14 +790,17 @@ def test_post_commit_status_defaults_to_thorough_context(monkeypatch) -> None:
     assert f"context={review_gate.STATUS_CONTEXT_THOROUGH}" in joined
 
 
-def test_fast_mode_is_removed_from_the_supported_interface() -> None:
+def test_targeted_resolution_replaces_fast_mode_in_the_supported_interface() -> None:
     reusable = REUSABLE_WORKFLOW_PATH.read_text()
     script = SCRIPT_PATH.read_text()
 
     assert "fast_codex_model:" not in reusable
     assert '--mode "${{ inputs.mode }}"' not in reusable
     assert "REVIEW_GATE_FAST_CODEX_MODEL" not in reusable
-    assert "REVIEW_GATE_STATE_KEY" not in reusable
+    assert "REVIEW_GATE_STATE_KEY:" in reusable
+    assert "REVIEW_GATE_STATE_KEY: ${{ secrets.REVIEW_GATE_STATE_KEY }}" in reusable
+    assert "scope:" in reusable
+    assert '--scope "${{ inputs.scope }}"' in reusable
     assert "fast advisory" not in reusable.lower()
     assert "FAST_COMMENT_MARKER" not in script
     assert "run_fast_advisory" not in script
