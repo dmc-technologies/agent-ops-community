@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import stat
 import uuid
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -33,8 +35,10 @@ except ImportError:  # pragma: no cover - Windows imports, then fails closed bef
 
 _SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 _COMMIT = re.compile(r"[0-9a-fA-F]{40}\Z")
+_FINGERPRINT = re.compile(r"[0-9a-f]{64}\Z")
 _REF_FORBIDDEN = re.compile(r"[\x00-\x20\x7f~^:?*\\\[]")
 _RECEIPT_FILE = re.compile(r"(?P<sequence>[0-9]{20})\.json\Z")
+_RECEIPT_TEMP = re.compile(r"\.(?P<receipt>[0-9]{20}\.json)\.[A-Za-z0-9]+\.tmp\Z")
 _MAX_REGISTRY_BYTES = 1024 * 1024
 _MAX_RECEIPT_BYTES = 1024 * 1024
 _ROOT_KEYS = frozenset({"schema_version", "sources", "channels", "targets"})
@@ -43,6 +47,9 @@ _CHANNEL_KEYS = frozenset({"source", "ref"})
 _TARGET_KEYS = frozenset({"framework", "home", "channel"})
 _RECEIPT_KEYS = frozenset({"operation", "commits", "targets"})
 _STATUS_KEYS = frozenset({"target_id", "state", "channel", "commit"})
+_RECEIPT_WRAPPER_KEYS = frozenset({"schema_version", "registry_fingerprint", "receipt"})
+_RECEIPT_COUNTER = "receipt-count"
+_MAX_RECEIPTS = 10**20 - 1
 
 
 class _StrictLoader(yaml.SafeLoader):
@@ -109,6 +116,17 @@ class RegistryConfig:
         object.__setattr__(self, "targets", tuple(sorted(self.targets, key=lambda item: item.id)))
 
 
+@dataclass(frozen=True)
+class RegistrySnapshot:
+    config: RegistryConfig
+    fingerprint: str
+
+    def __post_init__(self) -> None:
+        if type(self.config) is not RegistryConfig:
+            raise ValueError("snapshot config must be an exact RegistryConfig")
+        _validate_fingerprint(self.fingerprint)
+
+
 class DeploymentRegistry:
     """A host-local deployment registry with private append-only receipts."""
 
@@ -126,30 +144,39 @@ class DeploymentRegistry:
     def receipts_path(self) -> Path:
         return self.state_path / "receipts"
 
+    @property
+    def lock_path(self) -> Path:
+        return self.path.with_name(f".{self.path.name}.lock")
+
     def load(self) -> RegistryConfig:
-        _require_secure_platform()
-        parent = _open_directory_chain(self.path.parent)
+        return self.load_snapshot().config
+
+    def load_snapshot(self) -> RegistrySnapshot:
+        _require_secure_platform(require_locking=True)
+        parent, identities, lock = _open_locked_parent(
+            self.path.parent, self.lock_path.name, exclusive=False
+        )
         try:
-            content = _read_regular_file(
-                parent,
-                self.path.name,
-                required_mode=0o600,
-                maximum=_MAX_REGISTRY_BYTES,
-                label="registry file",
-            )
+            snapshot = _snapshot_from_parent(parent, self.path.name)
+            _verify_canonical_parent(self.path.parent, parent, identities)
+            return snapshot
         finally:
+            _close_registry_lock(lock)
             os.close(parent)
-        return _parse_registry(content)
 
     def save(self, config: RegistryConfig) -> None:
-        _require_secure_platform()
+        _require_secure_platform(require_locking=True)
         _validate_config(config, require_nonempty=True)
         content = _dump_registry(config)
         _parse_registry(content)
-        parent = _open_directory_chain(self.path.parent)
+        parent, identities, lock = _open_locked_parent(
+            self.path.parent, self.lock_path.name, exclusive=True
+        )
         temporary = f".{self.path.name}.{uuid.uuid4().hex}.tmp"
+        backup: str | None = None
         descriptor: int | None = None
         published = False
+        original: tuple[int, int] | None = None
         try:
             original = _optional_regular_identity(parent, self.path.name, "registry file")
             descriptor = os.open(
@@ -168,43 +195,108 @@ class DeploymentRegistry:
             descriptor = None
             if _optional_regular_identity(parent, self.path.name, "registry file") != original:
                 raise RuntimeError("registry file changed during save")
-            os.replace(temporary, self.path.name, src_dir_fd=parent, dst_dir_fd=parent)
+            _verify_canonical_parent(self.path.parent, parent, identities)
+            if original is not None:
+                backup = f".{self.path.name}.{uuid.uuid4().hex}.backup"
+                os.link(
+                    self.path.name,
+                    backup,
+                    src_dir_fd=parent,
+                    dst_dir_fd=parent,
+                    follow_symlinks=False,
+                )
+                os.fsync(parent)
+            _replace_at(parent, temporary, self.path.name)
             published = True
             final_stat = os.stat(self.path.name, dir_fd=parent, follow_symlinks=False)
             if not stat.S_ISREG(final_stat.st_mode) or stat.S_IMODE(final_stat.st_mode) != 0o600:
                 raise RuntimeError("published registry file is not a private regular file")
             os.fsync(parent)
+            _verify_canonical_parent(self.path.parent, parent, identities)
+            if backup is not None:
+                os.unlink(backup, dir_fd=parent)
+                backup = None
+                os.fsync(parent)
         except BaseException:
             if descriptor is not None:
                 os.close(descriptor)
-            if not published:
+            if published:
+                if backup is not None:
+                    with suppress(BaseException):
+                        _replace_at(parent, backup, self.path.name)
+                        os.fsync(parent)
+                    backup = None
+                elif original is None:
+                    with suppress(BaseException):
+                        _unlink_if_regular(parent, self.path.name)
+                        os.fsync(parent)
+            else:
                 _unlink_if_regular(parent, temporary)
+                if backup is not None:
+                    _unlink_if_regular(parent, backup)
             raise
         finally:
+            _close_registry_lock(lock)
             os.close(parent)
 
-    def append_receipt(self, receipt: DeploymentReceipt) -> Path:
+    def append_receipt(
+        self,
+        receipt: DeploymentReceipt,
+        *,
+        expected_fingerprint: str | None = None,
+    ) -> Path:
         _require_secure_platform(require_locking=True)
-        content = _dump_receipt(receipt)
-        parent = _open_directory_chain(self.path.parent)
+        receipt_data = _receipt_to_data(receipt)
+        if expected_fingerprint is not None:
+            _validate_fingerprint(expected_fingerprint)
+        parent, identities, lock = _open_locked_parent(
+            self.path.parent, self.lock_path.name, exclusive=True
+        )
         state: int | None = None
         receipts: int | None = None
-        lock: int | None = None
         temporary: str | None = None
+        destination: str | None = None
+        sequence: int | None = None
+        published = False
         try:
-            _read_regular_file(
-                parent,
-                self.path.name,
-                required_mode=0o600,
-                maximum=_MAX_REGISTRY_BYTES,
-                label="registry file",
-            )
+            snapshot = _snapshot_from_parent(parent, self.path.name)
+            if (
+                expected_fingerprint is not None
+                and snapshot.fingerprint != expected_fingerprint
+            ):
+                raise ValueError("registry fingerprint does not match expected snapshot")
             state = _open_private_directory(parent, self.state_path.name, create=True)
-            lock = _open_private_lock(state, "receipts.lock")
-            fcntl.flock(lock, fcntl.LOCK_EX)
             receipts = _open_private_directory(state, "receipts", create=True)
-            sequence = _next_receipt_sequence(receipts)
+            _verify_canonical_parent(self.path.parent, parent, identities)
+            sequence = _load_or_initialize_counter(state, receipts)
             destination = f"{sequence:020d}.json"
+            content = _dump_receipt_wrapper(receipt_data, snapshot.fingerprint)
+            _verify_canonical_parent(self.path.parent, parent, identities)
+            expected_names = tuple(f"{index:020d}.json" for index in range(sequence))
+            names = _receipt_names_for_append(
+                receipts,
+                destination=destination,
+                expected_names=expected_names,
+                registry_fingerprint=snapshot.fingerprint,
+                receipt=receipt,
+            )
+            if names == (*expected_names, destination):
+                orphan_fingerprint, orphan = _read_receipt_wrapper(receipts, destination)
+                if orphan_fingerprint != snapshot.fingerprint or orphan != receipt:
+                    raise RuntimeError("orphan receipt does not match append retry")
+                _verify_canonical_parent(self.path.parent, parent, identities)
+                _write_counter(state, sequence + 1)
+                try:
+                    _verify_canonical_parent(self.path.parent, parent, identities)
+                except BaseException:
+                    with suppress(BaseException):
+                        _write_counter(state, sequence)
+                    raise
+                return self.receipts_path / destination
+            if names != expected_names:
+                raise RuntimeError("receipt history is not contiguous with its counter")
+            if sequence >= _MAX_RECEIPTS:
+                raise ValueError("receipt counter exceeds supported bound")
             temporary = f".{destination}.{uuid.uuid4().hex}.tmp"
             descriptor = os.open(
                 temporary,
@@ -221,6 +313,7 @@ class DeploymentRegistry:
                 os.fsync(descriptor)
             finally:
                 os.close(descriptor)
+            _verify_canonical_parent(self.path.parent, parent, identities)
             os.link(
                 temporary,
                 destination,
@@ -228,74 +321,68 @@ class DeploymentRegistry:
                 dst_dir_fd=receipts,
                 follow_symlinks=False,
             )
+            published = True
             os.unlink(temporary, dir_fd=receipts)
             temporary = None
             os.fsync(receipts)
-            os.fsync(state)
+            _verify_canonical_parent(self.path.parent, parent, identities)
+            _write_counter(state, sequence + 1)
+            _verify_canonical_parent(self.path.parent, parent, identities)
             return self.receipts_path / destination
         except BaseException:
             if temporary is not None and receipts is not None:
                 _unlink_if_regular(receipts, temporary)
+            if published and receipts is not None and state is not None and sequence is not None:
+                with suppress(BaseException):
+                    _write_counter(state, sequence)
+                if destination is not None:
+                    with suppress(BaseException):
+                        _unlink_if_regular(receipts, destination)
+                        os.fsync(receipts)
             raise
         finally:
-            if lock is not None:
-                fcntl.flock(lock, fcntl.LOCK_UN)
-                os.close(lock)
             if receipts is not None:
                 os.close(receipts)
             if state is not None:
                 os.close(state)
+            _close_registry_lock(lock)
             os.close(parent)
 
     def receipts(self) -> tuple[DeploymentReceipt, ...]:
         _require_secure_platform(require_locking=True)
-        parent = _open_directory_chain(self.path.parent)
+        parent, identities, lock = _open_locked_parent(
+            self.path.parent, self.lock_path.name, exclusive=False
+        )
         state: int | None = None
         receipts: int | None = None
-        lock: int | None = None
         try:
-            _read_regular_file(
-                parent,
-                self.path.name,
-                required_mode=0o600,
-                maximum=_MAX_REGISTRY_BYTES,
-                label="registry file",
-            )
+            _snapshot_from_parent(parent, self.path.name)
             state = _open_private_directory(
                 parent, self.state_path.name, create=False, missing_ok=True
             )
             if state is None:
+                _verify_canonical_parent(self.path.parent, parent, identities)
                 return ()
-            lock = _open_existing_private_lock(state, "receipts.lock")
-            if lock is None:
-                if _child_exists(state, "receipts"):
-                    raise RuntimeError("receipt lock file is missing")
-                return ()
-            fcntl.flock(lock, fcntl.LOCK_SH)
             receipts = _open_private_directory(state, "receipts", create=False, missing_ok=True)
             if receipts is None:
-                return ()
+                raise RuntimeError("receipt history directory is missing")
+            try:
+                counter = _read_counter(state)
+            except FileNotFoundError:
+                raise RuntimeError("receipt counter is missing") from None
             names = _receipt_names(receipts)
-            return tuple(
-                _parse_receipt(
-                    _read_regular_file(
-                        receipts,
-                        name,
-                        required_mode=0o600,
-                        maximum=_MAX_RECEIPT_BYTES,
-                        label="receipt file",
-                    )
-                )
-                for name in names
-            )
+            expected_names = tuple(f"{index:020d}.json" for index in range(counter))
+            if names != expected_names:
+                raise RuntimeError("receipt history is missing entries or exceeds its counter")
+            result = tuple(_read_receipt_wrapper(receipts, name)[1] for name in names)
+            _verify_canonical_parent(self.path.parent, parent, identities)
+            return result
         finally:
-            if lock is not None:
-                fcntl.flock(lock, fcntl.LOCK_UN)
-                os.close(lock)
             if receipts is not None:
                 os.close(receipts)
             if state is not None:
                 os.close(state)
+            _close_registry_lock(lock)
             os.close(parent)
 
     def status(
@@ -306,9 +393,12 @@ class DeploymentRegistry:
         resolved_commit: str | None,
         audit: DeploymentAudit | None,
         failure: str | None = None,
+        snapshot: RegistrySnapshot | None = None,
     ) -> TargetStatus:
         _validate_id(target_id, "target id")
-        config = self.load()
+        if snapshot is not None and type(snapshot) is not RegistrySnapshot:
+            raise ValueError("status snapshot must be an exact RegistrySnapshot")
+        config = snapshot.config if snapshot is not None else self.load()
         targets = {target.id: target for target in config.targets}
         try:
             target = targets[target_id]
@@ -642,10 +732,17 @@ def _receipt_to_data(receipt: DeploymentReceipt) -> dict[str, Any]:
     return {"operation": operation, "commits": commits, "targets": targets}
 
 
-def _dump_receipt(receipt: DeploymentReceipt) -> bytes:
+def _dump_receipt_wrapper(
+    receipt: dict[str, Any], registry_fingerprint: str
+) -> bytes:
+    _validate_fingerprint(registry_fingerprint)
     return (
         json.dumps(
-            _receipt_to_data(receipt),
+            {
+                "schema_version": 1,
+                "registry_fingerprint": registry_fingerprint,
+                "receipt": receipt,
+            },
             ensure_ascii=True,
             separators=(",", ":"),
             sort_keys=True,
@@ -654,12 +751,17 @@ def _dump_receipt(receipt: DeploymentReceipt) -> bytes:
     ).encode("ascii")
 
 
-def _parse_receipt(content: bytes) -> DeploymentReceipt:
+def _parse_receipt_wrapper(content: bytes) -> tuple[str, DeploymentReceipt]:
     try:
         data = json.loads(content.decode("utf-8"), object_pairs_hook=_strict_json_object)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ValueError("receipt must be strict UTF-8 JSON") from error
-    root = _mapping(data, "receipt")
+    wrapper = _mapping(data, "receipt wrapper")
+    _exact_keys(wrapper, _RECEIPT_WRAPPER_KEYS, "receipt wrapper")
+    if type(wrapper["schema_version"]) is not int or wrapper["schema_version"] != 1:
+        raise ValueError("receipt wrapper schema version must be integer 1")
+    fingerprint = _validate_fingerprint(wrapper["registry_fingerprint"])
+    root = _mapping(wrapper["receipt"], "receipt")
     _exact_keys(root, _RECEIPT_KEYS, "receipt")
     operation = _require_string(root["operation"], "receipt operation")
     if type(root["commits"]) is not list:
@@ -686,24 +788,62 @@ def _parse_receipt(content: bytes) -> DeploymentReceipt:
                 commit=commit,
             )
         )
-    return DeploymentReceipt(operation=operation, commits=commits, targets=tuple(targets))
+    return fingerprint, DeploymentReceipt(
+        operation=operation, commits=commits, targets=tuple(targets)
+    )
+
+
+def _read_receipt_wrapper(
+    receipts: int, name: str
+) -> tuple[str, DeploymentReceipt]:
+    return _parse_receipt_wrapper(
+        _read_regular_file(
+            receipts,
+            name,
+            required_mode=0o600,
+            maximum=_MAX_RECEIPT_BYTES,
+            label="receipt file",
+        )
+    )
+
+
+def _validate_fingerprint(value: Any) -> str:
+    if type(value) is not str or _FINGERPRINT.fullmatch(value) is None:
+        raise ValueError("registry fingerprint must be 64 lowercase hex characters")
+    return value
 
 
 def _require_secure_platform(*, require_locking: bool = False) -> None:
-    if (
+    required_flags = ("O_NOFOLLOW", "O_DIRECTORY", "O_CREAT", "O_EXCL")
+    required_dir_fd = (os.open, os.stat, os.mkdir, os.unlink, os.link, os.rename)
+    missing = [
+        function.__name__
+        for function in required_dir_fd
+        if function not in os.supports_dir_fd
+    ]
+    unsupported = (
         os.name != "posix"
-        or not hasattr(os, "O_NOFOLLOW")
-        or not hasattr(os, "O_DIRECTORY")
-        or not os.supports_dir_fd
-    ):
-        raise RuntimeError("secure registry operations are unavailable on this platform")
+        or any(not hasattr(os, flag) for flag in required_flags)
+        or os.stat not in os.supports_follow_symlinks
+        or os.link not in os.supports_follow_symlinks
+        or os.listdir not in os.supports_fd
+        or bool(missing)
+    )
+    if unsupported:
+        detail = f": missing descriptor support for {', '.join(missing)}" if missing else ""
+        raise RuntimeError(
+            f"secure registry descriptor operations are unavailable on this platform{detail}"
+        )
     if require_locking and fcntl is None:
-        raise RuntimeError("secure receipt locking is unavailable on this platform")
+        raise RuntimeError("secure registry locking is unavailable on this platform")
 
 
-def _open_directory_chain(path: Path) -> int:
+def _open_directory_chain_with_identity(
+    path: Path,
+) -> tuple[int, tuple[tuple[int, int], ...]]:
     _validate_absolute_normal_path(path, "registry parent")
     descriptor = os.open(path.anchor, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    identities = [_identity(os.fstat(descriptor))]
     try:
         for part in path.parts[1:]:
             child = os.open(
@@ -717,10 +857,71 @@ def _open_directory_chain(path: Path) -> int:
                 raise RuntimeError("registry parent contains a non-directory component")
             os.close(descriptor)
             descriptor = child
-        return descriptor
+            identities.append(_identity(item))
+        return descriptor, tuple(identities)
     except BaseException:
         os.close(descriptor)
         raise
+
+
+def _open_directory_chain(path: Path) -> int:
+    descriptor, _ = _open_directory_chain_with_identity(path)
+    return descriptor
+
+
+def _verify_canonical_parent(
+    path: Path,
+    descriptor: int,
+    identities: tuple[tuple[int, int], ...],
+) -> None:
+    if _identity(os.fstat(descriptor)) != identities[-1]:
+        raise RuntimeError("retained registry parent descriptor changed identity")
+    reopened, observed = _open_directory_chain_with_identity(path)
+    try:
+        if observed != identities:
+            raise RuntimeError("canonical registry parent ancestor chain changed")
+    finally:
+        os.close(reopened)
+
+
+def _open_locked_parent(
+    path: Path, lock_name: str, *, exclusive: bool
+) -> tuple[int, tuple[tuple[int, int], ...], int]:
+    parent, identities = _open_directory_chain_with_identity(path)
+    lock: int | None = None
+    try:
+        _verify_canonical_parent(path, parent, identities)
+        lock = _open_private_lock(parent, lock_name)
+        fcntl.flock(lock, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        observed_lock = os.stat(lock_name, dir_fd=parent, follow_symlinks=False)
+        if _identity(observed_lock) != _identity(os.fstat(lock)):
+            raise RuntimeError("registry lock changed after acquisition")
+        _verify_canonical_parent(path, parent, identities)
+        return parent, identities, lock
+    except BaseException:
+        if lock is not None:
+            os.close(lock)
+        os.close(parent)
+        raise
+
+
+def _close_registry_lock(lock: int) -> None:
+    try:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+    finally:
+        os.close(lock)
+
+
+def _snapshot_from_parent(parent: int, name: str) -> RegistrySnapshot:
+    content = _read_regular_file(
+        parent,
+        name,
+        required_mode=0o600,
+        maximum=_MAX_REGISTRY_BYTES,
+        label="registry file",
+    )
+    config = _parse_registry(content)
+    return RegistrySnapshot(config=config, fingerprint=hashlib.sha256(content).hexdigest())
 
 
 def _identity(item: os.stat_result) -> tuple[int, int]:
@@ -796,6 +997,10 @@ def _write_all(descriptor: int, content: bytes) -> None:
         view = view[written:]
 
 
+def _replace_at(parent: int, source: str, destination: str) -> None:
+    os.rename(source, destination, src_dir_fd=parent, dst_dir_fd=parent)
+
+
 def _unlink_if_regular(parent: int, name: str) -> None:
     try:
         item = os.stat(name, dir_fd=parent, follow_symlinks=False)
@@ -808,6 +1013,7 @@ def _unlink_if_regular(parent: int, name: str) -> None:
 def _open_private_directory(
     parent: int, name: str, *, create: bool, missing_ok: bool = False
 ) -> int | None:
+    created = False
     try:
         item = os.stat(name, dir_fd=parent, follow_symlinks=False)
     except FileNotFoundError:
@@ -820,18 +1026,21 @@ def _open_private_directory(
         except FileExistsError:
             pass
         else:
-            os.chmod(name, 0o700, dir_fd=parent, follow_symlinks=False)
+            created = True
             os.fsync(parent)
         item = os.stat(name, dir_fd=parent, follow_symlinks=False)
     if stat.S_ISLNK(item.st_mode) or not stat.S_ISDIR(item.st_mode):
         raise RuntimeError(f"private directory {name!r} must be a non-symlink directory")
-    if stat.S_IMODE(item.st_mode) != 0o700:
-        raise PermissionError(f"private directory {name!r} mode must be 0700")
     descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+    if created:
+        os.fchmod(descriptor, 0o700)
     opened = os.fstat(descriptor)
     if _identity(opened) != _identity(item):
         os.close(descriptor)
         raise RuntimeError(f"private directory {name!r} changed while it was opened")
+    if stat.S_IMODE(opened.st_mode) != 0o700:
+        os.close(descriptor)
+        raise PermissionError(f"private directory {name!r} mode must be 0700")
     return descriptor
 
 
@@ -850,37 +1059,15 @@ def _open_private_lock(parent: int, name: str) -> int:
     opened = os.fstat(descriptor)
     if not stat.S_ISREG(opened.st_mode):
         os.close(descriptor)
-        raise RuntimeError("receipt lock must be a regular file")
+        raise RuntimeError("registry lock must be a regular file")
     if stat.S_IMODE(opened.st_mode) != 0o600:
         os.close(descriptor)
-        raise PermissionError("receipt lock mode must be 0600")
-    return descriptor
-
-
-def _open_existing_private_lock(parent: int, name: str) -> int | None:
-    try:
-        before = os.stat(name, dir_fd=parent, follow_symlinks=False)
-    except FileNotFoundError:
-        return None
-    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
-        raise RuntimeError("receipt lock must be a non-symlink regular file")
-    descriptor = os.open(name, os.O_RDWR | os.O_NOFOLLOW, dir_fd=parent)
-    opened = os.fstat(descriptor)
-    if _identity(opened) != _identity(before):
+        raise PermissionError("registry lock mode must be 0600")
+    observed = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    if _identity(observed) != _identity(opened):
         os.close(descriptor)
-        raise RuntimeError("receipt lock changed while it was opened")
-    if stat.S_IMODE(opened.st_mode) != 0o600:
-        os.close(descriptor)
-        raise PermissionError("receipt lock mode must be 0600")
+        raise RuntimeError("registry lock changed while it was opened")
     return descriptor
-
-
-def _child_exists(parent: int, name: str) -> bool:
-    try:
-        os.stat(name, dir_fd=parent, follow_symlinks=False)
-    except FileNotFoundError:
-        return False
-    return True
 
 
 def _receipt_names(directory: int) -> tuple[str, ...]:
@@ -893,11 +1080,132 @@ def _receipt_names(directory: int) -> tuple[str, ...]:
     return tuple(sorted(receipt_names))
 
 
-def _next_receipt_sequence(directory: int) -> int:
-    names = _receipt_names(directory)
-    if not names:
+def _receipt_names_for_append(
+    directory: int,
+    *,
+    destination: str,
+    expected_names: tuple[str, ...],
+    registry_fingerprint: str,
+    receipt: DeploymentReceipt,
+) -> tuple[str, ...]:
+    receipt_names: list[str] = []
+    temporary_names: list[str] = []
+    for name in os.listdir(directory):
+        if _RECEIPT_FILE.fullmatch(name) is not None:
+            receipt_names.append(name)
+        elif (
+            (match := _RECEIPT_TEMP.fullmatch(name)) is not None
+            and match.group("receipt") == destination
+        ):
+            temporary_names.append(name)
+        else:
+            raise RuntimeError(f"unexpected entry in receipt directory: {name}")
+    ordered_names = tuple(sorted(receipt_names))
+    if ordered_names not in (expected_names, (*expected_names, destination)):
+        raise RuntimeError("receipt history is not contiguous with its counter")
+    if not temporary_names:
+        return ordered_names
+    if len(temporary_names) != 1:
+        raise RuntimeError("receipt history contains multiple interrupted stages")
+    temporary = temporary_names[0]
+    staged_fingerprint, staged_receipt = _read_receipt_wrapper(directory, temporary)
+    if staged_fingerprint != registry_fingerprint or staged_receipt != receipt:
+        raise RuntimeError("interrupted receipt stage does not match append retry")
+    if destination in receipt_names:
+        destination_identity = _optional_regular_identity(
+            directory, destination, "orphan receipt"
+        )
+        temporary_identity = _optional_regular_identity(
+            directory, temporary, "receipt temporary file"
+        )
+        if destination_identity != temporary_identity:
+            raise RuntimeError("interrupted receipt stage is not linked to orphan receipt")
+    else:
+        os.link(
+            temporary,
+            destination,
+            src_dir_fd=directory,
+            dst_dir_fd=directory,
+            follow_symlinks=False,
+        )
+        receipt_names.append(destination)
+    os.unlink(temporary, dir_fd=directory)
+    os.fsync(directory)
+    return tuple(sorted(receipt_names))
+
+
+def _read_counter(state: int) -> int:
+    content = _read_regular_file(
+        state,
+        _RECEIPT_COUNTER,
+        required_mode=0o600,
+        maximum=32,
+        label="receipt counter",
+    )
+    try:
+        text = content.decode("ascii")
+    except UnicodeDecodeError as error:
+        raise ValueError("receipt counter must be canonical ASCII") from error
+    if re.fullmatch(r"(?:0|[1-9][0-9]{0,19})\n", text) is None:
+        raise ValueError("receipt counter must be a canonical bounded integer")
+    counter = int(text)
+    if counter > _MAX_RECEIPTS:
+        raise ValueError("receipt counter exceeds supported bound")
+    return counter
+
+
+def _load_or_initialize_counter(state: int, receipts: int) -> int:
+    try:
+        return _read_counter(state)
+    except FileNotFoundError:
+        if _receipt_names(receipts):
+            raise RuntimeError("receipt counter is missing for existing history") from None
+        _write_counter(state, 0)
         return 0
-    return int(names[-1][:-5]) + 1
+
+
+def _write_counter(state: int, counter: int) -> None:
+    if type(counter) is not int or not 0 <= counter <= _MAX_RECEIPTS:
+        raise ValueError("receipt counter exceeds supported bound")
+    _write_private_atomic(
+        state,
+        _RECEIPT_COUNTER,
+        f"{counter}\n".encode("ascii"),
+        label="receipt counter",
+    )
+
+
+def _write_private_atomic(parent: int, name: str, content: bytes, *, label: str) -> None:
+    temporary = f".{name}.{uuid.uuid4().hex}.tmp"
+    descriptor: int | None = None
+    published = False
+    try:
+        original = _optional_regular_identity(parent, name, label)
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=parent,
+        )
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise RuntimeError(f"{label} temporary file must be regular")
+        os.fchmod(descriptor, 0o600)
+        _write_all(descriptor, content)
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        if _optional_regular_identity(parent, name, label) != original:
+            raise RuntimeError(f"{label} changed during atomic write")
+        _replace_at(parent, temporary, name)
+        published = True
+        os.fsync(parent)
+    except BaseException:
+        if descriptor is not None:
+            os.close(descriptor)
+        if not published:
+            _unlink_if_regular(parent, temporary)
+        raise
 
 
 def _is_preview_channel(channel: str) -> bool:
@@ -919,8 +1227,8 @@ def _audit_is_invalid(audit: DeploymentAudit) -> bool:
         or any(type(values) is not tuple for values in diagnostics)
         or any(type(value) is not str for values in diagnostics for value in values)
         or not audit.matches
-        or bool(audit.validation_errors)
+        or any(bool(values) for values in diagnostics)
     )
 
 
-__all__ = ["ChannelSpec", "DeploymentRegistry", "RegistryConfig"]
+__all__ = ["ChannelSpec", "DeploymentRegistry", "RegistryConfig", "RegistrySnapshot"]
