@@ -32,6 +32,7 @@ from agent_ops.deployment.registry import (
     DeploymentRegistry,
     RegistryConfig,
     RegistrySnapshot,
+    _is_preview_channel,
 )
 from agent_ops.deployment.source_store import (
     SourceStore,
@@ -241,7 +242,11 @@ class DeploymentEngine:
         source_id = next(iter(source_ids))
         sources = {item.id: item for item in original_snapshot.config.sources}
         source = sources[source_id]
+        if type(ref) is not str or not ref.startswith("refs/heads/"):
+            raise ValueError("deploy ref must begin exactly with refs/heads/")
         requested = ChannelSpec(channel, source_id, ref)
+        if _is_preview_channel(requested.id):
+            raise ValueError("deploy channel alias must not use a preview-reserved name")
         if requested.ref == source.stable_ref:
             raise ValueError("deploy ref must not be the configured stable ref")
         existing = configured_channels.get(channel)

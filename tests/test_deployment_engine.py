@@ -233,7 +233,7 @@ def test_deploy_rejects_selected_targets_from_multiple_sources(tmp_path: Path) -
     ("channel", "ref", "message"),
     [
         ("bad/name", "refs/heads/feature", "channel id"),
-        ("demo", "feature", "fully qualified"),
+        ("demo", "feature", "refs/heads"),
         ("demo", "refs/heads/main", "stable ref"),
         ("stable", "refs/heads/feature", "alias.*differs"),
     ],
@@ -249,6 +249,67 @@ def test_deploy_rejects_invalid_or_conflicting_alias_before_mutation(
 
     assert registry.load_snapshot() == before
     assert not home.exists()
+    assert registry.receipts() == ()
+
+
+@pytest.mark.parametrize(
+    "ref",
+    (
+        "refs/tags/v1",
+        "refs/remotes/origin/feature",
+        "refs/pull/1/head",
+        "refs/agentops/internal/test",
+        "refs/heads-not-a-branch/feature",
+    ),
+)
+def test_deploy_rejects_non_branch_ref_before_fetch_or_mutation(
+    tmp_path: Path, ref: str
+) -> None:
+    engine, registry, home = _engine_fixture(tmp_path)
+    home.mkdir()
+    sentinel = home / "operator.txt"
+    sentinel.write_bytes(b"unchanged\n")
+    source = tmp_path / "source"
+    commit = _create_branch(source, "feature", b"feature\n")
+    subprocess.run(["git", "update-ref", ref, commit], cwd=source, check=True)
+    before = registry.load_snapshot()
+
+    with pytest.raises(ValueError, match="refs/heads"):
+        engine.deploy("demo", ref, ("codex",))
+
+    assert not (tmp_path / "source-store").exists()
+    assert registry.load_snapshot() == before
+    assert sentinel.read_bytes() == b"unchanged\n"
+    assert registry.receipts() == ()
+
+
+@pytest.mark.parametrize(
+    "channel",
+    (
+        "preview",
+        "preview-demo",
+        "unreviewed-local",
+        "unreviewed-local-demo",
+        "unreviewed-locality",
+    ),
+)
+def test_deploy_rejects_preview_reserved_alias_before_fetch_or_mutation(
+    tmp_path: Path, channel: str
+) -> None:
+    engine, registry, home = _engine_fixture(tmp_path)
+    home.mkdir()
+    sentinel = home / "operator.txt"
+    sentinel.write_bytes(b"unchanged\n")
+    source = tmp_path / "source"
+    _create_branch(source, "feature", b"feature\n")
+    before = registry.load_snapshot()
+
+    with pytest.raises(ValueError, match="preview"):
+        engine.deploy(channel, "refs/heads/feature", ("codex",))
+
+    assert not (tmp_path / "source-store").exists()
+    assert registry.load_snapshot() == before
+    assert sentinel.read_bytes() == b"unchanged\n"
     assert registry.receipts() == ()
 
 
