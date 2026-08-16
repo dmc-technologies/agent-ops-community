@@ -652,7 +652,7 @@ def _directories(files: tuple[PlannedFile, ...]) -> tuple[ManifestDirectory, ...
 
 
 def _manifest_to_dict(manifest: DeploymentManifest) -> dict[str, Any]:
-    return {
+    result = {
         "schema_version": manifest.schema_version,
         "target_id": manifest.target_id,
         "framework": manifest.framework.value,
@@ -672,6 +672,9 @@ def _manifest_to_dict(manifest: DeploymentManifest) -> dict[str, Any]:
             for item in manifest.files
         ],
     }
+    if manifest.review_state is not None:
+        result["review_state"] = manifest.review_state
+    return result
 
 
 def _manifest_bytes(manifest: DeploymentManifest) -> bytes:
@@ -716,9 +719,7 @@ def _validated_manifest_data(content: bytes, *, target: TargetSpec) -> dict[str,
         or data["schema_version"] != _SCHEMA_VERSION
     ):
         raise ValueError("invalid deployment manifest schema")
-    _require_exact_keys(
-        data,
-        {
+    manifest_keys = {
             "schema_version",
             "target_id",
             "framework",
@@ -727,9 +728,22 @@ def _validated_manifest_data(content: bytes, *, target: TargetSpec) -> dict[str,
             "transaction_id",
             "files",
             "directories",
-        },
-        label="deployment manifest",
-    )
+        }
+    data_keys = set(data)
+    allowed_manifest_keys = manifest_keys | {"review_state"}
+    unknown_manifest_keys = sorted(data_keys - allowed_manifest_keys)
+    missing_manifest_keys = sorted(manifest_keys - data_keys)
+    if unknown_manifest_keys:
+        raise ValueError(
+            f"unknown deployment manifest member: {unknown_manifest_keys[0]}"
+        )
+    if missing_manifest_keys:
+        raise ValueError(
+            f"missing deployment manifest member: {missing_manifest_keys[0]}"
+        )
+    review_state = data.get("review_state")
+    if review_state not in {None, "unreviewed-local"}:
+        raise ValueError("invalid deployment manifest review state")
     if data.get("target_id") != target.id or data.get("framework") != target.framework.value:
         raise ValueError("deployment manifest target does not match plan")
     if not isinstance(data.get("source_revision"), str) or not data["source_revision"]:
@@ -1320,6 +1334,13 @@ def _install_provider_plan_groups(
             ),
             directories=_directories(files),
             transaction_id=transaction_id,
+            review_state=(
+                "unreviewed-local"
+                if target.channel == "preview"
+                or target.channel.startswith("preview-")
+                or target.channel.startswith("unreviewed-local")
+                else None
+            ),
         )
         with _target_lock(target.home) as home_fs:
             _validate_group_current_state(home_fs, group)
@@ -1483,6 +1504,7 @@ def _install_provider_plan_groups(
                 files=manifest.files,
                 directories=tuple(actual_directories),
                 transaction_id=manifest.transaction_id,
+                review_state=manifest.review_state,
             )
             record = {
                 "schema_version": _TRANSACTION_SCHEMA_VERSION,
@@ -1744,6 +1766,7 @@ def _manifest_from_data(
                 for item in validated["directories"]
             ),
             transaction_id=validated["transaction_id"],
+            review_state=validated.get("review_state"),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError(f"invalid transaction record manifest: {exc}") from exc

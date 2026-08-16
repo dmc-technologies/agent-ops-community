@@ -25,6 +25,7 @@ from agent_ops.deployment.models import (
     TargetState,
     TargetStatus,
 )
+from agent_ops.deployment.preview import PreviewEngine, PreviewResult
 from agent_ops.deployment.registry import DeploymentRegistry, RegistryConfig
 from agent_ops.deployment.source_store import SourceStore
 from agent_ops.frameworks import get_adapter
@@ -70,6 +71,19 @@ def _load_runtime(
         else root / "deployments.yaml"
     )
     return registry, DeploymentEngine(registry, SourceStore(root / "sources"))
+
+
+def _load_preview_runtime(
+    registry_path: Path | None,
+    state_home: Path | None,
+) -> PreviewEngine:
+    root = _state_root(state_home)
+    registry = DeploymentRegistry(
+        registry_path.expanduser().absolute()
+        if registry_path is not None
+        else root / "deployments.yaml"
+    )
+    return PreviewEngine(registry)
 
 
 def _jsonable(value: Any) -> Any:
@@ -150,6 +164,19 @@ def _emit_receipt(receipt: DeploymentReceipt, json_output: bool) -> None:
         return
     typer.echo(f"{receipt.operation}: {','.join(receipt.commits) or '-'}")
     _emit_statuses(receipt.targets, False)
+
+
+def _emit_preview(result: PreviewResult, json_output: bool) -> None:
+    if json_output:
+        _emit_json(result)
+        return
+    typer.echo(
+        f"preview: {result.target_id} channel={result.channel} "
+        f"review={result.review_state} fingerprint={result.fingerprint}"
+    )
+    typer.echo(
+        f"providers={','.join(result.providers)} paths={','.join(result.paths)}"
+    )
 
 
 def _fail(
@@ -373,6 +400,29 @@ def audit_command(
         _call(registry.load), targets=targets, target=target, all_targets=all_targets
     )
     _emit_receipt(_call(lambda: engine.audit(selected or ())), json_output)
+
+
+@deployment_app.command("preview")
+@_json_command
+def preview_command(
+    source_checkout: Annotated[Path | None, typer.Option("--source-checkout")] = None,
+    skill: Annotated[list[str] | None, typer.Option("--skill")] = None,
+    target: Annotated[str | None, typer.Option("--target")] = None,
+    json_output: Annotated[bool, typer.Option("--json")] = False,
+    registry_path: Annotated[Path | None, typer.Option("--registry")] = None,
+    state_home: Annotated[Path | None, typer.Option("--state-home")] = None,
+) -> None:
+    if source_checkout is None:
+        _fail("--source-checkout is required", usage=True)
+    if not skill:
+        _fail("select at least one skill with --skill", usage=True)
+    if target is None:
+        _fail("--target is required", usage=True)
+    engine = _call(lambda: _load_preview_runtime(registry_path, state_home))
+    result = _call(
+        lambda: engine.preview(source_checkout, tuple(sorted(skill)), target)
+    )
+    _emit_preview(result, json_output)
 
 
 @channel_app.command("deploy")

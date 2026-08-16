@@ -104,7 +104,9 @@ class DeploymentEngine:
         self, target_ids: tuple[str, ...] | None = None
     ) -> tuple[TargetStatus, ...]:
         snapshot = self._registry.load_snapshot()
-        targets = self._select_targets(snapshot.config, target_ids, allow_all=True)
+        targets = self._select_targets(
+            snapshot.config, target_ids, allow_all=True, allow_preview=True
+        )
         latest: dict[str, TargetStatus] = {}
         for record in self._registry.receipt_records():
             if record.registry_fingerprint != snapshot.fingerprint:
@@ -431,11 +433,17 @@ class DeploymentEngine:
         target_ids: tuple[str, ...] | None,
         *,
         allow_all: bool = False,
+        allow_preview: bool = False,
     ) -> tuple[TargetSpec, ...]:
         if target_ids is None:
             if not allow_all:
                 raise ValueError("target ids are required")
-            return config.targets
+            selected = config.targets
+            if not allow_preview and any(
+                _is_preview_channel(target.channel) for target in selected
+            ):
+                raise ValueError("managed deployment operations reject preview targets")
+            return selected
         if type(target_ids) is not tuple or not target_ids:
             raise ValueError("target ids must be a nonempty tuple")
         if any(type(target_id) is not str or not target_id for target_id in target_ids):
@@ -446,7 +454,12 @@ class DeploymentEngine:
         unknown = sorted(set(target_ids) - targets.keys())
         if unknown:
             raise ValueError(f"unknown target: {unknown[0]}")
-        return tuple(targets[target_id] for target_id in sorted(target_ids))
+        selected = tuple(targets[target_id] for target_id in sorted(target_ids))
+        if not allow_preview and any(
+            _is_preview_channel(target.channel) for target in selected
+        ):
+            raise ValueError("managed deployment operations reject preview targets")
+        return selected
 
     def _fetch_snapshots(
         self,

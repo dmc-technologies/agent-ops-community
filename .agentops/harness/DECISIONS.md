@@ -4,6 +4,20 @@ Repository: `agent-ops-community`
 
 Record durable architecture, workflow, and harness decisions here.
 
+### 2026-08-15: Branch channels are machine-local data selections over one shared transaction
+
+- Decision: keep executable deployment authority in the reviewed installed community package. Treat stable and branch repositories as provider-declared data sources, give every target an isolated framework home, keep registry, source store, locks, and receipts machine-local, and use one grouped descriptor-bound transaction, audit, and reverse recovery path for every provider and target.
+- Rationale: one implementation prevents provider-specific installation drift, while independent machine state permits rapid branch deployment without making branch content executable or coupling machines through locks or receipts.
+- Applies to: deployment models, provider discovery, source store, registry, transaction engine, orchestration, CLI, launch adapters, documentation, and acceptance tests.
+- Revisit when: a supported framework cannot isolate native state by home, or a provider needs executable source behavior that cannot remain in the reviewed package.
+
+### 2026-08-15: Local preview is selected unreviewed data and cannot become a managed channel
+
+- Decision: preview requires an explicit authored checkout, explicit skill selection, and an existing preview-reserved target. Fingerprint the selected Git-tracked working-tree path, kind, mode, and byte closure as SHA-256, mark the result `unreviewed-local`, and apply it through the shared transaction without fetching, publishing, building, importing, or writing a managed source snapshot. Reject managed plan, refresh, audit, deploy, switch, and launch treatment of preview targets.
+- Rationale: authors can try local skill edits quickly while the target remains isolated and visibly outside stable or branch review state. The content fingerprint and transaction evidence preserve exact local facts without granting the working tree code authority.
+- Applies to: local preview, managed engine selection, deployment CLI, documentation, and tests.
+- Revisit when: a reviewed promotion workflow can bind an unreviewed preview fingerprint to an immutable committed source without weakening the current boundary.
+
 ### 2026-08-13: HumanLayer show-me stays an exact pinned dependency
 
 - Decision: install only `plugins/show-me/skills/show-me` from `humanlayer/skills` version 1.0.0 at commit `4d8d644ca747517973f58d7953f58d7cd07520cd` through a fingerprint-owned transactional adapter for all six managed agent hosts. Keep the upstream skill identity and core instructions, but replace its host-specific HTML opener with a portable artifact-preview fallback.

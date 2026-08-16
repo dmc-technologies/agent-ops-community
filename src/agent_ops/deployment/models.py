@@ -150,11 +150,14 @@ class DeploymentManifest:
     files: tuple[ManifestFile, ...]
     directories: tuple[ManifestDirectory, ...]
     transaction_id: str
+    review_state: str | None = None
 
     def __post_init__(self) -> None:
         _nonempty(self.target_id, "target id")
         _nonempty(self.source_revision, "source revision")
         _nonempty(self.transaction_id, "transaction id")
+        if self.review_state not in {None, "unreviewed-local"}:
+            raise ValueError("manifest review state is invalid")
         object.__setattr__(self, "provider_ids", tuple(self.provider_ids))
         object.__setattr__(self, "files", tuple(self.files))
         object.__setattr__(self, "directories", tuple(self.directories))

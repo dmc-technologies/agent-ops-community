@@ -27,6 +27,7 @@ from agent_ops.deployment.models import (
     TargetState,
     TargetStatus,
 )
+from agent_ops.deployment.preview import PreviewEngine, PreviewResult
 from agent_ops.deployment.providers import (
     load_deployment_providers,
     normalize_deployment_providers,
@@ -48,6 +49,8 @@ __all__ = [
     "ManifestFile",
     "PlannedFile",
     "ProviderPlan",
+    "PreviewEngine",
+    "PreviewResult",
     "RewriteAcceptance",
     "SourceSnapshot",
     "SourceSpec",

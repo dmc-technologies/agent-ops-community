@@ -4,25 +4,27 @@ Repository: `agent-ops-community`
 
 ## Current State
 
-- Branch: `feat/humanlayer-show-me-skill`
-- Main baseline: `4eda2a8`, the merge of public pull request 13.
-- Current handoff: public `agent-ops-community` pull request 14 pins HumanLayer's `show-me` skill at upstream commit `4d8d644ca747517973f58d7953f58d7cd07520cd` and configures it for all six Agent Ops agent hosts without importing the repository's four unrelated skills. Three Review Gate cycles exposed unsafe replacement, incomplete discovery, non-durable recovery, Linux-only filesystem assumptions, incomplete nested collision detection, and incorrect OpenClaw profile resolution. The corrected adapter now refuses unowned or modified targets, owns updates by fingerprint, locks and recovers durable transactions on POSIX and Windows, preserves changed crash-recovery content, scans flat and nested skill identities through confined no-follow operations, resolves OpenClaw's active state precedence, and uses a portable artifact-preview fallback. Replacement hosted acceptance, merge, and the post-merge package refresh remain pending external finalization. No external tracker applies to this public package change.
-- Verification: the registry contract test failed before the dependency was added and now passes. Complete Ruff, all 173 tests, the source-tree harness check, whitespace validation, focused installer/framework tests, six exact pinned disposable installs, POSIX and Windows-path transaction tests, interruption recovery, changed-target preservation, recursive collision, and no-follow profile-confinement checks pass.
+- Branch: `feat/deployment-channels`
+- Main baseline: `e8f2add`, the community `origin/main` selected for this implementation.
+- Current handoff: the community branch implements the generic pull-based deployment engine, provider contract, managed Git source store, machine registry and receipts, grouped recovery, CLI and isolated launch support, plus authored-checkout local preview. Two independent machine fixtures follow the same branch using separate homes, stores, locks, and receipts. This closeout commit is the intended community final head; record its exact SHA in GitHub without changing files after the final local gate. No Plane work item applies. The community pull request, hosted CI, one person-applied final-head `ai review`, merge, and the dependent private overlay remain external.
+- Verification: preview, CLI, and engine tests pass locally during implementation. The complete final-head gate remains to be run after the closeout commit.
 
 ## Current Work
 
-- Goal: make the requested visual-explanation skill available through both machine-global discovery and reproducible Agent Ops harness installation.
-- Active task: publish the verified public dependency change and obtain hosted CI and Review Gate on the final pull-request head.
-- Files in play: the source and packaged dependency registries, installation contract test, public setup documentation, and harness handoff records.
-- Blockers: no product or implementation blocker. Hosted acceptance and merge remain external.
+- Goal: provide fast pull-based stable, branch, and local-preview deployment to isolated agent homes without making branch code executable.
+- Active task: freeze and verify the complete community deployment-channel head before external publication.
+- Files in play: the deployment package, framework launch adapters, deployment tests, public documentation, and harness closeout records.
+- Blockers: no local product or implementation blocker. Pull-request publication, hosted CI, final-head review, merge, and the dependent private overlay remain external.
 
 ## Next Actions
 
-- Obtain hosted CI and Review Gate on the unchanged final head of public `agent-ops-community` pull request 14.
-- Merge public `agent-ops-community` pull request 14 only after the required checks pass.
-- After merge, refresh the installed Agent Ops package from public `main`; the machine-global and Prime Agent copies are already installed.
+- Run `ruff check .`, `python -m pytest -q`, `agentops harness check .`, and `git diff --check` once on the unchanged closeout commit.
+- Open one community pull request for the complete generic deployment-channel result and obtain ordinary hosted CI on that exact head.
+- Ask a person to apply `ai review` once after CI passes, merge only if the unchanged head passes, and record the merged community commit for the dependent private overlay.
 
 ## Session Log
+
+- 2026-08-15: Added pull-based stable and arbitrary branch channels with one stable provider interface and one grouped transaction, audit, and recovery path. Each machine owns independent state and every framework target owns an isolated home. Added local preview for selected Git-tracked working-tree skill data with a path, mode, and byte fingerprint and `unreviewed-local` review state; managed operations reject preview targets. Final local commands remain to be run on the closeout commit; no community pull request or Plane item exists yet.
 
 - 2026-08-13: Review Gate run `31703138089` found missing higher-precedence OpenClaw roots. Collision discovery now includes the personal compatibility root whenever the selected state is the default regardless of config location, plus default and configured agent workspace `skills` and `.agents/skills` roots.
 

@@ -21,12 +21,31 @@ from agent_ops.deployment.models import (
     TargetState,
     TargetStatus,
 )
+from agent_ops.deployment.preview import PreviewResult
 from agent_ops.deployment.registry import ChannelSpec, RegistryConfig, RegistrySnapshot
 from agent_ops.registries.models import Framework
 
 runner = CliRunner()
 COMMIT = "a" * 40
 OLD_COMMIT = "b" * 40
+
+
+class FakePreviewEngine:
+    def __init__(self) -> None:
+        self.calls: list[tuple[object, ...]] = []
+
+    def preview(self, checkout, skills, target_id):
+        self.calls.append((checkout, skills, target_id))
+        return PreviewResult(
+            "preview",
+            "unreviewed-local",
+            target_id,
+            "preview",
+            "d" * 64,
+            "d" * 64,
+            ("selected-skills",),
+            ("skills/demo/SKILL.md",),
+        )
 
 
 @dataclass
@@ -143,6 +162,71 @@ def test_deployment_status_has_deterministic_human_and_json_output(
         {"target_id": "codex-demo", "state": "branch", "channel": "demo", "commit": COMMIT}
     ]
     assert engine.calls == [("status", None), ("status", None)]
+
+
+def test_deployment_preview_delegates_explicit_inputs_and_renders_deterministically(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from agent_ops.deployment import cli as deployment_cli
+
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    preview = FakePreviewEngine()
+    monkeypatch.setattr(
+        deployment_cli,
+        "_load_preview_runtime",
+        lambda *_args, **_kwargs: preview,
+    )
+
+    common = [
+        "deployment",
+        "preview",
+        "--source-checkout",
+        str(checkout),
+        "--skill",
+        "demo",
+        "--target",
+        "codex-preview",
+    ]
+    human = runner.invoke(app, common)
+    structured = runner.invoke(app, [*common, "--json"])
+
+    assert human.exit_code == 0
+    assert human.output == (
+        "preview: codex-preview channel=preview review=unreviewed-local "
+        f"fingerprint={'d' * 64}\n"
+        "providers=selected-skills paths=skills/demo/SKILL.md\n"
+    )
+    assert structured.exit_code == 0
+    assert json.loads(structured.output) == {
+        "operation": "preview",
+        "review_state": "unreviewed-local",
+        "target_id": "codex-preview",
+        "channel": "preview",
+        "fingerprint": "d" * 64,
+        "source_revision": "d" * 64,
+        "providers": ["selected-skills"],
+        "paths": ["skills/demo/SKILL.md"],
+    }
+    assert preview.calls == [
+        (checkout, ("demo",), "codex-preview"),
+        (checkout, ("demo",), "codex-preview"),
+    ]
+
+
+def test_deployment_preview_requires_every_explicit_input(tmp_path: Path) -> None:
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    common = ["deployment", "preview"]
+    cases = (
+        [*common, "--skill", "demo", "--target", "codex-preview"],
+        [*common, "--source-checkout", str(checkout), "--target", "codex-preview"],
+        [*common, "--source-checkout", str(checkout), "--skill", "demo"],
+    )
+
+    for arguments in cases:
+        result = runner.invoke(app, arguments)
+        assert result.exit_code == 2
 
 
 def test_deployment_plan_is_read_only_and_reports_commit(tmp_path: Path, monkeypatch) -> None:

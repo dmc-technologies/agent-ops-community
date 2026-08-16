@@ -65,6 +65,37 @@ agentops frameworks command examples/local-smoke.yaml --framework prime-agent --
 
 Prime Agent handoff uses its non-interactive `--print` mode and passes the job context with an explicit `--cwd`. Prime Agent skill bundles install namespaced skills under `${PRIME_AGENT_CODING_AGENT_DIR:-$HOME/.prime/agent}/skills` and keep ownership records outside the shared skill namespace. See [Prime Agent support](docs/prime-agent.md) for the complete setup, collision contract, and command contract.
 
+## Pull-Based Deployment Channels
+
+Agent Ops can keep multiple isolated framework homes on stable `main` or an explicitly selected branch. Each machine owns its registry, fetched snapshots, locks, receipts, and target homes; machines that follow the same branch do not share mutable deployment state. Stable remains the reviewed path, while a branch target can refresh immediately and continue to receive ordinary pull-request review in parallel.
+
+Supported daily commands are:
+
+```bash
+agentops deployment status --all
+agentops deployment plan --all
+agentops deployment refresh --all
+agentops deployment audit --all
+agentops channel deploy skill-routing-v2 --ref refs/heads/feat/skill-routing-v2 --targets codex-skill-routing-v2,claude-skill-routing-v2
+agentops channel refresh skill-routing-v2
+agentops channel switch stable --targets codex-skill-routing-v2,claude-skill-routing-v2
+agentops channel launch skill-routing-v2 --framework codex
+```
+
+Branch snapshots are data sources only. The stable installed package discovers providers, validates each provider's declared source closure, and plans against a restricted copy containing only that closure. Agent Ops does not import or execute Python from the branch, invoke branch build files or hooks, or copy unrelated catalog or configuration content. A grouped refresh plans every selected target before mutation, locks homes in deterministic order, audits the result, and restores every changed target if installation or audit fails. Incomplete recovery stops with retained transaction evidence under the affected target's `.agentops/deployment/transactions` directory.
+
+Every target needs its own home. Authenticate the native framework inside that target's environment before launch, such as `CODEX_HOME=/path/to/home codex login`; the launch command reports the framework-specific prerequisite when readiness cannot be verified. Credentials remain in the isolated home and are not copied from a repository or another target.
+
+For an explicitly unreviewed local skill edit, configure an existing preview-reserved target and run:
+
+```bash
+agentops deployment preview --source-checkout /path/to/agent-ops-checkout --skill my-skill --target codex-preview
+```
+
+Preview accepts only selected Git-tracked data from that checkout, includes selected working-tree changes in a SHA-256 fingerprint, and reports `review_state=unreviewed-local`. It rejects stable and branch targets, links, untracked referenced resources, overlapping source and target paths, and managed refresh, switch, deploy, or launch treatment. It never fetches or publishes a ref or creates a managed source-store snapshot.
+
+Installed extension packages expose deployment providers through the `agent_ops.deployment_providers` entry-point group. A provider supplies a stable `provider_id`, a boolean `supports(snapshot, target)` decision, an exact repository-relative `source_closure(snapshot, target, selection)`, and an immutable `plan(snapshot, target)`. The shared engine confines and validates the closure before calling `plan`.
+
 ## Extension Model
 
 Third-party and organization-specific runners integrate through Python entry
