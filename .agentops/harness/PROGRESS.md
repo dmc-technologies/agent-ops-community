@@ -6,8 +6,8 @@ Repository: `agent-ops-community`
 
 - Branch: `feat/deployment-channels`
 - Main baseline: `e8f2add`, the community `origin/main` selected for this implementation.
-- Current handoff: the community branch implements the generic pull-based deployment engine, provider contract, managed Git source store, machine registry and receipts, grouped recovery, CLI and isolated launch support, plus authored-checkout local preview. Two independent machine fixtures follow the same branch using separate homes, stores, locks, and receipts. This closeout commit is the intended community final head; record its exact SHA in GitHub without changing files after the final local gate. No Plane work item applies. The community pull request, hosted CI, one person-applied final-head `ai review`, merge, and the dependent private overlay remain external.
-- Verification: preview, CLI, and engine tests pass locally during implementation. The complete final-head gate remains to be run after the closeout commit.
+- Current handoff: the community branch implements the generic pull-based deployment engine, provider contract, managed Git source store, machine registry and receipts, grouped recovery, CLI and isolated launch support, plus authored-checkout local preview. Preview now retains exact filesystem and Git authority through planning, requires canonical provider-owned skill closures, and rejects unsafe or Git-inconsistent modes. Two independent machine fixtures follow the same branch using separate homes, stores, locks, and receipts. This correction commit is the intended community final head; record its exact SHA in GitHub without changing files after the final local gate. No Plane work item applies. The community pull request, hosted CI, one person-applied final-head `ai review`, merge, and the dependent private overlay remain external.
+- Verification: the new identity, authority-race, and mode tests failed against the prior implementation and pass after correction. The complete final-head gate remains to be run after the correction commit.
 
 ## Current Work
 
@@ -23,6 +23,8 @@ Repository: `agent-ops-community`
 - Ask a person to apply `ai review` once after CI passes, merge only if the unchanged head passes, and record the merged community commit for the dependent private overlay.
 
 ## Session Log
+
+- 2026-08-15: Pre-publication specification review found that local preview released source descriptors before installation, accepted path-only providers without canonical skill ownership, and allowed group or world-writable and Git-inconsistent modes. The correction retains selected path, parent, index, and HEAD authority through planning; revalidates it under the target lock before installation; requires exact provider and skill identity resolution; and rejects unsafe filesystem or Git entry modes. The complete final-head gate remains pending until this correction is committed.
 
 - 2026-08-15: Added pull-based stable and arbitrary branch channels with one stable provider interface and one grouped transaction, audit, and recovery path. Each machine owns independent state and every framework target owns an isolated home. Added local preview for selected Git-tracked working-tree skill data with a path, mode, and byte fingerprint and `unreviewed-local` review state; managed operations reject preview targets. Final local commands remain to be run on the closeout commit; no community pull request or Plane item exists yet.
 

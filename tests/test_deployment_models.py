@@ -11,6 +11,8 @@ from agent_ops.deployment import (
     ManifestFile,
     PlannedFile,
     ProviderPlan,
+    ProviderSourceClosure,
+    SkillSourceClosure,
     SourceSnapshot,
     TargetSource,
     TargetSpec,
@@ -97,6 +99,40 @@ def test_deployment_provider_entry_points_are_separate_from_runner_plugins(monke
 
     assert load_deployment_providers() == []
     assert requested_groups == ["agent_ops.deployment_providers"]
+
+
+def test_preview_source_closure_binds_provider_skill_aliases_and_paths() -> None:
+    skill = SkillSourceClosure(
+        canonical_id="founder-brief",
+        aliases=("brief",),
+        paths=(Path("skills/founder-brief"), Path("configs/policy.yaml")),
+    )
+    closure = ProviderSourceClosure("public-skills", (skill,))
+
+    assert closure.provider_id == "public-skills"
+    assert closure.skills == (skill,)
+
+
+def test_preview_skill_closure_rejects_duplicate_identity_members() -> None:
+    with pytest.raises(ValueError, match="aliases"):
+        SkillSourceClosure(
+            "founder-brief", ("brief", "brief"), (Path("skills/a"),)
+        )
+    with pytest.raises(ValueError, match="paths"):
+        SkillSourceClosure(
+            "founder-brief", (), (Path("skills/a"), Path("skills/a"))
+        )
+
+
+def test_preview_provider_closure_rejects_duplicate_canonical_ids_and_path_ownership() -> None:
+    first = SkillSourceClosure("one", (), (Path("skills/one"),))
+    duplicate = SkillSourceClosure("one", (), (Path("skills/two"),))
+    overlapping = SkillSourceClosure("two", (), (Path("skills/one/resource.txt"),))
+
+    with pytest.raises(ValueError, match="canonical"):
+        ProviderSourceClosure("public-skills", (first, duplicate))
+    with pytest.raises(ValueError, match="owned"):
+        ProviderSourceClosure("public-skills", (first, overlapping))
 
 
 def _valid_deployment_plan_parts():

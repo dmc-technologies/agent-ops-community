@@ -94,6 +94,70 @@ class ProviderPlan:
 
 
 @dataclass(frozen=True)
+class SkillSourceClosure:
+    """Canonical preview identity and the source paths that it exclusively owns."""
+
+    canonical_id: str
+    aliases: tuple[str, ...]
+    paths: tuple[Path, ...]
+
+    def __post_init__(self) -> None:
+        _nonempty(self.canonical_id, "canonical skill id")
+        if type(self.aliases) is not tuple or any(
+            type(alias) is not str or not alias for alias in self.aliases
+        ):
+            raise ValueError("skill aliases must be nonempty strings")
+        if len(set(self.aliases)) != len(self.aliases) or self.canonical_id in self.aliases:
+            raise ValueError("skill aliases must be unique and differ from the canonical id")
+        if type(self.paths) is not tuple or not self.paths:
+            raise ValueError("skill source paths must be a nonempty tuple")
+        normalized = tuple(_repository_relative_path(path) for path in self.paths)
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("skill source paths must be unique")
+        object.__setattr__(self, "aliases", tuple(sorted(self.aliases)))
+        object.__setattr__(
+            self, "paths", tuple(sorted(normalized, key=lambda path: path.as_posix()))
+        )
+
+
+@dataclass(frozen=True)
+class ProviderSourceClosure:
+    """Preview-only identity binding returned by an installed provider."""
+
+    provider_id: str
+    skills: tuple[SkillSourceClosure, ...]
+
+    def __post_init__(self) -> None:
+        _nonempty(self.provider_id, "provider source closure id")
+        if type(self.skills) is not tuple or any(
+            type(skill) is not SkillSourceClosure for skill in self.skills
+        ):
+            raise ValueError("provider source closure skills must be exact values")
+        canonical = [skill.canonical_id for skill in self.skills]
+        if len(set(canonical)) != len(canonical):
+            raise ValueError("provider source closure has duplicate canonical skill identities")
+        names: set[str] = set()
+        owned: list[Path] = []
+        for skill in self.skills:
+            identities = {skill.canonical_id, *skill.aliases}
+            if names & identities:
+                raise ValueError("provider source closure has duplicate skill aliases")
+            names.update(identities)
+            for path in skill.paths:
+                if any(
+                    path == prior or path in prior.parents or prior in path.parents
+                    for prior in owned
+                ):
+                    raise ValueError("provider source path is not exclusively owned by one skill")
+                owned.append(path)
+        object.__setattr__(
+            self,
+            "skills",
+            tuple(sorted(self.skills, key=lambda skill: skill.canonical_id)),
+        )
+
+
+@dataclass(frozen=True)
 class DeploymentRequest:
     source_id: str
     revision: str
@@ -294,7 +358,7 @@ class DeploymentProvider(Protocol):
         snapshot: SourceSnapshot,
         target: TargetSpec,
         selection: tuple[str, ...] | None,
-    ) -> tuple[Path, ...]:
+    ) -> tuple[Path, ...] | ProviderSourceClosure:
         """Return repository-relative source paths selected for deployment."""
 
     def plan(self, snapshot: SourceSnapshot, target: TargetSpec) -> ProviderPlan:
