@@ -5,11 +5,14 @@ import pytest
 
 from agent_ops.deployment import (
     DeploymentAudit,
+    DeploymentPlan,
     DeploymentRequest,
     ManifestDirectory,
     ManifestFile,
     PlannedFile,
     ProviderPlan,
+    SourceSnapshot,
+    TargetSource,
     TargetSpec,
 )
 from agent_ops.deployment.providers import load_deployment_providers
@@ -94,3 +97,91 @@ def test_deployment_provider_entry_points_are_separate_from_runner_plugins(monke
 
     assert load_deployment_providers() == []
     assert requested_groups == ["agent_ops.deployment_providers"]
+
+
+def _valid_deployment_plan_parts():
+    target = TargetSpec("codex-dev", Framework.CODEX, Path("/tmp/codex"), "feature")
+    snapshot = SourceSnapshot(
+        "community", "refs/heads/feature", "a" * 40, Path("/snapshot")
+    )
+    provider = ProviderPlan(
+        "skills", snapshot.commit, target, (), (Path("obsolete"),)
+    )
+    association = TargetSource(
+        target.id,
+        target.channel,
+        snapshot.source_id,
+        snapshot.ref,
+        snapshot.commit,
+    )
+    return target, snapshot, provider, association
+
+
+def test_deployment_plan_requires_target_source_associations() -> None:
+    _target, snapshot, provider, _association = _valid_deployment_plan_parts()
+
+    with pytest.raises(TypeError):
+        DeploymentPlan((snapshot,), (provider,))
+
+
+@pytest.mark.parametrize(
+    "change, message",
+    [
+        ("missing", "exactly one source association"),
+        ("duplicate", "exactly one source association"),
+        ("extra", "exactly one source association"),
+        ("commit", "provider revision"),
+        ("channel", "target channel"),
+        ("snapshot", "unique source snapshot"),
+        ("duplicate-snapshot", "unique source snapshot"),
+    ],
+)
+def test_deployment_plan_rejects_invalid_target_source_associations(
+    change: str, message: str
+) -> None:
+    target, snapshot, provider, association = _valid_deployment_plan_parts()
+    snapshots = (snapshot,)
+    providers = (provider,)
+    associations = (association,)
+
+    if change == "missing":
+        associations = ()
+    elif change == "duplicate":
+        associations = (association, association)
+    elif change == "extra":
+        associations = associations + (
+            TargetSource("other", "feature", "community", snapshot.ref, snapshot.commit),
+        )
+    elif change == "commit":
+        associations = (
+            TargetSource(target.id, target.channel, "community", snapshot.ref, "b" * 40),
+        )
+        snapshots = snapshots + (
+            SourceSnapshot("community", snapshot.ref, "b" * 40, Path("/other")),
+        )
+    elif change == "channel":
+        associations = (
+            TargetSource(target.id, "other", "community", snapshot.ref, snapshot.commit),
+        )
+    elif change == "snapshot":
+        associations = (
+            TargetSource(
+                target.id,
+                target.channel,
+                "other",
+                snapshot.ref,
+                snapshot.commit,
+            ),
+        )
+    elif change == "duplicate-snapshot":
+        snapshots = snapshots + (
+            SourceSnapshot(
+                snapshot.source_id,
+                snapshot.ref,
+                snapshot.commit,
+                Path("/duplicate"),
+            ),
+        )
+
+    with pytest.raises(ValueError, match=message):
+        DeploymentPlan(snapshots, providers, associations)

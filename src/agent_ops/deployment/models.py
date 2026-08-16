@@ -180,12 +180,44 @@ class TargetSource:
 class DeploymentPlan:
     snapshots: tuple[SourceSnapshot, ...]
     provider_plans: tuple[ProviderPlan, ...]
-    target_sources: tuple[TargetSource, ...] = ()
+    target_sources: tuple[TargetSource, ...]
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "snapshots", tuple(self.snapshots))
         object.__setattr__(self, "provider_plans", tuple(self.provider_plans))
         object.__setattr__(self, "target_sources", tuple(self.target_sources))
+        if any(type(item) is not TargetSource for item in self.target_sources):
+            raise ValueError("plan target sources must be exact TargetSource values")
+        planned_ids = {plan.target.id for plan in self.provider_plans}
+        association_ids = [association.target_id for association in self.target_sources]
+        if set(association_ids) != planned_ids or len(association_ids) != len(planned_ids):
+            raise ValueError("plan requires exactly one source association per planned target")
+        associations = {association.target_id: association for association in self.target_sources}
+        for target_id in sorted(planned_ids):
+            association = associations[target_id]
+            target_plans = tuple(
+                plan for plan in self.provider_plans if plan.target.id == target_id
+            )
+            if any(plan.target.channel != association.channel for plan in target_plans):
+                raise ValueError("plan source association target channel does not match")
+            if any(plan.source_revision != association.commit for plan in target_plans):
+                raise ValueError("plan source association does not match provider revision")
+            matches = tuple(
+                snapshot
+                for snapshot in self.snapshots
+                if (
+                    snapshot.source_id,
+                    snapshot.ref,
+                    snapshot.commit,
+                )
+                == (
+                    association.source_id,
+                    association.ref,
+                    association.commit,
+                )
+            )
+            if len(matches) != 1:
+                raise ValueError("plan source association must map to one unique source snapshot")
 
 
 class TargetState(StrEnum):
