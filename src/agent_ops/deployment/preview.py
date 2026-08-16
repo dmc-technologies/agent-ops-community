@@ -25,7 +25,11 @@ from agent_ops.deployment.providers import (
     load_deployment_providers,
     normalize_deployment_providers,
 )
-from agent_ops.deployment.registry import DeploymentRegistry, _is_preview_channel
+from agent_ops.deployment.registry import (
+    DeploymentRegistry,
+    RegistryConfig,
+    _is_preview_channel,
+)
 from agent_ops.deployment.transaction import (
     _locked_provider_plan_targets,
     _preflight_provider_plans_read_only,
@@ -132,92 +136,83 @@ class PreviewEngine:
                 path for skill in closure.skills for path in skill.paths
             )
         _validate_selected_skill_closures(selection, tuple(closures.values()))
+        selected_providers = tuple(
+            provider for provider in supported if closures[provider.provider_id].skills
+        )
         with _capture_tracked_closure(
             checkout, tuple(all_declared), expected_head=head
         ) as authority:
             captured = authority.entries
             fingerprint = _closure_fingerprint(captured)
-
-            plans: list[ProviderPlan] = []
-            for provider in supported:
-                provider_entries = _provider_entries(
-                    captured,
-                    tuple(
-                        path
-                        for skill in closures[provider.provider_id].skills
-                        for path in skill.paths
-                    ),
-                )
-                with tempfile.TemporaryDirectory(
-                    prefix="agentops-local-preview-"
-                ) as raw:
-                    restricted_root = Path(raw)
-                    _materialize(restricted_root, provider_entries)
-                    restricted = SourceSnapshot(
-                        "unreviewed-local",
-                        "refs/heads/local-preview",
-                        fingerprint,
-                        restricted_root,
-                    )
-                    plan = provider.plan(restricted, target)
-                    _validate_plan(plan, provider, target, fingerprint)
-                    plans.append(plan)
-                    _verify_materialized(restricted_root, provider_entries)
-
-            ordered_plans = tuple(sorted(plans, key=lambda item: item.provider_id))
+            ordered_plans = _plan_preview_providers(
+                selected_providers, closures, captured, fingerprint, target
+            )
             _preflight_provider_plans_read_only(ordered_plans)
-            manifests: tuple[DeploymentManifest, ...] = ()
             with _locked_provider_plan_targets(ordered_plans):
-                _before_preview_apply(authority)
-                authority.verify()
-                try:
-                    manifests = install_provider_plans(ordered_plans)
-                    audit = audit_provider_plans(ordered_plans)
-                    if not audit.matches:
-                        raise DeploymentAuditError(
-                            f"deployment audit did not match preview target {target.id!r}"
-                        )
-                    _verify_locked_provider_plan_targets(ordered_plans)
-                    authority.verify()
-                    return PreviewResult(
-                        operation="preview",
-                        review_state="unreviewed-local",
-                        target_id=target.id,
-                        channel=target.channel,
-                        fingerprint=fingerprint,
-                        source_revision=fingerprint,
-                        providers=tuple(
-                            plan.provider_id for plan in ordered_plans
-                        ),
-                        paths=tuple(
-                            entry.path.as_posix()
-                            for entry in captured
-                            if entry.kind == "file"
-                        ),
+                ordered_plans = _plan_preview_providers(
+                    selected_providers, closures, captured, fingerprint, target
+                )
+                _preflight_provider_plans_read_only(ordered_plans)
+                with self._registry.retain_snapshot(
+                    registry_snapshot
+                ) as registry_authority:
+                    _validate_preview_registry_target(
+                        registry_authority.snapshot.config, target
                     )
-                except BaseException as error:
-                    if manifests:
-                        try:
-                            rollback_manifests(manifests)
-                        except BaseException as rollback_error:
-                            if not isinstance(rollback_error, Exception):
-                                rollback_error.add_note(
-                                    "local preview recovery was incomplete; "
-                                    f"original failure: {error}; transaction evidence "
-                                    "was retained"
-                                )
-                                raise
-                            if not isinstance(error, Exception):
-                                error.add_note(
-                                    "local preview recovery was incomplete; transaction "
-                                    "evidence was retained"
-                                )
-                                raise error from rollback_error
-                            raise DeploymentRecoveryError(
-                                f"local preview failed: {error}; recovery incomplete: "
-                                f"{rollback_error}; transaction evidence was retained"
-                            ) from rollback_error
-                    raise
+                    registry_authority.verify()
+                    _before_preview_apply(authority)
+                    authority.verify()
+                    manifests: tuple[DeploymentManifest, ...] = ()
+                    try:
+                        manifests = install_provider_plans(ordered_plans)
+                        audit = audit_provider_plans(ordered_plans)
+                        if not audit.matches:
+                            raise DeploymentAuditError(
+                                "deployment audit did not match preview target "
+                                f"{target.id!r}"
+                            )
+                        _verify_locked_provider_plan_targets(ordered_plans)
+                        authority.verify()
+                        registry_authority.verify()
+                        return PreviewResult(
+                            operation="preview",
+                            review_state="unreviewed-local",
+                            target_id=target.id,
+                            channel=target.channel,
+                            fingerprint=fingerprint,
+                            source_revision=fingerprint,
+                            providers=tuple(
+                                plan.provider_id for plan in ordered_plans
+                            ),
+                            paths=tuple(
+                                entry.path.as_posix()
+                                for entry in captured
+                                if entry.kind == "file"
+                            ),
+                        )
+                    except BaseException as error:
+                        if manifests:
+                            try:
+                                rollback_manifests(manifests)
+                            except BaseException as rollback_error:
+                                if not isinstance(rollback_error, Exception):
+                                    rollback_error.add_note(
+                                        "local preview recovery was incomplete; "
+                                        f"original failure: {error}; transaction evidence "
+                                        "was retained"
+                                    )
+                                    raise
+                                if not isinstance(error, Exception):
+                                    error.add_note(
+                                        "local preview recovery was incomplete; transaction "
+                                        "evidence was retained"
+                                    )
+                                    raise error from rollback_error
+                                raise DeploymentRecoveryError(
+                                    f"local preview failed: {error}; recovery incomplete: "
+                                    f"{rollback_error}; transaction evidence was retained"
+                                ) from rollback_error
+                        raise
 
     def _supported(
         self, snapshot: SourceSnapshot, target: TargetSpec
@@ -232,6 +227,45 @@ class PreviewEngine:
         if not supported:
             raise ValueError(f"no deployment provider supports target {target.id!r}")
         return tuple(supported)
+
+
+def _plan_preview_providers(
+    providers: tuple[DeploymentProvider, ...],
+    closures: dict[str, ProviderSourceClosure],
+    captured: tuple[_CapturedEntry, ...],
+    fingerprint: str,
+    target: TargetSpec,
+) -> tuple[ProviderPlan, ...]:
+    plans: list[ProviderPlan] = []
+    for provider in providers:
+        provider_entries = _provider_entries(
+            captured,
+            tuple(
+                path
+                for skill in closures[provider.provider_id].skills
+                for path in skill.paths
+            ),
+        )
+        with tempfile.TemporaryDirectory(prefix="agentops-local-preview-") as raw:
+            restricted_root = Path(raw)
+            _materialize(restricted_root, provider_entries)
+            restricted = SourceSnapshot(
+                "unreviewed-local",
+                "refs/heads/local-preview",
+                fingerprint,
+                restricted_root,
+            )
+            plan = provider.plan(restricted, target)
+            _validate_plan(plan, provider, target, fingerprint)
+            plans.append(plan)
+            _verify_materialized(restricted_root, provider_entries)
+    return tuple(sorted(plans, key=lambda item: item.provider_id))
+
+
+def _validate_preview_registry_target(config: RegistryConfig, target: TargetSpec) -> None:
+    current = tuple(candidate for candidate in config.targets if candidate.id == target.id)
+    if current != (target,) or not _is_preview_channel(target.channel):
+        raise RuntimeError("preview target no longer matches the retained registry snapshot")
 
 
 def _validate_selected_skill_closures(
@@ -304,6 +338,15 @@ def _checkout_root(source_checkout: Path) -> Path:
 
 
 def _git(arguments: tuple[str, ...], checkout: Path) -> str:
+    approved = {
+        ("rev-parse", "--show-toplevel"),
+        ("rev-parse", "--verify", "HEAD^{commit}"),
+        ("rev-parse", "--git-path", "HEAD"),
+        ("rev-parse", "--git-path", "index"),
+        ("ls-files", "--stage", "-z"),
+    }
+    if arguments not in approved:
+        raise ValueError("preview Git command is not approved as read-only")
     environment = {
         name: value
         for name in ("PATH", "LANG", "LC_ALL", "LC_CTYPE")
@@ -316,13 +359,33 @@ def _git(arguments: tuple[str, ...], checkout: Path) -> str:
             "GIT_TERMINAL_PROMPT": "0",
             "GCM_INTERACTIVE": "never",
             "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_PAGER": "cat",
+            "PAGER": "cat",
+            "GIT_EDITOR": "/bin/false",
+            "GIT_SEQUENCE_EDITOR": "/bin/false",
+            "GIT_ASKPASS": "/bin/false",
+            "SSH_ASKPASS": "/bin/false",
         }
     )
     completed = subprocess.run(
         (
             "git",
             "-c",
+            "core.fsmonitor=false",
+            "-c",
             f"core.hooksPath={os.devnull}",
+            "-c",
+            "core.pager=cat",
+            "-c",
+            "pager.ls-files=false",
+            "-c",
+            "pager.rev-parse=false",
+            "-c",
+            "diff.external=",
+            "-c",
+            "interactive.diffFilter=",
+            "-c",
+            "credential.helper=",
             "-c",
             "credential.interactive=false",
             "-c",

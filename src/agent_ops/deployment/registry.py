@@ -553,16 +553,27 @@ class DeploymentRegistry:
             target = targets[target_id]
         except KeyError as error:
             raise ValueError(f"unknown target: {target_id}") from error
+        preview_target = _is_preview_channel(target.channel)
         if manifest is not None:
             if manifest.target_id != target_id:
                 raise ValueError("manifest belongs to a different target")
             if manifest.framework is not target.framework:
                 raise ValueError("manifest framework does not match target")
-            _validate_commit(manifest.source_revision, "manifest source revision")
+            if preview_target:
+                _validate_fingerprint(manifest.source_revision)
+                if manifest.review_state != "unreviewed-local":
+                    raise ValueError("preview manifest review state is invalid")
+            else:
+                _validate_commit(manifest.source_revision, "manifest source revision")
+                if manifest.review_state is not None:
+                    raise ValueError("managed manifest must not have a preview review state")
         if audit is not None and audit.target_id != target_id:
             raise ValueError("audit belongs to a different target")
         if resolved_commit is not None:
-            _validate_commit(resolved_commit, "resolved commit")
+            if preview_target:
+                _validate_fingerprint(resolved_commit)
+            else:
+                _validate_commit(resolved_commit, "resolved commit")
         commit = manifest.source_revision if manifest is not None else resolved_commit
         if failure is not None:
             _require_string(failure, "failure")
@@ -573,7 +584,7 @@ class DeploymentRegistry:
             state = TargetState.MODIFIED
         elif manifest is None or manifest.source_revision != resolved_commit:
             state = TargetState.STALE
-        elif _is_preview_channel(target.channel):
+        elif preview_target:
             state = TargetState.PREVIEW
         else:
             channels = {channel.id: channel for channel in config.channels}

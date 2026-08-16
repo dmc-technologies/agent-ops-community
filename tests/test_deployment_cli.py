@@ -164,6 +164,38 @@ def test_deployment_status_has_deterministic_human_and_json_output(
     assert engine.calls == [("status", None), ("status", None)]
 
 
+def test_deployment_status_renders_preview_fingerprint_in_human_and_json(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from agent_ops.deployment import cli as deployment_cli
+
+    fingerprint = "a" * 64
+    status = TargetStatus(
+        "codex-preview", TargetState.PREVIEW, "preview", fingerprint
+    )
+    engine = FakeEngine(status)
+    registry = FakeRegistry(_config(tmp_path / "codex-preview"))
+    monkeypatch.setattr(
+        deployment_cli, "_load_runtime", lambda *_args, **_kwargs: (registry, engine)
+    )
+
+    human = runner.invoke(app, ["deployment", "status", "--all"])
+    structured = runner.invoke(app, ["deployment", "status", "--all", "--json"])
+
+    assert human.exit_code == 0
+    assert human.output == (
+        f"codex-preview: preview channel=preview commit={fingerprint}\n"
+    )
+    assert json.loads(structured.output) == [
+        {
+            "target_id": "codex-preview",
+            "state": "preview",
+            "channel": "preview",
+            "commit": fingerprint,
+        }
+    ]
+
+
 def test_deployment_preview_delegates_explicit_inputs_and_renders_deterministically(
     tmp_path: Path, monkeypatch
 ) -> None:

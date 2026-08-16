@@ -4,6 +4,8 @@ import hashlib
 import json
 import os
 import subprocess
+import threading
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -17,6 +19,7 @@ from agent_ops.deployment.models import (
     SourceSnapshot,
     SourceSpec,
     TargetSpec,
+    TargetState,
 )
 from agent_ops.deployment.preview import PreviewEngine
 from agent_ops.deployment.registry import ChannelSpec, DeploymentRegistry, RegistryConfig
@@ -118,6 +121,28 @@ def _assert_no_preview_install(home: Path) -> None:
     assert not list((home / ".agentops/deployment/manifests").glob("*.json"))
 
 
+def _changed_registry_config(
+    registry: DeploymentRegistry, tmp_path: Path, change: str
+) -> RegistryConfig:
+    config = registry.load()
+    target = config.targets[0]
+    channels = config.channels
+    if change == "stable":
+        target = replace(target, channel="stable")
+    elif change == "branch":
+        channels += (ChannelSpec("feature", "community", "refs/heads/feature"),)
+        target = replace(target, channel="feature")
+    elif change == "home":
+        replacement_home = (tmp_path / "replacement-preview-home").absolute()
+        replacement_home.mkdir(exist_ok=True)
+        target = replace(target, home=replacement_home)
+    elif change == "framework":
+        target = replace(target, framework=Framework.CLAUDE_CODE)
+    elif change != "aba":
+        raise AssertionError(f"unknown registry test change: {change}")
+    return RegistryConfig(config.schema_version, config.sources, channels, (target,))
+
+
 def test_preview_installs_only_selected_tracked_worktree_closure(tmp_path: Path) -> None:
     engine, checkout, home = _preview(tmp_path)
     selected = checkout / "skills/demo/SKILL.md"
@@ -139,6 +164,61 @@ def test_preview_installs_only_selected_tracked_worktree_closure(tmp_path: Path)
     manifest_data = json.loads(manifest.read_bytes())
     assert manifest_data["source_revision"] == result.fingerprint
     assert manifest_data["review_state"] == "unreviewed-local"
+
+
+def test_preview_git_queries_disable_hostile_executable_configuration(
+    tmp_path: Path, monkeypatch
+) -> None:
+    engine, checkout, home = _preview(tmp_path)
+    marker = tmp_path / "git-config-executed"
+    executable = tmp_path / "hostile-git-helper"
+    executable.write_text(f"#!/bin/sh\ntouch '{marker}'\nexit 0\n")
+    executable.chmod(0o755)
+    for key in (
+        "core.fsmonitor",
+        "core.pager",
+        "pager.ls-files",
+        "diff.external",
+        "credential.helper",
+        "core.sshCommand",
+    ):
+        _git("config", "--local", key, str(executable), cwd=checkout)
+    for name in ("GIT_PAGER", "PAGER", "GIT_EDITOR", "GIT_ASKPASS", "SSH_ASKPASS"):
+        monkeypatch.setenv(name, str(executable))
+
+    result = engine.preview(checkout, ("demo",), "codex-preview")
+
+    assert result.review_state == "unreviewed-local"
+    assert not marker.exists()
+    assert (home / "skills/demo/SKILL.md").exists()
+
+
+def test_preview_git_runner_rejects_commands_outside_read_only_allowlist(
+    tmp_path: Path,
+) -> None:
+    from agent_ops.deployment import preview as preview_module
+
+    checkout = _checkout(tmp_path)
+
+    with pytest.raises(ValueError, match="not approved"):
+        preview_module._git(("status",), checkout)
+
+
+def test_preview_preserves_linked_git_worktree_support(tmp_path: Path) -> None:
+    primary = _checkout(tmp_path)
+    linked = tmp_path / "linked-checkout"
+    _git("worktree", "add", "-b", "linked-preview", str(linked), cwd=primary)
+    (linked / "skills").chmod(0o755)
+    (linked / "skills/demo").chmod(0o755)
+    (linked / "skills/demo/SKILL.md").chmod(0o644)
+    registry, home = _registry(tmp_path)
+    engine = PreviewEngine(registry, providers=(_SelectedSkillProvider(),))
+
+    result = engine.preview(linked, ("demo",), "codex-preview")
+
+    assert result.review_state == "unreviewed-local"
+    assert len(result.fingerprint) == 64
+    assert (home / "skills/demo/SKILL.md").exists()
 
 
 def test_preview_fingerprint_binds_path_mode_and_exact_bytes(tmp_path: Path) -> None:
@@ -211,6 +291,41 @@ def test_preview_confines_each_installed_provider_to_its_own_declared_closure(
     assert result.providers == ("selected-policy", "selected-skills")
     assert (home / "skills/demo/SKILL.md").exists()
     assert (home / "policy/unrelated.txt").exists()
+
+
+def test_preview_skips_provider_that_owns_no_requested_skill(tmp_path: Path) -> None:
+    checkout = _checkout(tmp_path)
+    registry, home = _registry(tmp_path)
+    called = False
+
+    class UnrelatedProvider(_SelectedSkillProvider):
+        provider_id = "unrelated"
+
+        def source_closure(self, snapshot, target, selection):
+            if selection is None:
+                return (Path("unrelated.txt"),)
+            return ProviderSourceClosure(self.provider_id, ())
+
+        def plan(self, snapshot, target):
+            nonlocal called
+            called = True
+            return ProviderPlan(
+                self.provider_id,
+                snapshot.commit,
+                target,
+                (),
+                (Path("skills/demo/SKILL.md"),),
+            )
+
+    engine = PreviewEngine(
+        registry, providers=(_SelectedSkillProvider(), UnrelatedProvider())
+    )
+
+    result = engine.preview(checkout, ("demo",), "codex-preview")
+
+    assert called is False
+    assert result.providers == ("selected-skills",)
+    assert (home / "skills/demo/SKILL.md").exists()
 
 
 def test_preview_rejects_legacy_provider_without_skill_identity(tmp_path: Path) -> None:
@@ -547,6 +662,121 @@ def test_preview_revalidates_complete_source_authority_before_success(
     assert _registry_receipts(tmp_path) == ()
 
 
+@pytest.mark.parametrize("change", ("stable", "branch", "home", "framework", "aba"))
+def test_preview_rejects_registry_change_during_provider_planning(
+    tmp_path: Path, change: str
+) -> None:
+    checkout = _checkout(tmp_path)
+    registry, home = _registry(tmp_path)
+    changed = False
+
+    class RegistryChangingProvider(_SelectedSkillProvider):
+        def plan(self, snapshot, target):
+            nonlocal changed
+            if not changed:
+                changed = True
+                registry.save(_changed_registry_config(registry, tmp_path, change))
+            return super().plan(snapshot, target)
+
+    engine = PreviewEngine(registry, providers=(RegistryChangingProvider(),))
+
+    with pytest.raises((RuntimeError, ValueError), match="registry|required snapshot"):
+        engine.preview(checkout, ("demo",), "codex-preview")
+
+    _assert_no_preview_install(home)
+    assert _registry_receipts(tmp_path) == ()
+
+
+@pytest.mark.parametrize("phase", ("install", "audit"))
+@pytest.mark.parametrize("change", ("stable", "branch", "home", "framework", "aba"))
+def test_preview_rolls_back_registry_replacement_during_target_mutation(
+    tmp_path: Path, monkeypatch, phase: str, change: str
+) -> None:
+    from agent_ops.deployment import preview as preview_module
+    from agent_ops.deployment import registry as registry_module
+
+    engine, checkout, home = _preview(tmp_path)
+    registry = engine._registry
+
+    def replace_registry() -> None:
+        content = registry_module._dump_registry(
+            _changed_registry_config(registry, tmp_path, change)
+        )
+        replacement = registry.path.with_name("replacement-registry.yaml")
+        replacement.write_bytes(content)
+        replacement.chmod(0o600)
+        os.replace(replacement, registry.path)
+
+    if phase == "install":
+        original_install = preview_module.install_provider_plans
+
+        def install_then_replace(plans):
+            manifests = original_install(plans)
+            replace_registry()
+            return manifests
+
+        monkeypatch.setattr(preview_module, "install_provider_plans", install_then_replace)
+    else:
+        original_audit = preview_module.audit_provider_plans
+
+        def audit_then_replace(plans):
+            audit = original_audit(plans)
+            replace_registry()
+            return audit
+
+        monkeypatch.setattr(preview_module, "audit_provider_plans", audit_then_replace)
+
+    with pytest.raises((RuntimeError, ValueError), match="registry|required snapshot"):
+        engine.preview(checkout, ("demo",), "codex-preview")
+
+    _assert_no_preview_install(home)
+    assert _registry_receipts(tmp_path) == ()
+
+
+def test_preview_retains_shared_registry_authority_through_terminal_success(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from agent_ops.deployment import preview as preview_module
+
+    engine, checkout, home = _preview(tmp_path)
+    registry = engine._registry
+    candidate = _changed_registry_config(registry, tmp_path, "stable")
+    original_audit = preview_module.audit_provider_plans
+    entered = threading.Event()
+    completed = threading.Event()
+    errors: list[BaseException] = []
+    worker: threading.Thread | None = None
+
+    def save_registry() -> None:
+        entered.set()
+        try:
+            registry.save(candidate)
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            completed.set()
+
+    def audit_while_save_waits(plans):
+        nonlocal worker
+        worker = threading.Thread(target=save_registry)
+        worker.start()
+        assert entered.wait(timeout=5)
+        assert completed.wait(timeout=0.1) is False
+        return original_audit(plans)
+
+    monkeypatch.setattr(preview_module, "audit_provider_plans", audit_while_save_waits)
+
+    result = engine.preview(checkout, ("demo",), "codex-preview")
+    assert worker is not None
+    worker.join(timeout=5)
+
+    assert worker.is_alive() is False
+    assert errors == []
+    assert completed.is_set()
+    assert result.review_state == "unreviewed-local"
+    assert (home / "skills/demo/SKILL.md").exists()
+
+
 def test_preview_preserves_process_control_during_provider_planning(tmp_path: Path) -> None:
     checkout = _checkout(tmp_path)
     registry, home = _registry(tmp_path)
@@ -721,6 +951,128 @@ def test_managed_engine_rejects_preview_promotion_and_remote_operations(
     _assert_no_preview_install(home)
     assert not (tmp_path / "managed-sources").exists()
     assert registry.receipts() == ()
+
+
+def test_engine_status_reads_valid_preview_manifest_without_managed_fetch(
+    tmp_path: Path, monkeypatch
+) -> None:
+    preview, checkout, home = _preview(tmp_path)
+    result = preview.preview(checkout, ("demo",), "codex-preview")
+    registry = preview._registry
+    store_root = tmp_path / "managed-sources"
+    engine = DeploymentEngine(
+        registry,
+        SourceStore(store_root.absolute()),
+        providers=(_SelectedSkillProvider(),),
+    )
+    before = {
+        path.relative_to(home): (
+            path.lstat().st_mode,
+            path.read_bytes() if path.is_file() else None,
+            path.lstat().st_mtime_ns,
+        )
+        for path in home.rglob("*")
+    }
+    assert registry.receipts() == ()
+
+    def receipts_must_not_be_read():
+        raise AssertionError("preview status must not read managed receipts")
+
+    monkeypatch.setattr(registry, "receipt_records", receipts_must_not_be_read)
+
+    status = engine.status(("codex-preview",))[0]
+
+    assert status.state is TargetState.PREVIEW
+    assert status.commit == result.fingerprint
+    assert len(status.commit) == 64
+    assert not store_root.exists()
+    assert before == {
+        path.relative_to(home): (
+            path.lstat().st_mode,
+            path.read_bytes() if path.is_file() else None,
+            path.lstat().st_mtime_ns,
+        )
+        for path in home.rglob("*")
+    }
+
+
+@pytest.mark.parametrize("change", ("content", "mode", "directory"))
+def test_engine_status_reports_modified_preview_owned_state(
+    tmp_path: Path, change: str
+) -> None:
+    preview, checkout, home = _preview(tmp_path)
+    result = preview.preview(checkout, ("demo",), "codex-preview")
+    installed = home / "skills/demo/SKILL.md"
+    if change == "content":
+        installed.write_text("modified\n")
+    elif change == "mode":
+        installed.chmod(0o600)
+    else:
+        (home / "skills/demo").chmod(0o700)
+    engine = DeploymentEngine(
+        preview._registry,
+        SourceStore((tmp_path / "managed-sources").absolute()),
+        providers=(_SelectedSkillProvider(),),
+    )
+
+    status = engine.status(("codex-preview",))[0]
+
+    assert status.state is TargetState.MODIFIED
+    assert status.commit == result.fingerprint
+    assert not (tmp_path / "managed-sources").exists()
+    assert preview._registry.receipts() == ()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("review_state", None),
+        ("target_id", "other-target"),
+        ("framework", "claude-code"),
+        ("source_revision", "a" * 40),
+    ),
+)
+def test_engine_status_reports_failed_for_invalid_preview_manifest(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    preview, checkout, home = _preview(tmp_path)
+    preview.preview(checkout, ("demo",), "codex-preview")
+    manifest = next((home / ".agentops/deployment/manifests").glob("*.json"))
+    data = json.loads(manifest.read_bytes())
+    data[field] = value
+    manifest.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+    manifest.chmod(0o600)
+    engine = DeploymentEngine(
+        preview._registry,
+        SourceStore((tmp_path / "managed-sources").absolute()),
+        providers=(_SelectedSkillProvider(),),
+    )
+
+    status = engine.status(("codex-preview",))[0]
+
+    assert status.state is TargetState.FAILED
+    assert status.commit is None
+    assert not (tmp_path / "managed-sources").exists()
+    assert preview._registry.receipts() == ()
+
+
+def test_engine_status_never_classifies_preview_manifest_on_managed_channel(
+    tmp_path: Path,
+) -> None:
+    preview, checkout, _home = _preview(tmp_path)
+    preview.preview(checkout, ("demo",), "codex-preview")
+    registry = preview._registry
+    registry.save(_changed_registry_config(registry, tmp_path, "stable"))
+    engine = DeploymentEngine(
+        registry,
+        SourceStore((tmp_path / "managed-sources").absolute()),
+        providers=(_SelectedSkillProvider(),),
+    )
+
+    status = engine.status(("codex-preview",))[0]
+
+    assert status.state is not TargetState.PREVIEW
+    assert status.commit is None
 
 
 def test_two_machines_refresh_same_branch_with_independent_state_and_evidence(

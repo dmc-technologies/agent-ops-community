@@ -2771,3 +2771,96 @@ def audit_provider_plans(plans: tuple[ProviderPlan, ...]) -> DeploymentAudit:
         duplicates=tuple(duplicates),
         validation_errors=tuple(validation_errors),
     )
+
+
+def _read_preview_status_evidence(
+    target: TargetSpec,
+) -> tuple[DeploymentManifest | None, DeploymentAudit | None]:
+    """Read and audit one preview manifest without fetching or target mutation."""
+    _require_supported_platform()
+    if not (
+        target.channel == "preview"
+        or target.channel.startswith("preview-")
+        or target.channel.startswith("unreviewed-local")
+    ):
+        raise ValueError("preview status evidence requires a preview target")
+    try:
+        home_descriptor = _open_absolute_directory(target.home, create=False)
+    except FileNotFoundError:
+        return None, None
+    except OSError as error:
+        raise ValueError("preview target home could not be read safely") from error
+    opened_home = os.fstat(home_descriptor)
+    home_fs = _HomeFS(
+        target.home,
+        home_descriptor,
+        home_identity=(opened_home.st_dev, opened_home.st_ino),
+    )
+    with home_fs:
+        manifest_content, manifest_error = _read_ownership_manifest_for_audit(
+            home_fs, _manifest_path(target)
+        )
+        if manifest_content is None:
+            if manifest_error == "deployment manifest is missing":
+                return None, None
+            raise ValueError(manifest_error or "preview manifest could not be read")
+        data = _validated_manifest_data(manifest_content, target=target)
+        revision = data["source_revision"]
+        if (
+            data.get("review_state") != "unreviewed-local"
+            or len(revision) != 64
+            or any(character not in "0123456789abcdef" for character in revision)
+        ):
+            raise ValueError("invalid preview manifest review state or fingerprint")
+        manifest = DeploymentManifest(
+            schema_version=data["schema_version"],
+            target_id=target.id,
+            framework=target.framework,
+            source_revision=revision,
+            provider_ids=tuple(data["provider_ids"]),
+            files=tuple(
+                ManifestFile(Path(item["path"]), item["fingerprint"], item["mode"])
+                for item in data["files"]
+            ),
+            directories=tuple(
+                ManifestDirectory(Path(item["path"]), item["mode"])
+                for item in data["directories"]
+            ),
+            transaction_id=data["transaction_id"],
+            review_state="unreviewed-local",
+        )
+        missing: list[str] = []
+        changed: list[str] = []
+        for item in manifest.files:
+            try:
+                matches = home_fs.matches_fingerprint_file(
+                    item.path, item.fingerprint, item.mode
+                )
+            except FileNotFoundError:
+                missing.append(item.path.as_posix())
+                continue
+            except OSError:
+                matches = False
+            if not matches:
+                changed.append(item.path.as_posix())
+        for item in manifest.directories:
+            try:
+                observed = home_fs.stat(item.path)
+            except FileNotFoundError:
+                missing.append(item.path.as_posix())
+                continue
+            except OSError:
+                changed.append(item.path.as_posix())
+                continue
+            if (
+                not stat.S_ISDIR(observed.st_mode)
+                or stat.S_IMODE(observed.st_mode) != item.mode
+            ):
+                changed.append(item.path.as_posix())
+        home_fs.verify_lock_identity()
+    return manifest, DeploymentAudit(
+        target_id=target.id,
+        matches=not (missing or changed),
+        missing=tuple(sorted(missing)),
+        changed=tuple(sorted(changed)),
+    )

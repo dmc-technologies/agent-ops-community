@@ -45,6 +45,7 @@ from agent_ops.deployment.source_store import (
 from agent_ops.deployment.transaction import (
     _locked_provider_plan_targets,
     _preflight_provider_plans_read_only,
+    _read_preview_status_evidence,
     _verify_locked_provider_plan_targets,
     audit_provider_plans,
     install_provider_plans,
@@ -108,13 +109,41 @@ class DeploymentEngine:
             snapshot.config, target_ids, allow_all=True, allow_preview=True
         )
         latest: dict[str, TargetStatus] = {}
-        for record in self._registry.receipt_records():
-            if record.registry_fingerprint != snapshot.fingerprint:
-                continue
-            for target_status in record.receipt.targets:
-                latest[target_status.target_id] = target_status
+        if any(not _is_preview_channel(target.channel) for target in targets):
+            for record in self._registry.receipt_records():
+                if record.registry_fingerprint != snapshot.fingerprint:
+                    continue
+                for target_status in record.receipt.targets:
+                    latest[target_status.target_id] = target_status
         statuses: list[TargetStatus] = []
         for target in targets:
+            if _is_preview_channel(target.channel):
+                try:
+                    manifest, audit = _read_preview_status_evidence(target)
+                except Exception as error:
+                    statuses.append(
+                        self._registry.status(
+                            target.id,
+                            manifest=None,
+                            resolved_commit=None,
+                            audit=None,
+                            failure=str(error),
+                            snapshot=snapshot,
+                        )
+                    )
+                    continue
+                statuses.append(
+                    self._registry.status(
+                        target.id,
+                        manifest=manifest,
+                        resolved_commit=(
+                            manifest.source_revision if manifest is not None else None
+                        ),
+                        audit=audit,
+                        snapshot=snapshot,
+                    )
+                )
+                continue
             recorded = latest.get(target.id)
             if recorded is None or recorded.channel != target.channel:
                 statuses.append(

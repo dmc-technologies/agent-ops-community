@@ -112,6 +112,7 @@ def _manifest(target_id: str, revision: str) -> DeploymentManifest:
         files=(),
         directories=(),
         transaction_id="transaction-1",
+        review_state="unreviewed-local" if len(revision) == 64 else None,
     )
 
 
@@ -1314,7 +1315,7 @@ def test_cross_process_concurrent_receipts_are_each_appended_once(tmp_path: Path
         ("stable", "a" * 40, "a" * 40, False, None, TargetState.MODIFIED, "a" * 40),
         ("stable", None, "a" * 40, True, None, TargetState.STALE, "a" * 40),
         ("stable", "b" * 40, "a" * 40, True, None, TargetState.STALE, "b" * 40),
-        ("preview", "a" * 40, "a" * 40, True, None, TargetState.PREVIEW, "a" * 40),
+        ("preview", "a" * 64, "a" * 64, True, None, TargetState.PREVIEW, "a" * 64),
         ("stable", "a" * 40, "a" * 40, True, None, TargetState.STABLE, "a" * 40),
         ("feature", "a" * 40, "a" * 40, True, None, TargetState.BRANCH, "a" * 40),
     ),
