@@ -6,8 +6,8 @@ Repository: `agent-ops-community`
 
 - Branch: `feat/deployment-channels`
 - Main baseline: `e8f2add`, the community `origin/main` selected for this implementation.
-- Current handoff: the community branch implements the generic pull-based deployment engine, provider contract, managed Git source store, machine registry and receipts, grouped recovery, CLI and isolated launch support, plus authored-checkout local preview. Preview now retains exact filesystem and Git authority through planning, requires canonical provider-owned skill closures, and rejects unsafe or Git-inconsistent modes. Two independent machine fixtures follow the same branch using separate homes, stores, locks, and receipts. This correction commit is the intended community final head; record its exact SHA in GitHub without changing files after the final local gate. No Plane work item applies. The community pull request, hosted CI, one person-applied final-head `ai review`, merge, and the dependent private overlay remain external.
-- Verification: the new identity, authority-race, and mode tests failed against the prior implementation and pass after correction. The complete final-head gate remains to be run after the correction commit.
+- Current handoff: the community branch implements the generic pull-based deployment engine, provider contract, managed Git source store, machine registry and receipts, grouped recovery, CLI and isolated launch support, plus authored-checkout local preview. Preview retains exact filesystem and Git authority through planning and terminal success, requires canonical provider-owned skill closures, rejects unsafe or Git-inconsistent modes, and rolls back a terminal source mismatch without recording success. Two independent machine fixtures follow the same branch using separate homes, stores, locks, and receipts. This follow-up correction commit is the intended community final head; record its exact SHA in GitHub without changing files after the final local gate. No Plane work item applies. The community pull request, hosted CI, one person-applied final-head `ai review`, merge, and the dependent private overlay remain external.
+- Verification: identity, pre-mutation authority-race, mode, post-install and post-audit authority-race, and recovery-causality tests failed against the respective prior implementation and pass after correction. The complete final-head gate remains to be run after the follow-up correction commit.
 
 ## Current Work
 
@@ -23,6 +23,8 @@ Repository: `agent-ops-community`
 - Ask a person to apply `ai review` once after CI passes, merge only if the unchanged head passes, and record the merged community commit for the dependent private overlay.
 
 ## Session Log
+
+- 2026-08-15: Specification re-review found that preview did not revalidate retained source authority after target mutation and an ordinary rollback failure omitted the ordinary primary failure. Preview now performs terminal source validation after install and audit inside the locked recovery boundary, rolls back terminal mismatches, reports both ordinary failures with retained transaction evidence, and preserves process-control identity during primary failure or recovery. The complete final-head gate remains pending until this follow-up correction is committed.
 
 - 2026-08-15: Pre-publication specification review found that local preview released source descriptors before installation, accepted path-only providers without canonical skill ownership, and allowed group or world-writable and Git-inconsistent modes. The correction retains selected path, parent, index, and HEAD authority through planning; revalidates it under the target lock before installation; requires exact provider and skill identity resolution; and rejects unsafe filesystem or Git entry modes. The complete final-head gate remains pending until this correction is committed.
 

@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_ops.deployment.engine import DeploymentEngine
+from agent_ops.deployment.engine import DeploymentEngine, DeploymentRecoveryError
 from agent_ops.deployment.models import (
     PlannedFile,
     ProviderPlan,
@@ -142,7 +142,7 @@ def test_preview_installs_only_selected_tracked_worktree_closure(tmp_path: Path)
 
 
 def test_preview_fingerprint_binds_path_mode_and_exact_bytes(tmp_path: Path) -> None:
-    engine, checkout, _home = _preview(tmp_path)
+    engine, checkout, home = _preview(tmp_path)
     first = engine.preview(checkout, ("demo",), "codex-preview")
     selected = checkout / "skills/demo/SKILL.md"
     selected.write_text("# Demo\n\nDifferent bytes.\n")
@@ -487,6 +487,66 @@ def test_preview_revalidates_checkout_authority_immediately_before_mutation(
     assert _registry_receipts(tmp_path) == ()
 
 
+@pytest.mark.parametrize("phase", ("install", "audit"))
+@pytest.mark.parametrize(
+    "race", ("file-replacement", "parent-replacement", "content", "mode", "index", "head")
+)
+def test_preview_revalidates_complete_source_authority_before_success(
+    tmp_path: Path, monkeypatch, phase: str, race: str
+) -> None:
+    from agent_ops.deployment import preview as preview_module
+
+    engine, checkout, home = _preview(tmp_path)
+    selected = checkout / "skills/demo/SKILL.md"
+
+    def race_checkout() -> None:
+        if race == "file-replacement":
+            replacement = selected.with_name("replacement")
+            replacement.write_bytes(selected.read_bytes())
+            replacement.chmod(selected.stat().st_mode & 0o777)
+            os.replace(replacement, selected)
+        elif race == "parent-replacement":
+            parent = selected.parent
+            moved = parent.with_name("demo-old")
+            parent.rename(moved)
+            parent.mkdir()
+            selected.write_bytes((moved / "SKILL.md").read_bytes())
+            selected.chmod((moved / "SKILL.md").stat().st_mode & 0o777)
+        elif race == "content":
+            selected.write_text("changed during target mutation\n")
+        elif race == "mode":
+            selected.chmod(0o600)
+        elif race == "index":
+            _git("update-index", "--chmod=+x", "skills/demo/SKILL.md", cwd=checkout)
+        else:
+            _git("commit", "--allow-empty", "-m", "move head during target mutation", cwd=checkout)
+
+    if phase == "install":
+        original_install = preview_module.install_provider_plans
+
+        def install_then_race(plans):
+            manifests = original_install(plans)
+            race_checkout()
+            return manifests
+
+        monkeypatch.setattr(preview_module, "install_provider_plans", install_then_race)
+    else:
+        original_audit = preview_module.audit_provider_plans
+
+        def audit_then_race(plans):
+            audit = original_audit(plans)
+            race_checkout()
+            return audit
+
+        monkeypatch.setattr(preview_module, "audit_provider_plans", audit_then_race)
+
+    with pytest.raises(RuntimeError, match="changed"):
+        engine.preview(checkout, ("demo",), "codex-preview")
+
+    _assert_no_preview_install(home)
+    assert _registry_receipts(tmp_path) == ()
+
+
 def test_preview_preserves_process_control_during_provider_planning(tmp_path: Path) -> None:
     checkout = _checkout(tmp_path)
     registry, home = _registry(tmp_path)
@@ -546,6 +606,62 @@ def test_preview_preserves_process_control_when_recovery_is_incomplete(
 
     assert caught.value is control
     assert any("recovery was incomplete" in note for note in control.__notes__)
+    assert _registry_receipts(tmp_path) == ()
+
+
+def test_preview_incomplete_recovery_retains_primary_and_recovery_failures(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from agent_ops.deployment import preview as preview_module
+
+    engine, checkout, home = _preview(tmp_path)
+    recovery = RuntimeError("rollback failed")
+
+    def fail_audit(_plans):
+        raise ValueError("primary failed")
+
+    def fail_recovery(_manifests):
+        raise recovery
+
+    monkeypatch.setattr(preview_module, "audit_provider_plans", fail_audit)
+    monkeypatch.setattr(preview_module, "rollback_manifests", fail_recovery)
+
+    with pytest.raises(DeploymentRecoveryError, match="primary failed.*rollback failed") as caught:
+        engine.preview(checkout, ("demo",), "codex-preview")
+
+    assert caught.value.__cause__ is recovery
+    assert "transaction evidence" in str(caught.value)
+    assert list(
+        (home / ".agentops/deployment/transactions").glob("*/record.json")
+    )
+    assert _registry_receipts(tmp_path) == ()
+
+
+def test_preview_preserves_recovery_process_control_identity(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from agent_ops.deployment import preview as preview_module
+
+    engine, checkout, _home = _preview(tmp_path)
+    control = KeyboardInterrupt("operator stopped recovery")
+
+    def fail_audit(_plans):
+        raise RuntimeError("primary failed")
+
+    def interrupt_recovery(_manifests):
+        raise control
+
+    monkeypatch.setattr(preview_module, "audit_provider_plans", fail_audit)
+    monkeypatch.setattr(preview_module, "rollback_manifests", interrupt_recovery)
+
+    with pytest.raises(KeyboardInterrupt) as caught:
+        engine.preview(checkout, ("demo",), "codex-preview")
+
+    assert caught.value is control
+    assert any(
+        "primary failed" in note and "recovery was incomplete" in note
+        for note in control.__notes__
+    )
     assert _registry_receipts(tmp_path) == ()
 
 

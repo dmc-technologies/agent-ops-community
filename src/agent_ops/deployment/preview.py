@@ -178,6 +178,23 @@ class PreviewEngine:
                             f"deployment audit did not match preview target {target.id!r}"
                         )
                     _verify_locked_provider_plan_targets(ordered_plans)
+                    authority.verify()
+                    return PreviewResult(
+                        operation="preview",
+                        review_state="unreviewed-local",
+                        target_id=target.id,
+                        channel=target.channel,
+                        fingerprint=fingerprint,
+                        source_revision=fingerprint,
+                        providers=tuple(
+                            plan.provider_id for plan in ordered_plans
+                        ),
+                        paths=tuple(
+                            entry.path.as_posix()
+                            for entry in captured
+                            if entry.kind == "file"
+                        ),
+                    )
                 except BaseException as error:
                     if manifests:
                         try:
@@ -197,25 +214,10 @@ class PreviewEngine:
                                 )
                                 raise error from rollback_error
                             raise DeploymentRecoveryError(
-                                "local preview failed and target recovery was incomplete; "
-                                "transaction evidence was retained"
+                                f"local preview failed: {error}; recovery incomplete: "
+                                f"{rollback_error}; transaction evidence was retained"
                             ) from rollback_error
                     raise
-
-        return PreviewResult(
-            operation="preview",
-            review_state="unreviewed-local",
-            target_id=target.id,
-            channel=target.channel,
-            fingerprint=fingerprint,
-            source_revision=fingerprint,
-            providers=tuple(plan.provider_id for plan in ordered_plans),
-            paths=tuple(
-                entry.path.as_posix()
-                for entry in captured
-                if entry.kind == "file"
-            ),
-        )
 
     def _supported(
         self, snapshot: SourceSnapshot, target: TargetSpec
