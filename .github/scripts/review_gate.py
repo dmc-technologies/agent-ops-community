@@ -1116,8 +1116,10 @@ def read_resolution_state(repo: str, pr_number: int) -> ResolutionState | None:
 
 def post_or_update_pr_comment(repo: str, pr_number: int, body: str) -> None:
     comment_id = None
+    expected_login = expected_gate_login()
     for comment in fetch_issue_comments(repo, pr_number):
-        if COMMENT_MARKER in comment.get("body", ""):
+        author = str((comment.get("user") or {}).get("login") or "")
+        if COMMENT_MARKER in comment.get("body", "") and author == expected_login:
             comment_id = comment["id"]
             break
     if comment_id:
@@ -1196,8 +1198,11 @@ def post_or_update_follow_up_issue(
             "--method",
             "GET",
             "--paginate",
+            "--slurp",
             "-f",
             "state=all",
+            "-f",
+            "per_page=100",
         ]
     )
     if list_result.returncode != 0:
@@ -1277,10 +1282,12 @@ def post_finding_comments(
 ) -> None:
     findings = result.blocking
     existing = fetch_issue_comments(repo, pr_number)
+    expected_login = expected_gate_login()
     by_marker = {
         comment.get("body", "").split("-->", 1)[0] + "-->": comment["id"]
         for comment in existing
         if comment.get("body", "").startswith(FINDING_MARKER_PREFIX)
+        and str((comment.get("user") or {}).get("login") or "") == expected_login
     }
     desired = {}
     for finding in findings:

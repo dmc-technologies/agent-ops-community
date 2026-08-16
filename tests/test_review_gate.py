@@ -588,6 +588,8 @@ def test_noncritical_findings_are_grouped_into_one_follow_up_issue(monkeypatch) 
     assert issue_url == "https://github.com/example-org/example/issues/12"
     listing = next(call for call in calls if "--paginate" in call)
     assert listing[listing.index("--method") + 1] == "GET"
+    assert "--slurp" in listing
+    assert "per_page=100" in listing
     create = next(call for call in calls if "--method" in call and "POST" in call)
     body = next(arg.removeprefix("body=") for arg in create if arg.startswith("body="))
     assert "Follow-up findings from PR #7" in body
@@ -670,6 +672,7 @@ def test_post_finding_comments_deletes_stale_findings(monkeypatch) -> None:
         {
             "id": 101,
             "body": "<!-- review-gate-finding:stale -->\n## P1: Old finding",
+            "user": {"login": "gate-bot"},
         },
         {
             "id": 102,
@@ -679,6 +682,8 @@ def test_post_finding_comments_deletes_stale_findings(monkeypatch) -> None:
 
     def fake_run_command(args, cwd=None, env=None, input_text=None):
         calls.append(args)
+        if args[:3] == ["gh", "api", "user"]:
+            return subprocess.CompletedProcess(args, 0, stdout="gate-bot\n", stderr="")
         if args[:3] == ["gh", "api", "repos/example-org/example/issues/7/comments"]:
             return subprocess.CompletedProcess(args, 0, stdout=json.dumps(existing), stderr="")
         if args[:3] == ["gh", "api", "repos/example-org/example/issues/comments/101"]:
@@ -774,6 +779,38 @@ def test_fetch_issue_comments_flattens_multiple_pages(monkeypatch) -> None:
     monkeypatch.setattr(review_gate, "run_command", fake_run_command)
     comments = review_gate.fetch_issue_comments("example-org/example", 7)
     assert [c["id"] for c in comments] == [1, 2, 3]
+
+
+def test_pr_comment_updates_only_the_exact_gate_identity(monkeypatch) -> None:
+    review_gate = load_review_gate()
+    calls = []
+    comments = [
+        {
+            "id": 1,
+            "body": review_gate.COMMENT_MARKER,
+            "user": {"login": "attacker"},
+        },
+        {
+            "id": 2,
+            "body": review_gate.COMMENT_MARKER,
+            "user": {"login": "gate-bot"},
+        },
+    ]
+
+    def fake_run_command(args, cwd=None, env=None, input_text=None):
+        calls.append(args)
+        if args[:3] == ["gh", "api", "user"]:
+            return subprocess.CompletedProcess(args, 0, stdout="gate-bot\n", stderr="")
+        if args[:3] == ["gh", "api", "repos/example-org/example/issues/7/comments"]:
+            return subprocess.CompletedProcess(args, 0, stdout=json.dumps(comments), stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout="{}", stderr="")
+
+    monkeypatch.setattr(review_gate, "run_command", fake_run_command)
+    review_gate.post_or_update_pr_comment("example-org/example", 7, "updated")
+
+    patch_call = next(call for call in calls if "PATCH" in call)
+    assert "repos/example-org/example/issues/comments/2" in patch_call
+    assert all("issues/comments/1" not in arg for arg in patch_call)
 
 
 def test_post_commit_status_defaults_to_thorough_context(monkeypatch) -> None:
