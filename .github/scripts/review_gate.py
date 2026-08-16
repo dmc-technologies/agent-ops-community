@@ -20,6 +20,7 @@ COMMENT_MARKER = "<!-- review-gate-agent-review -->"
 FINDING_MARKER_PREFIX = "<!-- review-gate-finding:"
 RESOLUTION_STATE_MARKER_PREFIX = "<!-- review-gate-resolution-state:"
 FOLLOW_UP_ISSUE_MARKER_PREFIX = "<!-- review-gate-follow-up:"
+FOLLOW_UP_FINDING_MARKER_PREFIX = "<!-- review-gate-follow-up-finding:"
 STATUS_CONTEXT_THOROUGH = "Review Gate"
 DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
 REVIEW_EFFORTS = ("low", "medium", "high", "xhigh")
@@ -60,12 +61,24 @@ REVIEW_FAILURE_CODES = {
     "CODEX_REVIEW_INVALID",
 }
 CRITICAL_PATH_RULES = (
-    ("privileged_workflow", (".github/workflows/", "scripts/release", "scripts/deploy")),
+    (
+        "privileged_workflow",
+        (
+            ".github/",
+            "scripts/release",
+            "scripts/deploy",
+            "dockerfile",
+            "containerfile",
+        ),
+    ),
     (
         "ci_policy",
         ("configs/global/agents.md", "review-gate", "branch-protection", "branch_protection"),
     ),
-    ("authorization", ("/auth/", "authorization", "permission", "access_control")),
+    (
+        "authorization",
+        ("/auth/", "/auth.", "auth_", "authorization", "permission", "access_control"),
+    ),
     ("credentials", ("credential", "secret", "token", "keyring")),
     ("irreversible_state", ("migration", "schema", "database", "storage", "persistence")),
     ("engineering_source_authority", ("source_authority", "source-authority", "provenance")),
@@ -73,6 +86,22 @@ CRITICAL_PATH_RULES = (
     ("public_contract", ("openapi", "public_api", "public-api", "/api/", "protocol")),
     ("provider_boundary", ("provider", "adapter", "connector")),
     ("concurrency", ("concurrency", "locking", "mutex", "queue", "worker")),
+    (
+        "dependency_boundary",
+        (
+            "pyproject.toml",
+            "requirements.txt",
+            "requirements.lock",
+            "package.json",
+            "package-lock.json",
+            "pnpm-lock.yaml",
+            "yarn.lock",
+            "cargo.toml",
+            "cargo.lock",
+            "go.mod",
+            "go.sum",
+        ),
+    ),
 )
 DEFAULT_REVIEW_PROMPT = """# Review Gate Prompt
 
@@ -107,6 +136,10 @@ class ReviewProfile:
 
 @dataclass(frozen=True)
 class ResolutionState:
+    repo: str
+    pr_number: int
+    base_ref: str
+    merge_base_sha: str
     sha: str
     scope: str
     findings: tuple[Finding, ...]
@@ -473,6 +506,15 @@ def ensure_base_ref(workspace: Path, repo: str, base_ref: str) -> str:
     return target_ref
 
 
+def resolve_merge_base(workspace: Path, base_diff_ref: str) -> str:
+    result = run_command(["git", "merge-base", base_diff_ref, "HEAD"], cwd=workspace)
+    merge_base_sha = result.stdout.strip()
+    if result.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}", merge_base_sha):
+        detail = result.stderr.strip() or "Could not resolve the pull-request merge base."
+        raise RuntimeError(detail)
+    return merge_base_sha
+
+
 def _string_tuple(value: object) -> tuple[str, ...]:
     if not isinstance(value, list):
         return ()
@@ -521,12 +563,50 @@ def classify_review_profile(changed_files: list[str] | None) -> ReviewProfile:
     )
 
 
+def apply_scope_policy(
+    profile: ReviewProfile,
+    *,
+    requested_scope: str | None = None,
+    prior_scope: str | None = None,
+) -> ReviewProfile:
+    """Apply explicit and prior scope without allowing a critical downgrade."""
+    scopes = {profile.scope, requested_scope, prior_scope}
+    scope = "critical" if "critical" in scopes else "lite"
+    if scope == profile.scope:
+        return profile
+    reason = (
+        "Review scope was explicitly raised to critical."
+        if requested_scope == "critical"
+        else "Resolution keeps the prior critical review scope."
+    )
+    return ReviewProfile(
+        scope=scope,
+        effort="xhigh" if scope == "critical" else "medium",
+        confidence="high",
+        risk_domains=profile.risk_domains,
+        reasons=(reason, *profile.reasons),
+        review_questions=profile.review_questions,
+    )
+
+
 def select_review_stage(
     workspace: Path,
     head_sha: str,
     prior_state: ResolutionState | None,
+    *,
+    repo: str,
+    pr_number: int,
+    base_ref: str,
+    merge_base_sha: str,
 ) -> ReviewStage:
     if prior_state is None:
+        return ReviewStage()
+    if (
+        prior_state.repo,
+        prior_state.pr_number,
+        prior_state.base_ref,
+        prior_state.merge_base_sha,
+    ) != (repo, pr_number, base_ref, merge_base_sha):
         return ReviewStage()
     if prior_state.sha == head_sha:
         return ReviewStage(
@@ -850,18 +930,16 @@ def run_routed_codex_review(
     delta_from_sha: str | None = None,
     carried_findings: tuple[Finding, ...] = (),
     forced_scope: str | None = None,
+    prior_scope: str | None = None,
+    base_diff_ref: str | None = None,
 ) -> ReviewResult:
-    base_diff_ref = ensure_base_ref(workspace, repo, base_ref)
+    base_diff_ref = base_diff_ref or ensure_base_ref(workspace, repo, base_ref)
     profile = classify_review_profile(changed_files)
-    if forced_scope in {"lite", "critical"} and forced_scope != profile.scope:
-        profile = ReviewProfile(
-            scope=forced_scope,
-            effort="xhigh" if forced_scope == "critical" else "medium",
-            confidence="high",
-            risk_domains=profile.risk_domains,
-            reasons=(f"Review scope was explicitly set to {forced_scope}.", *profile.reasons),
-            review_questions=profile.review_questions,
-        )
+    profile = apply_scope_policy(
+        profile,
+        requested_scope=forced_scope,
+        prior_scope=prior_scope,
+    )
     return run_codex_review(
         workspace,
         review_prompt,
@@ -937,6 +1015,10 @@ def _finding_payload(finding: Finding) -> dict:
 def _encoded_resolution_payload(state: ResolutionState) -> str:
     payload = json.dumps(
         {
+            "repo": state.repo,
+            "pr_number": state.pr_number,
+            "base_ref": state.base_ref,
+            "merge_base_sha": state.merge_base_sha,
             "sha": state.sha,
             "scope": state.scope,
             "findings": [_finding_payload(finding) for finding in state.findings],
@@ -975,10 +1057,22 @@ def verify_resolution_state(
             return None
     try:
         payload = json.loads(base64.urlsafe_b64decode(encoded.encode("ascii")).decode("utf-8"))
+        repo = str(payload["repo"]).strip()
+        pr_number = int(payload["pr_number"])
+        base_ref = str(payload["base_ref"]).strip()
+        merge_base_sha = str(payload["merge_base_sha"]).strip()
         sha = str(payload["sha"]).strip()
         scope = str(payload["scope"]).strip()
         raw_findings = payload["findings"]
-        if not sha or scope not in {"lite", "critical"} or not isinstance(raw_findings, list):
+        if (
+            not repo
+            or pr_number < 1
+            or not base_ref
+            or not merge_base_sha
+            or not sha
+            or scope not in {"lite", "critical"}
+            or not isinstance(raw_findings, list)
+        ):
             return None
         findings = tuple(
             Finding(
@@ -996,7 +1090,15 @@ def verify_resolution_state(
         return None
     if not findings:
         return None
-    return ResolutionState(sha=sha, scope=scope, findings=findings)
+    return ResolutionState(
+        repo=repo,
+        pr_number=pr_number,
+        base_ref=base_ref,
+        merge_base_sha=merge_base_sha,
+        sha=sha,
+        scope=scope,
+        findings=findings,
+    )
 
 
 def build_review_comment(
@@ -1105,10 +1207,10 @@ def read_resolution_state(repo: str, pr_number: int) -> ResolutionState | None:
         )
         if match:
             token = match.group(1)
+            author = str((comment.get("user") or {}).get("login") or "")
+            if expected_login is None or author != expected_login:
+                continue
             if token.startswith("unsigned."):
-                author = str((comment.get("user") or {}).get("login") or "")
-                if expected_login is None or author != expected_login:
-                    continue
                 return verify_resolution_state(token, allow_trusted_unsigned=True)
             return verify_resolution_state(token)
     return None
@@ -1168,8 +1270,16 @@ def build_follow_up_issue_body(
         "",
     ]
     for finding in findings:
+        encoded_finding = base64.urlsafe_b64encode(
+            json.dumps(
+                _finding_payload(finding),
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).decode("ascii")
         lines.extend(
             [
+                f"{FOLLOW_UP_FINDING_MARKER_PREFIX}{encoded_finding} -->",
                 f"## {finding.title}",
                 "",
                 finding.detail,
@@ -1179,6 +1289,40 @@ def build_follow_up_issue_body(
             lines.extend(["", f"Files: {', '.join(finding.files)}"])
         lines.append("")
     return "\n".join(lines).rstrip()
+
+
+def findings_from_follow_up_issue(body: str) -> tuple[Finding, ...]:
+    findings: list[Finding] = []
+    pattern = re.escape(FOLLOW_UP_FINDING_MARKER_PREFIX) + r"\s*(\S+?)\s*-->"
+    for match in re.finditer(pattern, body):
+        try:
+            payload = json.loads(
+                base64.urlsafe_b64decode(match.group(1).encode("ascii")).decode("utf-8")
+            )
+            finding = Finding(
+                severity=str(payload["severity"]),
+                code=str(payload["code"]),
+                title=str(payload["title"]),
+                detail=str(payload["detail"]),
+                files=tuple(str(path) for path in payload.get("files", [])),
+                root_cause=str(payload.get("root_cause") or ""),
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError, binascii.Error):
+            continue
+        if finding.title and finding.detail:
+            findings.append(finding)
+    return tuple(findings)
+
+
+def merge_follow_up_findings(
+    prior: tuple[Finding, ...],
+    current: tuple[Finding, ...],
+) -> tuple[Finding, ...]:
+    merged: dict[str, Finding] = {}
+    for finding in (*prior, *current):
+        key = finding.root_cause or finding_fingerprint(finding)
+        merged[key] = finding
+    return tuple(merged.values())
 
 
 def post_or_update_follow_up_issue(
@@ -1214,7 +1358,23 @@ def post_or_update_follow_up_issue(
             issues.extend(candidate for candidate in item if isinstance(candidate, dict))
         elif isinstance(item, dict):
             issues.append(item)
-    existing = next((issue for issue in issues if marker in str(issue.get("body") or "")), None)
+    expected_login = expected_gate_login()
+    existing = next(
+        (
+            issue
+            for issue in issues
+            if marker in str(issue.get("body") or "")
+            and "pull_request" not in issue
+            and expected_login is not None
+            and str((issue.get("user") or {}).get("login") or "") == expected_login
+        ),
+        None,
+    )
+    if existing:
+        findings = merge_follow_up_findings(
+            findings_from_follow_up_issue(str(existing.get("body") or "")),
+            findings,
+        )
     body = build_follow_up_issue_body(repo, pr_number, sha, findings)
     title = f"Review follow-up from PR #{pr_number}"
     if existing:
@@ -1376,7 +1536,10 @@ def main() -> None:
         "--scope",
         choices=("auto", "lite", "critical"),
         default="auto",
-        help="auto selects scope from changed paths; lite or critical is an explicit override",
+        help=(
+            "auto selects scope from changed paths; lite cannot lower detected or prior "
+            "critical scope"
+        ),
     )
     args = parser.parse_args()
 
@@ -1384,26 +1547,21 @@ def main() -> None:
     workspace = Path(args.workspace).resolve()
     changed_files = changed_files_for_pr(args.repo, args.pr)
     profile = classify_review_profile(changed_files)
-    if args.scope in {"lite", "critical"}:
-        profile = ReviewProfile(
-            scope=args.scope,
-            effort="xhigh" if args.scope == "critical" else "medium",
-            confidence="high",
-            risk_domains=profile.risk_domains,
-            reasons=(f"Review scope was explicitly set to {args.scope}.", *profile.reasons),
-            review_questions=profile.review_questions,
-        )
+    requested_scope = args.scope if args.scope in {"lite", "critical"} else None
+    profile = apply_scope_policy(profile, requested_scope=requested_scope)
+    base_diff_ref = ensure_base_ref(workspace, args.repo, args.base_ref)
+    merge_base_sha = resolve_merge_base(workspace, base_diff_ref)
     prior_state = read_resolution_state(args.repo, args.pr)
-    stage = select_review_stage(workspace, args.sha, prior_state)
-    if stage.scope and args.scope == "auto":
-        profile = ReviewProfile(
-            scope=stage.scope,
-            effort="xhigh" if stage.scope == "critical" else "medium",
-            confidence="high",
-            risk_domains=profile.risk_domains,
-            reasons=("Resolution keeps the discovery review scope.", *profile.reasons),
-            review_questions=profile.review_questions,
-        )
+    stage = select_review_stage(
+        workspace,
+        args.sha,
+        prior_state,
+        repo=args.repo,
+        pr_number=args.pr,
+        base_ref=args.base_ref,
+        merge_base_sha=merge_base_sha,
+    )
+    profile = apply_scope_policy(profile, prior_scope=stage.scope)
 
     preflight = analyze_workspace(workspace, changed_files)
     model_follow_ups: tuple[Finding, ...] = ()
@@ -1434,6 +1592,8 @@ def main() -> None:
             delta_from_sha=stage.delta_from_sha,
             carried_findings=stage.carried_findings,
             forced_scope=profile.scope,
+            prior_scope=stage.scope,
+            base_diff_ref=base_diff_ref,
         )
         model_follow_ups = result.warnings
         if preflight.warnings:
@@ -1451,6 +1611,10 @@ def main() -> None:
         next_state = prior_state
     elif result.blocking:
         next_state = ResolutionState(
+            repo=args.repo,
+            pr_number=args.pr,
+            base_ref=args.base_ref,
+            merge_base_sha=merge_base_sha,
             sha=args.sha,
             scope=result.profile.scope if result.profile else profile.scope,
             findings=result.blocking,

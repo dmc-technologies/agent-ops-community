@@ -275,6 +275,9 @@ def test_scope_classifier_uses_changed_paths_without_a_model_call() -> None:
         ]
     )
     unknown = review_gate.classify_review_profile(None)
+    critical_files = review_gate.classify_review_profile(
+        ["src/auth.py", "Dockerfile", "pyproject.toml", ".github/actions/deploy/action.yml"]
+    )
 
     assert lite.scope == "lite"
     assert lite.effort == "medium"
@@ -285,6 +288,13 @@ def test_scope_classifier_uses_changed_paths_without_a_model_call() -> None:
     assert "authorization" in critical.risk_domains
     assert unknown.scope == "critical"
     assert unknown.effort == "xhigh"
+    assert critical_files.scope == "critical"
+
+    forced_lite = review_gate.apply_scope_policy(critical_files, requested_scope="lite")
+    raised_resolution = review_gate.apply_scope_policy(lite, prior_scope="critical")
+
+    assert forced_lite.scope == "critical"
+    assert raised_resolution.scope == "critical"
 
 
 def test_routed_review_uses_one_model_call_with_deterministic_scope(
@@ -478,6 +488,10 @@ def test_resolution_state_is_signed_and_rejects_tampering(monkeypatch) -> None:
     review_gate = load_review_gate()
     monkeypatch.setenv("REVIEW_GATE_STATE_KEY", "gate-key")
     state = review_gate.ResolutionState(
+        repo="example-org/example",
+        pr_number=7,
+        base_ref="main",
+        merge_base_sha="base123",
         sha="abc123",
         scope="critical",
         findings=(
@@ -497,6 +511,10 @@ def test_resolution_state_is_signed_and_rejects_tampering(monkeypatch) -> None:
 def test_resolution_stage_uses_only_a_descendant_fix_delta(monkeypatch, tmp_path: Path) -> None:
     review_gate = load_review_gate()
     state = review_gate.ResolutionState(
+        repo="example-org/example",
+        pr_number=7,
+        base_ref="main",
+        merge_base_sha="base123",
         sha="abc123",
         scope="critical",
         findings=(
@@ -512,20 +530,40 @@ def test_resolution_stage_uses_only_a_descendant_fix_delta(monkeypatch, tmp_path
 
     monkeypatch.setattr(review_gate, "run_command", fake_run_command)
 
-    resolution = review_gate.select_review_stage(tmp_path, "def456", state)
-    unchanged = review_gate.select_review_stage(tmp_path, "abc123", state)
+    context = {
+        "repo": "example-org/example",
+        "pr_number": 7,
+        "base_ref": "main",
+        "merge_base_sha": "base123",
+    }
+    resolution = review_gate.select_review_stage(tmp_path, "def456", state, **context)
+    unchanged = review_gate.select_review_stage(tmp_path, "abc123", state, **context)
+    copied = review_gate.select_review_stage(
+        tmp_path,
+        "def456",
+        state,
+        repo="example-org/example",
+        pr_number=8,
+        base_ref="main",
+        merge_base_sha="base123",
+    )
 
     assert resolution.name == "resolution"
     assert resolution.scope == "critical"
     assert resolution.delta_from_sha == "abc123"
     assert resolution.carried_findings == state.findings
     assert unchanged.name == "unchanged"
+    assert copied.name == "discovery"
 
 
 def test_resolution_state_without_a_key_requires_the_exact_gate_identity(monkeypatch) -> None:
     review_gate = load_review_gate()
     monkeypatch.delenv("REVIEW_GATE_STATE_KEY", raising=False)
     state = review_gate.ResolutionState(
+        repo="example-org/example",
+        pr_number=7,
+        base_ref="main",
+        merge_base_sha="base123",
         sha="abc123",
         scope="lite",
         findings=(
@@ -593,6 +631,70 @@ def test_noncritical_findings_are_grouped_into_one_follow_up_issue(monkeypatch) 
     create = next(call for call in calls if "--method" in call and "POST" in call)
     body = next(arg.removeprefix("body=") for arg in create if arg.startswith("body="))
     assert "Follow-up findings from PR #7" in body
+    assert "Preserve display value" in body
+    assert "Clarify retry message" in body
+
+
+def test_follow_up_update_ignores_forged_pr_and_preserves_prior_findings(monkeypatch) -> None:
+    review_gate = load_review_gate()
+    calls = []
+    prior = review_gate.Finding(
+        "P2",
+        "CODEX_P2_1",
+        "Preserve display value",
+        "Secondary view omits value.",
+        ("src/view.py",),
+        "display-value",
+    )
+    current = review_gate.Finding(
+        "P3",
+        "CODEX_P3_2",
+        "Clarify retry message",
+        "Retry text is misleading.",
+        ("src/retry.py",),
+        "retry-message",
+    )
+    marker = f"{review_gate.FOLLOW_UP_ISSUE_MARKER_PREFIX}example-org/example#7 -->"
+    issues = [
+        {
+            "number": 99,
+            "body": marker,
+            "user": {"login": "attacker"},
+            "pull_request": {"url": "https://api.example.test/pulls/99"},
+        },
+        {
+            "number": 12,
+            "body": review_gate.build_follow_up_issue_body(
+                "example-org/example", 7, "abc123", (prior,)
+            ),
+            "user": {"login": "gate-bot"},
+            "html_url": "https://github.com/example-org/example/issues/12",
+        },
+    ]
+
+    def fake_run_command(args, cwd=None, env=None, input_text=None):
+        calls.append(args)
+        if args[:3] == ["gh", "api", "user"]:
+            return subprocess.CompletedProcess(args, 0, stdout="gate-bot\n", stderr="")
+        if "--paginate" in args:
+            return subprocess.CompletedProcess(args, 0, stdout=json.dumps([issues]), stderr="")
+        if "PATCH" in args:
+            return subprocess.CompletedProcess(
+                args,
+                0,
+                stdout='{"html_url":"https://github.com/example-org/example/issues/12"}',
+                stderr="",
+            )
+        return subprocess.CompletedProcess(args, 0, stdout="{}", stderr="")
+
+    monkeypatch.setattr(review_gate, "run_command", fake_run_command)
+    review_gate.post_or_update_follow_up_issue(
+        "example-org/example", 7, "def456", (current,)
+    )
+
+    update = next(call for call in calls if "PATCH" in call)
+    assert "repos/example-org/example/issues/12" in update
+    body = next(arg.removeprefix("body=") for arg in update if arg.startswith("body="))
     assert "Preserve display value" in body
     assert "Clarify retry message" in body
 
