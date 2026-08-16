@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import stat
 import subprocess
 import threading
@@ -10,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_ops.deployment.engine import DeploymentEngine
+from agent_ops.deployment.engine import DeploymentEngine, DeploymentRecoveryError
 from agent_ops.deployment.models import (
     DeploymentAudit,
     PlannedFile,
@@ -255,6 +256,82 @@ def test_waiting_same_home_refresh_replans_only_after_acquiring_operation_lock(
     assert len(provider.calls["waiting-refresh"]) >= 2
     assert provider.calls["waiting-refresh"][-1] is True
     assert len(registry.receipts()) == 2
+
+
+@pytest.mark.parametrize("operation", ["refresh", "switch"])
+def test_grouped_audit_rejects_byte_identical_replacement_of_locked_home(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    engine, registry, home = _engine_fixture(tmp_path)
+    if operation == "switch":
+        source = tmp_path / "source"
+        subprocess.run(
+            ["git", "switch", "-c", "feature"],
+            cwd=source,
+            check=True,
+            capture_output=True,
+        )
+        (source / "payload.txt").write_bytes(b"feature\n")
+        subprocess.run(
+            ["git", "commit", "-am", "feature"],
+            cwd=source,
+            check=True,
+            capture_output=True,
+        )
+        config = registry.load()
+        registry.save(
+            RegistryConfig(
+                1,
+                config.sources,
+                config.channels
+                + (ChannelSpec("feature", "community", "refs/heads/feature"),),
+                config.targets,
+            )
+        )
+    original_registry = registry.load_snapshot()
+    outside = tmp_path / "outside.txt"
+    outside.write_bytes(b"outside\n")
+    displaced = tmp_path / "displaced-home"
+    observed: dict[str, dict[Path, tuple[int, bytes | None]]] = {}
+    original_audit = __import__(
+        "agent_ops.deployment.transaction", fromlist=["audit_provider_plans"]
+    ).audit_provider_plans
+
+    def tree_snapshot(root: Path) -> dict[Path, tuple[int, bytes | None]]:
+        return {
+            path.relative_to(root): (
+                stat.S_IMODE(path.lstat().st_mode),
+                path.read_bytes() if path.is_file() else None,
+            )
+            for path in root.rglob("*")
+        }
+
+    def replace_before_audit(plans: tuple[ProviderPlan, ...]) -> DeploymentAudit:
+        os.replace(home, displaced)
+        shutil.copytree(displaced, home, copy_function=shutil.copy2)
+        observed["displaced"] = tree_snapshot(displaced)
+        observed["replacement"] = tree_snapshot(home)
+        return original_audit(plans)
+
+    monkeypatch.setattr(
+        "agent_ops.deployment.engine.audit_provider_plans",
+        replace_before_audit,
+    )
+
+    with pytest.raises(DeploymentRecoveryError, match="recovery incomplete"):
+        if operation == "refresh":
+            engine.refresh(("codex",))
+        else:
+            engine.switch("feature", ("codex",))
+
+    assert registry.load_snapshot() == original_registry
+    assert registry.receipts() == ()
+    assert outside.read_bytes() == b"outside\n"
+    assert tree_snapshot(displaced) == observed["displaced"]
+    assert tree_snapshot(home) == observed["replacement"]
+    assert list((displaced / ".agentops/deployment/transactions").glob("*/record.json"))
 
 
 def test_engine_audit_reports_modified_without_repairing_target(tmp_path: Path) -> None:

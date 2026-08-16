@@ -40,6 +40,7 @@ from agent_ops.deployment.source_store import (
 from agent_ops.deployment.transaction import (
     _locked_provider_plan_targets,
     _preflight_provider_plans_read_only,
+    _verify_locked_provider_plan_targets,
     audit_provider_plans,
     install_provider_plans,
     rollback_manifests,
@@ -166,6 +167,7 @@ class DeploymentEngine:
                     manifests=manifests,
                     audits=audits,
                 )
+                _verify_locked_provider_plan_targets(plan.provider_plans)
                 self._registry.append_receipt(receipt, snapshot=registry_snapshot)
             except BaseException as error:
                 self._rollback_after_failure(manifests, error)
@@ -188,6 +190,7 @@ class DeploymentEngine:
                 manifests=(),
                 audits=audits,
             )
+            _verify_locked_provider_plan_targets(plan.provider_plans)
             self._registry.append_receipt(receipt, snapshot=registry_snapshot)
         return receipt
 
@@ -243,6 +246,7 @@ class DeploymentEngine:
                     manifests=manifests,
                     audits=audits,
                 )
+                _verify_locked_provider_plan_targets(plan.provider_plans)
                 self._registry.append_receipt(receipt, snapshot=candidate_snapshot)
             except BaseException as error:
                 recovery_errors: list[BaseException] = []

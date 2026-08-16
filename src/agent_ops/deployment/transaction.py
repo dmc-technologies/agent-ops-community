@@ -1268,6 +1268,26 @@ def _locked_provider_plan_targets(
             _GROUP_HOME_LOCKS.reset(token)
 
 
+def _verify_locked_provider_plan_targets(plans: tuple[ProviderPlan, ...]) -> None:
+    """Revalidate every retained home and lock identity for grouped success."""
+    groups = _validate_and_group(plans)
+    active = _GROUP_HOME_LOCKS.get()
+    if active is None:
+        raise RuntimeError("deployment target lock set is not active")
+    homes = sorted(
+        {_absolute_home(group.target.home) for group in groups},
+        key=str,
+    )
+    for home in homes:
+        try:
+            home_fs = active[home]
+        except KeyError as error:
+            raise RuntimeError(
+                "active deployment lock set does not cover every target"
+            ) from error
+        home_fs.verify_lock_identity()
+
+
 def _install_provider_plan_groups(
     groups: tuple[_PlanGroup, ...],
     manifests: list[DeploymentManifest],
@@ -2545,20 +2565,35 @@ def audit_provider_plans(plans: tuple[ProviderPlan, ...]) -> DeploymentAudit:
     unexpected: set[str] = set()
     duplicates: list[str] = []
     validation_errors: list[str] = []
-    try:
-        home_descriptor = _open_absolute_directory(target.home, create=False)
-    except FileNotFoundError:
-        return DeploymentAudit(
-            target_id=target.id,
-            matches=False,
-            missing=tuple(item.path.as_posix() for item in files),
-        )
-    except OSError:
-        return DeploymentAudit(
-            target_id=target.id,
-            matches=False,
-            validation_errors=(_CANONICAL_HOME_IDENTITY_ERROR,),
-        )
+    active = _GROUP_HOME_LOCKS.get()
+    retained_home = (
+        active.get(_absolute_home(target.home)) if active is not None else None
+    )
+    if retained_home is not None:
+        try:
+            retained_home.verify_lock_identity()
+            home_descriptor = os.dup(retained_home.descriptor)
+        except (OSError, ValueError):
+            return DeploymentAudit(
+                target_id=target.id,
+                matches=False,
+                validation_errors=(_CANONICAL_HOME_IDENTITY_ERROR,),
+            )
+    else:
+        try:
+            home_descriptor = _open_absolute_directory(target.home, create=False)
+        except FileNotFoundError:
+            return DeploymentAudit(
+                target_id=target.id,
+                matches=False,
+                missing=tuple(item.path.as_posix() for item in files),
+            )
+        except OSError:
+            return DeploymentAudit(
+                target_id=target.id,
+                matches=False,
+                validation_errors=(_CANONICAL_HOME_IDENTITY_ERROR,),
+            )
     try:
         opened_home = os.fstat(home_descriptor)
     except OSError:
@@ -2574,7 +2609,15 @@ def audit_provider_plans(plans: tuple[ProviderPlan, ...]) -> DeploymentAudit:
     home_fs = _HomeFS(
         target.home,
         home_descriptor,
-        home_identity=(opened_home.st_dev, opened_home.st_ino),
+        home_identity=(
+            retained_home._home_identity
+            if retained_home is not None
+            else (opened_home.st_dev, opened_home.st_ino)
+        ),
+        lock_name=retained_home._lock_name if retained_home is not None else None,
+        lock_identity=(
+            retained_home._lock_identity if retained_home is not None else None
+        ),
     )
     with home_fs:
         manifest_path = _manifest_path(target)
