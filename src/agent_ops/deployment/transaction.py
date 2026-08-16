@@ -7,7 +7,8 @@ import os
 import stat
 import uuid
 from collections.abc import Iterator
-from contextlib import contextmanager, suppress
+from contextlib import ExitStack, contextmanager, suppress
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 from typing import Any
@@ -546,8 +547,19 @@ def _replace_at(
     )
 
 
+_GROUP_HOME_LOCKS: ContextVar[dict[Path, _HomeFS] | None] = ContextVar(
+    "deployment_group_home_locks",
+    default=None,
+)
+
+
 @contextmanager
 def _target_lock(home: Path) -> Iterator[_HomeFS]:
+    home = _absolute_home(home)
+    grouped = _GROUP_HOME_LOCKS.get()
+    if grouped is not None and home in grouped:
+        yield grouped[home]
+        return
     parent = _open_absolute_directory(home.parent, create=True)
     try:
         assert fcntl is not None
@@ -1201,7 +1213,43 @@ def install_provider_plans(
 ) -> tuple[DeploymentManifest, ...]:
     _require_supported_platform()
     manifests: list[DeploymentManifest] = []
-    for group in _validate_and_group(plans):
+    groups = _validate_and_group(plans)
+    with ExitStack() as locks:
+        grouped_locks: dict[Path, _HomeFS] = {}
+        for group in groups:
+            home = _absolute_home(group.target.home)
+            grouped_locks.setdefault(home, locks.enter_context(_target_lock(home)))
+        token = _GROUP_HOME_LOCKS.set(grouped_locks)
+        try:
+            try:
+                _install_provider_plan_groups(groups, manifests)
+            except BaseException as install_error:
+                if not manifests:
+                    raise
+                try:
+                    rollback_manifests(tuple(manifests))
+                except BaseException as rollback_error:
+                    if not isinstance(install_error, Exception):
+                        install_error.add_note(
+                            "grouped rollback failed; recovery evidence retained for "
+                            "earlier targets"
+                        )
+                        raise install_error from rollback_error
+                    raise IncompleteRollbackError(
+                        f"installation failed: {install_error}; grouped rollback "
+                        "incomplete; recovery evidence retained for earlier targets"
+                    ) from rollback_error
+                raise
+        finally:
+            _GROUP_HOME_LOCKS.reset(token)
+    return tuple(manifests)
+
+
+def _install_provider_plan_groups(
+    groups: tuple[_PlanGroup, ...],
+    manifests: list[DeploymentManifest],
+) -> None:
+    for group in groups:
         target = group.target
         files = group.files
         transaction_id = uuid.uuid4().hex
@@ -1520,7 +1568,6 @@ def install_provider_plans(
                     ) from rollback_error
                 raise
         manifests.append(manifest)
-    return tuple(manifests)
 
 
 def _validate_group_current_state(home_fs: _HomeFS, group: _PlanGroup) -> None:

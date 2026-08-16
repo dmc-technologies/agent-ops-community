@@ -9,13 +9,377 @@ from pathlib import Path
 
 import pytest
 
-from agent_ops.deployment.models import PlannedFile, ProviderPlan, TargetSpec
+from agent_ops.deployment.engine import DeploymentEngine
+from agent_ops.deployment.models import (
+    DeploymentAudit,
+    PlannedFile,
+    ProviderPlan,
+    SourceSnapshot,
+    SourceSpec,
+    TargetSpec,
+    TargetState,
+)
 from agent_ops.deployment.public_skills import build_public_skill_plans
+from agent_ops.deployment.registry import ChannelSpec, DeploymentRegistry, RegistryConfig
+from agent_ops.deployment.source_store import SourceStore
 from agent_ops.deployment.transaction import UnsupportedPlatformError
 from agent_ops.deployment.transaction import install_provider_plans as apply_provider_plans
 from agent_ops.registries.models import Framework, SkillDependency, SkillDependencyInstall
 from agent_ops.show_me_adapter import OWNERSHIP_MANIFEST_RELATIVE, install_show_me
 from agent_ops.skill_installer import InstalledSkillDependency, install_skill_dependencies
+
+
+class _FixtureProvider:
+    provider_id = "fixture"
+
+    def supports(self, snapshot: SourceSnapshot, target: TargetSpec) -> bool:
+        return target.framework is Framework.CODEX
+
+    def source_closure(
+        self,
+        snapshot: SourceSnapshot,
+        target: TargetSpec,
+        selection: tuple[str, ...] | None,
+    ) -> tuple[Path, ...]:
+        return (Path("payload.txt"),)
+
+    def plan(self, snapshot: SourceSnapshot, target: TargetSpec) -> ProviderPlan:
+        return ProviderPlan(
+            self.provider_id,
+            snapshot.commit,
+            target,
+            (
+                PlannedFile(
+                    Path("skills/example/payload.txt"),
+                    (snapshot.root / "payload.txt").read_bytes(),
+                    0o640,
+                ),
+            ),
+        )
+
+
+def _engine_fixture(tmp_path: Path) -> tuple[DeploymentEngine, DeploymentRegistry, Path]:
+    source = tmp_path / "source"
+    source.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=source, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "agentops@example.com"], cwd=source, check=True)
+    subprocess.run(["git", "config", "user.name", "Agent Ops"], cwd=source, check=True)
+    (source / "payload.txt").write_bytes(b"deployed\n")
+    subprocess.run(["git", "add", "payload.txt"], cwd=source, check=True)
+    subprocess.run(["git", "commit", "-m", "fixture"], cwd=source, check=True, capture_output=True)
+    registry_path = tmp_path / "registry/deployments.yaml"
+    registry_path.parent.mkdir()
+    registry = DeploymentRegistry(registry_path)
+    home = tmp_path / "home"
+    registry.save(
+        RegistryConfig(
+            1,
+            (SourceSpec("community", str(source)),),
+            (ChannelSpec("stable", "community", "refs/heads/main"),),
+            (TargetSpec("codex", Framework.CODEX, home, "stable"),),
+        )
+    )
+    return (
+        DeploymentEngine(
+            registry,
+            SourceStore(tmp_path / "source-store"),
+            providers=(_FixtureProvider(),),
+        ),
+        registry,
+        home,
+    )
+
+
+def test_deployment_engine_plans_without_mutation_then_refreshes_once(tmp_path: Path) -> None:
+    engine, registry, home = _engine_fixture(tmp_path)
+
+    plan = engine.plan(("codex",))
+
+    assert [item.provider_id for item in plan.provider_plans] == ["fixture"]
+    assert not home.exists()
+    assert registry.receipts() == ()
+
+    receipt = engine.refresh(("codex",))
+
+    assert (home / "skills/example/payload.txt").read_bytes() == b"deployed\n"
+    assert receipt.operation == "refresh"
+    assert receipt.targets[0].state is TargetState.STABLE
+    assert registry.receipts() == (receipt,)
+
+
+def test_engine_rejects_duplicate_selection_before_source_store_mutation(
+    tmp_path: Path,
+) -> None:
+    engine, registry, home = _engine_fixture(tmp_path)
+    source_store_root = tmp_path / "source-store"
+
+    with pytest.raises(ValueError, match="duplicate target"):
+        engine.plan(("codex", "codex"))
+
+    assert not source_store_root.exists()
+    assert not home.exists()
+    assert registry.receipts() == ()
+
+
+def test_engine_audit_reports_modified_without_repairing_target(tmp_path: Path) -> None:
+    engine, registry, home = _engine_fixture(tmp_path)
+    engine.refresh(("codex",))
+    installed = home / "skills/example/payload.txt"
+    installed.write_bytes(b"operator change\n")
+
+    receipt = engine.audit(("codex",))
+
+    assert receipt.operation == "audit"
+    assert receipt.targets[0].state is TargetState.MODIFIED
+    assert installed.read_bytes() == b"operator change\n"
+    assert registry.receipts()[-1] == receipt
+
+
+def test_engine_audit_reports_exact_installed_target_as_stable(tmp_path: Path) -> None:
+    engine, registry, _home = _engine_fixture(tmp_path)
+    engine.refresh(("codex",))
+
+    receipt = engine.audit(("codex",))
+
+    assert receipt.targets[0].state is TargetState.STABLE
+    assert registry.receipts()[-1] == receipt
+
+
+def test_engine_status_is_conservative_and_does_not_fetch(tmp_path: Path) -> None:
+    engine, registry, home = _engine_fixture(tmp_path)
+    engine.refresh(("codex",))
+    store_state_before = sorted(
+        (path.relative_to(tmp_path / "source-store"), path.stat().st_mtime_ns)
+        for path in (tmp_path / "source-store").rglob("*")
+    )
+
+    statuses = engine.status(("codex",))
+
+    assert statuses[0].state is TargetState.STALE
+    assert home.exists()
+    assert len(registry.receipts()) == 1
+    assert store_state_before == sorted(
+        (path.relative_to(tmp_path / "source-store"), path.stat().st_mtime_ns)
+        for path in (tmp_path / "source-store").rglob("*")
+    )
+
+
+def test_engine_rejects_provider_snapshot_tamper_before_target_mutation(
+    tmp_path: Path,
+) -> None:
+    class TamperingProvider(_FixtureProvider):
+        def plan(self, snapshot: SourceSnapshot, target: TargetSpec) -> ProviderPlan:
+            plan = super().plan(snapshot, target)
+            (snapshot.root / "payload.txt").write_bytes(b"tampered\n")
+            return plan
+
+    engine, registry, home = _engine_fixture(tmp_path)
+    engine = DeploymentEngine(
+        registry,
+        SourceStore(tmp_path / "other-source-store"),
+        providers=(TamperingProvider(),),
+    )
+
+    with pytest.raises(RuntimeError, match="changed the restricted source snapshot"):
+        engine.refresh(("codex",))
+
+    assert not home.exists()
+    assert registry.receipts() == ()
+
+
+def test_engine_requires_provider_support_decision_to_be_boolean(tmp_path: Path) -> None:
+    class InvalidSupportsProvider(_FixtureProvider):
+        def supports(self, snapshot: SourceSnapshot, target: TargetSpec) -> bool:
+            return "yes"  # type: ignore[return-value]
+
+    _engine, registry, home = _engine_fixture(tmp_path)
+    engine = DeploymentEngine(
+        registry,
+        SourceStore(tmp_path / "other-source-store"),
+        providers=(InvalidSupportsProvider(),),
+    )
+
+    with pytest.raises(ValueError, match="supports decision must be boolean"):
+        engine.plan(("codex",))
+
+    assert not home.exists()
+
+
+def test_engine_materializes_only_the_declared_directory_closure(
+    tmp_path: Path,
+) -> None:
+    class DirectoryProvider(_FixtureProvider):
+        def source_closure(
+            self,
+            snapshot: SourceSnapshot,
+            target: TargetSpec,
+            selection: tuple[str, ...] | None,
+        ) -> tuple[Path, ...]:
+            return (Path("catalog"),)
+
+        def plan(self, snapshot: SourceSnapshot, target: TargetSpec) -> ProviderPlan:
+            assert not (snapshot.root / "payload.txt").exists()
+            source = snapshot.root / "catalog/nested/data.txt"
+            return ProviderPlan(
+                self.provider_id,
+                snapshot.commit,
+                target,
+                (PlannedFile(Path("skills/example/data.txt"), source.read_bytes(), 0o640),),
+            )
+
+    _engine, registry, home = _engine_fixture(tmp_path)
+    source = tmp_path / "source"
+    nested = source / "catalog/nested"
+    nested.mkdir(parents=True)
+    data = nested / "data.txt"
+    data.write_bytes(b"nested\n")
+    data.chmod(0o600)
+    subprocess.run(["git", "add", "catalog"], cwd=source, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "catalog"], cwd=source, check=True, capture_output=True
+    )
+    engine = DeploymentEngine(
+        registry,
+        SourceStore(tmp_path / "other-source-store"),
+        providers=(DirectoryProvider(),),
+    )
+
+    engine.refresh(("codex",))
+
+    assert (home / "skills/example/data.txt").read_bytes() == b"nested\n"
+
+
+def test_switch_saves_candidate_only_after_install_and_audit(tmp_path: Path) -> None:
+    engine, registry, home = _engine_fixture(tmp_path)
+    source = tmp_path / "source"
+    subprocess.run(["git", "switch", "-c", "feature"], cwd=source, check=True, capture_output=True)
+    (source / "payload.txt").write_bytes(b"feature\n")
+    subprocess.run(["git", "commit", "-am", "feature"], cwd=source, check=True, capture_output=True)
+    current = registry.load()
+    registry.save(
+        RegistryConfig(
+            1,
+            current.sources,
+            current.channels + (ChannelSpec("feature", "community", "refs/heads/feature"),),
+            current.targets,
+        )
+    )
+
+    receipt = engine.switch("feature", ("codex",))
+
+    assert receipt.operation == "switch"
+    assert receipt.targets[0].state is TargetState.BRANCH
+    assert registry.load().targets[0].channel == "feature"
+    assert (home / "skills/example/payload.txt").read_bytes() == b"feature\n"
+    assert registry.receipts()[-1] == receipt
+
+
+def test_second_target_audit_mismatch_restores_every_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, registry, first_home = _engine_fixture(tmp_path)
+    config = registry.load()
+    second_home = tmp_path / "second-home"
+    registry.save(
+        RegistryConfig(
+            1,
+            config.sources,
+            config.channels,
+            config.targets
+            + (TargetSpec("second", Framework.CODEX, second_home, "stable"),),
+        )
+    )
+
+    def audit(plans: tuple[ProviderPlan, ...]) -> DeploymentAudit:
+        target_id = plans[0].target.id
+        return DeploymentAudit(target_id, matches=target_id != "second")
+
+    monkeypatch.setattr("agent_ops.deployment.engine.audit_provider_plans", audit)
+
+    with pytest.raises(RuntimeError, match="audit did not match"):
+        engine.refresh(("codex", "second"))
+
+    assert not (first_home / "skills/example/payload.txt").exists()
+    assert not (second_home / "skills/example/payload.txt").exists()
+    assert registry.receipts() == ()
+
+
+def test_refresh_receipt_failure_rolls_back_installed_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, registry, home = _engine_fixture(tmp_path)
+    append_error = OSError("injected receipt failure")
+
+    def fail_append(*_args: object, **_kwargs: object) -> None:
+        raise append_error
+
+    monkeypatch.setattr(registry, "append_receipt", fail_append)
+
+    with pytest.raises(OSError) as caught:
+        engine.refresh(("codex",))
+
+    assert caught.value is append_error
+    assert not (home / "skills/example/payload.txt").exists()
+    assert registry.receipts() == ()
+
+
+def test_refresh_process_control_during_audit_is_preserved_after_rollback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, registry, home = _engine_fixture(tmp_path)
+    control = KeyboardInterrupt("operator stop")
+
+    def interrupt(_plans: tuple[ProviderPlan, ...]) -> DeploymentAudit:
+        raise control
+
+    monkeypatch.setattr("agent_ops.deployment.engine.audit_provider_plans", interrupt)
+
+    with pytest.raises(KeyboardInterrupt) as caught:
+        engine.refresh(("codex",))
+
+    assert caught.value is control
+    assert not (home / "skills/example/payload.txt").exists()
+    assert registry.receipts() == ()
+
+
+def test_switch_receipt_failure_restores_registry_and_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, registry, home = _engine_fixture(tmp_path)
+    source = tmp_path / "source"
+    subprocess.run(
+        ["git", "switch", "-c", "feature"], cwd=source, check=True, capture_output=True
+    )
+    (source / "payload.txt").write_bytes(b"feature\n")
+    subprocess.run(
+        ["git", "commit", "-am", "feature"], cwd=source, check=True, capture_output=True
+    )
+    original = registry.load()
+    registry.save(
+        RegistryConfig(
+            1,
+            original.sources,
+            original.channels
+            + (ChannelSpec("feature", "community", "refs/heads/feature"),),
+            original.targets,
+        )
+    )
+    configured = registry.load()
+    append_error = OSError("injected switch receipt failure")
+
+    def fail_append(*_args: object, **_kwargs: object) -> None:
+        raise append_error
+
+    monkeypatch.setattr(registry, "append_receipt", fail_append)
+
+    with pytest.raises(OSError) as caught:
+        engine.switch("feature", ("codex",))
+
+    assert caught.value is append_error
+    assert registry.load() == configured
+    assert registry.load().targets[0].channel == "stable"
+    assert not (home / "skills/example/payload.txt").exists()
+    assert registry.receipts() == ()
 
 
 def _dependency(

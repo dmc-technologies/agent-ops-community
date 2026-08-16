@@ -1,5 +1,11 @@
 """Public contracts for managed Agent Ops deployments."""
 
+from agent_ops.deployment.engine import (
+    DeploymentAuditError,
+    DeploymentEngine,
+    DeploymentEngineError,
+    DeploymentRecoveryError,
+)
 from agent_ops.deployment.models import (
     DeploymentAudit,
     DeploymentManifest,
@@ -19,15 +25,22 @@ from agent_ops.deployment.models import (
     TargetState,
     TargetStatus,
 )
-from agent_ops.deployment.providers import load_deployment_providers
+from agent_ops.deployment.providers import (
+    load_deployment_providers,
+    normalize_deployment_providers,
+)
 
 __all__ = [
     "DeploymentAudit",
+    "DeploymentAuditError",
+    "DeploymentEngine",
+    "DeploymentEngineError",
     "DeploymentManifest",
     "DeploymentPlan",
     "DeploymentProvider",
     "DeploymentReceipt",
     "DeploymentRequest",
+    "DeploymentRecoveryError",
     "ManifestDirectory",
     "ManifestFile",
     "PlannedFile",
@@ -40,4 +53,5 @@ __all__ = [
     "TargetState",
     "TargetStatus",
     "load_deployment_providers",
+    "normalize_deployment_providers",
 ]

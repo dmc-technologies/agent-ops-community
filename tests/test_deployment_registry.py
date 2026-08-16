@@ -115,6 +115,23 @@ def _manifest(target_id: str, revision: str) -> DeploymentManifest:
     )
 
 
+def test_save_with_stale_expected_snapshot_does_not_replace_current_registry(
+    tmp_path: Path,
+) -> None:
+    registry = _registry(tmp_path)
+    original = _config(tmp_path)
+    registry.save(original)
+    expected = registry.load_snapshot()
+    replacement = _config(tmp_path, channel="feature")
+    registry.save(replacement)
+    current = registry.load_snapshot()
+
+    with pytest.raises(ValueError, match="required snapshot"):
+        registry.save(original, expected_snapshot=expected)
+
+    assert registry.load_snapshot() == current
+
+
 def _append_after_signal(path: str, commit: str, start: object, results: object) -> None:
     start.wait()
     try:

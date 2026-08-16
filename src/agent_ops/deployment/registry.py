@@ -185,9 +185,16 @@ class DeploymentRegistry:
             _close_registry_lock(lock)
             os.close(parent)
 
-    def save(self, config: RegistryConfig) -> None:
+    def save(
+        self,
+        config: RegistryConfig,
+        *,
+        expected_snapshot: RegistrySnapshot | None = None,
+    ) -> RegistrySnapshot:
         _require_secure_platform(require_locking=True)
         _validate_config(config, require_nonempty=True)
+        if expected_snapshot is not None and type(expected_snapshot) is not RegistrySnapshot:
+            raise TypeError("expected snapshot must be an exact RegistrySnapshot")
         content = _dump_registry(config)
         _parse_registry(content)
         parent, identities, lock = _open_locked_parent(
@@ -198,12 +205,15 @@ class DeploymentRegistry:
         descriptor: int | None = None
         published = False
         original: tuple[int, int] | None = None
+        published_snapshot: RegistrySnapshot | None = None
         try:
             original = _optional_regular_identity(parent, self.path.name, "registry file")
             if original is not None:
                 old_snapshot = _snapshot_from_parent(parent, self.path.name)
                 if old_snapshot.registry_identity != original:
                     raise RuntimeError("registry file changed before receipt recovery")
+                if expected_snapshot is not None and old_snapshot != expected_snapshot:
+                    raise ValueError("registry no longer matches the required snapshot")
                 _verify_canonical_parent(self.path.parent, parent, identities)
                 _recover_history_before_save(
                     parent,
@@ -218,8 +228,11 @@ class DeploymentRegistry:
                     ),
                 )
                 _verify_canonical_parent(self.path.parent, parent, identities)
-            elif _entry_exists(parent, self.state_path.name):
-                raise RuntimeError("receipt state exists without an initialized registry")
+            else:
+                if expected_snapshot is not None:
+                    raise ValueError("registry no longer matches the required snapshot")
+                if _entry_exists(parent, self.state_path.name):
+                    raise RuntimeError("receipt state exists without an initialized registry")
             descriptor = os.open(
                 temporary,
                 os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
@@ -236,6 +249,8 @@ class DeploymentRegistry:
             descriptor = None
             if _optional_regular_identity(parent, self.path.name, "registry file") != original:
                 raise RuntimeError("registry file changed during save")
+            if expected_snapshot is not None:
+                _require_current_snapshot(parent, self.path.name, expected_snapshot)
             _verify_canonical_parent(self.path.parent, parent, identities)
             if original is not None:
                 backup = f".{self.path.name}.{uuid.uuid4().hex}.backup"
@@ -254,10 +269,18 @@ class DeploymentRegistry:
                 raise RuntimeError("published registry file is not a private regular file")
             os.fsync(parent)
             _verify_canonical_parent(self.path.parent, parent, identities)
+            published_snapshot = _snapshot_from_parent(parent, self.path.name)
+            if (
+                published_snapshot.config != config
+                or published_snapshot.fingerprint != hashlib.sha256(content).hexdigest()
+                or published_snapshot.registry_identity != _identity(final_stat)
+            ):
+                raise RuntimeError("published registry does not match the requested config")
             if backup is not None:
                 os.unlink(backup, dir_fd=parent)
                 backup = None
                 os.fsync(parent)
+            _require_current_snapshot(parent, self.path.name, published_snapshot)
             _verify_canonical_parent(self.path.parent, parent, identities)
         except BaseException:
             if descriptor is not None:
@@ -280,6 +303,8 @@ class DeploymentRegistry:
         finally:
             _close_registry_lock(lock)
             os.close(parent)
+        assert published_snapshot is not None
+        return published_snapshot
 
     def append_receipt(
         self,

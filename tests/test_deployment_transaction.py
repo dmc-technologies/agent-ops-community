@@ -324,6 +324,41 @@ def test_process_control_exceptions_propagate_after_rollback(
     assert not (home / "skills/example/SKILL.md").exists()
 
 
+def test_later_target_install_failure_rolls_back_every_earlier_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first_home = tmp_path / "a-home"
+    second_home = tmp_path / "b-home"
+    first = ProviderPlan(
+        "fixture",
+        "1" * 40,
+        TargetSpec("first", Framework.CODEX, first_home, "feature"),
+        (PlannedFile(Path("skills/example/SKILL.md"), b"first\n", 0o640),),
+    )
+    second = ProviderPlan(
+        "fixture",
+        "1" * 40,
+        TargetSpec("second", Framework.CODEX, second_home, "feature"),
+        (PlannedFile(Path("skills/example/SKILL.md"), b"second\n", 0o644),),
+    )
+    original_hook = transaction_module._before_manifest_replace
+
+    def fail_second(home_fs: object, *args: object) -> None:
+        if home_fs.home == second_home:
+            raise OSError("injected second target failure")
+        original_hook(home_fs, *args)
+
+    monkeypatch.setattr(transaction_module, "_before_manifest_replace", fail_second)
+
+    with pytest.raises(OSError, match="injected second target failure"):
+        install_provider_plans((second, first))
+
+    assert not (first_home / "skills/example/SKILL.md").exists()
+    assert not (second_home / "skills/example/SKILL.md").exists()
+    assert not list((first_home / ".agentops/deployment/manifests").glob("*.json"))
+    assert not list((second_home / ".agentops/deployment/manifests").glob("*.json"))
+
+
 def test_same_home_operations_are_serialized_without_sleep_polling(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
