@@ -5,6 +5,11 @@ from pathlib import Path
 
 from typer.testing import CliRunner
 
+try:
+    from click import unstyle
+except ModuleNotFoundError:  # Typer 0.27 vendors Click instead of exposing its package.
+    from typer._click.utils import strip_ansi as unstyle
+
 from agent_ops.cli import app
 
 runner = CliRunner()
@@ -32,11 +37,12 @@ verification:
 
 
 def test_deployment_json_parse_boundary_does_not_change_unrelated_commands() -> None:
-    result = runner.invoke(app, ["bootstrap", "--unknown", "--json"], color=False)
+    result = runner.invoke(app, ["bootstrap", "--unknown", "--json"], color=True)
 
     assert result.exit_code == 2
-    assert result.output.startswith("Usage:")
-    assert "No such option: --unknown" in result.output
+    output = unstyle(result.output)
+    assert output.startswith("Usage:")
+    assert "No such option: --unknown" in output
 
 
 def test_verify_command_returns_nonzero_on_failure(tmp_path: Path) -> None:

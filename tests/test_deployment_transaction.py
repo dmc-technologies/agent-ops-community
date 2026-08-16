@@ -989,7 +989,12 @@ def test_record_rejects_removed_required_backup_reference(tmp_path: Path) -> Non
     )
     manifests = install_provider_plans((replacement,))
     manifest_path = next((home / ".agentops/deployment/manifests").glob("*.json"))
-    record_path = next((home / ".agentops/deployment/transactions").glob("*/record.json"))
+    record_path = (
+        home
+        / ".agentops/deployment/transactions"
+        / manifests[0].transaction_id
+        / "record.json"
+    )
     record = json.loads(record_path.read_text())
     record["operations"][0]["backup"] = None
     record_path.write_text(json.dumps(record))
@@ -1188,7 +1193,12 @@ def test_record_rejects_erased_existing_file_prestate(tmp_path: Path) -> None:
     manifests = install_provider_plans((replacement,))
     destination = home / "skills/example/SKILL.md"
     manifest_path = next((home / ".agentops/deployment/manifests").glob("*.json"))
-    record_path = next((home / ".agentops/deployment/transactions").glob("*/record.json"))
+    record_path = (
+        home
+        / ".agentops/deployment/transactions"
+        / manifests[0].transaction_id
+        / "record.json"
+    )
     record = json.loads(record_path.read_text())
     operation = record["operations"][0]
     operation["backup"] = None

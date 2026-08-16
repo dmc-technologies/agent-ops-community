@@ -8,6 +8,11 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
+try:
+    from click import unstyle
+except ModuleNotFoundError:  # Typer 0.27 vendors Click instead of exposing its package.
+    from typer._click.utils import strip_ansi as unstyle
+
 from agent_ops.cli import app
 from agent_ops.deployment.models import (
     DeploymentPlan,
@@ -737,11 +742,13 @@ def test_json_after_delimiter_does_not_change_parse_error_format() -> None:
     result = runner.invoke(
         app,
         ["deployment", "status", "--unknown", "--", "--json"],
+        color=True,
     )
 
     assert result.exit_code == 2
-    assert result.output.startswith("Usage:")
-    assert "No such option: --unknown" in result.output
+    output = unstyle(result.output)
+    assert output.startswith("Usage:")
+    assert "No such option: --unknown" in output
 
 
 def test_channel_launch_refuses_unready_target(tmp_path: Path, monkeypatch) -> None:
