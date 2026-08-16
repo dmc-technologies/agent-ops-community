@@ -20,6 +20,7 @@ from agent_ops.deployment.models import (
     ProviderPlan,
     RewriteAcceptance,
     SourceSnapshot,
+    TargetChannelTransition,
     TargetSource,
     TargetSpec,
     TargetState,
@@ -387,21 +388,39 @@ class DeploymentEngine:
         *,
         rewrite: RewriteAcceptance | None = None,
     ) -> DeploymentReceipt:
+        original_targets = {
+            target.id: target for target in original_snapshot.config.targets
+        }
+        channel_transitions = tuple(
+            TargetChannelTransition(
+                target.id,
+                original_targets[target.id].channel,
+                target.channel,
+            )
+            for target in candidate_targets
+        )
         snapshots = self._fetch_snapshots(
             candidate,
             candidate_targets,
             rewrite=rewrite,
         )
         plan = self._build_plan(candidate, candidate_targets, snapshots)
-        _preflight_provider_plans_read_only(plan.provider_plans)
+        _preflight_provider_plans_read_only(
+            plan.provider_plans,
+            channel_transitions=channel_transitions,
+        )
         with _locked_provider_plan_targets(plan.provider_plans):
             plan = self._build_plan(candidate, candidate_targets, snapshots)
-            _preflight_provider_plans_read_only(plan.provider_plans)
+            _preflight_provider_plans_read_only(
+                plan.provider_plans,
+                channel_transitions=channel_transitions,
+            )
             plan, manifests = self._apply_with_one_stale_retry(
                 candidate,
                 candidate_targets,
                 snapshots,
                 plan,
+                channel_transitions=channel_transitions,
             )
             candidate_snapshot: RegistrySnapshot | None = None
             try:
@@ -689,17 +708,25 @@ class DeploymentEngine:
         targets: tuple[TargetSpec, ...],
         snapshots: dict[tuple[str, str], SourceSnapshot],
         plan: DeploymentPlan,
+        *,
+        channel_transitions: tuple[TargetChannelTransition, ...] | None = None,
     ) -> tuple[DeploymentPlan, tuple[DeploymentManifest, ...]]:
         current_plan = plan
         for attempt in range(2):
             try:
-                manifests = install_provider_plans(current_plan.provider_plans)
+                manifests = install_provider_plans(
+                    current_plan.provider_plans,
+                    channel_transitions=channel_transitions,
+                )
                 return current_plan, manifests
             except ValueError as error:
                 if attempt or not self._is_stale_apply_error(error):
                     raise
                 current_plan = self._build_plan(config, targets, snapshots)
-                _preflight_provider_plans_read_only(current_plan.provider_plans)
+                _preflight_provider_plans_read_only(
+                    current_plan.provider_plans,
+                    channel_transitions=channel_transitions,
+                )
         raise AssertionError("bounded deployment retry exhausted")
 
     @staticmethod

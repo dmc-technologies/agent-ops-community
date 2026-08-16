@@ -97,6 +97,8 @@ Preview accepts only selected Git-tracked data from that checkout, requires ever
 
 `agentops deployment status --target codex-preview` takes a cooperative shared target lock and reads the preview manifest and every owned file and directory through retained no-follow descriptors without a managed fetch or receipt. The manifest binds the exact target channel alias as well as target ID, framework, `unreviewed-local` state, and 64-hex fingerprint. Status revalidates every canonical inode, mode, and exact file content before returning; replacement or contradictory evidence reports `failed`, while stable owned-state differences report `modified`.
 
+Every grouped install records both the expected prior channel and the candidate channel. Ordinary refresh and preview require an existing ownership manifest to match the target's current channel; only `channel switch` and `channel deploy` authorize a different exact prior-to-candidate pair. Recovery validates that same pair before restoring the exact prior manifest.
+
 Installed extension packages expose deployment providers through the `agent_ops.deployment_providers` entry-point group. A provider supplies a stable `provider_id`, a boolean `supports(snapshot, target)` decision, an exact repository-relative `source_closure(snapshot, target, selection)`, and an immutable `plan(snapshot, target)`. Managed branch planning retains the tuple-of-paths closure contract. Preview requires `source_closure` to return `ProviderSourceClosure`, which binds the provider to canonical `SkillSourceClosure` identities, aliases, and exclusively owned paths. The shared engine confines and validates the closure before calling `plan`.
 
 ## Extension Model

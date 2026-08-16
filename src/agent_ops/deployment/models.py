@@ -42,6 +42,18 @@ class TargetSpec:
 
 
 @dataclass(frozen=True)
+class TargetChannelTransition:
+    target_id: str
+    expected_prior_channel: str
+    candidate_channel: str
+
+    def __post_init__(self) -> None:
+        _nonempty(self.target_id, "transition target id")
+        _nonempty(self.expected_prior_channel, "expected prior channel")
+        _nonempty(self.candidate_channel, "candidate channel")
+
+
+@dataclass(frozen=True)
 class PlannedFile:
     path: Path
     content: bytes

@@ -27,6 +27,7 @@ from agent_ops.deployment.models import (
     ManifestFile,
     PlannedFile,
     ProviderPlan,
+    TargetChannelTransition,
     TargetSpec,
 )
 from agent_ops.registries.models import Framework
@@ -833,12 +834,10 @@ def _validated_manifest_data(content: bytes, *, target: TargetSpec) -> dict[str,
     review_state = data.get("review_state")
     if review_state not in {None, "unreviewed-local"}:
         raise ValueError("invalid deployment manifest review state")
-    if (
-        data.get("target_id") != target.id
-        or data.get("framework") != target.framework.value
-        or data.get("channel") != target.channel
-    ):
+    if data.get("target_id") != target.id or data.get("framework") != target.framework.value:
         raise ValueError("deployment manifest target does not match plan")
+    if data.get("channel") != target.channel:
+        raise ValueError("deployment manifest channel does not match expected channel")
     if not isinstance(data.get("source_revision"), str) or not data["source_revision"]:
         raise ValueError("invalid deployment manifest source revision")
     if (
@@ -913,22 +912,46 @@ def _validated_manifest_data(content: bytes, *, target: TargetSpec) -> dict[str,
 
 
 def _validated_prior_manifest_data(
-    content: bytes, *, target: TargetSpec
+    content: bytes, *, target: TargetSpec, expected_channel: str
 ) -> dict[str, Any]:
-    raw = _strict_json_loads(content, label="prior deployment manifest")
-    if (
-        not isinstance(raw, dict)
-        or not isinstance(raw.get("channel"), str)
-        or not raw["channel"]
-    ):
-        raise ValueError("invalid prior deployment manifest channel")
     prior_target = TargetSpec(
         target.id,
         target.framework,
         target.home,
-        raw["channel"],
+        expected_channel,
     )
     return _validated_manifest_data(content, target=prior_target)
+
+
+def _channel_transitions(
+    groups: tuple[_PlanGroup, ...],
+    supplied: tuple[TargetChannelTransition, ...] | None,
+) -> dict[str, TargetChannelTransition]:
+    transitions = (
+        tuple(
+            TargetChannelTransition(
+                group.target.id,
+                group.target.channel,
+                group.target.channel,
+            )
+            for group in groups
+        )
+        if supplied is None
+        else supplied
+    )
+    if type(transitions) is not tuple or any(
+        type(item) is not TargetChannelTransition for item in transitions
+    ):
+        raise ValueError("channel transitions must be exact immutable values")
+    by_target = {item.target_id: item for item in transitions}
+    if len(by_target) != len(transitions) or set(by_target) != {
+        group.target.id for group in groups
+    }:
+        raise ValueError("channel transitions must name each planned target exactly once")
+    for group in groups:
+        if by_target[group.target.id].candidate_channel != group.target.channel:
+            raise ValueError("candidate channel does not match planned target channel")
+    return by_target
 
 
 def _valid_permission_mode(value: object) -> bool:
@@ -1349,13 +1372,16 @@ def _publication_outcome(
 
 def install_provider_plans(
     plans: tuple[ProviderPlan, ...],
+    *,
+    channel_transitions: tuple[TargetChannelTransition, ...] | None = None,
 ) -> tuple[DeploymentManifest, ...]:
     _require_supported_platform()
     manifests: list[DeploymentManifest] = []
     groups = _validate_and_group(plans)
+    transitions = _channel_transitions(groups, channel_transitions)
     with _locked_provider_plan_targets(plans):
         try:
-            _install_provider_plan_groups(groups, manifests)
+            _install_provider_plan_groups(groups, manifests, transitions)
         except BaseException as install_error:
             if not manifests:
                 raise
@@ -1430,9 +1456,11 @@ def _verify_locked_provider_plan_targets(plans: tuple[ProviderPlan, ...]) -> Non
 def _install_provider_plan_groups(
     groups: tuple[_PlanGroup, ...],
     manifests: list[DeploymentManifest],
+    transitions: dict[str, TargetChannelTransition],
 ) -> None:
     for group in groups:
         target = group.target
+        transition = transitions[target.id]
         files = group.files
         transaction_id = uuid.uuid4().hex
         manifest = DeploymentManifest(
@@ -1456,7 +1484,7 @@ def _install_provider_plan_groups(
             ),
         )
         with _target_lock(target.home) as home_fs:
-            _validate_group_current_state(home_fs, group)
+            _validate_group_current_state(home_fs, group, transition)
             manifest_path = _manifest_path(target)
             prior_manifest_content = home_fs.read_optional(manifest_path)
             prior_data = None
@@ -1466,7 +1494,9 @@ def _install_provider_plan_groups(
                 _validate_ownership_manifest_stat(prior_manifest_stat)
                 prior_manifest_mode = stat.S_IMODE(prior_manifest_stat.st_mode)
                 prior_data = _validated_prior_manifest_data(
-                    prior_manifest_content, target=target
+                    prior_manifest_content,
+                    target=target,
+                    expected_channel=transition.expected_prior_channel,
                 )
                 _verify_manifest_files_and_directories(
                     home_fs,
@@ -1625,6 +1655,8 @@ def _install_provider_plan_groups(
             record = {
                 "schema_version": _TRANSACTION_SCHEMA_VERSION,
                 "state": "prepared",
+                "expected_prior_channel": transition.expected_prior_channel,
+                "candidate_channel": transition.candidate_channel,
                 "manifest": _manifest_to_dict(manifest),
                 "manifest_path": manifest_path.as_posix(),
                 "manifest_content": base64.b64encode(_manifest_bytes(manifest)).decode(),
@@ -1764,14 +1796,20 @@ def _install_provider_plan_groups(
         manifests.append(manifest)
 
 
-def _validate_group_current_state(home_fs: _HomeFS, group: _PlanGroup) -> None:
+def _validate_group_current_state(
+    home_fs: _HomeFS,
+    group: _PlanGroup,
+    transition: TargetChannelTransition,
+) -> None:
     manifest_path = _manifest_path(group.target)
     prior_content = home_fs.read_optional(manifest_path)
     prior_data = None
     if prior_content is not None:
         _validate_ownership_manifest_stat(home_fs.stat(manifest_path))
         prior_data = _validated_prior_manifest_data(
-            prior_content, target=group.target
+            prior_content,
+            target=group.target,
+            expected_channel=transition.expected_prior_channel,
         )
         _verify_manifest_files_and_directories(
             home_fs,
@@ -1831,10 +1869,16 @@ def _validate_group_current_state(home_fs: _HomeFS, group: _PlanGroup) -> None:
             raise ValueError(f"managed destination changed: {removal}")
 
 
-def _preflight_provider_plans_read_only(plans: tuple[ProviderPlan, ...]) -> None:
+def _preflight_provider_plans_read_only(
+    plans: tuple[ProviderPlan, ...],
+    *,
+    channel_transitions: tuple[TargetChannelTransition, ...] | None = None,
+) -> None:
     """Validate every live-apply precondition without creating target state."""
     _require_supported_platform()
-    for group in _validate_and_group(plans):
+    groups = _validate_and_group(plans)
+    transitions = _channel_transitions(groups, channel_transitions)
+    for group in groups:
         try:
             descriptor = _open_absolute_directory(group.target.home, create=False)
         except FileNotFoundError:
@@ -1851,7 +1895,7 @@ def _preflight_provider_plans_read_only(plans: tuple[ProviderPlan, ...]) -> None
                 lock_stat = home_fs.stat(lock_path)
                 if not stat.S_ISREG(lock_stat.st_mode) or lock_stat.st_nlink != 1:
                     raise ValueError("deployment lock is not a regular single-link file")
-            _validate_group_current_state(home_fs, group)
+            _validate_group_current_state(home_fs, group, transitions[group.target.id])
 
 
 def _manifest_from_data(
@@ -1935,6 +1979,8 @@ def _decode_record(
         {
             "schema_version",
             "state",
+            "expected_prior_channel",
+            "candidate_channel",
             "manifest",
             "manifest_path",
             "manifest_content",
@@ -1946,6 +1992,16 @@ def _decode_record(
         label="transaction record",
     )
     target, manifest = _manifest_from_data(record["manifest"], home=home)
+    expected_prior_channel = record.get("expected_prior_channel")
+    candidate_channel = record.get("candidate_channel")
+    if (
+        not isinstance(expected_prior_channel, str)
+        or not expected_prior_channel
+        or not isinstance(candidate_channel, str)
+        or not candidate_channel
+        or candidate_channel != manifest.channel
+    ):
+        raise ValueError("invalid transaction record channel transition")
     if manifest.transaction_id != transaction_id:
         raise ValueError("invalid transaction record identifier")
     transaction = _METADATA / "transactions" / transaction_id
@@ -1970,7 +2026,11 @@ def _decode_record(
             prior_content = base64.b64decode(prior_encoded, validate=True)
         except ValueError as exc:
             raise ValueError("invalid transaction record prior manifest") from exc
-        prior_data = _validated_prior_manifest_data(prior_content, target=target)
+        prior_data = _validated_prior_manifest_data(
+            prior_content,
+            target=target,
+            expected_channel=expected_prior_channel,
+        )
         if not _valid_ownership_manifest_mode(record.get("prior_manifest_mode")):
             raise ValueError("invalid transaction record prior manifest mode")
     elif record.get("prior_manifest_mode") is not None:

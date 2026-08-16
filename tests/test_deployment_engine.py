@@ -153,9 +153,29 @@ def test_deploy_adds_first_arbitrary_branch_alias_atomically(tmp_path: Path) -> 
     assert registry.receipts() == (receipt,)
 
 
+def test_refresh_rejects_manifest_channel_contradicting_registry(
+    tmp_path: Path,
+) -> None:
+    engine, registry, home = _engine_fixture(tmp_path)
+    engine.refresh(("codex",))
+    manifest_path = next((home / ".agentops/deployment/manifests").glob("*.json"))
+    manifest = json.loads(manifest_path.read_text())
+    manifest["channel"] = "feature"
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    manifest_path.chmod(0o600)
+    receipts = registry.receipts()
+
+    with pytest.raises(ValueError, match="channel"):
+        engine.refresh(("codex",))
+
+    assert (home / "skills/example/payload.txt").read_bytes() == b"deployed\n"
+    assert registry.receipts() == receipts
+
+
 def test_deploy_reuses_exact_existing_alias(tmp_path: Path) -> None:
     engine, registry, home = _engine_fixture(tmp_path)
     home.mkdir()
+    engine.refresh(("codex",))
     source = tmp_path / "source"
     commit = _create_branch(source, "feature", b"feature\n")
     current = registry.load()
@@ -950,6 +970,7 @@ def test_engine_materializes_only_the_declared_directory_closure(
 
 def test_switch_saves_candidate_only_after_install_and_audit(tmp_path: Path) -> None:
     engine, registry, home = _engine_fixture(tmp_path)
+    engine.refresh(("codex",))
     source = tmp_path / "source"
     subprocess.run(["git", "switch", "-c", "feature"], cwd=source, check=True, capture_output=True)
     (source / "payload.txt").write_bytes(b"feature\n")

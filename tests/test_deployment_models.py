@@ -15,6 +15,7 @@ from agent_ops.deployment import (
     ProviderSourceClosure,
     SkillSourceClosure,
     SourceSnapshot,
+    TargetChannelTransition,
     TargetSource,
     TargetSpec,
 )
@@ -40,6 +41,17 @@ def test_target_and_planned_file_are_immutable_and_repo_relative() -> None:
         target.channel = "stable"  # type: ignore[misc]
     with pytest.raises(FrozenInstanceError):
         planned.mode = 0o600  # type: ignore[misc]
+
+
+def test_target_channel_transition_is_explicit_and_immutable() -> None:
+    transition = TargetChannelTransition("codex-dev", "stable", "feature")
+
+    assert transition.expected_prior_channel == "stable"
+    assert transition.candidate_channel == "feature"
+    with pytest.raises(FrozenInstanceError):
+        transition.candidate_channel = "other"  # type: ignore[misc]
+    with pytest.raises(ValueError, match="prior channel"):
+        TargetChannelTransition("codex-dev", "", "feature")
 
 
 @pytest.mark.parametrize(

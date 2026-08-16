@@ -14,7 +14,12 @@ from pathlib import Path
 import pytest
 
 from agent_ops.deployment import transaction as transaction_module
-from agent_ops.deployment.models import PlannedFile, ProviderPlan, TargetSpec
+from agent_ops.deployment.models import (
+    PlannedFile,
+    ProviderPlan,
+    TargetChannelTransition,
+    TargetSpec,
+)
 from agent_ops.deployment.transaction import (
     IncompleteRollbackError,
     PublicationIndeterminateError,
@@ -91,6 +96,139 @@ def test_transaction_installs_and_audits_exact_plan(tmp_path: Path) -> None:
     ]
     assert stat.S_IMODE((target.home / "skills/example/SKILL.md").stat().st_mode) == 0o644
     assert audit_provider_plans((plan,)).matches
+
+
+def test_ordinary_install_rejects_prior_manifest_with_contradictory_channel(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    target = TargetSpec("codex-dev", Framework.CODEX, home, "stable")
+    original = ProviderPlan(
+        "fixture",
+        "1" * 40,
+        target,
+        (PlannedFile(Path("skills/example/SKILL.md"), b"old\n", 0o644),),
+    )
+    install_provider_plans((original,))
+    manifest_path = next((home / ".agentops/deployment/manifests").glob("*.json"))
+    manifest = json.loads(manifest_path.read_text())
+    manifest["channel"] = "feature"
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    manifest_path.chmod(0o600)
+    replacement = ProviderPlan(
+        "fixture",
+        "2" * 40,
+        target,
+        (PlannedFile(Path("skills/example/SKILL.md"), b"new\n", 0o644),),
+    )
+
+    with pytest.raises(ValueError, match="channel"):
+        install_provider_plans((replacement,))
+
+    assert (home / "skills/example/SKILL.md").read_bytes() == b"old\n"
+    assert json.loads(manifest_path.read_text())["channel"] == "feature"
+
+
+def test_explicit_channel_transition_allows_only_expected_prior_to_candidate(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    stable = TargetSpec("codex-dev", Framework.CODEX, home, "stable")
+    install_provider_plans(
+        (
+            ProviderPlan(
+                "fixture",
+                "1" * 40,
+                stable,
+                (PlannedFile(Path("skills/example/SKILL.md"), b"old\n", 0o644),),
+            ),
+        )
+    )
+    manifest_path = next((home / ".agentops/deployment/manifests").glob("*.json"))
+    stable_manifest = manifest_path.read_bytes()
+    feature = TargetSpec("codex-dev", Framework.CODEX, home, "feature")
+    replacement = ProviderPlan(
+        "fixture",
+        "2" * 40,
+        feature,
+        (PlannedFile(Path("skills/example/SKILL.md"), b"new\n", 0o644),),
+    )
+
+    with pytest.raises(ValueError, match="channel"):
+        install_provider_plans(
+            (replacement,),
+            channel_transitions=(
+                TargetChannelTransition("codex-dev", "wrong", "feature"),
+            ),
+        )
+
+    manifests = install_provider_plans(
+        (replacement,),
+        channel_transitions=(
+            TargetChannelTransition("codex-dev", "stable", "feature"),
+        ),
+    )
+    assert manifests[0].channel == "feature"
+    assert (home / "skills/example/SKILL.md").read_bytes() == b"new\n"
+    rollback_manifests(manifests)
+    assert (home / "skills/example/SKILL.md").read_bytes() == b"old\n"
+    assert manifest_path.read_bytes() == stable_manifest
+
+
+def test_channel_transition_process_control_is_preserved_before_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    plan = _plan(
+        home, PlannedFile(Path("skills/example/SKILL.md"), b"body\n", 0o644)
+    )
+    control = KeyboardInterrupt("operator stopped channel validation")
+
+    def interrupt(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise control
+
+    monkeypatch.setattr(transaction_module, "_channel_transitions", interrupt)
+
+    with pytest.raises(KeyboardInterrupt) as caught:
+        install_provider_plans((plan,))
+
+    assert caught.value is control
+    assert not home.exists()
+
+
+@pytest.mark.parametrize("field", ["expected_prior_channel", "candidate_channel"])
+@pytest.mark.parametrize("operation", ["rollback", "recover"])
+def test_rollback_rejects_tampered_channel_transition_record(
+    tmp_path: Path, field: str, operation: str
+) -> None:
+    home = tmp_path / "home"
+    original = _plan(
+        home, PlannedFile(Path("skills/example/SKILL.md"), b"old\n", 0o644)
+    )
+    install_provider_plans((original,))
+    replacement = _plan(
+        home,
+        PlannedFile(Path("skills/example/SKILL.md"), b"new\n", 0o644),
+        revision="2" * 40,
+    )
+    manifests = install_provider_plans((replacement,))
+    record_path = (
+        home
+        / ".agentops/deployment/transactions"
+        / manifests[0].transaction_id
+        / "record.json"
+    )
+    record = json.loads(record_path.read_text())
+    record[field] = "tampered"
+    record_path.write_text(json.dumps(record))
+
+    with pytest.raises(ValueError, match="channel"):
+        if operation == "rollback":
+            rollback_manifests(manifests)
+        else:
+            recover_transaction(record_path)
+
+    assert (home / "skills/example/SKILL.md").read_bytes() == b"new\n"
 
 
 def test_transaction_preserves_unknown_files_and_directories(tmp_path: Path) -> None:
