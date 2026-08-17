@@ -4,6 +4,13 @@ Repository: `agent-ops-community`
 
 Record durable architecture, workflow, and harness decisions here.
 
+### 2026-08-17: Self-approval rejection does not replace a successful Review Gate result
+
+- Decision: when the model result passes, treat GitHub's exact `Unprocessable Entity (HTTP 422)` response to the optional approving review as nonfatal only if trusted API reads resolve both the authenticated actor and pull-request author and their login identities match. Keep every other approval publication error, failed identity read, and actor mismatch fail-closed.
+- Rationale: GitHub forbids an author from approving their own pull request. The review comment, exact-head status, and passing model result remain valid evidence; an optional approval cannot be created by that actor and must not convert those facts into a false gate failure.
+- Applies to: `.github/scripts/review_gate.py`, `tests/test_review_gate.py`, and repositories using the shared Review Gate workflow.
+- Revisit when: GitHub exposes a stable machine-readable error code for self-approval or the shared workflow separates the pull-request author from the approval identity.
+
 ### 2026-08-16: Channel launch is limited to frameworks with a proven isolated-home contract
 
 - Decision: retain no-follow descriptors for every audited ownership manifest, managed file, and managed directory until receipt publication or launch handoff, and revalidate the retained identity, mode, topology, and bytes immediately before terminal success. Channel launch is enabled only for Local and Codex, whose isolated-home readiness contracts are implemented and tested; it rejects Claude Code, Cursor, OpenCode, Prime Agent, and OpenClaw until their native isolated-home contracts are proven.

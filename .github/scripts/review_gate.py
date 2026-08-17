@@ -1569,6 +1569,30 @@ def submit_pr_approval(repo: str, pr_number: int, sha: str, body: str) -> bool:
         ]
     )
     if result.returncode != 0:
+        if result.stderr.strip() == "gh: Unprocessable Entity (HTTP 422)":
+            actor = run_command(["gh", "api", "user", "--jq", ".login"])
+            author = run_command(
+                [
+                    "gh",
+                    "api",
+                    f"repos/{repo}/pulls/{pr_number}",
+                    "--jq",
+                    ".user.login",
+                ]
+            )
+            if (
+                actor.returncode == 0
+                and author.returncode == 0
+                and actor.stdout.strip()
+                and actor.stdout.strip().casefold() == author.stdout.strip().casefold()
+            ):
+                print(
+                    "WARNING: GitHub rejected the optional approving review because "
+                    "the authenticated actor opened the pull request; preserving the "
+                    "successful Review Gate result.",
+                    file=sys.stderr,
+                )
+                return True
         print(
             f"ERROR: could not submit PR approval: {result.stderr.strip()[:400]}",
             file=sys.stderr,
