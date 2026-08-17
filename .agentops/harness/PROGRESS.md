@@ -4,25 +4,27 @@ Repository: `agent-ops-community`
 
 ## Current State
 
-- Branch: `feat/deployment-channels`
-- Main baseline: `e8f2add`, the community `origin/main` selected for this implementation.
-- Current handoff: the community branch implements the generic pull-based deployment engine, provider contract, managed Git source store, machine registry and receipts, grouped recovery, CLI and isolated launch support, plus authored-checkout local preview and cooperative read-only preview status. Preview retains exact filesystem, Git, target, and registry authority through planning and terminal success; requires canonical provider-owned skill closures; omits zero-ownership providers; disables executable Git configuration; rejects unsafe or Git-inconsistent modes; and rolls back a terminal source or registry mismatch without recording success. Ownership manifests bind the exact target channel. Every grouped transaction persists and validates the exact expected-prior and candidate channel pair; ordinary refresh and preview require same-channel continuity, while switch and deploy receive the exact registry-authorized pair. All transition fields and adjacent public channel evidence require exact nonempty strings before target state can be created or serialized. Preview status retains the manifest and every owned path through terminal canonical identity, mode, and content validation. Two independent machine fixtures follow the same branch using separate homes, stores, locks, registries, and receipts. Community pull request #17 contains this result. No Plane work item applies. Hosted CI passed on `aed5d73b3fec71cfe10338f3b98b26f509e64dfe`; this harness closeout commit becomes the replacement final head and must pass the complete local and hosted gates before a person applies `ai review` once. Merge and the dependent private overlay remain external.
-- Verification: transition exact-type rejection before home creation, first-install transition recovery and rollback, managed prior-channel contradiction, authorized channel transition, transaction-record pair tamper, manifest and owned-path replacement races, exact preview alias changes, contradictory preview manifest channels, process-control, hostile Git configuration, linked worktree, registry planning/install/audit race and blocking, zero-ownership provider, preview status, identity, authority-race, mode, and recovery-causality tests failed against the respective prior implementations and pass after correction. The full local gate passed on `aed5d73b3fec71cfe10338f3b98b26f509e64dfe`: `ruff check .`; `python -m pytest -q` with 828 passed and 3 skipped; `agentops harness check .`; and `git diff --check`. GitHub Actions run `31928251834` passed both Linux and Windows jobs on that SHA. This harness closeout changes the final SHA, so the same complete gates must pass again on the closeout commit.
+- Branch: `fix/review-gate-self-approval`
+- Main baseline: `6b3110b72b2aff76c1857f5165ee321e5553cb35`, the current community `origin/main` selected for this correction.
+- Current handoff: Review Gate preserves a successful exact-head model result when GitHub returns the observed `Unprocessable Entity (HTTP 422)` approval response only after both authenticated actor and pull-request author identities resolve and match. Any other publication error or unconfirmed `422` still fails closed. No Plane work item applies.
+- Verification: the confirmed-self-approval regression failed against the baseline and passes after the correction. The focused Review Gate suite passes with 37 tests. The complete local gate passes: `ruff check .`; `python -m pytest -q` with 858 passed and 3 skipped from 861 collected tests; `agentops harness check .`; and `git diff --check`. Hosted gates remain pending.
 
 ## Current Work
 
-- Goal: provide fast pull-based stable, branch, and local-preview deployment to isolated agent homes without making branch code executable.
-- Active task: verify the harness-closeout commit on community pull request #17 before the person-applied final-head Review Gate.
-- Files in play: the deployment package, framework launch adapters, deployment tests, public documentation, and harness closeout records.
-- Blockers: no local product or implementation blocker. A person must apply `ai review` to the unchanged final pull-request head after replacement hosted CI passes; merge and the dependent private overlay then remain external.
+- Goal: prevent an optional self-approval rejection from replacing a successful Review Gate result with false failure evidence.
+- Active task: complete the local gates, publish one coherent community pull request, obtain exact-head hosted CI and Review Gate, and merge when both pass.
+- Files in play: `.github/scripts/review_gate.py`, `tests/test_review_gate.py`, and harness closeout records.
+- Blockers: none.
 
 ## Next Actions
 
-- Run `ruff check .`, `python -m pytest -q`, `agentops harness check .`, and `git diff --check` once on the unchanged harness-closeout commit, then push it to community pull request #17.
-- Obtain ordinary hosted Linux and Windows CI on that exact replacement head.
-- Ask a person to apply `ai review` once, merge only if the unchanged head passes, and record the merged community commit for the dependent private overlay.
+- Commit the coherent correction and rerun `ruff check .`, `python -m pytest -q`, `agentops harness check .`, and `git diff --check` on that exact SHA.
+- Push and open the community pull request, then obtain ordinary hosted Linux and Windows CI on its exact head.
+- Apply `ai review` once to the unchanged final head, merge only if Review Gate passes, and prove the Structures caller succeeds with the merged shared runtime.
 
 ## Session Log
+
+- 2026-08-17: Structures pull request #5 Review Gate run `32004861145` produced `PASS` with no findings, then failed solely because GitHub returned `Unprocessable Entity (HTTP 422)` while submitting the optional approval. The correction accepts that exact response only when trusted API reads prove the authenticated actor opened the pull request. Other publication errors and unconfirmed `422` responses remain failures.
 
 - 2026-08-17: Targeted resolution run `31994275274` found two remaining instances of the same critical classes: the transient HTTPS header was passed in Git process arguments, and a deleted managed directory raised during audit evidence retention. The next bounded correction moves the header to Git configuration environment variables and represents an absent audited directory without opening it; red regressions prove both cases. No new discovery review is authorized.
 

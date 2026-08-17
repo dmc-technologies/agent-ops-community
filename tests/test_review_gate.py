@@ -1046,6 +1046,94 @@ def test_submit_pr_approval_posts_approve_review(monkeypatch) -> None:
     ]
 
 
+def test_submit_pr_approval_accepts_confirmed_self_approval_422(monkeypatch) -> None:
+    review_gate = load_review_gate()
+    calls = []
+
+    def fake_run_command(args, cwd=None):
+        calls.append(args)
+        if args[:3] == ["gh", "api", "user"]:
+            return subprocess.CompletedProcess(
+                args, 0, stdout="Dan-S-Mueller\n", stderr=""
+            )
+        if args[:3] == [
+            "gh",
+            "api",
+            "repos/example-org/example/pulls/12",
+        ]:
+            return subprocess.CompletedProcess(
+                args, 0, stdout="dan-s-mueller\n", stderr=""
+            )
+        return subprocess.CompletedProcess(
+            args,
+            1,
+            stdout="",
+            stderr="gh: Unprocessable Entity (HTTP 422)\n",
+        )
+
+    monkeypatch.setattr(review_gate, "run_command", fake_run_command)
+
+    assert review_gate.submit_pr_approval(
+        "example-org/example", 12, "abc123", "AI review passed"
+    )
+    assert calls[1:] == [
+        ["gh", "api", "user", "--jq", ".login"],
+        [
+            "gh",
+            "api",
+            "repos/example-org/example/pulls/12",
+            "--jq",
+            ".user.login",
+        ],
+    ]
+
+
+def test_submit_pr_approval_fails_closed_for_other_publication_errors(
+    monkeypatch,
+) -> None:
+    review_gate = load_review_gate()
+    calls = []
+
+    def fake_run_command(args, cwd=None):
+        calls.append(args)
+        return subprocess.CompletedProcess(
+            args, 1, stdout="", stderr="gh: Internal Server Error (HTTP 500)\n"
+        )
+
+    monkeypatch.setattr(review_gate, "run_command", fake_run_command)
+
+    assert not review_gate.submit_pr_approval(
+        "example-org/example", 12, "abc123", "AI review passed"
+    )
+    assert len(calls) == 1
+
+
+def test_submit_pr_approval_fails_closed_for_unconfirmed_422(monkeypatch) -> None:
+    review_gate = load_review_gate()
+
+    def fake_run_command(args, cwd=None):
+        if args[:3] == ["gh", "api", "user"]:
+            return subprocess.CompletedProcess(args, 0, stdout="gate-bot\n", stderr="")
+        if args[:3] == [
+            "gh",
+            "api",
+            "repos/example-org/example/pulls/12",
+        ]:
+            return subprocess.CompletedProcess(args, 0, stdout="pr-author\n", stderr="")
+        return subprocess.CompletedProcess(
+            args,
+            1,
+            stdout="",
+            stderr="gh: Unprocessable Entity (HTTP 422)\n",
+        )
+
+    monkeypatch.setattr(review_gate, "run_command", fake_run_command)
+
+    assert not review_gate.submit_pr_approval(
+        "example-org/example", 12, "abc123", "AI review passed"
+    )
+
+
 def test_post_finding_comments_deletes_stale_findings(monkeypatch) -> None:
     review_gate = load_review_gate()
     calls = []
