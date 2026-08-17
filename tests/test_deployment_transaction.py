@@ -1456,7 +1456,13 @@ def test_runtime_cache_removal_crash_rolls_back_exact_prestate(
     process.join(10)
     assert process.exitcode == exit_code
     monkeypatch.setattr(transaction_module, hook_name, original_hook)
-    record_path = next((home / ".agentops/deployment/transactions").glob("*/record.json"))
+    matching_records = []
+    for candidate in (home / ".agentops/deployment/transactions").glob("*/record.json"):
+        record = json.loads(candidate.read_text())
+        if any(operation["kind"] == "runtime-cache-removal" for operation in record["operations"]):
+            matching_records.append(candidate)
+    assert len(matching_records) == 1
+    record_path = matching_records[0]
 
     recover_transaction(record_path)
 
