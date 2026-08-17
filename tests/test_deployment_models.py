@@ -8,6 +8,7 @@ from agent_ops.deployment import (
     DeploymentManifest,
     DeploymentPlan,
     DeploymentRequest,
+    LegacyLinkTransition,
     ManifestDirectory,
     ManifestFile,
     PlannedFile,
@@ -56,6 +57,36 @@ def test_target_channel_transition_is_explicit_and_immutable() -> None:
 
 class _StringSubclass(str):
     pass
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("provider_id", True),
+        ("target_id", 1),
+        ("expected_channel", Path("stable")),
+        ("expected_link_text", _StringSubclass("configs/global/AGENTS.md")),
+        ("replacement", bytearray(b"policy\n")),
+        ("mode", True),
+        ("mode", 0o1000),
+    ],
+)
+def test_legacy_link_transition_rejects_nonexact_authority_fields(
+    field: str, value: object
+) -> None:
+    values: dict[str, object] = {
+        "provider_id": "private-config",
+        "target_id": "codex-stable",
+        "expected_channel": "stable",
+        "destination": Path("AGENTS.md"),
+        "expected_link_text": "configs/global/AGENTS.md",
+        "replacement": b"policy\n",
+        "mode": 0o644,
+    }
+    values[field] = value
+
+    with pytest.raises(ValueError, match="legacy link"):
+        LegacyLinkTransition(**values)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(

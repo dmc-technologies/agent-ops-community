@@ -73,6 +73,28 @@ class PlannedFile:
 
 
 @dataclass(frozen=True)
+class LegacyLinkTransition:
+    provider_id: str
+    target_id: str
+    expected_channel: str
+    destination: Path
+    expected_link_text: str
+    replacement: bytes
+    mode: int
+
+    def __post_init__(self) -> None:
+        _exact_nonempty(self.provider_id, "legacy link provider id")
+        _exact_nonempty(self.target_id, "legacy link target id")
+        _exact_nonempty(self.expected_channel, "legacy link expected channel")
+        _exact_nonempty(self.expected_link_text, "legacy link text")
+        object.__setattr__(self, "destination", _repository_relative_path(self.destination))
+        if type(self.replacement) is not bytes or not self.replacement:
+            raise ValueError("legacy link replacement must be nonempty bytes")
+        if type(self.mode) is not int or not 0 <= self.mode <= 0o777 or not self.mode & 0o400:
+            raise ValueError("legacy link mode must be an owner-readable permission mode")
+
+
+@dataclass(frozen=True)
 class ManifestFile:
     path: Path
     fingerprint: str
@@ -100,6 +122,7 @@ class ProviderPlan:
     removals: tuple[Path, ...] = ()
     audit_roots: tuple[Path, ...] = ()
     runtime_python_sources: tuple[Path, ...] = ()
+    legacy_link_transition: LegacyLinkTransition | None = None
 
     def __post_init__(self) -> None:
         _nonempty(self.provider_id, "provider id")
@@ -118,6 +141,14 @@ class ProviderPlan:
             "runtime_python_sources",
             tuple(_repository_relative_path(path) for path in self.runtime_python_sources),
         )
+        if self.legacy_link_transition is not None:
+            transition = self.legacy_link_transition
+            if type(transition) is not LegacyLinkTransition:
+                raise ValueError("legacy link transition must be an exact immutable value")
+            if transition.provider_id != self.provider_id or transition.target_id != self.target.id:
+                raise ValueError("legacy link transition must belong to its provider plan")
+            if transition.expected_channel != self.target.channel:
+                raise ValueError("legacy link transition channel must match its provider plan")
 
 
 @dataclass(frozen=True)
