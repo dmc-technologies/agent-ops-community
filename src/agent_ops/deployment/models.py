@@ -98,6 +98,7 @@ class ProviderPlan:
     target: TargetSpec
     files: tuple[PlannedFile, ...]
     removals: tuple[Path, ...] = ()
+    audit_roots: tuple[Path, ...] = ()
 
     def __post_init__(self) -> None:
         _nonempty(self.provider_id, "provider id")
@@ -107,6 +108,9 @@ class ProviderPlan:
             self,
             "removals",
             tuple(_repository_relative_path(path) for path in self.removals),
+        )
+        object.__setattr__(
+            self, "audit_roots", tuple(_repository_relative_path(path) for path in self.audit_roots)
         )
 
 
