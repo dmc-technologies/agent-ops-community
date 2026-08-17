@@ -4,24 +4,26 @@ Repository: `agent-ops-community`
 
 ## Current State
 
-- Branch: `docs/pr-review-policy-harmonization`
-- Main baseline: `01c09b23124bb49ecfc56be745731506393cc680`, current Community `origin/main`, including merged PR35.
-- Current handoff: PR33 carries the shared contributor review and closure policy on top of the merged managed-refresh correction. The policy change does not alter Review Gate code, runtime behavior, managed deployment channels, credentials, framework adapters, or PR35. No Plane work item applies.
-- Verification: `uv run --extra dev pytest tests/test_public_safety.py tests/test_harness.py -q` passed 11 tests; `uv run --extra dev ruff check .`, `uv run --extra dev agentops harness check .`, and `git diff --check origin/main...HEAD` passed. Replacement hosted Linux and Windows CI plus one Review Gate remain required.
+- Branch: `fix/managed-pyc-cache-matrix`
+- Main baseline: `fd3a26243b0e2786f8ec8073a746252f87cd4d3c`, current Community `origin/main` at clock-in.
+- Current handoff: a source-only retirement plan now discovers the exact CPython 3.11–3.14 default, `opt-1`, and `opt-2` PEP 3147 cache paths for an exact prior-manifest Python source under the retained target lock. Valid derived caches receive ordinary transaction backup, rollback, crash recovery, and tamper evidence. Invalid or unrelated candidates remain present and audit-visible. No Plane work item applies.
+- Verification: the exact RED command `uv run --extra dev pytest tests/test_deployment_transaction.py::test_retired_source_discovers_supported_default_and_optimized_caches -q` failed before the implementation because caches remained. After implementation, the 36 focused cache tests and the 255-test affected transaction file passed. Ruff on the two affected Python files passed. Final repository checks, the one selected broad suite, independent targeted review, publication, and merge remain.
 
 ## Current Work
 
-- Goal: keep PR33's policy result reconciled with merged PR35 and current Community `main`, then obtain fresh exact-head CI and one Review Gate.
-- Active task: push the rebased closeout head, wait for hosted Linux and Windows CI, apply `ai review` once, and monitor the fresh Review Gate. Do not merge.
-- Files in play: `AGENTS.md` and this harness closeout record.
+- Goal: let Agent Ops retire every strictly bounded supported CPython cache for a retired managed source without granting deletion authority over foreign files.
+- Active task: freeze a minimal commit, obtain independent targeted resolution review and one broad final evidence source, then publish and merge under the approved exact-head closure policy.
+- Files in play: the shared deployment transaction, its focused tests, public architecture and usage documentation, and harness closeout records. Review Gate and global policy files are excluded.
 - Blockers: none.
 
 ## Next Actions
 
-- Obtain ordinary hosted Linux and Windows CI on the pushed exact head, then run the independent local advisory, apply `ai review` once, and monitor Review Gate.
-- Keep PR33 open for Dan; no downstream rerun or merge is authorized by this rollout.
+- Run final narrow repository checks, commit the frozen head, and request one independent targeted review of the cache-name correction.
+- After targeted acceptance, use exactly one broad final evidence source, publish the coherent pull request, require zero unresolved GitHub conversations, and merge immediately when accepted.
 
 ## Session Log
+
+- 2026-08-17: Began from Community main `fd3a26243b0e2786f8ec8073a746252f87cd4d3c` in an isolated worktree. The exact source-only retirement test failed because the transaction recognized only the running interpreter's default cache path. The correction uses a finite 12-path matrix per retired exact prior-manifest source: CPython 3.11–3.14 across default, `opt-1`, and `opt-2`. The running tag still requires compiled code equality. Another listed tag requires known magic, exact timestamp and source-length binding, safe regular single-link `0644` identity, canonical source-derived name and parent, and a 16 MiB bound. Twelve invalid or foreign cases remain present and make audit fail. Focused cache tests passed 36 tests; the affected transaction file passed 255 tests, including schema 6 and 7 recovery compatibility; affected Ruff passed. The single broad final suite and independent targeted review remain.
 
 - 2026-08-17: Rebased PR33 onto current Community `main` after PR35 merged as `01c09b23124bb49ecfc56be745731506393cc680`. Reconciled the overlapping harness progress record without changing PR35 implementation or Review Gate code. Prior CI and Review Gate evidence is invalidated; replacement local and hosted gates are required. Do not merge.
 

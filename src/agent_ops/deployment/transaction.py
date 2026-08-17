@@ -45,7 +45,9 @@ __all__ = (
 )
 
 _SCHEMA_VERSION = 1
-_TRANSACTION_SCHEMA_VERSION = 7
+_TRANSACTION_SCHEMA_VERSION = 8
+_RUNTIME_CACHE_PROVENANCE_SCHEMA_VERSION = 7
+_FINITE_RUNTIME_CACHE_MATRIX_SCHEMA_VERSION = 8
 _LEGACY_TRANSACTION_SCHEMA_VERSION = 3
 _LEGACY_OPERATION_CURSOR_SCHEMA_VERSION = 5
 _OPERATION_CURSOR_SCHEMA_VERSION = 6
@@ -59,6 +61,14 @@ _POSIX_SUPPORTED = os.name == "posix" and fcntl is not None
 _CANONICAL_HOME_IDENTITY_ERROR = "deployment canonical home identity changed"
 _RUNTIME_CACHE_REMOVAL = "runtime-cache-removal"
 _REMOVAL_KINDS = frozenset({"removal", _RUNTIME_CACHE_REMOVAL})
+_SUPPORTED_CPYTHON_CACHE_MAGICS = {
+    "cpython-311": bytes.fromhex("a70d0d0a"),
+    "cpython-312": bytes.fromhex("cb0d0d0a"),
+    "cpython-313": bytes.fromhex("f30d0d0a"),
+    "cpython-314": bytes.fromhex("2b0e0d0a"),
+}
+_SUPPORTED_CPYTHON_CACHE_OPTIMIZATIONS = (None, "1", "2")
+_MAX_RUNTIME_CACHE_BYTES = 16 * 1024 * 1024
 
 
 class PublicationIndeterminateError(OSError):
@@ -440,6 +450,34 @@ class _HomeFS:
                 while chunk := os.read(descriptor, 1024 * 1024):
                     chunks.append(chunk)
                 return b"".join(chunks)
+            finally:
+                os.close(descriptor)
+
+    def read_file_bounded(self, relative: Path, max_bytes: int) -> bytes:
+        if type(max_bytes) is not int or max_bytes < 0:
+            raise ValueError("invalid bounded file read size")
+        with self.parent(relative) as (parent, leaf):
+            descriptor = os.open(
+                leaf,
+                os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW,
+                dir_fd=parent,
+            )
+            try:
+                item = os.fstat(descriptor)
+                if not stat.S_ISREG(item.st_mode) or item.st_size > max_bytes:
+                    raise OSError(f"bounded file is invalid: {relative}")
+                chunks: list[bytes] = []
+                remaining = max_bytes + 1
+                while remaining:
+                    chunk = os.read(descriptor, min(1024 * 1024, remaining))
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+                content = b"".join(chunks)
+                if len(content) > max_bytes:
+                    raise OSError(f"bounded file changed during read: {relative}")
+                return content
             finally:
                 os.close(descriptor)
 
@@ -1742,6 +1780,11 @@ def _install_provider_plan_groups(
                 if prior_data is not None
                 else {}
             )
+            runtime_cache_removals = dict(group.runtime_cache_removals)
+            runtime_cache_removals.update(
+                _discover_runtime_cache_removals(home_fs, group, managed)
+            )
+            removals = tuple(sorted(set(group.removals) | set(runtime_cache_removals), key=str))
             for directory in manifest.directories:
                 if not home_fs.exists(directory.path):
                     continue
@@ -1790,7 +1833,7 @@ def _install_provider_plan_groups(
                     operation["prior_mode"] = prior[1]
                     operation["prior_exists"] = True
                 operations.append(operation)
-            for removal in group.removals:
+            for removal in removals:
                 prior = managed.get(removal)
                 if prior is None:
                     if not home_fs.exists(removal):
@@ -1799,13 +1842,16 @@ def _install_provider_plan_groups(
                         home_fs,
                         removal,
                         managed=managed,
-                        authorized_sources=dict(group.runtime_cache_removals),
+                        authorized_sources=runtime_cache_removals,
                     )
                     if runtime_source is None:
                         raise ValueError(f"refusing to remove unmanaged destination: {removal}")
                     index = len(operations)
                     removal_stat = home_fs.stat(removal)
-                    removal_content = home_fs.read_file(removal)
+                    removal_content = home_fs.read_file_bounded(
+                        removal,
+                        _MAX_RUNTIME_CACHE_BYTES,
+                    )
                     source_stat = home_fs.stat(runtime_source)
                     source_content = home_fs.read_file(runtime_source)
                     runtime_cache_provenance = _runtime_cache_provenance(
@@ -2111,7 +2157,7 @@ def _install_provider_plan_groups(
                         _OWNERSHIP_MANIFEST_MODE,
                     ):
                         raise ValueError("ownership manifest candidate changed before publication")
-                    _verify_planned_final_state(home_fs, manifest, group.removals)
+                    _verify_planned_final_state(home_fs, manifest, removals)
                     if prior_manifest_content is None:
                         home_fs.publish_new(manifest_temp, manifest_path)
                     else:
@@ -2375,6 +2421,7 @@ def _decode_record(
             4,
             _LEGACY_OPERATION_CURSOR_SCHEMA_VERSION,
             6,
+            _RUNTIME_CACHE_PROVENANCE_SCHEMA_VERSION,
             _TRANSACTION_SCHEMA_VERSION,
         }
         or record.get("state") not in {"prepared", "committed", "indeterminate", "rolled-back"}
@@ -2548,7 +2595,7 @@ def _decode_record(
         }
         if operation["kind"] == _RUNTIME_CACHE_REMOVAL:
             operation_keys.add("runtime_source")
-            if record["schema_version"] >= _TRANSACTION_SCHEMA_VERSION:
+            if record["schema_version"] >= _RUNTIME_CACHE_PROVENANCE_SCHEMA_VERSION:
                 operation_keys.add("runtime_cache_provenance")
         _require_exact_keys(
             operation,
@@ -2618,11 +2665,14 @@ def _decode_record(
                 operation.get("runtime_source"),
                 label="transaction runtime cache source",
             )
-            if record["schema_version"] >= _TRANSACTION_SCHEMA_VERSION:
+            if record["schema_version"] >= _RUNTIME_CACHE_PROVENANCE_SCHEMA_VERSION:
                 provenance = _decode_runtime_cache_provenance(
                     operation.get("runtime_cache_provenance"),
                     destination=destination,
                     source=runtime_source,
+                    strict_matrix=(
+                        record["schema_version"] >= _FINITE_RUNTIME_CACHE_MATRIX_SCHEMA_VERSION
+                    ),
                 )
                 if provenance["source"] != runtime_source.as_posix():
                     raise ValueError("invalid runtime cache removal source")
@@ -2979,7 +3029,10 @@ def _validate_runtime_cache_removal_evidence(
         )
         try:
             cache_stat = home_fs.stat(cache_evidence)
-            cache = home_fs.read_file(cache_evidence)
+            cache = home_fs.read_file_bounded(
+                cache_evidence,
+                _MAX_RUNTIME_CACHE_BYTES,
+            )
             source_stat = home_fs.stat(source_evidence)
             source = home_fs.read_file(source_evidence)
         except OSError as exc:
@@ -2994,9 +3047,12 @@ def _validate_runtime_cache_removal_evidence(
                     operation["runtime_cache_provenance"],
                     destination=Path(operation["destination"]),
                     source=Path(operation["runtime_source"]),
+                    strict_matrix=(
+                        record["schema_version"] >= _FINITE_RUNTIME_CACHE_MATRIX_SCHEMA_VERSION
+                    ),
                 ),
             )
-            if record["schema_version"] >= _TRANSACTION_SCHEMA_VERSION
+            if record["schema_version"] >= _RUNTIME_CACHE_PROVENANCE_SCHEMA_VERSION
             else _runtime_python_cache_content_is_valid(
                 cache,
                 cache_stat,
@@ -3216,15 +3272,18 @@ def _restore_runtime_cache_source_timestamps(
             source_operation["prior_mode"],
         ):
             raise IncompleteRollbackError("rollback runtime cache prestate changed")
-        if record["schema_version"] >= _TRANSACTION_SCHEMA_VERSION:
+        if record["schema_version"] >= _RUNTIME_CACHE_PROVENANCE_SCHEMA_VERSION:
             provenance = _decode_runtime_cache_provenance(
                 operation["runtime_cache_provenance"],
                 destination=cache,
                 source=source,
+                strict_matrix=(
+                    record["schema_version"] >= _FINITE_RUNTIME_CACHE_MATRIX_SCHEMA_VERSION
+                ),
             )
             home_fs.set_mtime_seconds(source, provenance["timestamp"])
         else:
-            content = home_fs.read_file(cache)
+            content = home_fs.read_file_bounded(cache, _MAX_RUNTIME_CACHE_BYTES)
             if (
                 len(content) < 16
                 or content[:4] != importlib.util.MAGIC_NUMBER
@@ -3424,13 +3483,16 @@ def _rollback_record(
             )
         if (
             kind == _RUNTIME_CACHE_REMOVAL
-            and record["schema_version"] >= _TRANSACTION_SCHEMA_VERSION
+            and record["schema_version"] >= _RUNTIME_CACHE_PROVENANCE_SCHEMA_VERSION
             and home_fs.exists(destination)
         ):
             provenance = _decode_runtime_cache_provenance(
                 operation["runtime_cache_provenance"],
                 destination=destination,
                 source=Path(operation["runtime_source"]),
+                strict_matrix=(
+                    record["schema_version"] >= _FINITE_RUNTIME_CACHE_MATRIX_SCHEMA_VERSION
+                ),
             )
             identity = provenance["identity"]
             observed = home_fs.stat(destination)
@@ -3878,22 +3940,66 @@ def _runtime_python_source_for_cache(candidate: Path) -> Path | None:
     cache_tag = sys.implementation.cache_tag
     if (
         type(cache_tag) is not str
-        or not cache_tag
+        or cache_tag not in _SUPPORTED_CPYTHON_CACHE_MAGICS
         or candidate.parent.name != "__pycache__"
     ):
         return None
-    suffix = f".{cache_tag}.pyc"
-    if not candidate.name.endswith(suffix):
+    for optimization in _SUPPORTED_CPYTHON_CACHE_OPTIMIZATIONS:
+        optimization_suffix = "" if optimization is None else f".opt-{optimization}"
+        suffix = f".{cache_tag}{optimization_suffix}.pyc"
+        if not candidate.name.endswith(suffix):
+            continue
+        source_name = candidate.name.removesuffix(suffix)
+        if not source_name:
+            return None
+        source = candidate.parent.parent / f"{source_name}.py"
+        try:
+            expected = Path(
+                importlib.util.cache_from_source(
+                    str(source),
+                    optimization=optimization,
+                )
+            )
+        except (NotImplementedError, ValueError):
+            return None
+        return source if expected == candidate else None
+    return None
+
+
+def _runtime_cache_candidates_for_source(source: Path) -> tuple[Path, ...]:
+    cache_root = source.parent / "__pycache__"
+    return tuple(
+        cache_root
+        / (
+            f"{source.stem}.{tag}"
+            f"{'' if optimization is None else f'.opt-{optimization}'}.pyc"
+        )
+        for tag in _SUPPORTED_CPYTHON_CACHE_MAGICS
+        for optimization in _SUPPORTED_CPYTHON_CACHE_OPTIMIZATIONS
+    )
+
+
+def _runtime_cache_shape_for_source(
+    candidate: Path,
+    source: Path,
+) -> tuple[str, str | None] | None:
+    if candidate.parent != source.parent / "__pycache__":
         return None
-    source_name = candidate.name.removesuffix(suffix)
-    if not source_name:
-        return None
-    source = candidate.parent.parent / f"{source_name}.py"
-    try:
-        expected = Path(importlib.util.cache_from_source(str(source)))
-    except (NotImplementedError, ValueError):
-        return None
-    return source if expected == candidate else None
+    for tag in _SUPPORTED_CPYTHON_CACHE_MAGICS:
+        for optimization in _SUPPORTED_CPYTHON_CACHE_OPTIMIZATIONS:
+            optimization_suffix = "" if optimization is None else f".opt-{optimization}"
+            if candidate.name == f"{source.stem}.{tag}{optimization_suffix}.pyc":
+                return tag, optimization
+    return None
+
+
+def _runtime_cache_stat_shape_is_safe(cache_stat: os.stat_result) -> bool:
+    return (
+        stat.S_ISREG(cache_stat.st_mode)
+        and cache_stat.st_nlink == 1
+        and stat.S_IMODE(cache_stat.st_mode) == 0o644
+        and 16 < cache_stat.st_size <= _MAX_RUNTIME_CACHE_BYTES
+    )
 
 
 def _is_valid_runtime_python_cache(
@@ -3902,10 +4008,15 @@ def _is_valid_runtime_python_cache(
     source = _runtime_python_source_for_cache(candidate)
     if source is None or source not in sources:
         return False
+    shape = _runtime_cache_shape_for_source(candidate, source)
+    if shape is None:
+        return False
     try:
         cache_stat = home_fs.stat(candidate)
         source_stat = home_fs.stat(source)
-        cache = home_fs.read_file(candidate)
+        if not _runtime_cache_stat_shape_is_safe(cache_stat):
+            return False
+        cache = home_fs.read_file_bounded(candidate, _MAX_RUNTIME_CACHE_BYTES)
         source_bytes = home_fs.read_file(source)
     except OSError:
         return False
@@ -3914,6 +4025,7 @@ def _is_valid_runtime_python_cache(
         cache_stat,
         source_bytes,
         source_stat,
+        optimization=shape[1],
     )
 
 
@@ -3922,10 +4034,12 @@ def _runtime_python_cache_content_is_valid(
     cache_stat: os.stat_result,
     source_bytes: bytes,
     source_stat: os.stat_result,
+    *,
+    optimization: str | None = None,
 ) -> bool:
     if (
-        not stat.S_ISREG(cache_stat.st_mode)
-        or stat.S_IMODE(cache_stat.st_mode) != 0o644
+        not _runtime_cache_stat_shape_is_safe(cache_stat)
+        or len(cache) != cache_stat.st_size
         or not stat.S_ISREG(source_stat.st_mode)
     ):
         return False
@@ -3939,7 +4053,13 @@ def _runtime_python_cache_content_is_valid(
         observed = marshal.loads(cache[16:])
         if not isinstance(observed, type(compile("", "", "exec"))):
             return False
-        expected = compile(source_bytes, observed.co_filename, "exec", dont_inherit=True)
+        expected = compile(
+            source_bytes,
+            observed.co_filename,
+            "exec",
+            dont_inherit=True,
+            optimize=-1 if optimization is None else int(optimization),
+        )
     except (SyntaxError, ValueError, TypeError):
         return False
     return observed == expected and marshal.dumps(observed) == cache[16:]
@@ -3954,11 +4074,29 @@ def _runtime_cache_provenance(
     source_stat: os.stat_result,
 ) -> dict[str, object] | None:
     """Return interpreter-independent evidence after live authorization."""
-    if not _runtime_python_cache_content_is_valid(cache, cache_stat, source_bytes, source_stat):
+    shape = _runtime_cache_shape_for_source(candidate, source)
+    if shape is None:
         return None
-    cache_tag = _runtime_cache_tag_for_source(candidate, source)
-    if cache_tag is None:
+    tag, optimization = shape
+    if tag == sys.implementation.cache_tag:
+        valid = _runtime_python_cache_content_is_valid(
+            cache,
+            cache_stat,
+            source_bytes,
+            source_stat,
+            optimization=optimization,
+        )
+    else:
+        valid = _foreign_runtime_python_cache_content_is_valid(
+            cache,
+            cache_stat,
+            source_bytes,
+            source_stat,
+            expected_magic=_SUPPORTED_CPYTHON_CACHE_MAGICS[tag],
+        )
+    if not valid:
         return None
+    cache_tag = tag if optimization is None else f"{tag}.opt-{optimization}"
     return {
         "source": source.as_posix(),
         "cache_tag": cache_tag,
@@ -3970,6 +4108,14 @@ def _runtime_cache_provenance(
 
 
 def _runtime_cache_tag_for_source(candidate: Path, source: Path) -> str | None:
+    shape = _runtime_cache_shape_for_source(candidate, source)
+    if shape is None:
+        return None
+    tag, optimization = shape
+    return tag if optimization is None else f"{tag}.opt-{optimization}"
+
+
+def _legacy_runtime_cache_tag_for_source(candidate: Path, source: Path) -> str | None:
     if candidate.parent != source.parent / "__pycache__":
         return None
     prefix = f"{source.stem}."
@@ -3985,11 +4131,31 @@ def _runtime_cache_tag_for_source(candidate: Path, source: Path) -> str | None:
     return cache_tag
 
 
+def _foreign_runtime_python_cache_content_is_valid(
+    cache: bytes,
+    cache_stat: os.stat_result,
+    source_bytes: bytes,
+    source_stat: os.stat_result,
+    *,
+    expected_magic: bytes,
+) -> bool:
+    return (
+        _runtime_cache_stat_shape_is_safe(cache_stat)
+        and len(cache) == cache_stat.st_size
+        and stat.S_ISREG(source_stat.st_mode)
+        and cache[:4] == expected_magic
+        and cache[4:8] == b"\0\0\0\0"
+        and int.from_bytes(cache[8:12], "little") == int(source_stat.st_mtime)
+        and int.from_bytes(cache[12:16], "little") == len(source_bytes)
+    )
+
+
 def _decode_runtime_cache_provenance(
     value: object,
     *,
     destination: Path,
     source: Path,
+    strict_matrix: bool = True,
 ) -> dict[str, object]:
     if not isinstance(value, dict):
         raise ValueError("invalid runtime cache removal provenance")
@@ -4004,14 +4170,27 @@ def _decode_runtime_cache_provenance(
     timestamp = value.get("timestamp")
     source_size = value.get("source_size")
     identity = value.get("identity")
+    shape = _runtime_cache_shape_for_source(destination, source) if strict_matrix else None
+    observed_cache_tag = (
+        _runtime_cache_tag_for_source(destination, source)
+        if strict_matrix
+        else _legacy_runtime_cache_tag_for_source(destination, source)
+    )
+    expected_magic = (
+        _SUPPORTED_CPYTHON_CACHE_MAGICS[shape[0]]
+        if strict_matrix and shape is not None
+        else None
+    )
     if (
         type(source_text) is not str
         or _canonical_relative_text(source_text, label="runtime cache provenance source") != source
         or type(cache_tag) is not str
-        or _runtime_cache_tag_for_source(destination, source) != cache_tag
+        or observed_cache_tag != cache_tag
         or type(magic_number) is not str
         or len(magic_number) != 8
         or any(character not in "0123456789abcdef" for character in magic_number)
+        or strict_matrix
+        and (expected_magic is None or magic_number != expected_magic.hex())
         or type(timestamp) is not int
         or not 0 <= timestamp < 2**32
         or type(source_size) is not int
@@ -4038,8 +4217,8 @@ def _runtime_cache_matches_provenance(
     provenance: dict[str, object],
 ) -> bool:
     return (
-        stat.S_ISREG(cache_stat.st_mode)
-        and stat.S_IMODE(cache_stat.st_mode) == 0o644
+        _runtime_cache_stat_shape_is_safe(cache_stat)
+        and len(cache) == cache_stat.st_size
         and stat.S_ISREG(source_stat.st_mode)
         and len(cache) >= 16
         and (cache_stat.st_dev, cache_stat.st_ino)
@@ -4063,11 +4242,11 @@ def _recorded_runtime_cache_is_valid(
 ) -> bool:
     cache = Path(operation["destination"])
     source = Path(operation["runtime_source"])
-    if record["schema_version"] < _TRANSACTION_SCHEMA_VERSION:
+    if record["schema_version"] < _RUNTIME_CACHE_PROVENANCE_SCHEMA_VERSION:
         return _is_valid_runtime_python_cache(home_fs, cache, (source,))
     try:
         cache_stat = home_fs.stat(cache)
-        cache_content = home_fs.read_file(cache)
+        cache_content = home_fs.read_file_bounded(cache, _MAX_RUNTIME_CACHE_BYTES)
         source_stat = home_fs.stat(source)
         source_content = home_fs.read_file(source)
     except OSError:
@@ -4081,6 +4260,9 @@ def _recorded_runtime_cache_is_valid(
             operation["runtime_cache_provenance"],
             destination=cache,
             source=source,
+            strict_matrix=(
+                record["schema_version"] >= _FINITE_RUNTIME_CACHE_MATRIX_SCHEMA_VERSION
+            ),
         ),
     )
 
@@ -4120,10 +4302,16 @@ class _PinnedRuntimeCache:
         observed = os.fstat(self.descriptor)
         if (
             os.get_inheritable(self.descriptor)
-            or not stat.S_ISREG(observed.st_mode)
+            or not _runtime_cache_stat_shape_is_safe(observed)
             or stat.S_IMODE(observed.st_mode) != self.mode
             or (observed.st_dev, observed.st_ino) != self.identity
-            or _fingerprint(_read_status_descriptor(self.descriptor)) != self.fingerprint
+            or _fingerprint(
+                _read_status_descriptor(
+                    self.descriptor,
+                    max_bytes=_MAX_RUNTIME_CACHE_BYTES,
+                )
+            )
+            != self.fingerprint
         ):
             raise ValueError(f"runtime cache removal changed before mutation: {self.path}")
 
@@ -4167,7 +4355,7 @@ def _restore_unauthorized_runtime_cache_before_evidence(
     record: dict[str, Any],
 ) -> None:
     """Keep a raced cache reachable before rejecting its transaction authority."""
-    if record["schema_version"] < _TRANSACTION_SCHEMA_VERSION:
+    if record["schema_version"] < _RUNTIME_CACHE_PROVENANCE_SCHEMA_VERSION:
         return
     for operation in record["operations"]:
         if operation["kind"] != _RUNTIME_CACHE_REMOVAL:
@@ -4178,6 +4366,9 @@ def _restore_unauthorized_runtime_cache_before_evidence(
             operation["runtime_cache_provenance"],
             destination=destination,
             source=Path(operation["runtime_source"]),
+            strict_matrix=(
+                record["schema_version"] >= _FINITE_RUNTIME_CACHE_MATRIX_SCHEMA_VERSION
+            ),
         )
         identity = provenance["identity"]
         expected_identity = identity["device"], identity["inode"]
@@ -4206,15 +4397,53 @@ def _authorized_runtime_cache_removal_source(
     managed: dict[Path, tuple[str, int]],
     authorized_sources: dict[Path, Path],
 ) -> Path | None:
-    source = _runtime_python_source_for_cache(candidate)
+    source = authorized_sources.get(candidate)
     if (
         source is None
-        or authorized_sources.get(candidate) != source
         or source not in managed
-        or not _is_valid_runtime_python_cache(home_fs, candidate, (source,))
     ):
         return None
-    return source
+    try:
+        cache_stat = home_fs.stat(candidate)
+        source_stat = home_fs.stat(source)
+        if not _runtime_cache_stat_shape_is_safe(cache_stat):
+            return None
+        cache = home_fs.read_file_bounded(candidate, _MAX_RUNTIME_CACHE_BYTES)
+        source_bytes = home_fs.read_file(source)
+    except OSError:
+        return None
+    provenance = _runtime_cache_provenance(
+        candidate,
+        source,
+        cache,
+        cache_stat,
+        source_bytes,
+        source_stat,
+    )
+    return source if provenance is not None else None
+
+
+def _discover_runtime_cache_removals(
+    home_fs: _HomeFS,
+    group: _PlanGroup,
+    managed: dict[Path, tuple[str, int]],
+) -> dict[Path, Path]:
+    discovered: dict[Path, Path] = {}
+    for source in group.removals:
+        if source not in managed or source.suffix != ".py" or not home_fs.exists(source):
+            continue
+        for candidate in _runtime_cache_candidates_for_source(source):
+            if not home_fs.exists(candidate):
+                continue
+            authorized = _authorized_runtime_cache_removal_source(
+                home_fs,
+                candidate,
+                managed=managed,
+                authorized_sources={candidate: source},
+            )
+            if authorized == source:
+                discovered[candidate] = source
+    return discovered
 
 
 def audit_provider_plans(plans: tuple[ProviderPlan, ...]) -> DeploymentAudit:
@@ -4407,12 +4636,20 @@ def _status_identity(item: os.stat_result) -> tuple[int, int, int, int, int, int
     )
 
 
-def _read_status_descriptor(descriptor: int) -> bytes:
+def _read_status_descriptor(descriptor: int, *, max_bytes: int | None = None) -> bytes:
     offset = 0
     chunks: list[bytes] = []
-    while chunk := os.pread(descriptor, 1024 * 1024, offset):
+    if max_bytes is not None and os.fstat(descriptor).st_size > max_bytes:
+        raise OSError("descriptor exceeds bounded read size")
+    while chunk := os.pread(
+        descriptor,
+        min(1024 * 1024, max_bytes + 1 - offset) if max_bytes is not None else 1024 * 1024,
+        offset,
+    ):
         chunks.append(chunk)
         offset += len(chunk)
+        if max_bytes is not None and offset > max_bytes:
+            raise OSError("descriptor changed during bounded read")
     return b"".join(chunks)
 
 
