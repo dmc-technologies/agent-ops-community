@@ -4,6 +4,7 @@ import base64
 import ctypes
 import errno
 import hashlib
+import importlib.util
 import json
 import multiprocessing
 import os
@@ -731,6 +732,8 @@ def test_legacy_link_transition_schema_downgrade_cannot_rollback_installed_file(
     record = json.loads(record_path.read_text())
     record["schema_version"] = 3
     del record["legacy_link_transition"]
+    del record["operation_cursor"]
+    del record["operation_phase"]
     record_path.write_text(json.dumps(record))
     record_path.chmod(0o600)
     installed = destination.read_bytes()
@@ -774,6 +777,8 @@ def test_legacy_link_transition_schema_downgrade_recovery_preserves_prior_link(
     record = json.loads(record_path.read_text())
     record["schema_version"] = 3
     del record["legacy_link_transition"]
+    del record["operation_cursor"]
+    del record["operation_phase"]
     record_path.write_text(json.dumps(record))
     record_path.chmod(0o600)
 
@@ -894,6 +899,26 @@ def test_existing_transaction_record_without_legacy_member_remains_recoverable(
     record = json.loads(record_path.read_text())
     record["schema_version"] = 3
     del record["legacy_link_transition"]
+    del record["operation_cursor"]
+    del record["operation_phase"]
+    record_path.write_text(json.dumps(record))
+    record_path.chmod(0o600)
+
+    assert recover_transaction(record_path) == manifest
+
+
+def test_existing_schema_five_transaction_without_global_cursor_remains_recoverable(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    manifest = install_provider_plans(
+        (_plan(home, PlannedFile(Path("skills/example/SKILL.md"), b"body\n", 0o644)),)
+    )[0]
+    record_path = next((home / ".agentops/deployment/transactions").glob("*/record.json"))
+    record = json.loads(record_path.read_text())
+    record["schema_version"] = 5
+    del record["operation_cursor"]
+    del record["operation_phase"]
     record_path.write_text(json.dumps(record))
     record_path.chmod(0o600)
 
@@ -1137,6 +1162,307 @@ def test_audit_accepts_only_opted_in_exact_python_cache(tmp_path: Path) -> None:
     cache = next((home / source.parent / "__pycache__").glob("*.pyc"))
     cache.write_bytes(cache.read_bytes() + b"tampered")
     assert not audit_provider_plans((plan,)).matches
+
+
+def test_refresh_removes_exact_runtime_cache_with_its_prior_managed_source(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    target = TargetSpec("codex", Framework.CODEX, home, "stable")
+    source = Path("skills/private/src/sitecustomize.py")
+    initial = ProviderPlan(
+        "private",
+        "1" * 40,
+        target,
+        (PlannedFile(source, b"value = 'retired'\n", 0o644),),
+        audit_roots=(Path("skills/private"),),
+        runtime_python_sources=(source,),
+    )
+    install_provider_plans((initial,))
+    cache = Path(importlib.util.cache_from_source(str(source)))
+    os.utime(home / source, (1_700_000_000, 1_700_000_000))
+    py_compile.compile(home / source, cfile=home / cache, doraise=True)
+    assert audit_provider_plans((initial,)).matches
+
+    replacement = ProviderPlan(
+        "private",
+        "2" * 40,
+        target,
+        (),
+        removals=(source, cache),
+        audit_roots=(Path("skills/private"),),
+    )
+    install_provider_plans((replacement,))
+
+    assert not (home / source).exists()
+    assert not (home / cache).exists()
+    assert audit_provider_plans((replacement,)).matches
+
+
+def test_runtime_cache_removal_rejects_forged_backup_and_record_fingerprint(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    target = TargetSpec("codex", Framework.CODEX, home, "stable")
+    source = Path("skills/private/src/sitecustomize.py")
+    initial = ProviderPlan(
+        "private",
+        "1" * 40,
+        target,
+        (PlannedFile(source, b"value = 'retired'\n", 0o644),),
+        runtime_python_sources=(source,),
+    )
+    install_provider_plans((initial,))
+    cache = Path(importlib.util.cache_from_source(str(source)))
+    py_compile.compile(home / source, cfile=home / cache, doraise=True)
+    replacement = ProviderPlan(
+        "private",
+        "2" * 40,
+        target,
+        (),
+        removals=(source, cache),
+    )
+    manifests = install_provider_plans((replacement,))
+    record_path = transaction_module._TRANSACTION_PATHS[manifests[0].transaction_id]
+    record = json.loads(record_path.read_text())
+    operation = next(
+        item for item in record["operations"] if item["kind"] == "runtime-cache-removal"
+    )
+    forged = b"forged bytecode"
+    backup = home / operation["backup"]
+    backup.write_bytes(forged)
+    backup.chmod(0o644)
+    operation["prior_fingerprint"] = hashlib.sha256(forged).hexdigest()
+    record_path.write_text(json.dumps(record))
+
+    with pytest.raises(ValueError, match="runtime cache.*evidence"):
+        rollback_manifests(manifests)
+
+    assert not (home / source).exists()
+    assert not (home / cache).exists()
+
+
+def test_runtime_cache_removal_rejects_changed_source_backup(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    target = TargetSpec("codex", Framework.CODEX, home, "stable")
+    source = Path("skills/private/src/sitecustomize.py")
+    initial = ProviderPlan(
+        "private",
+        "1" * 40,
+        target,
+        (PlannedFile(source, b"value = 'retired'\n", 0o644),),
+        runtime_python_sources=(source,),
+    )
+    install_provider_plans((initial,))
+    cache = Path(importlib.util.cache_from_source(str(source)))
+    py_compile.compile(home / source, cfile=home / cache, doraise=True)
+    replacement = ProviderPlan(
+        "private",
+        "2" * 40,
+        target,
+        (),
+        removals=(source, cache),
+    )
+    manifests = install_provider_plans((replacement,))
+    record_path = transaction_module._TRANSACTION_PATHS[manifests[0].transaction_id]
+    record = json.loads(record_path.read_text())
+    source_operation = next(
+        item for item in record["operations"] if item["destination"] == source.as_posix()
+    )
+    source_backup = home / source_operation["backup"]
+    source_backup.write_bytes(b"changed source\n")
+    source_backup.chmod(0o644)
+
+    with pytest.raises(ValueError, match="runtime cache.*evidence"):
+        rollback_manifests(manifests)
+
+    assert not (home / source).exists()
+    assert not (home / cache).exists()
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "wrong-tag",
+        "wrong-mode",
+        "changed-content",
+        "symlink",
+        "source-not-removed",
+        "source-not-prior-managed",
+        "other-file",
+    ],
+)
+def test_runtime_cache_removal_rejects_untrusted_candidates(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    home = tmp_path / "home"
+    target = TargetSpec("codex", Framework.CODEX, home, "stable")
+    source = Path("skills/private/src/sitecustomize.py")
+    initial_source = source
+    if case == "source-not-prior-managed":
+        initial_source = Path("skills/private/src/managed.py")
+    initial = ProviderPlan(
+        "private",
+        "1" * 40,
+        target,
+        (PlannedFile(initial_source, b"value = 'retired'\n", 0o644),),
+        runtime_python_sources=(initial_source,),
+    )
+    install_provider_plans((initial,))
+    if case == "source-not-prior-managed":
+        (home / source).write_bytes(b"value = 'unmanaged'\n")
+        (home / source).chmod(0o644)
+    cache = Path(importlib.util.cache_from_source(str(source)))
+    py_compile.compile(home / source, cfile=home / cache, doraise=True)
+    candidate = cache
+    removals = (source, cache)
+    if case == "wrong-tag":
+        candidate = cache.with_name("sitecustomize.cpython-000.pyc")
+        (home / cache).rename(home / candidate)
+        removals = (source, candidate)
+    elif case == "wrong-mode":
+        (home / cache).chmod(0o600)
+    elif case == "changed-content":
+        (home / cache).write_bytes((home / cache).read_bytes() + b"changed")
+    elif case == "symlink":
+        external = tmp_path / "external.pyc"
+        external.write_bytes((home / cache).read_bytes())
+        (home / cache).unlink()
+        (home / cache).symlink_to(external)
+    elif case == "source-not-removed":
+        removals = (cache,)
+    elif case == "other-file":
+        candidate = Path("skills/private/src/unrelated.txt")
+        (home / candidate).write_text("unrelated\n")
+        removals = (source, candidate)
+    replacement = ProviderPlan(
+        "private",
+        "2" * 40,
+        target,
+        (),
+        removals=removals,
+    )
+
+    with pytest.raises(ValueError, match="refusing to remove unmanaged destination"):
+        install_provider_plans((replacement,))
+
+    assert (home / candidate).exists() or (home / candidate).is_symlink()
+
+
+def test_runtime_cache_removal_requires_source_removal_in_the_same_provider_plan(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    target = TargetSpec("codex", Framework.CODEX, home, "stable")
+    source = Path("skills/private/src/sitecustomize.py")
+    initial = ProviderPlan(
+        "source-owner",
+        "1" * 40,
+        target,
+        (PlannedFile(source, b"value = 'retired'\n", 0o644),),
+        runtime_python_sources=(source,),
+    )
+    install_provider_plans((initial,))
+    cache = Path(importlib.util.cache_from_source(str(source)))
+    py_compile.compile(home / source, cfile=home / cache, doraise=True)
+    source_removal = ProviderPlan(
+        "source-owner",
+        "2" * 40,
+        target,
+        (),
+        removals=(source,),
+    )
+    cache_removal = ProviderPlan(
+        "cache-remover",
+        "2" * 40,
+        target,
+        (),
+        removals=(cache,),
+    )
+
+    with pytest.raises(ValueError, match="refusing to remove unmanaged destination"):
+        install_provider_plans((source_removal, cache_removal))
+
+    assert (home / source).is_file()
+    assert (home / cache).is_file()
+
+
+@pytest.mark.parametrize(
+    ("phase", "hook_name", "exit_code"),
+    [
+        ("before-cache", "_before_operation_mutation", 96),
+        ("after-cache-backup", "_after_operation_backup", 97),
+        ("after-source-backup", "_after_operation_backup", 98),
+    ],
+)
+def test_runtime_cache_removal_crash_rolls_back_exact_prestate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+    hook_name: str,
+    exit_code: int,
+) -> None:
+    home = tmp_path / "home"
+    target = TargetSpec("codex", Framework.CODEX, home, "stable")
+    source = Path("skills/private/src/sitecustomize.py")
+    initial = ProviderPlan(
+        "private",
+        "1" * 40,
+        target,
+        (PlannedFile(source, b"value = 'retired'\n", 0o644),),
+        runtime_python_sources=(source,),
+    )
+    install_provider_plans((initial,))
+    cache = Path(importlib.util.cache_from_source(str(source)))
+    os.utime(home / source, (1_700_000_000, 1_700_000_000))
+    py_compile.compile(home / source, cfile=home / cache, doraise=True)
+    source_before = (home / source).read_bytes()
+    cache_before = (home / cache).read_bytes()
+    replacement = ProviderPlan(
+        "private",
+        "2" * 40,
+        target,
+        (),
+        removals=(source, cache),
+    )
+    original_hook = getattr(transaction_module, hook_name)
+
+    def terminate_at_selected_phase(
+        _home_fs: object,
+        _record_path: Path,
+        operation: dict[str, object],
+    ) -> None:
+        cache_phase = phase in {"before-cache", "after-cache-backup"}
+        if (
+            cache_phase
+            and operation["kind"] == "runtime-cache-removal"
+            or phase == "after-source-backup"
+            and operation["destination"] == source.as_posix()
+        ):
+            os._exit(exit_code)
+
+    monkeypatch.setattr(
+        transaction_module,
+        hook_name,
+        terminate_at_selected_phase,
+    )
+    process = multiprocessing.get_context("fork").Process(
+        target=lambda: install_provider_plans((replacement,))
+    )
+    process.start()
+    process.join(10)
+    assert process.exitcode == exit_code
+    monkeypatch.setattr(transaction_module, hook_name, original_hook)
+    record_path = next((home / ".agentops/deployment/transactions").glob("*/record.json"))
+
+    recover_transaction(record_path)
+
+    assert (home / source).read_bytes() == source_before
+    assert (home / cache).read_bytes() == cache_before
+    assert audit_provider_plans((initial,)).matches
 
 
 def test_ordinary_install_rejects_prior_manifest_with_contradictory_channel(
@@ -1957,6 +2283,7 @@ def test_record_operations_are_bound_to_recorded_manifests(
         operation["staged"] = (transaction / "rendered/unmanaged.txt").as_posix()
     elif case == "missing-operation":
         record["operations"] = []
+        record["operation_cursor"] = 0
     elif case == "extra-operation":
         extra = dict(operation)
         extra["destination"] = "unmanaged.txt"
@@ -3103,8 +3430,8 @@ def test_strict_transaction_json_rejects_ambiguity(
     record_path = next((home / ".agentops/deployment/transactions").glob("*/record.json"))
     if case == "duplicate-record-key":
         content = record_path.read_text().replace(
-            '"schema_version": 5,',
-            '"schema_version": 5,\n  "schema_version": 5,',
+            '"schema_version": 6,',
+            '"schema_version": 6,\n  "schema_version": 6,',
         )
         record_path.write_text(content)
     else:
