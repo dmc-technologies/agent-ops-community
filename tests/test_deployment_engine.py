@@ -26,7 +26,7 @@ from agent_ops.deployment.models import (
 from agent_ops.deployment.public_skills import build_public_skill_plans
 from agent_ops.deployment.registry import ChannelSpec, DeploymentRegistry, RegistryConfig
 from agent_ops.deployment.source_store import SourceStore
-from agent_ops.deployment.transaction import UnsupportedPlatformError
+from agent_ops.deployment.transaction import UnsupportedPlatformError, audit_provider_plans
 from agent_ops.deployment.transaction import install_provider_plans as apply_provider_plans
 from agent_ops.registries.models import Framework, SkillDependency, SkillDependencyInstall
 from agent_ops.show_me_adapter import OWNERSHIP_MANIFEST_RELATIVE, install_show_me
@@ -1419,6 +1419,71 @@ def test_public_plan_builder_renders_over_shadow_without_mutating_existing_targe
     assert plans[0].files[0] == PlannedFile(Path("skills/gstack/SKILL.md"), b"new\n", 0o644)
     assert plans[0].files[1].path == Path("skills/.agentops-public-provider-index.json")
     assert installed.read_bytes() == b"old\n"
+
+
+@pytest.mark.parametrize(
+    ("framework", "strategy"),
+    ((Framework.CODEX, "gstack"), (Framework.PRIME_AGENT, "prime-gstack")),
+)
+def test_gstack_audit_retains_owned_roots_but_ignores_transaction_metadata(
+    tmp_path: Path, framework: Framework, strategy: str
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "SKILL.md").write_bytes(b"gstack\n")
+    home = tmp_path / framework.value
+    dependency = SkillDependency(
+        id="gstack",
+        name="gstack",
+        repo="https://example.invalid/gstack.git",
+        ref="1" * 40,
+        install={
+            framework.value: SkillDependencyInstall(
+                strategy=strategy, destination="skills/agentops-gstack"
+            )
+        },
+    )
+
+    def install_dependency(**kwargs: object) -> None:
+        target_home = kwargs["target_home"]
+        assert isinstance(target_home, Path)
+        (target_home / "skills/agentops-gstack").mkdir(parents=True)
+        (target_home / "skills/agentops-gstack/SKILL.md").write_bytes(b"gstack\n")
+        runtime = target_home / ".agentops/runtime/gstack"
+        runtime.mkdir(parents=True)
+        (runtime / "ETHOS.md").write_bytes(b"ethos\n")
+        if kwargs["install"].strategy == "prime-gstack":
+            (target_home / ".agentops/gstack-prime-manifest.json").write_text(
+                json.dumps(
+                    {
+                        "files": [
+                            ".agentops/runtime/gstack/ETHOS.md",
+                            "skills/agentops-gstack/SKILL.md",
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+    plans = build_public_skill_plans(
+        framework=framework,
+        dependencies=[dependency],
+        target_home=home,
+        cache_root=tmp_path / "cache",
+        checkout_dependency=lambda _dependency, _cache: source,
+        install_dependency=install_dependency,
+    )
+    apply_provider_plans(plans)
+    assert audit_provider_plans(plans).matches
+
+    (home / ".agentops/deployment/unrelated.json").write_bytes(b"metadata\n")
+    assert audit_provider_plans(plans).matches
+    injected = home / "skills/agentops-gstack/injected/SKILL.md"
+    injected.parent.mkdir()
+    injected.write_bytes(b"unowned\n")
+    assert audit_provider_plans(plans).unexpected == (
+        "skills/agentops-gstack/injected/SKILL.md",
+    )
 
 
 def test_public_plan_builder_rejects_cache_overlap_before_checkout(tmp_path: Path) -> None:

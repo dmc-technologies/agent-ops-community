@@ -468,10 +468,21 @@ def _render_dependency_in_workspace(
         source_revision=dependency.ref,
         target=target,
         files=files,
-        audit_roots=(Path(".agentops/runtime/gstack"),)
-        if dependency.id == "gstack"
-        else (),
+        audit_roots=_audit_roots_for_dependency(dependency, files),
     )
+
+
+def _audit_roots_for_dependency(
+    dependency: SkillDependency, files: tuple[PlannedFile, ...]
+) -> tuple[Path, ...]:
+    """Keep every owned root while limiting gstack's reserved metadata scan."""
+
+    inferred = {Path(item.path.parts[0]) for item in files}
+    if dependency.id != "gstack" or Path(".agentops") not in inferred:
+        return ()
+    inferred.remove(Path(".agentops"))
+    inferred.add(Path(".agentops/runtime/gstack"))
+    return tuple(sorted(inferred, key=lambda path: path.as_posix()))
 
 
 def _renderer_environment(workspace: Path) -> dict[str, str]:
