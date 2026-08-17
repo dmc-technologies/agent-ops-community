@@ -4,29 +4,29 @@ Repository: `agent-ops-community`
 
 ## Current State
 
-- Branch: `fix/unchanged-managed-refresh`
-- Main baseline: `84c38fd811505f5a11dd2b78ecea6ab49a75d426`, the exact community `origin/main` selected for this correction.
-- Current handoff: Community pull request #35 contains the managed-refresh correction. An existing regular file is preserved when its bytes and mode exactly match the next plan, so a normally imported Python-backed skill keeps its valid bytecode cache across an unchanged refresh. Changed sources still use the established replacement transaction, and stale or hostile caches still fail audit. No Plane work item applies.
-- Verification: the new unchanged-refresh regression failed first because the source inode changed and passes after the transaction correction. The three focused refresh/cache nodes pass; the transaction suite passes with 239 tests; the other six deployment suites pass with 441 tests; and the complete suite passes with 947 passed and 3 skipped from 950 collected tests. Ruff, the harness check, and `git diff --check` pass. Hosted Linux and Windows CI run `32040576336` passed implementation commit `d8dbc310d9c2557868d4cd211ed8094bac4829e1`; the final closeout head requires the same exact-head gates.
+- Branch: `docs/pr-review-policy-harmonization`
+- Main baseline: `01c09b23124bb49ecfc56be745731506393cc680`, current Community `origin/main`, including merged PR35.
+- Current handoff: PR33 carries the shared contributor review and closure policy on top of the merged managed-refresh correction. The policy change does not alter Review Gate code, runtime behavior, managed deployment channels, credentials, framework adapters, or PR35. No Plane work item applies.
+- Verification: replacement local and hosted gates are required after this rebase.
 
 ## Current Work
 
-- Goal: allow routine managed refresh after normal Python use without rewriting unchanged sources or weakening runtime-cache audit boundaries.
-- Active task: verify the final closeout head locally and in hosted Linux and Windows CI without applying the Review Gate label or merging.
-- Files in play: `src/agent_ops/deployment/transaction.py`, `tests/test_deployment_transaction.py`, and this harness closeout record.
+- Goal: keep PR33's policy result reconciled with merged PR35 and current Community `main`, then obtain fresh exact-head CI and one Review Gate.
+- Active task: run the affected local checks, push the rebased closeout head, wait for hosted Linux and Windows CI, apply `ai review` once, and monitor the fresh Review Gate. Do not merge.
+- Files in play: `AGENTS.md` and this harness closeout record.
 - Blockers: none.
 
 ## Next Actions
 
-- Repeat `.venv/bin/ruff check .`, `.venv/bin/python -m pytest`, `.venv/bin/agentops harness check .`, and `git diff --check` on the final closeout SHA.
-- Obtain ordinary hosted Linux and Windows CI on that exact head.
-- Leave Community pull request #35 open for a later person-applied `ai review`; do not merge. After merge, the private caller must pin the Community merge commit and rerun its acceptance and CI.
+- Run `uv run --extra dev ruff check .`, `uv run --extra dev pytest tests/test_public_safety.py tests/test_harness.py -q`, `uv run --extra dev agentops harness check .`, and `git diff --check origin/main...HEAD` on the final closeout SHA.
+- Obtain ordinary hosted Linux and Windows CI on that exact head, then apply `ai review` once and monitor Review Gate.
+- Keep PR33 open for Dan; no downstream rerun or merge is authorized by this rollout.
 
 ## Session Log
 
-- 2026-08-17: A transaction regression installed a Python-backed managed skill, imported it in a normal Python subprocess to create its cache, and refreshed unchanged bytes at a new source revision. The old transaction replaced the unchanged source, changed its inode and modification time, and made the retained cache fail audit. Exact existing managed bytes and mode now use the established non-mutating operation; changed source bytes still replace the file, and stale or hostile caches remain unexpected. The focused nodes, 239-test transaction suite, 441-test adjacent deployment suite, 950-test complete suite, Ruff, harness, and whitespace validation passed locally. Community pull request #35 opened; hosted Linux and Windows CI run `32040576336` passed implementation commit `d8dbc310d9c2557868d4cd211ed8094bac4829e1`. No Plane work item applies.
+- 2026-08-17: Rebased PR33 onto current Community `main` after PR35 merged as `01c09b23124bb49ecfc56be745731506393cc680`. Reconciled the overlapping harness progress record without changing PR35 implementation or Review Gate code. Prior CI and Review Gate evidence is invalidated; replacement local and hosted gates are required. Do not merge.
 
-- 2026-08-17: A public `DeploymentEngine.refresh` regression reproduced that `type(Path("x"))` is the platform concrete path class rather than the `Path` factory class, causing every nonempty removal plan to fail validation. The validator now compares against `type(Path())`, preserving exact-type rejection for subclasses. The single regression, 361 adjacent deployment tests, and the 948-test complete suite pass locally; final exact-commit gates and hosted Linux/Windows CI remain.
+- 2026-08-17: Pull request 33 documents the shared contributor review and closure baseline without changing Review Gate code, runtime behavior, managed deployment channels, credentials, framework adapters, or pull request 31. `uv run --extra dev ruff check .` passed, `uv run --extra dev pytest` passed 924 tests with 3 skipped, `uv run --extra dev agentops harness check .` passed, and `git diff --check origin/main...HEAD` was silent. The final closeout commit, exact-head hosted Linux and Windows CI, one hosted `ai review`, and accepted Review Gate remain; do not merge. No Plane work item applies.
 
 - 2026-08-17: Structures pull request #5 Review Gate run `32004861145` produced `PASS` with no findings, then failed solely because GitHub returned `Unprocessable Entity (HTTP 422)` while submitting the optional approval. The correction accepts that exact response only when trusted API reads prove the authenticated actor opened the pull request. Other publication errors and unconfirmed `422` responses remain failures.
 
