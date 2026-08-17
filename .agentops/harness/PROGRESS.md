@@ -7,24 +7,25 @@ Repository: `agent-ops-community`
 - Branch: `docs/pr-review-policy-harmonization`
 - Main baseline: `01c09b23124bb49ecfc56be745731506393cc680`, current Community `origin/main`, including merged PR35.
 - Current handoff: PR33 carries the shared contributor review and closure policy on top of the merged managed-refresh correction. The policy change does not alter Review Gate code, runtime behavior, managed deployment channels, credentials, framework adapters, or PR35. No Plane work item applies.
-- Verification: replacement local and hosted gates are required after this rebase.
+- Verification: `uv run --extra dev pytest tests/test_public_safety.py tests/test_harness.py -q` passed 11 tests; `uv run --extra dev ruff check .`, `uv run --extra dev agentops harness check .`, and `git diff --check origin/main...HEAD` passed. Replacement hosted Linux and Windows CI plus one Review Gate remain required.
 
 ## Current Work
 
 - Goal: keep PR33's policy result reconciled with merged PR35 and current Community `main`, then obtain fresh exact-head CI and one Review Gate.
-- Active task: run the affected local checks, push the rebased closeout head, wait for hosted Linux and Windows CI, apply `ai review` once, and monitor the fresh Review Gate. Do not merge.
+- Active task: push the rebased closeout head, wait for hosted Linux and Windows CI, apply `ai review` once, and monitor the fresh Review Gate. Do not merge.
 - Files in play: `AGENTS.md` and this harness closeout record.
 - Blockers: none.
 
 ## Next Actions
 
-- Run `uv run --extra dev ruff check .`, `uv run --extra dev pytest tests/test_public_safety.py tests/test_harness.py -q`, `uv run --extra dev agentops harness check .`, and `git diff --check origin/main...HEAD` on the final closeout SHA.
-- Obtain ordinary hosted Linux and Windows CI on that exact head, then apply `ai review` once and monitor Review Gate.
+- Obtain ordinary hosted Linux and Windows CI on the pushed exact head, then run the independent local advisory, apply `ai review` once, and monitor Review Gate.
 - Keep PR33 open for Dan; no downstream rerun or merge is authorized by this rollout.
 
 ## Session Log
 
 - 2026-08-17: Rebased PR33 onto current Community `main` after PR35 merged as `01c09b23124bb49ecfc56be745731506393cc680`. Reconciled the overlapping harness progress record without changing PR35 implementation or Review Gate code. Prior CI and Review Gate evidence is invalidated; replacement local and hosted gates are required. Do not merge.
+
+- 2026-08-17: On the rebased policy head, `uv run --extra dev pytest tests/test_public_safety.py tests/test_harness.py -q` passed 11 tests; `uv run --extra dev ruff check .`, `uv run --extra dev agentops harness check .`, and `git diff --check origin/main...HEAD` passed. The policy remains public-safe and repository-specific verification remains intact. Push, exact-head hosted Linux and Windows CI, one independent local advisory, and one hosted Review Gate remain; do not merge.
 
 - 2026-08-17: Pull request 33 documents the shared contributor review and closure baseline without changing Review Gate code, runtime behavior, managed deployment channels, credentials, framework adapters, or pull request 31. `uv run --extra dev ruff check .` passed, `uv run --extra dev pytest` passed 924 tests with 3 skipped, `uv run --extra dev agentops harness check .` passed, and `git diff --check origin/main...HEAD` was silent. The final closeout commit, exact-head hosted Linux and Windows CI, one hosted `ai review`, and accepted Review Gate remain; do not merge. No Plane work item applies.
 
