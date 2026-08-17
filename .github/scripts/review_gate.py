@@ -148,6 +148,7 @@ class ResolutionState:
     sha: str
     scope: str
     findings: tuple[Finding, ...]
+    backend: str = ""
 
 
 @dataclass(frozen=True)
@@ -1041,20 +1042,23 @@ def _finding_payload(finding: Finding) -> dict:
 
 
 def _encoded_resolution_payload(state: ResolutionState) -> str:
-    payload = json.dumps(
-        {
-            "repo": state.repo,
-            "pr_number": state.pr_number,
-            "base_ref": state.base_ref,
-            "merge_base_sha": state.merge_base_sha,
-            "sha": state.sha,
-            "scope": state.scope,
-            "findings": [_finding_payload(finding) for finding in state.findings],
-        },
+    payload = {
+        "repo": state.repo,
+        "pr_number": state.pr_number,
+        "base_ref": state.base_ref,
+        "merge_base_sha": state.merge_base_sha,
+        "sha": state.sha,
+        "scope": state.scope,
+        "findings": [_finding_payload(finding) for finding in state.findings],
+    }
+    if state.backend:
+        payload["backend"] = state.backend
+    encoded_payload = json.dumps(
+        payload,
         sort_keys=True,
         separators=(",", ":"),
     )
-    return base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii")
+    return base64.urlsafe_b64encode(encoded_payload.encode("utf-8")).decode("ascii")
 
 
 def sign_resolution_state(state: ResolutionState) -> str:
@@ -1091,6 +1095,7 @@ def verify_resolution_state(
         merge_base_sha = str(payload["merge_base_sha"]).strip()
         sha = str(payload["sha"]).strip()
         scope = str(payload["scope"]).strip()
+        backend = str(payload.get("backend") or "").strip()
         raw_findings = payload["findings"]
         if (
             not repo
@@ -1099,6 +1104,7 @@ def verify_resolution_state(
             or not merge_base_sha
             or not sha
             or scope not in {"lite", "critical"}
+            or backend not in {"", "codex"}
             or not isinstance(raw_findings, list)
         ):
             return None
@@ -1126,6 +1132,7 @@ def verify_resolution_state(
         sha=sha,
         scope=scope,
         findings=findings,
+        backend=backend,
     )
 
 
@@ -1220,6 +1227,11 @@ def expected_gate_login() -> str | None:
     return configured or None
 
 
+def review_comment_backend(body: str) -> str:
+    match = re.search(r"^## Backend\n- ([^\n]+)$", body, flags=re.MULTILINE)
+    return match.group(1).strip() if match else ""
+
+
 def read_resolution_state(repo: str, pr_number: int) -> ResolutionState | None:
     try:
         comments = fetch_issue_comments(repo, pr_number)
@@ -1241,8 +1253,14 @@ def read_resolution_state(repo: str, pr_number: int) -> ResolutionState | None:
             if expected_login is None or author != expected_login:
                 continue
             if token.startswith("unsigned."):
-                return verify_resolution_state(token, allow_trusted_unsigned=True)
-            return verify_resolution_state(token)
+                state = verify_resolution_state(token, allow_trusted_unsigned=True)
+            else:
+                state = verify_resolution_state(token)
+            if state is None:
+                return None
+            if state.backend == "codex" or review_comment_backend(body) == "codex":
+                return state
+            return None
         return None
     return None
 
@@ -1252,12 +1270,16 @@ def post_or_update_pr_comment(repo: str, pr_number: int, body: str) -> None:
     expected_login = expected_gate_login()
     for comment in fetch_issue_comments(repo, pr_number):
         author = str((comment.get("user") or {}).get("login") or "")
-        body = str(comment.get("body") or "")
-        exact_header = body.splitlines()[:2] == [
+        existing_body = str(comment.get("body") or "")
+        exact_header = existing_body.splitlines()[:2] == [
             COMMENT_MARKER,
             "# Review Gate agent review",
         ]
-        if exact_header and author == expected_login:
+        if (
+            exact_header
+            and author == expected_login
+            and review_comment_backend(existing_body) != "preflight"
+        ):
             comment_id = comment["id"]
             break
     if comment_id:
@@ -1643,9 +1665,9 @@ def main() -> None:
             )
 
     review_failed = any(finding.code in REVIEW_FAILURE_CODES for finding in result.blocking)
-    if review_failed:
+    if review_failed or result.backend == "prior-review":
         next_state = prior_state
-    elif result.blocking:
+    elif result.backend == "codex" and result.blocking:
         next_state = ResolutionState(
             repo=args.repo,
             pr_number=args.pr,
@@ -1654,6 +1676,7 @@ def main() -> None:
             sha=args.sha,
             scope="critical",
             findings=result.blocking,
+            backend="codex",
         )
     else:
         next_state = None

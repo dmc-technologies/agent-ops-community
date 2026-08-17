@@ -24,6 +24,10 @@ Repository: `agent-ops-community`
 
 ## Session Log
 
+- 2026-08-16: Review Gate run `31991058112` found that the preflight-evidence preservation scan shadowed the requested model-comment body. The targeted correction keeps the requested body separate, and the regression now proves the exact Codex body is posted, its `backend=codex` state is readable, and a later unchanged head reuses the blocker rather than rediscovering. Replacement CI and targeted resolution remain pending.
+
+- 2026-08-16: Issue 18 repair keeps deterministic preflight comments and their Actions evidence separate from reusable model-review state. Legacy signed and unsigned preflight state now causes an authorized same-head discovery recheck, while an actual Codex result remains reusable. Focused state and evidence-preservation regressions, the 34-test Review Gate suite, Ruff, harness check, and whitespace validation pass locally; focused pull request, hosted CI, and one discovery review remain pending.
+
 - 2026-08-13: Review Gate run `31703138089` found missing higher-precedence OpenClaw roots. Collision discovery now includes the personal compatibility root whenever the selected state is the default regardless of config location, plus default and configured agent workspace `skills` and `.agents/skills` roots.
 
 - 2026-08-13: Review Gate run `31701642780` found a POSIX target-replacement race and OpenClaw target-context mismatch. POSIX updates now pin the exact managed target identity, verify the renamed backup before promoting the stage, and restore a concurrent replacement on mismatch. OpenClaw discovery now carries the selected target state through config, limits, compatibility roots, and plugin scanning, including separate config and state paths.
@@ -104,6 +108,10 @@ Repository: `agent-ops-community`
   mechanical/domain, product, security, and evidence prompt into Codex.
 
 ## Verification Log
+
+- 2026-08-16: After Review Gate finding `CODEX_P1_1`, `python3 -m pytest -o addopts='' -q tests/test_review_gate.py::test_model_review_does_not_replace_preflight_evidence` passed (`1 passed`); `python3 -m pytest -o addopts='' -q tests/test_review_gate.py` passed (`34 passed`); `ruff check .`, `agentops harness check .`, and `git diff --check` passed before the replacement head.
+
+- 2026-08-16: `python3 -m pytest -o addopts='' -q tests/test_review_gate.py::test_legacy_preflight_state_is_rechecked_but_model_state_is_reused tests/test_review_gate.py::test_model_review_does_not_replace_preflight_evidence` passed (`2 passed`); `python3 -m pytest -o addopts='' -q tests/test_review_gate.py` passed (`34 passed`); `ruff check .`, `agentops harness check .`, and `git diff --check` passed.
 
 - 2026-08-10: The latest Review Gate corrections bind every generated path to the selected Prime profile, exclude four hook-enforced gstack workflows that Prime cannot safely preserve, adapt investigate to a truthful manual scope boundary, package the required review, plan-review, design, and extension assets, and reject dirty Superpowers source checkouts. A real pinned install produced 38 gstack and 14 Superpowers skills in a custom disposable profile with no unresolved provider/profile markers; required runtime assets and review paths resolved. `uv run --extra dev ruff check .`, `uv run --extra dev pytest -q` (`91 passed`), `uv run --extra dev agentops harness check .`, and `git diff --check` passed.
 - 2026-08-10: After the final Review Gate run, the Prime Superpowers adapter now proves closure for namespaced skill transitions and managed file references, states the child-to-parent reply contract correctly, and treats an empty native Prime profile override as unset. `uv run --extra dev ruff check .`, `uv run --extra dev pytest -q` (`88 passed`), `uv run --extra dev agentops harness check .`, and `git diff --check` passed; adapting the exact pinned Superpowers checkout produced all 14 skills with reference validation enabled.

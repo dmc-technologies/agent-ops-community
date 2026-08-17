@@ -4,6 +4,16 @@ Repository: `agent-ops-community`
 
 Record durable architecture, workflow, and harness decisions here.
 
+### 2026-08-16: Only model results may be reused as Review Gate resolution state
+
+- Decision: a preflight result never creates reusable resolution state. Legacy state comments without recorded provenance are reusable only when their trusted Review Gate comment records `Backend: codex`; new state records Codex provenance in its signed payload. Keep preflight comments separate when posting the later model result.
+- Rationale: deterministic checks can change without a pull-request commit. Replaying an old preflight finding prevents the corrected check and model from running, while replaying an actual same-head Codex result avoids unnecessary repeat discovery.
+- Applies to: `.github/scripts/review_gate.py` and `tests/test_review_gate.py`.
+- Revisit when: Review Gate gains a versioned persistent result store that can retain backend provenance without relying on GitHub comment structure.
+
+- Correction: retain the requested model-comment body while scanning existing comments. Scanned comments are evidence only; they must never replace the body passed to the POST or PATCH request.
+- Rationale: replacement with a preflight comment would discard the signed Codex state and let a later same-head retry rediscover instead of carrying a known blocker.
+
 ### 2026-08-13: HumanLayer show-me stays an exact pinned dependency
 
 - Decision: install only `plugins/show-me/skills/show-me` from `humanlayer/skills` version 1.0.0 at commit `4d8d644ca747517973f58d7953f58d7cd07520cd` through a fingerprint-owned transactional adapter for all six managed agent hosts. Keep the upstream skill identity and core instructions, but replace its host-specific HTML opener with a portable artifact-preview fallback.
