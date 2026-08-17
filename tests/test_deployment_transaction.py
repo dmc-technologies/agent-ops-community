@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ctypes
+import errno
 import hashlib
 import json
 import multiprocessing
@@ -7,15 +9,18 @@ import os
 import py_compile
 import socket
 import stat
+import sys
 import threading
 from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from agent_ops.deployment import transaction as transaction_module
 from agent_ops.deployment.models import (
+    LegacyLinkTransition,
     PlannedFile,
     ProviderPlan,
     TargetChannelTransition,
@@ -44,6 +49,36 @@ def _plan(
         target=TargetSpec("codex-dev", Framework.CODEX, home, "feature"),
         files=tuple(files),
     )
+
+
+def _legacy_plan(home: Path) -> ProviderPlan:
+    return ProviderPlan(
+        "fixture",
+        "1" * 40,
+        TargetSpec("codex-dev", Framework.CODEX, home, "stable"),
+        (PlannedFile(Path("AGENTS.md"), b"stable\n", 0o644),),
+        legacy_link_transition=LegacyLinkTransition(
+            "fixture",
+            "codex-dev",
+            "stable",
+            Path("AGENTS.md"),
+            "configs/global/AGENTS.md",
+            b"stable\n",
+            0o644,
+        ),
+    )
+
+
+class _FakeNativeRename:
+    def __init__(self, result: int) -> None:
+        self.result = result
+        self.calls: list[tuple[object, ...]] = []
+        self.argtypes: object = None
+        self.restype: object = None
+
+    def __call__(self, *args: object) -> int:
+        self.calls.append(args)
+        return self.result
 
 
 def _run_bounded(function: Callable[[], object]) -> tuple[str, object]:
@@ -97,6 +132,471 @@ def test_transaction_installs_and_audits_exact_plan(tmp_path: Path) -> None:
     ]
     assert stat.S_IMODE((target.home / "skills/example/SKILL.md").stat().st_mode) == 0o644
     assert audit_provider_plans((plan,)).matches
+
+
+def test_legacy_link_transition_record_binds_exact_authority(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "AGENTS.md").symlink_to("configs/global/AGENTS.md")
+    install_provider_plans((_legacy_plan(home),))
+    record_path = next((home / ".agentops/deployment/transactions").glob("*/record.json"))
+    record = json.loads(record_path.read_text())
+    assert record["legacy_link_transition"]["destination"] == "AGENTS.md"
+    record["legacy_link_transition"]["expected_link_text"] = "other"
+    record_path.write_text(json.dumps(record))
+    record_path.chmod(0o600)
+    with pytest.raises(ValueError, match="legacy link"):
+        recover_transaction(record_path)
+
+
+@pytest.mark.parametrize(
+    ("platform", "symbol", "flag"),
+    [("linux", "renameat2", 1), ("darwin", "renameatx_np", 0x00000004)],
+)
+def test_atomic_noreplace_selects_native_backend_with_exact_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+    platform: str,
+    symbol: str,
+    flag: int,
+) -> None:
+    native = _FakeNativeRename(0)
+    monkeypatch.setattr(sys, "platform", platform)
+    monkeypatch.setattr(
+        ctypes,
+        "CDLL",
+        lambda *_args, **_kwargs: SimpleNamespace(**{symbol: native}),
+    )
+
+    transaction_module._rename_noreplace_at(
+        "source",
+        "destination",
+        source_dir_fd=11,
+        destination_dir_fd=12,
+    )
+
+    assert native.calls == [(11, b"source", 12, b"destination", flag)]
+    assert native.argtypes is not None
+    assert native.restype is ctypes.c_int
+
+
+@pytest.mark.parametrize(
+    ("native_errno", "error_type", "message"),
+    [
+        (errno.EEXIST, FileExistsError, "destination"),
+        (errno.ENOSYS, transaction_module.UnsupportedPlatformError, "unavailable"),
+        (errno.EPERM, OSError, "not permitted"),
+    ],
+)
+def test_macos_atomic_noreplace_maps_native_errno_exactly(
+    monkeypatch: pytest.MonkeyPatch,
+    native_errno: int,
+    error_type: type[BaseException],
+    message: str,
+) -> None:
+    native = _FakeNativeRename(-1)
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(
+        ctypes,
+        "CDLL",
+        lambda *_args, **_kwargs: SimpleNamespace(renameatx_np=native),
+    )
+    monkeypatch.setattr(ctypes, "get_errno", lambda: native_errno)
+
+    with pytest.raises(error_type, match=message):
+        transaction_module._rename_noreplace_at(
+            "source",
+            "destination",
+            source_dir_fd=11,
+            destination_dir_fd=12,
+        )
+
+
+def test_legacy_link_transition_without_atomic_backend_creates_no_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    destination = home / "AGENTS.md"
+    destination.symlink_to("configs/global/AGENTS.md")
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(ctypes, "CDLL", lambda *_args, **_kwargs: SimpleNamespace())
+
+    with pytest.raises(transaction_module.UnsupportedPlatformError, match="unavailable"):
+        install_provider_plans((_legacy_plan(home),))
+
+    assert destination.is_symlink()
+    assert os.readlink(destination) == "configs/global/AGENTS.md"
+    assert not (home / ".agentops").exists()
+
+
+def test_legacy_link_transition_record_cannot_downgrade_to_prior_schema(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "AGENTS.md").symlink_to("configs/global/AGENTS.md")
+    install_provider_plans((_legacy_plan(home),))
+    record_path = next((home / ".agentops/deployment/transactions").glob("*/record.json"))
+    record = json.loads(record_path.read_text())
+    del record["legacy_link_transition"]
+    record_path.write_text(json.dumps(record))
+    record_path.chmod(0o600)
+
+    with pytest.raises(ValueError, match="missing transaction record member"):
+        recover_transaction(record_path)
+
+
+def test_legacy_link_transition_schema_downgrade_cannot_rollback_installed_file(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    destination = home / "AGENTS.md"
+    destination.symlink_to("configs/global/AGENTS.md")
+    manifest = install_provider_plans((_legacy_plan(home),))[0]
+    record_path = (
+        home
+        / ".agentops/deployment/transactions"
+        / manifest.transaction_id
+        / "record.json"
+    )
+    evidence = record_path.parent / "prestate/legacy-link.json"
+    record = json.loads(record_path.read_text())
+    record["schema_version"] = 3
+    del record["legacy_link_transition"]
+    record_path.write_text(json.dumps(record))
+    record_path.chmod(0o600)
+    installed = destination.read_bytes()
+
+    with pytest.raises(ValueError, match="prestate evidence"):
+        rollback_manifests((manifest,))
+
+    assert destination.read_bytes() == installed
+    assert evidence.is_file()
+    assert record_path.is_file()
+
+
+def test_legacy_link_transition_schema_downgrade_recovery_preserves_prior_link(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    destination = home / "AGENTS.md"
+    destination.symlink_to("configs/global/AGENTS.md")
+    stop = SystemExit(23)
+    original_write = transaction_module._HomeFS.write_file
+
+    def stop_after_record(
+        home_fs: object,
+        relative: Path,
+        content: bytes,
+        mode: int,
+    ) -> None:
+        original_write(home_fs, relative, content, mode)
+        if relative.name == "record.json":
+            raise stop
+
+    monkeypatch.setattr(transaction_module._HomeFS, "write_file", stop_after_record)
+    with pytest.raises(SystemExit) as caught:
+        install_provider_plans((_legacy_plan(home),))
+    assert caught.value is stop
+    monkeypatch.setattr(transaction_module._HomeFS, "write_file", original_write)
+
+    record_path = next((home / ".agentops/deployment/transactions").glob("*/record.json"))
+    evidence = record_path.parent / "prestate/legacy-link.json"
+    record = json.loads(record_path.read_text())
+    record["schema_version"] = 3
+    del record["legacy_link_transition"]
+    record_path.write_text(json.dumps(record))
+    record_path.chmod(0o600)
+
+    with pytest.raises(ValueError, match="prestate evidence"):
+        recover_transaction(record_path)
+
+    assert destination.is_symlink()
+    assert os.readlink(destination) == "configs/global/AGENTS.md"
+    assert evidence.is_file()
+    assert record_path.is_file()
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("provider_id", True),
+        ("target_id", True),
+        ("expected_channel", True),
+        ("destination", "other"),
+        ("expected_link_text", True),
+        ("replacement_fingerprint", "f" * 64),
+        ("replacement_mode", True),
+        ("operation_index", True),
+        ("prestate_evidence", "other"),
+        ("retained_entry", "other"),
+    ],
+)
+def test_legacy_link_transition_record_rejects_tampered_binding(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "AGENTS.md").symlink_to("configs/global/AGENTS.md")
+    install_provider_plans((_legacy_plan(home),))
+    record_path = next((home / ".agentops/deployment/transactions").glob("*/record.json"))
+    record = json.loads(record_path.read_text())
+    record["legacy_link_transition"][field] = value
+    record_path.write_text(json.dumps(record))
+    record_path.chmod(0o600)
+
+    with pytest.raises(ValueError, match="legacy link"):
+        recover_transaction(record_path)
+
+
+def test_legacy_link_transition_migrates_only_exact_existing_link(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "AGENTS.md").symlink_to("configs/global/AGENTS.md")
+    install_provider_plans((_legacy_plan(home),))
+    assert not (home / "AGENTS.md").is_symlink()
+
+
+def test_legacy_link_transition_allows_absent_destination_as_normal_install(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    install_provider_plans((_legacy_plan(home),))
+    record_path = next((home / ".agentops/deployment/transactions").glob("*/record.json"))
+    record = json.loads(record_path.read_text())
+    assert record["legacy_link_transition"] is None
+
+
+def test_legacy_link_transition_rollback_restores_exact_link(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    destination = home / "AGENTS.md"
+    destination.symlink_to("configs/global/AGENTS.md")
+    manifests = install_provider_plans((_legacy_plan(home),))
+
+    rollback_manifests(manifests)
+
+    assert destination.is_symlink()
+    assert os.readlink(destination) == "configs/global/AGENTS.md"
+
+
+def test_legacy_link_transition_failure_restores_exact_link(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    destination = home / "AGENTS.md"
+    destination.symlink_to("configs/global/AGENTS.md")
+
+    def fail_before_manifest(*_args: object) -> None:
+        raise OSError("injected publication failure")
+
+    monkeypatch.setattr(transaction_module, "_before_manifest_replace", fail_before_manifest)
+
+    with pytest.raises(OSError, match="injected publication failure"):
+        install_provider_plans((_legacy_plan(home),))
+
+    assert destination.is_symlink()
+    assert os.readlink(destination) == "configs/global/AGENTS.md"
+
+
+def test_legacy_link_transition_wrong_link_remains_unchanged(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    destination = home / "AGENTS.md"
+    destination.symlink_to("other-policy.md")
+
+    with pytest.raises(ValueError, match="symbolic link"):
+        install_provider_plans((_legacy_plan(home),))
+
+    assert destination.is_symlink()
+    assert os.readlink(destination) == "other-policy.md"
+    assert not (home / ".agentops").exists()
+
+
+def test_existing_transaction_record_without_legacy_member_remains_recoverable(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    manifest = install_provider_plans(
+        (_plan(home, PlannedFile(Path("skills/example/SKILL.md"), b"body\n", 0o644)),)
+    )[0]
+    record_path = next((home / ".agentops/deployment/transactions").glob("*/record.json"))
+    record = json.loads(record_path.read_text())
+    record["schema_version"] = 3
+    del record["legacy_link_transition"]
+    record_path.write_text(json.dumps(record))
+    record_path.chmod(0o600)
+
+    assert recover_transaction(record_path) == manifest
+
+
+def test_legacy_link_transition_later_refresh_uses_normal_managed_path(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    destination = home / "AGENTS.md"
+    destination.symlink_to("configs/global/AGENTS.md")
+    install_provider_plans((_legacy_plan(home),))
+
+    refreshed = ProviderPlan(
+        "fixture",
+        "2" * 40,
+        TargetSpec("codex-dev", Framework.CODEX, home, "stable"),
+        (PlannedFile(Path("AGENTS.md"), b"refreshed\n", 0o600),),
+        legacy_link_transition=LegacyLinkTransition(
+            "fixture",
+            "codex-dev",
+            "stable",
+            Path("AGENTS.md"),
+            "configs/global/AGENTS.md",
+            b"refreshed\n",
+            0o600,
+        ),
+    )
+    install_provider_plans((refreshed,))
+    record_path = sorted(
+        (home / ".agentops/deployment/transactions").glob("*/record.json"),
+        key=lambda path: path.stat().st_mtime_ns,
+    )[-1]
+
+    assert destination.read_bytes() == b"refreshed\n"
+    assert stat.S_IMODE(destination.stat().st_mode) == 0o600
+    assert json.loads(record_path.read_text())["legacy_link_transition"] is None
+
+
+def test_recovery_verifies_completed_legacy_link_rollback(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    destination = home / "AGENTS.md"
+    destination.symlink_to("configs/global/AGENTS.md")
+    manifest = install_provider_plans((_legacy_plan(home),))[0]
+    record_path = (
+        home
+        / ".agentops/deployment/transactions"
+        / manifest.transaction_id
+        / "record.json"
+    )
+
+    rollback_manifests((manifest,))
+
+    assert recover_transaction(record_path) == manifest
+    assert destination.is_symlink()
+    assert os.readlink(destination) == "configs/global/AGENTS.md"
+
+
+@pytest.mark.parametrize("process_exit", [KeyboardInterrupt("stop"), SystemExit(19)])
+def test_legacy_link_transition_restores_same_process_control_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    process_exit: BaseException,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    destination = home / "AGENTS.md"
+    destination.symlink_to("configs/global/AGENTS.md")
+
+    def interrupt(*_args: object) -> None:
+        raise process_exit
+
+    monkeypatch.setattr(transaction_module, "_before_manifest_replace", interrupt)
+
+    with pytest.raises(type(process_exit)) as caught:
+        install_provider_plans((_legacy_plan(home),))
+
+    assert caught.value is process_exit
+    assert destination.is_symlink()
+    assert os.readlink(destination) == "configs/global/AGENTS.md"
+
+
+def test_legacy_link_transition_preserves_replacement_at_final_move_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    destination = home / "AGENTS.md"
+    destination.symlink_to("configs/global/AGENTS.md")
+    original_move = transaction_module._rename_noreplace_at
+
+    def replace_at_boundary(
+        source: str,
+        target: str,
+        *,
+        source_dir_fd: int,
+        destination_dir_fd: int,
+    ) -> None:
+        if target == "legacy-link.entry":
+            os.unlink(source, dir_fd=source_dir_fd)
+            os.symlink("concurrent-policy.md", source, dir_fd=source_dir_fd)
+        original_move(
+            source,
+            target,
+            source_dir_fd=source_dir_fd,
+            destination_dir_fd=destination_dir_fd,
+        )
+
+    monkeypatch.setattr(transaction_module, "_rename_noreplace_at", replace_at_boundary)
+
+    with pytest.raises(IncompleteRollbackError, match="rollback incomplete"):
+        install_provider_plans((_legacy_plan(home),))
+
+    assert destination.is_symlink()
+    assert os.readlink(destination) == "concurrent-policy.md"
+    assert len(list((home / ".agentops/deployment/transactions").glob("*/record.json"))) == 1
+
+
+def test_legacy_link_transition_preserves_post_move_destination_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    destination = home / "AGENTS.md"
+    destination.symlink_to("configs/global/AGENTS.md")
+
+    def create_destination(*_args: object) -> None:
+        destination.write_bytes(b"concurrent\n")
+
+    monkeypatch.setattr(transaction_module, "_after_legacy_link_move", create_destination)
+
+    with pytest.raises(IncompleteRollbackError, match="rollback incomplete"):
+        install_provider_plans((_legacy_plan(home),))
+
+    record_path = next((home / ".agentops/deployment/transactions").glob("*/record.json"))
+    backup = record_path.parent / "prestate/legacy-link.entry"
+    assert destination.read_bytes() == b"concurrent\n"
+    assert backup.is_symlink()
+    assert os.readlink(backup) == "configs/global/AGENTS.md"
+
+
+def test_legacy_link_transition_rollback_preserves_destination_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    destination = home / "AGENTS.md"
+    destination.symlink_to("configs/global/AGENTS.md")
+    manifest = install_provider_plans((_legacy_plan(home),))[0]
+    record_path = (
+        home
+        / ".agentops/deployment/transactions"
+        / manifest.transaction_id
+        / "record.json"
+    )
+    backup = record_path.parent / "prestate/legacy-link.entry"
+    original_move = transaction_module._HomeFS.move_new
+
+    def race_restore(home_fs: object, source: Path, target: Path) -> None:
+        if source.name == "legacy-link.entry" and target == Path("AGENTS.md"):
+            destination.write_bytes(b"concurrent rollback\n")
+        original_move(home_fs, source, target)
+
+    monkeypatch.setattr(transaction_module._HomeFS, "move_new", race_restore)
+
+    with pytest.raises(IncompleteRollbackError, match="rollback incomplete"):
+        rollback_manifests((manifest,))
+
+    assert destination.read_bytes() == b"concurrent rollback\n"
+    assert backup.is_symlink()
+    assert os.readlink(backup) == "configs/global/AGENTS.md"
 
 
 def test_audit_allows_co_resident_provider_owned_roots_only(tmp_path: Path) -> None:
@@ -2134,8 +2634,8 @@ def test_strict_transaction_json_rejects_ambiguity(
     record_path = next((home / ".agentops/deployment/transactions").glob("*/record.json"))
     if case == "duplicate-record-key":
         content = record_path.read_text().replace(
-            '"schema_version": 3,',
-            '"schema_version": 3,\n  "schema_version": 3,',
+            '"schema_version": 4,',
+            '"schema_version": 4,\n  "schema_version": 4,',
         )
         record_path.write_text(content)
     else:
