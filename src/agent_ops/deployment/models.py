@@ -99,6 +99,7 @@ class ProviderPlan:
     files: tuple[PlannedFile, ...]
     removals: tuple[Path, ...] = ()
     audit_roots: tuple[Path, ...] = ()
+    runtime_python_sources: tuple[Path, ...] = ()
 
     def __post_init__(self) -> None:
         _nonempty(self.provider_id, "provider id")
@@ -111,6 +112,11 @@ class ProviderPlan:
         )
         object.__setattr__(
             self, "audit_roots", tuple(_repository_relative_path(path) for path in self.audit_roots)
+        )
+        object.__setattr__(
+            self,
+            "runtime_python_sources",
+            tuple(_repository_relative_path(path) for path in self.runtime_python_sources),
         )
 
 
