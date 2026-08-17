@@ -4,25 +4,27 @@ Repository: `agent-ops-community`
 
 ## Current State
 
-- Branch: `fix/review-gate-approval-422`
-- Main baseline: `5dd64c759fcbfe5956d0936c7089f330e1b289ae`, the current community `origin/main` selected for this correction.
-- Current handoff: a live downstream retry consumed the merged identity-checked correction, produced a passing model result with no blockers, and still failed on the exact optional-approval `Unprocessable Entity (HTTP 422)` response because the token actor and pull-request author differed. Review Gate now preserves a passing result for that exact response without making an unsupported identity assumption. All other approval publication failures remain fail-closed. No Plane work item applies.
-- Verification: the differing-identity `422` regression failed against the merged baseline and passes after the correction. The focused Review Gate suite passes with 37 tests. The complete local gate passes: `ruff check .`; `python -m pytest -q` with 858 passed and 3 skipped from 861 collected tests; `agentops harness check .`; and `git diff --check`. Hosted gates remain pending.
+- Branch: `fix/deployment-engine-removal-path-type`
+- Main baseline: `a5f8f72f5a6b9103dc16428d4c81a0add07d67cc`, the exact community `origin/main` selected for this correction.
+- Current handoff: the public deployment engine now accepts nonempty removal plans containing the platform's exact concrete `Path` type while continuing to reject arbitrary subclasses. The regression exercises a complete refresh that installs and then removes one managed file. No Plane work item applies.
+- Verification: the new engine regression failed first with `ValueError: provider plan removals must be exact Path values` and passes after the one-line correction. The adjacent deployment engine, model, and transaction tests pass with 361 tests. The complete suite passes with 945 passed and 3 skipped from 948 collected tests; focused Ruff and `git diff --check` pass. Final exact-commit gates and hosted Linux/Windows CI remain pending.
 
 ## Current Work
 
-- Goal: prevent an optional self-approval rejection from replacing a successful Review Gate result with false failure evidence.
-- Active task: complete the replacement local gates, publish one coherent community pull request, obtain exact-head hosted CI and Review Gate, merge when both pass, and rerun one downstream caller against merged `main`.
-- Files in play: `.github/scripts/review_gate.py`, `tests/test_review_gate.py`, and harness closeout records.
+- Goal: allow the deployment engine to validate and execute safe nonempty removal plans on every supported platform.
+- Active task: complete the final local gates, publish one coherent community pull request, and obtain exact-head Linux and Windows CI without applying the Review Gate label or merging.
+- Files in play: `src/agent_ops/deployment/engine.py`, `tests/test_deployment_engine.py`, and this harness closeout record.
 - Blockers: none.
 
 ## Next Actions
 
 - Commit the coherent correction and repeat `ruff check .`, `python -m pytest -q`, `agentops harness check .`, and `git diff --check` on that exact SHA.
 - Push and open the community pull request, then obtain ordinary hosted Linux and Windows CI on its exact head.
-- Apply `ai review` once to the unchanged final head, merge only if Review Gate passes, and prove the Structures caller succeeds with the merged shared runtime.
+- Stop after CI. Dan must authorize the targeted hosted review before a person applies `ai review`; do not merge without a passing Review Gate on the unchanged final head.
 
 ## Session Log
+
+- 2026-08-17: A public `DeploymentEngine.refresh` regression reproduced that `type(Path("x"))` is the platform concrete path class rather than the `Path` factory class, causing every nonempty removal plan to fail validation. The validator now compares against `type(Path())`, preserving exact-type rejection for subclasses. The single regression, 361 adjacent deployment tests, and the 948-test complete suite pass locally; final exact-commit gates and hosted Linux/Windows CI remain.
 
 - 2026-08-17: Structures pull request #5 Review Gate run `32004861145` produced `PASS` with no findings, then failed solely because GitHub returned `Unprocessable Entity (HTTP 422)` while submitting the optional approval. The correction accepts that exact response only when trusted API reads prove the authenticated actor opened the pull request. Other publication errors and unconfirmed `422` responses remain failures.
 
