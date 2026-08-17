@@ -114,6 +114,13 @@ Record durable architecture, workflow, and harness decisions here.
 
 ## Template
 
+### 2026-08-17: Source-store state stays private and audit receipts retain their first result
+
+- Decision: require the source-store root, sources, source directory, snapshot reads, and lock directory to be owned by the effective user with exact `0700` mode. Persist an HTTPS remote without userinfo and pass that userinfo only as transient Git fetch authentication. Retain the first audit result through receipt creation and refuse any later result that differs, including a previously missing managed file.
+- Rationale: local source mirrors can contain private repository data, and their configuration must not retain reusable credentials. A receipt represents the audit that authorized it, not a later changed target state.
+- Applies to: `src/agent_ops/deployment/source_store.py`, deployment audit retention, and their regression tests.
+- Revisit when: the source-store adds an approved credential helper or a durable encrypted credential boundary.
+
 ### YYYY-MM-DD: Decision title
 
 - Decision: what changed or what standard was chosen.

@@ -4,6 +4,7 @@ import hashlib
 import json
 import multiprocessing
 import os
+import stat
 import subprocess
 import threading
 import time
@@ -133,6 +134,41 @@ def test_branch_refresh_resolves_one_immutable_commit(
         text=True,
     ).stdout.strip()
     assert observed == snapshot.commit
+
+
+def test_source_store_creates_owner_only_state_for_fetched_private_content(
+    git_remote: Path, tmp_path: Path
+) -> None:
+    state = tmp_path / "state"
+    previous_umask = os.umask(0o022)
+    try:
+        snapshot = SourceStore(state).fetch(_source(git_remote), "refs/heads/main")
+    finally:
+        os.umask(previous_umask)
+
+    assert stat.S_IMODE(state.stat().st_mode) == 0o700
+    assert stat.S_IMODE((state / "sources").stat().st_mode) == 0o700
+    assert stat.S_IMODE((state / "sources/example").stat().st_mode) == 0o700
+    assert (snapshot.root / "catalog/skill.txt").read_text() == "one\n"
+
+
+def test_source_store_never_persists_https_credentials_in_mirror_config(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state"
+    source_root = state / "sources" / "private"
+    source_root.mkdir(parents=True)
+    store = SourceStore(state)
+
+    mirror = store._prepare_mirror(
+        source_root,
+        "https://username:password@example.invalid/private/repository.git",
+    )
+
+    persisted = (mirror / "config").read_text(encoding="utf-8")
+    assert "username" not in persisted
+    assert "password" not in persisted
+    assert "https://example.invalid/private/repository.git" in persisted
 
 
 def test_layout_detached_head_and_old_snapshot_remains_unchanged(
@@ -508,6 +544,9 @@ def test_unexpected_source_paths_and_failed_fetch_leave_no_temporaries(
     state = tmp_path / "state"
     mirror = state / "sources/example/mirror.git"
     mirror.parent.mkdir(parents=True)
+    state.chmod(0o700)
+    (state / "sources").chmod(0o700)
+    mirror.parent.chmod(0o700)
     mirror.symlink_to(tmp_path, target_is_directory=True)
     with pytest.raises(RuntimeError, match="mirror"):
         SourceStore(state).fetch(
@@ -795,6 +834,9 @@ def test_legacy_metadata_only_state_self_heals(git_remote: Path, tmp_path: Path)
     source_root = state / "sources/example"
     legacy = source_root / "snapshot-metadata"
     legacy.mkdir(parents=True)
+    state.chmod(0o700)
+    (state / "sources").chmod(0o700)
+    source_root.chmod(0o700)
     commit = _git("rev-parse", "refs/heads/main", cwd=git_remote)
     (legacy / f"{commit}.json").write_text("{}\n")
     snapshot = SourceStore(state).fetch(_source(git_remote), "refs/heads/main")
@@ -808,6 +850,9 @@ def test_legacy_metadata_parent_symlink_never_unlinks_outside(
     state = tmp_path / "state"
     source_root = state / "sources/example"
     source_root.mkdir(parents=True)
+    state.chmod(0o700)
+    (state / "sources").chmod(0o700)
+    source_root.chmod(0o700)
     outside = tmp_path / "outside-metadata"
     outside.mkdir()
     commit = _git("rev-parse", "refs/heads/main", cwd=git_remote)

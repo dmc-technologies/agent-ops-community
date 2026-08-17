@@ -238,7 +238,9 @@ class DeploymentEngine:
             plan = self._build_plan(registry_snapshot.config, targets, snapshots)
             audits = self._audit_plans(plan.provider_plans, require_matches=False)
             with retain_provider_plan_evidence(
-                plan.provider_plans, require_matches=False
+                plan.provider_plans,
+                require_matches=False,
+                expected_audits=audits,
             ) as authority:
                 receipt = self._receipt(
                     "audit",

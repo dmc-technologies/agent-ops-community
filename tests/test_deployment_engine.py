@@ -762,6 +762,38 @@ def test_engine_audit_reports_exact_installed_target_as_stable(tmp_path: Path) -
     assert registry.receipts()[-1] == receipt
 
 
+def test_engine_audit_refuses_a_stable_receipt_when_target_bytes_change_after_audit(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import agent_ops.deployment.engine as engine_module
+
+    engine, registry, home = _engine_fixture(tmp_path)
+    engine.refresh(("codex",))
+    original_audit = engine_module.audit_provider_plans
+
+    def audit_then_tamper(plans: tuple[ProviderPlan, ...]) -> DeploymentAudit:
+        audit = original_audit(plans)
+        (home / "skills/example/payload.txt").write_bytes(b"tampered after audit\n")
+        return audit
+
+    monkeypatch.setattr(engine_module, "audit_provider_plans", audit_then_tamper)
+
+    with pytest.raises(ValueError, match="retained audit evidence"):
+        engine.audit(("codex",))
+
+    assert len(registry.receipts()) == 1
+
+
+def test_engine_audit_reports_a_missing_managed_file_as_modified(tmp_path: Path) -> None:
+    engine, _registry, home = _engine_fixture(tmp_path)
+    engine.refresh(("codex",))
+    (home / "skills/example/payload.txt").unlink()
+
+    receipt = engine.audit(("codex",))
+
+    assert receipt.targets[0].state is TargetState.MODIFIED
+
+
 def test_launch_authorization_retains_exact_audit_and_revalidates_home(
     tmp_path: Path,
 ) -> None:

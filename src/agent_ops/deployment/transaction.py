@@ -3081,25 +3081,35 @@ class _RetainedProviderPlanEvidence:
         pinned: list[_PinnedStatusFile | _PinnedStatusDirectory],
         *,
         require_matches: bool,
+        expected_audits: dict[str, DeploymentAudit] | None,
     ) -> None:
         self._plans = plans
         self._pinned = pinned
         self._require_matches = require_matches
+        self._expected_audits = expected_audits
 
     def verify(self) -> None:
         _verify_locked_provider_plan_targets(self._plans)
         try:
             for evidence in self._pinned:
                 evidence.verify()
-            if self._require_matches:
-                for target_id in sorted({plan.target.id for plan in self._plans}):
-                    audit = audit_provider_plans(
-                        tuple(plan for plan in self._plans if plan.target.id == target_id)
+            for target_id in sorted({plan.target.id for plan in self._plans}):
+                audit = audit_provider_plans(
+                    tuple(plan for plan in self._plans if plan.target.id == target_id)
+                )
+                expected = (
+                    None
+                    if self._expected_audits is None
+                    else self._expected_audits[target_id]
+                )
+                if expected is not None and audit != expected:
+                    raise ValueError(
+                        f"retained audit evidence no longer matches target {target_id!r}"
                     )
-                    if not audit.matches:
-                        raise ValueError(
-                            f"retained audit evidence no longer matches target {target_id!r}"
-                        )
+                if self._require_matches and not audit.matches:
+                    raise ValueError(
+                        f"retained audit evidence no longer matches target {target_id!r}"
+                    )
             for evidence in self._pinned:
                 evidence.verify()
         except ValueError as error:
@@ -3113,6 +3123,7 @@ def retain_provider_plan_evidence(
     plans: tuple[ProviderPlan, ...],
     *,
     require_matches: bool = True,
+    expected_audits: dict[str, DeploymentAudit] | None = None,
 ) -> Iterator[_RetainedProviderPlanEvidence]:
     """Pin audited manifests, files, and directories through terminal success."""
     _require_supported_platform()
@@ -3120,6 +3131,9 @@ def retain_provider_plan_evidence(
     active = _GROUP_HOME_LOCKS.get()
     if active is None:
         raise RuntimeError("deployment target lock set is not active")
+    target_ids = {group.target.id for group in groups}
+    if expected_audits is not None and set(expected_audits) != target_ids:
+        raise ValueError("retained audit evidence must name every planned target")
     pinned: list[_PinnedStatusFile | _PinnedStatusDirectory] = []
     try:
         for group in groups:
@@ -3130,16 +3144,28 @@ def retain_provider_plan_evidence(
                 raise RuntimeError(
                     "active deployment lock set does not cover every target"
                 ) from error
-            pinned.append(
-                _PinnedStatusFile(home_fs, _manifest_path(group.target), manifest=True)
+            expected = (
+                None if expected_audits is None else expected_audits[group.target.id]
             )
-            pinned.extend(_PinnedStatusFile(home_fs, item.path) for item in group.files)
+            if expected is None or not expected.validation_errors:
+                pinned.append(
+                    _PinnedStatusFile(home_fs, _manifest_path(group.target), manifest=True)
+                )
+            missing = set() if expected is None else set(expected.missing)
+            pinned.extend(
+                _PinnedStatusFile(home_fs, item.path)
+                for item in group.files
+                if item.path.as_posix() not in missing
+            )
             pinned.extend(
                 _PinnedStatusDirectory(home_fs, item.path)
                 for item in _directories(group.files)
             )
         authority = _RetainedProviderPlanEvidence(
-            plans, pinned, require_matches=require_matches
+            plans,
+            pinned,
+            require_matches=require_matches,
+            expected_audits=expected_audits,
         )
         authority.verify()
         yield authority

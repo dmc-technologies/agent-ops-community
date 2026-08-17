@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import errno
 import hashlib
 import json
@@ -19,7 +20,7 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 from agent_ops.deployment.models import RewriteAcceptance, SourceSnapshot, SourceSpec
 
@@ -240,6 +241,28 @@ def _canonical_local_url(url: str) -> Path | None:
     return None
 
 
+def _persisted_remote_url_and_transient_auth(url: str) -> tuple[str, tuple[str, ...]]:
+    """Keep HTTPS userinfo out of mirror config while supplying it only to fetch."""
+    parsed = urlsplit(url)
+    if parsed.scheme.lower() != "https" or parsed.username is None:
+        return url, ()
+    host = parsed.hostname
+    if host is None:
+        raise ValueError("source URL is malformed")
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    if parsed.port is not None:
+        host = f"{host}:{parsed.port}"
+    persisted = urlunsplit(("https", host, parsed.path, "", ""))
+    credentials = base64.b64encode(
+        f"{unquote(parsed.username)}:{unquote(parsed.password or '')}".encode()
+    ).decode("ascii")
+    return persisted, (
+        "-c",
+        f"http.{persisted}.extraHeader=Authorization: Basic {credentials}",
+    )
+
+
 def _urls_equivalent(expected: str, observed: str) -> bool:
     if expected == observed:
         return True
@@ -265,14 +288,29 @@ def _require_directory(path: Path, label: str, *, create: bool = False) -> None:
         raise RuntimeError(f"{label} must be a non-symlink directory")
 
 
+def _require_owner_only_directory(path: Path, label: str, *, create: bool = False) -> None:
+    try:
+        item = path.lstat()
+    except FileNotFoundError:
+        if not create:
+            raise RuntimeError(f"{label} is missing") from None
+        path.mkdir(parents=True, mode=0o700, exist_ok=True)
+        item = path.lstat()
+    if (
+        not stat.S_ISDIR(item.st_mode)
+        or stat.S_ISLNK(item.st_mode)
+        or item.st_uid != os.geteuid()
+        or stat.S_IMODE(item.st_mode) != 0o700
+    ):
+        raise RuntimeError(f"{label} must be an owner-only 0o700 directory")
+
+
 def _ensure_store_root(state_root: Path) -> Path:
-    if state_root.exists() or state_root.is_symlink():
-        _require_directory(state_root, "source store root")
-    else:
-        state_root.mkdir(parents=True, exist_ok=True)
-        _require_directory(state_root, "source store root")
+    _require_owner_only_directory(state_root, "source store root", create=True)
     sources = state_root / "sources"
-    _require_directory(sources, "source store sources directory", create=True)
+    _require_owner_only_directory(
+        sources, "source store sources directory", create=True
+    )
     return sources
 
 
@@ -600,7 +638,7 @@ class SourceStore:
         sources = _ensure_store_root(self._state_root)
         with self._source_lock(sources, source.id):
             source_root = sources / source.id
-            _require_directory(source_root, "source directory", create=True)
+            _require_owner_only_directory(source_root, "source directory", create=True)
             self._cleanup_partial_state(source_root)
             mirror = self._prepare_mirror(source_root, url)
             previous = self._read_ref_state(source_root, source.id, ref)
@@ -610,7 +648,7 @@ class SourceStore:
             )
             candidate = f"refs/agentops/candidate/{uuid.uuid4().hex}"
             try:
-                commit = self._fetch_candidate(mirror, ref, candidate)
+                commit = self._fetch_candidate(mirror, ref, candidate, url)
                 self._check_refresh(mirror, source, ref, previous, commit, rewrite)
                 snapshot = self._ensure_snapshot(source_root, source.id, ref, commit)
                 expected_old = accepted_before or ("0" * 40)
@@ -635,11 +673,11 @@ class SourceStore:
     def snapshot(self, source_id: str, commit: str) -> SourceSnapshot:
         _validate_source_id(source_id)
         normalized = _normalize_commit(commit)
-        _require_directory(self._state_root, "source store root")
+        _require_owner_only_directory(self._state_root, "source store root")
         sources = self._state_root / "sources"
-        _require_directory(sources, "source store sources directory")
+        _require_owner_only_directory(sources, "source store sources directory")
         source_root = sources / source_id
-        _require_directory(source_root, "source directory")
+        _require_owner_only_directory(source_root, "source directory")
         return self._load_snapshot(source_root, source_id, normalized)
 
     def _git(
@@ -659,7 +697,7 @@ class SourceStore:
     @contextmanager
     def _source_lock(self, sources: Path, source_id: str) -> Iterator[None]:
         locks = sources / ".locks"
-        _require_directory(locks, "source lock directory", create=True)
+        _require_owner_only_directory(locks, "source lock directory", create=True)
         descriptor = os.open(
             locks / f"{source_id}.lock",
             os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
@@ -682,6 +720,7 @@ class SourceStore:
             _remove_owned_tree(path)
 
     def _prepare_mirror(self, source_root: Path, url: str) -> Path:
+        persisted_url, _ = _persisted_remote_url_and_transient_auth(url)
         mirror = source_root / "mirror.git"
         if mirror.exists() or mirror.is_symlink():
             _require_directory(mirror, "source mirror")
@@ -691,7 +730,7 @@ class SourceStore:
                 ).stdout.splitlines()
             except _GitFailure as error:
                 raise RuntimeError("source mirror has no readable origin URL") from error
-            if len(urls) != 1 or not _urls_equivalent(url, urls[0]):
+            if len(urls) != 1 or not _urls_equivalent(persisted_url, urls[0]):
                 raise RuntimeError("source mirror origin URL differs from SourceSpec.url")
             return mirror
         staging_parent = Path(tempfile.mkdtemp(prefix=".tmp-mirror-", dir=source_root))
@@ -704,7 +743,7 @@ class SourceStore:
                     str(staged_mirror),
                     "config",
                     "remote.origin.url",
-                    url,
+                    persisted_url,
                 )
             )
             os.replace(staged_mirror, mirror)
@@ -713,12 +752,14 @@ class SourceStore:
             _remove_owned_tree(staging_parent)
         return mirror
 
-    def _fetch_candidate(self, mirror: Path, ref: str, candidate: str) -> str:
+    def _fetch_candidate(self, mirror: Path, ref: str, candidate: str, url: str) -> str:
+        _, transient_auth = _persisted_remote_url_and_transient_auth(url)
         try:
             self._git(
                 (
                     "--git-dir",
                     str(mirror),
+                    *transient_auth,
                     "fetch",
                     "--no-tags",
                     "--no-write-fetch-head",
