@@ -1471,6 +1471,262 @@ def test_runtime_cache_removal_crash_rolls_back_exact_prestate(
     assert audit_provider_plans((initial,)).matches
 
 
+def test_runtime_cache_recovery_rejects_replaced_backup_inode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    target = TargetSpec("codex", Framework.CODEX, home, "stable")
+    source = Path("skills/private/src/sitecustomize.py")
+    initial = ProviderPlan(
+        "private",
+        "1" * 40,
+        target,
+        (PlannedFile(source, b"value = 'retired'\n", 0o644),),
+        runtime_python_sources=(source,),
+    )
+    install_provider_plans((initial,))
+    cache = Path(importlib.util.cache_from_source(str(source)))
+    os.utime(home / source, (1_700_000_000, 1_700_000_000))
+    py_compile.compile(home / source, cfile=home / cache, doraise=True)
+    replacement = ProviderPlan(
+        "private",
+        "2" * 40,
+        target,
+        (),
+        removals=(source, cache),
+    )
+
+    def crash_after_cache_backup(
+        _home_fs: object,
+        _record_path: Path,
+        operation: dict[str, object],
+    ) -> None:
+        if operation["kind"] == "runtime-cache-removal":
+            os._exit(99)
+
+    monkeypatch.setattr(
+        transaction_module,
+        "_after_operation_backup",
+        crash_after_cache_backup,
+    )
+    process = multiprocessing.get_context("fork").Process(
+        target=lambda: install_provider_plans((replacement,))
+    )
+    process.start()
+    process.join(timeout=10)
+    assert process.exitcode == 99
+    record_path = next(
+        candidate
+        for candidate in (home / ".agentops/deployment/transactions").glob("*/record.json")
+        if any(
+            operation["kind"] == "runtime-cache-removal"
+            for operation in json.loads(candidate.read_text())["operations"]
+        )
+    )
+    record = json.loads(record_path.read_text())
+    operation = next(
+        item for item in record["operations"] if item["kind"] == "runtime-cache-removal"
+    )
+    backup = home / operation["backup"]
+    backup_bytes = backup.read_bytes()
+    original_identity = backup.stat().st_dev, backup.stat().st_ino
+    replacement_backup = backup.with_name("replacement-backup")
+    replacement_backup.write_bytes(backup_bytes)
+    replacement_backup.chmod(0o644)
+    os.replace(replacement_backup, backup)
+    assert (backup.stat().st_dev, backup.stat().st_ino) != original_identity
+
+    with pytest.raises(ValueError, match="runtime cache removal evidence"):
+        recover_transaction(record_path)
+
+    assert backup.read_bytes() == backup_bytes
+    assert (backup.stat().st_dev, backup.stat().st_ino) != original_identity
+
+
+def test_runtime_cache_removal_preserves_replacement_after_authorization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    target = TargetSpec("codex", Framework.CODEX, home, "stable")
+    source = Path("skills/private/src/sitecustomize.py")
+    initial = ProviderPlan(
+        "private",
+        "1" * 40,
+        target,
+        (PlannedFile(source, b"value = 'retired'\n", 0o644),),
+        runtime_python_sources=(source,),
+    )
+    install_provider_plans((initial,))
+    cache = Path(importlib.util.cache_from_source(str(source)))
+    os.utime(home / source, (1_700_000_000, 1_700_000_000))
+    py_compile.compile(home / source, cfile=home / cache, doraise=True)
+    replacement = ProviderPlan(
+        "private",
+        "2" * 40,
+        target,
+        (),
+        removals=(source, cache),
+    )
+    authorized_bytes = (home / cache).read_bytes()
+    authorized_identity = (home / cache).stat().st_dev, (home / cache).stat().st_ino
+    original_hook = transaction_module._before_operation_mutation
+
+    def replace_authorized_cache(
+        _home_fs: object,
+        _record_path: Path,
+        operation: dict[str, object],
+    ) -> None:
+        if operation["kind"] != "runtime-cache-removal":
+            return
+        candidate = home / "replacement.pyc"
+        candidate.write_bytes(authorized_bytes)
+        candidate.chmod(0o644)
+        os.replace(candidate, home / cache)
+
+    monkeypatch.setattr(
+        transaction_module,
+        "_before_operation_mutation",
+        replace_authorized_cache,
+    )
+
+    with pytest.raises(IncompleteRollbackError, match="runtime cache removal changed"):
+        install_provider_plans((replacement,))
+
+    monkeypatch.setattr(transaction_module, "_before_operation_mutation", original_hook)
+    assert (home / cache).read_bytes() == authorized_bytes
+    assert ((home / cache).stat().st_dev, (home / cache).stat().st_ino) != authorized_identity
+    assert (home / source).read_bytes() == b"value = 'retired'\n"
+
+
+def test_runtime_cache_removal_recovery_uses_recorded_cache_provenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    target = TargetSpec("codex", Framework.CODEX, home, "stable")
+    source = Path("skills/private/src/sitecustomize.py")
+    initial = ProviderPlan(
+        "private",
+        "1" * 40,
+        target,
+        (PlannedFile(source, b"value = 'retired'\n", 0o644),),
+        runtime_python_sources=(source,),
+    )
+    install_provider_plans((initial,))
+    cache = Path(importlib.util.cache_from_source(str(source)))
+    os.utime(home / source, (1_700_000_000, 1_700_000_000))
+    py_compile.compile(home / source, cfile=home / cache, doraise=True)
+    source_before = (home / source).read_bytes()
+    cache_before = (home / cache).read_bytes()
+    replacement = ProviderPlan(
+        "private",
+        "2" * 40,
+        target,
+        (),
+        removals=(source, cache),
+    )
+
+    def crash_after_cache_backup(
+        _home_fs: object,
+        _record_path: Path,
+        operation: dict[str, object],
+    ) -> None:
+        if operation["kind"] == "runtime-cache-removal":
+            os._exit(98)
+
+    monkeypatch.setattr(
+        transaction_module,
+        "_after_operation_backup",
+        crash_after_cache_backup,
+    )
+    process = multiprocessing.get_context("fork").Process(
+        target=lambda: install_provider_plans((replacement,))
+    )
+    process.start()
+    process.join(timeout=10)
+    assert process.exitcode == 98
+    record_path = next(
+        candidate
+        for candidate in (home / ".agentops/deployment/transactions").glob("*/record.json")
+        if any(
+            operation["kind"] == "runtime-cache-removal"
+            for operation in json.loads(candidate.read_text())["operations"]
+        )
+    )
+
+    monkeypatch.setattr(sys, "pycache_prefix", str(tmp_path / "alternate-cache-root"))
+    monkeypatch.setattr(sys.implementation, "cache_tag", "cpython-alternate")
+    monkeypatch.setattr(transaction_module.importlib.util, "MAGIC_NUMBER", b"ALTR")
+
+    assert recover_transaction(record_path).source_revision == "2" * 40
+    assert (home / source).read_bytes() == source_before
+    assert (home / cache).read_bytes() == cache_before
+
+
+def test_schema_six_runtime_cache_recovery_keeps_operation_cursor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    target = TargetSpec("codex", Framework.CODEX, home, "stable")
+    source = Path("skills/private/src/sitecustomize.py")
+    initial = ProviderPlan(
+        "private",
+        "1" * 40,
+        target,
+        (PlannedFile(source, b"value = 'retired'\n", 0o644),),
+        runtime_python_sources=(source,),
+    )
+    install_provider_plans((initial,))
+    cache = Path(importlib.util.cache_from_source(str(source)))
+    os.utime(home / source, (1_700_000_000, 1_700_000_000))
+    py_compile.compile(home / source, cfile=home / cache, doraise=True)
+    replacement = ProviderPlan(
+        "private",
+        "2" * 40,
+        target,
+        (),
+        removals=(source, cache),
+    )
+
+    def crash_after_cache_backup(
+        _home_fs: object,
+        _record_path: Path,
+        operation: dict[str, object],
+    ) -> None:
+        if operation["kind"] == "runtime-cache-removal":
+            os._exit(97)
+
+    monkeypatch.setattr(
+        transaction_module,
+        "_after_operation_backup",
+        crash_after_cache_backup,
+    )
+    process = multiprocessing.get_context("fork").Process(
+        target=lambda: install_provider_plans((replacement,))
+    )
+    process.start()
+    process.join(timeout=10)
+    assert process.exitcode == 97
+    record_path = next(
+        candidate
+        for candidate in (home / ".agentops/deployment/transactions").glob("*/record.json")
+        if any(
+            operation["kind"] == "runtime-cache-removal"
+            for operation in json.loads(candidate.read_text())["operations"]
+        )
+    )
+    record = json.loads(record_path.read_text())
+    record["schema_version"] = 6
+    for operation in record["operations"]:
+        operation.pop("runtime_cache_provenance", None)
+    record_path.write_text(json.dumps(record))
+
+    assert recover_transaction(record_path).source_revision == "2" * 40
+
+
 def test_ordinary_install_rejects_prior_manifest_with_contradictory_channel(
     tmp_path: Path,
 ) -> None:
@@ -3436,8 +3692,8 @@ def test_strict_transaction_json_rejects_ambiguity(
     record_path = next((home / ".agentops/deployment/transactions").glob("*/record.json"))
     if case == "duplicate-record-key":
         content = record_path.read_text().replace(
-            '"schema_version": 6,',
-            '"schema_version": 6,\n  "schema_version": 6,',
+            '"schema_version": 7,',
+            '"schema_version": 7,\n  "schema_version": 7,',
         )
         record_path.write_text(content)
     else:
