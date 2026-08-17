@@ -20,3 +20,7 @@ operational workflows.
 - `ruff check .`
 - `pytest`
 - `agentops harness check .`
+
+## Stack and migration
+
+Do not introduce a new implementation language, runtime, or framework unless an existing supported boundary strictly requires it or Dan has approved a material product or operational benefit. Prefer the repository's current stack, preserve prototypes and history, and require source-backed migration plus rollback proof before replacement.
