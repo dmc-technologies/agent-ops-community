@@ -6,25 +6,25 @@ Repository: `agent-ops-community`
 
 - Branch: `fix/unchanged-managed-refresh`
 - Main baseline: `84c38fd811505f5a11dd2b78ecea6ab49a75d426`, the exact community `origin/main` selected for this correction.
-- Current handoff: managed refresh now preserves an existing regular file when its bytes and mode exactly match the next plan. A normally imported Python-backed skill therefore keeps its valid bytecode cache across an unchanged refresh, while changed sources still use the established replacement transaction and stale or hostile caches still fail audit. No Plane work item applies.
-- Verification: the new unchanged-refresh regression failed first because the source inode changed and passes after the transaction correction. The three focused refresh/cache nodes pass; the transaction suite passes with 239 tests; the other six deployment suites pass with 441 tests; and the complete suite passes with 947 passed and 3 skipped from 950 collected tests. Focused Ruff and `git diff --check` pass. Final exact-commit gates and hosted Linux/Windows CI remain pending.
+- Current handoff: Community pull request #35 contains the managed-refresh correction. An existing regular file is preserved when its bytes and mode exactly match the next plan, so a normally imported Python-backed skill keeps its valid bytecode cache across an unchanged refresh. Changed sources still use the established replacement transaction, and stale or hostile caches still fail audit. No Plane work item applies.
+- Verification: the new unchanged-refresh regression failed first because the source inode changed and passes after the transaction correction. The three focused refresh/cache nodes pass; the transaction suite passes with 239 tests; the other six deployment suites pass with 441 tests; and the complete suite passes with 947 passed and 3 skipped from 950 collected tests. Ruff, the harness check, and `git diff --check` pass. Hosted Linux and Windows CI run `32040576336` passed implementation commit `d8dbc310d9c2557868d4cd211ed8094bac4829e1`; the final closeout head requires the same exact-head gates.
 
 ## Current Work
 
 - Goal: allow routine managed refresh after normal Python use without rewriting unchanged sources or weakening runtime-cache audit boundaries.
-- Active task: freeze the final commit, repeat the repository gates, publish one coherent community pull request, and obtain exact-head Linux and Windows CI without applying the Review Gate label or merging.
+- Active task: verify the final closeout head locally and in hosted Linux and Windows CI without applying the Review Gate label or merging.
 - Files in play: `src/agent_ops/deployment/transaction.py`, `tests/test_deployment_transaction.py`, and this harness closeout record.
 - Blockers: none.
 
 ## Next Actions
 
-- Commit the coherent correction and repeat `.venv/bin/ruff check .`, `.venv/bin/python -m pytest`, `.venv/bin/agentops harness check .`, and `git diff --check` on that exact SHA.
-- Push and open the community pull request, then obtain ordinary hosted Linux and Windows CI on its exact head.
-- Stop after CI without applying `ai review` or merging.
+- Repeat `.venv/bin/ruff check .`, `.venv/bin/python -m pytest`, `.venv/bin/agentops harness check .`, and `git diff --check` on the final closeout SHA.
+- Obtain ordinary hosted Linux and Windows CI on that exact head.
+- Leave Community pull request #35 open for a later person-applied `ai review`; do not merge. After merge, the private caller must pin the Community merge commit and rerun its acceptance and CI.
 
 ## Session Log
 
-- 2026-08-17: A transaction regression installed a Python-backed managed skill, imported it in a normal Python subprocess to create its cache, and refreshed unchanged bytes at a new source revision. The old transaction replaced the unchanged source, changed its inode and modification time, and made the retained cache fail audit. Exact existing managed bytes and mode now use the established non-mutating operation; changed source bytes still replace the file, and stale or hostile caches remain unexpected. The focused nodes, 239-test transaction suite, 441-test adjacent deployment suite, 950-test complete suite, focused Ruff, and whitespace validation pass locally; final exact-commit gates and hosted Linux/Windows CI remain.
+- 2026-08-17: A transaction regression installed a Python-backed managed skill, imported it in a normal Python subprocess to create its cache, and refreshed unchanged bytes at a new source revision. The old transaction replaced the unchanged source, changed its inode and modification time, and made the retained cache fail audit. Exact existing managed bytes and mode now use the established non-mutating operation; changed source bytes still replace the file, and stale or hostile caches remain unexpected. The focused nodes, 239-test transaction suite, 441-test adjacent deployment suite, 950-test complete suite, Ruff, harness, and whitespace validation passed locally. Community pull request #35 opened; hosted Linux and Windows CI run `32040576336` passed implementation commit `d8dbc310d9c2557868d4cd211ed8094bac4829e1`. No Plane work item applies.
 
 - 2026-08-17: A public `DeploymentEngine.refresh` regression reproduced that `type(Path("x"))` is the platform concrete path class rather than the `Path` factory class, causing every nonempty removal plan to fail validation. The validator now compares against `type(Path())`, preserving exact-type rejection for subclasses. The single regression, 361 adjacent deployment tests, and the 948-test complete suite pass locally; final exact-commit gates and hosted Linux/Windows CI remain.
 
