@@ -103,6 +103,11 @@ CRITICAL_PATH_RULES = (
         ),
     ),
 )
+LITE_PATH_SUFFIXES = (
+    ".md",
+    ".rst",
+    ".txt",
+)
 DEFAULT_REVIEW_PROMPT = """# Review Gate Prompt
 
 Review this PR for necessity, company-policy alignment, architecture, AI safety,
@@ -248,13 +253,24 @@ def read_text(path: Path) -> str:
         return ""
 
 
-def changed_files_for_pr(repo: str, pr_number: int) -> list[str] | None:
-    override = os.environ.get("REVIEW_GATE_CHANGED_FILES", "")
-    if override.strip():
-        return [line.strip() for line in override.splitlines() if line.strip()]
-    result = run_command(["gh", "pr", "diff", str(pr_number), "--repo", repo, "--name-only"])
+def changed_files_for_exact_head(
+    workspace: Path,
+    merge_base_sha: str,
+    expected_head_sha: str,
+) -> list[str]:
+    head_result = run_command(["git", "rev-parse", "HEAD"], cwd=workspace)
+    actual_head_sha = head_result.stdout.strip()
+    if head_result.returncode != 0 or actual_head_sha != expected_head_sha:
+        raise RuntimeError(
+            "Checked-out head does not match the requested review head: "
+            f"expected {expected_head_sha}, got {actual_head_sha or 'unavailable'}."
+        )
+    result = run_command(
+        ["git", "diff", "--name-only", f"{merge_base_sha}...{expected_head_sha}"],
+        cwd=workspace,
+    )
     if result.returncode != 0:
-        return None
+        raise RuntimeError(result.stderr.strip() or "Could not list exact-head changed files.")
     return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
 
@@ -554,12 +570,24 @@ def classify_review_profile(changed_files: list[str] | None) -> ReviewProfile:
                 for domain in domains
             ),
         )
+    known_lite = bool(normalized) and all(
+        path.endswith(LITE_PATH_SUFFIXES) for path in normalized
+    )
+    if known_lite:
+        return ReviewProfile(
+            scope="lite",
+            effort="medium",
+            confidence="high",
+            reasons=("Every changed path matched the conservative lite allowlist.",),
+            review_questions=("Do the changed documents state the supported behavior correctly?",),
+        )
     return ReviewProfile(
-        scope="lite",
-        effort="medium",
-        confidence="high",
-        reasons=("No configured critical path changed.",),
-        review_questions=("Do changed functions and their direct callers behave correctly?",),
+        scope="critical",
+        effort="xhigh",
+        confidence="low",
+        risk_domains=("unclassified_behavior",),
+        reasons=("An unrecognized behavioral path changed, so review scope expanded.",),
+        review_questions=("Can an unclassified behavior change cross a critical boundary?",),
     )
 
 
@@ -608,10 +636,11 @@ def select_review_stage(
         prior_state.merge_base_sha,
     ) != (repo, pr_number, base_ref, merge_base_sha):
         return ReviewStage()
+    persisted_scope = "critical" if prior_state.findings else prior_state.scope
     if prior_state.sha == head_sha:
         return ReviewStage(
             name="unchanged",
-            scope=prior_state.scope,
+            scope=persisted_scope,
             delta_from_sha=prior_state.sha,
             carried_findings=prior_state.findings,
         )
@@ -622,7 +651,7 @@ def select_review_stage(
         return ReviewStage()
     return ReviewStage(
         name="resolution",
-        scope=prior_state.scope,
+        scope=persisted_scope,
         delta_from_sha=prior_state.sha,
         carried_findings=prior_state.findings,
     )
@@ -716,7 +745,6 @@ def finding_from_payload(payload: dict, index: int) -> tuple[str, Finding] | Non
         return None
     disposition = "block" if (
         requested_disposition == "block"
-        and severity != "P3"
         and consequence_class in CRITICAL_CONSEQUENCE_CLASSES
     ) else "follow_up"
     title = str(payload.get("title") or f"Codex finding {index + 1}").strip()
@@ -1045,7 +1073,7 @@ def verify_resolution_state(
 ) -> ResolutionState | None:
     key = _state_key()
     if token.startswith("unsigned."):
-        if not allow_trusted_unsigned:
+        if key is not None or not allow_trusted_unsigned:
             return None
         encoded = token.removeprefix("unsigned.")
     elif key is None or "." not in token:
@@ -1200,10 +1228,12 @@ def read_resolution_state(repo: str, pr_number: int) -> ResolutionState | None:
     expected_login = expected_gate_login()
     for comment in reversed(comments):
         body = str(comment.get("body") or "")
-        if COMMENT_MARKER not in body:
+        lines = body.splitlines()
+        if len(lines) < 2 or lines[0] != COMMENT_MARKER or lines[1] != "# Review Gate agent review":
             continue
-        match = re.search(
-            re.escape(RESOLUTION_STATE_MARKER_PREFIX) + r"\s*(\S+?)\s*-->", body
+        state_line = lines[2] if len(lines) > 2 else ""
+        match = re.fullmatch(
+            re.escape(RESOLUTION_STATE_MARKER_PREFIX) + r"(\S+?) -->", state_line
         )
         if match:
             token = match.group(1)
@@ -1213,6 +1243,7 @@ def read_resolution_state(repo: str, pr_number: int) -> ResolutionState | None:
             if token.startswith("unsigned."):
                 return verify_resolution_state(token, allow_trusted_unsigned=True)
             return verify_resolution_state(token)
+        return None
     return None
 
 
@@ -1221,7 +1252,12 @@ def post_or_update_pr_comment(repo: str, pr_number: int, body: str) -> None:
     expected_login = expected_gate_login()
     for comment in fetch_issue_comments(repo, pr_number):
         author = str((comment.get("user") or {}).get("login") or "")
-        if COMMENT_MARKER in comment.get("body", "") and author == expected_login:
+        body = str(comment.get("body") or "")
+        exact_header = body.splitlines()[:2] == [
+            COMMENT_MARKER,
+            "# Review Gate agent review",
+        ]
+        if exact_header and author == expected_login:
             comment_id = comment["id"]
             break
     if comment_id:
@@ -1363,7 +1399,7 @@ def post_or_update_follow_up_issue(
         (
             issue
             for issue in issues
-            if marker in str(issue.get("body") or "")
+            if str(issue.get("body") or "").splitlines()[:1] == [marker]
             and "pull_request" not in issue
             and expected_login is not None
             and str((issue.get("user") or {}).get("login") or "") == expected_login
@@ -1545,12 +1581,12 @@ def main() -> None:
 
     review_prompt = os.environ.get("REVIEW_GATE_PROMPT", "").strip() or DEFAULT_REVIEW_PROMPT
     workspace = Path(args.workspace).resolve()
-    changed_files = changed_files_for_pr(args.repo, args.pr)
+    base_diff_ref = ensure_base_ref(workspace, args.repo, args.base_ref)
+    merge_base_sha = resolve_merge_base(workspace, base_diff_ref)
+    changed_files = changed_files_for_exact_head(workspace, merge_base_sha, args.sha)
     profile = classify_review_profile(changed_files)
     requested_scope = args.scope if args.scope in {"lite", "critical"} else None
     profile = apply_scope_policy(profile, requested_scope=requested_scope)
-    base_diff_ref = ensure_base_ref(workspace, args.repo, args.base_ref)
-    merge_base_sha = resolve_merge_base(workspace, base_diff_ref)
     prior_state = read_resolution_state(args.repo, args.pr)
     stage = select_review_stage(
         workspace,
@@ -1616,7 +1652,7 @@ def main() -> None:
             base_ref=args.base_ref,
             merge_base_sha=merge_base_sha,
             sha=args.sha,
-            scope=result.profile.scope if result.profile else profile.scope,
+            scope="critical",
             findings=result.blocking,
         )
     else:

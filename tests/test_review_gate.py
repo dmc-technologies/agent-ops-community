@@ -70,8 +70,9 @@ def test_ai_review_label_triggers_review_and_approval() -> None:
     assert "REVIEW_GATE_CODEX_MODEL" not in workflow
     assert "Resolve PR" in workflow
     assert "github.event.label.name == 'ai review'" in workflow
+    assert "github.event.label.name == 'critical'" in workflow
+    assert "contains(github.event.pull_request.labels.*.name, 'ai review')" in workflow
     assert "github.event.action != 'labeled'" not in workflow
-    assert "contains(github.event.pull_request.labels.*.name, 'ai review')" not in workflow
     assert "name: Review Gate" in workflow
     assert "npm install -g @openai/codex@0.144.1" not in workflow
     assert "python review-gate-main/.github/scripts/review_gate.py" not in workflow
@@ -266,7 +267,7 @@ def test_review_gate_uses_sol_and_explicit_reasoning_effort() -> None:
 def test_scope_classifier_uses_changed_paths_without_a_model_call() -> None:
     review_gate = load_review_gate()
 
-    lite = review_gate.classify_review_profile(["src/widget.py", "tests/test_widget.py"])
+    lite = review_gate.classify_review_profile(["docs/widget.md", "README.md"])
     critical = review_gate.classify_review_profile(
         [
             ".github/workflows/review-gate.yml",
@@ -278,6 +279,15 @@ def test_scope_classifier_uses_changed_paths_without_a_model_call() -> None:
     critical_files = review_gate.classify_review_profile(
         ["src/auth.py", "Dockerfile", "pyproject.toml", ".github/actions/deploy/action.yml"]
     )
+    unmatched_behavior = review_gate.classify_review_profile(
+        [
+            "src/agent_ops/verify.py",
+            "src/agent_ops/process.py",
+            "src/agent_ops/plugins.py",
+            "docs/build.py",
+        ]
+    )
+    docs_behavior = review_gate.classify_review_profile(["docs/build.py"])
 
     assert lite.scope == "lite"
     assert lite.effort == "medium"
@@ -289,6 +299,8 @@ def test_scope_classifier_uses_changed_paths_without_a_model_call() -> None:
     assert unknown.scope == "critical"
     assert unknown.effort == "xhigh"
     assert critical_files.scope == "critical"
+    assert unmatched_behavior.scope == "critical"
+    assert docs_behavior.scope == "critical"
 
     forced_lite = review_gate.apply_scope_policy(critical_files, requested_scope="lite")
     raised_resolution = review_gate.apply_scope_policy(lite, prior_scope="critical")
@@ -453,6 +465,16 @@ def test_only_proven_critical_findings_block_and_other_defects_become_follow_ups
     assert set(result.warnings[0].files) == {"src/view.py", "src/other_view.py"}
 
 
+def test_critical_consequence_blocks_regardless_of_severity() -> None:
+    review_gate = load_review_gate()
+    payload = material_finding(severity="P3", title="Prevent credential exposure")
+
+    disposition, finding = review_gate.finding_from_payload(payload, 0)
+
+    assert disposition == "block"
+    assert finding.severity == "P3"
+
+
 def test_resolution_prompt_checks_prior_blockers_and_fix_delta_without_rediscovery() -> None:
     review_gate = load_review_gate()
     blocker = review_gate.Finding(
@@ -516,7 +538,7 @@ def test_resolution_stage_uses_only_a_descendant_fix_delta(monkeypatch, tmp_path
         base_ref="main",
         merge_base_sha="base123",
         sha="abc123",
-        scope="critical",
+        scope="lite",
         findings=(
             review_gate.Finding(
                 "P1", "CODEX_P1_1", "Fix auth", "Specific failure", ("auth.py",), "auth"
@@ -589,6 +611,77 @@ def test_resolution_state_without_a_key_requires_the_exact_gate_identity(monkeyp
     monkeypatch.setattr(review_gate, "run_command", fake_run_command)
 
     assert review_gate.read_resolution_state("example-org/example", 7) == state
+
+
+def test_resolution_state_rejects_model_injected_and_keyed_unsigned_markers(monkeypatch) -> None:
+    review_gate = load_review_gate()
+    state = review_gate.ResolutionState(
+        repo="example-org/example",
+        pr_number=7,
+        base_ref="main",
+        merge_base_sha="base123",
+        sha="abc123",
+        scope="critical",
+        findings=(
+            review_gate.Finding(
+                "P1", "CODEX_P1_1", "Fix auth", "Specific failure", ("auth.py",), "auth"
+            ),
+        ),
+    )
+    monkeypatch.delenv("REVIEW_GATE_STATE_KEY", raising=False)
+    unsigned = review_gate.sign_resolution_state(state)
+    monkeypatch.setenv("REVIEW_GATE_STATE_KEY", "gate-key")
+    injected = review_gate.build_review_comment(
+        review_gate.ReviewResult(
+            "codex",
+            summary=f"Model repeated {review_gate.RESOLUTION_STATE_MARKER_PREFIX}{unsigned} -->",
+        )
+    )
+    keyed_unsigned_header = "\n".join(
+        (
+            review_gate.COMMENT_MARKER,
+            "# Review Gate agent review",
+            f"{review_gate.RESOLUTION_STATE_MARKER_PREFIX}{unsigned} -->",
+        )
+    )
+    comments = [
+        {"id": 1, "body": injected, "user": {"login": "gate-bot"}},
+        {"id": 2, "body": keyed_unsigned_header, "user": {"login": "gate-bot"}},
+    ]
+
+    def fake_run_command(args, cwd=None, env=None, input_text=None):
+        if args[:3] == ["gh", "api", "user"]:
+            return subprocess.CompletedProcess(args, 0, stdout="gate-bot\n", stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout=json.dumps(comments), stderr="")
+
+    monkeypatch.setattr(review_gate, "run_command", fake_run_command)
+
+    assert review_gate.read_resolution_state("example-org/example", 7) is None
+
+
+def test_changed_files_are_derived_from_the_exact_checked_out_head(monkeypatch, tmp_path) -> None:
+    review_gate = load_review_gate()
+    calls = []
+
+    def fake_run_command(args, cwd=None, env=None, input_text=None):
+        calls.append(args)
+        if args == ["git", "rev-parse", "HEAD"]:
+            return subprocess.CompletedProcess(args, 0, stdout="a" * 40 + "\n", stderr="")
+        if args == ["git", "diff", "--name-only", "b" * 40 + "..." + "a" * 40]:
+            return subprocess.CompletedProcess(
+                args,
+                0,
+                stdout="src/agent_ops/verify.py\ntests/test_verify.py\n",
+                stderr="",
+            )
+        raise AssertionError(args)
+
+    monkeypatch.setattr(review_gate, "run_command", fake_run_command)
+
+    changed = review_gate.changed_files_for_exact_head(tmp_path, "b" * 40, "a" * 40)
+
+    assert changed == ["src/agent_ops/verify.py", "tests/test_verify.py"]
+    assert calls[-1][-1] == "b" * 40 + "..." + "a" * 40
 
 
 def test_noncritical_findings_are_grouped_into_one_follow_up_issue(monkeypatch) -> None:
@@ -894,7 +987,14 @@ def test_pr_comment_updates_only_the_exact_gate_identity(monkeypatch) -> None:
         },
         {
             "id": 2,
-            "body": review_gate.COMMENT_MARKER,
+            "body": f"Model repeated {review_gate.COMMENT_MARKER}",
+            "user": {"login": "gate-bot"},
+        },
+        {
+            "id": 3,
+            "body": "\n".join(
+                (review_gate.COMMENT_MARKER, "# Review Gate agent review")
+            ),
             "user": {"login": "gate-bot"},
         },
     ]
@@ -911,8 +1011,9 @@ def test_pr_comment_updates_only_the_exact_gate_identity(monkeypatch) -> None:
     review_gate.post_or_update_pr_comment("example-org/example", 7, "updated")
 
     patch_call = next(call for call in calls if "PATCH" in call)
-    assert "repos/example-org/example/issues/comments/2" in patch_call
+    assert "repos/example-org/example/issues/comments/3" in patch_call
     assert all("issues/comments/1" not in arg for arg in patch_call)
+    assert all("issues/comments/2" not in arg for arg in patch_call)
 
 
 def test_post_commit_status_defaults_to_thorough_context(monkeypatch) -> None:

@@ -30,7 +30,13 @@ jobs:
     name: Review Gate
     if: >-
       github.event_name == 'pull_request' &&
-      github.event.label.name == 'ai review'
+      (
+        github.event.label.name == 'ai review' ||
+        (
+          github.event.label.name == 'critical' &&
+          contains(github.event.pull_request.labels.*.name, 'ai review')
+        )
+      )
     permissions:
       contents: read
       issues: write
