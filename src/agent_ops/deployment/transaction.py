@@ -1649,11 +1649,11 @@ def _locked_provider_plan_targets(
         return
     with ExitStack() as locks:
         grouped_locks = {home: locks.enter_context(_target_lock(home)) for home in homes}
-        token = _GROUP_HOME_LOCKS.set(grouped_locks)
+        lock_context = _GROUP_HOME_LOCKS.set(grouped_locks)
         try:
             yield
         finally:
-            _GROUP_HOME_LOCKS.reset(token)
+            _GROUP_HOME_LOCKS.reset(lock_context)
 
 
 def _verify_locked_provider_plan_targets(plans: tuple[ProviderPlan, ...]) -> None:
