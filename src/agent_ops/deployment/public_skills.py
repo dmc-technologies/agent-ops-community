@@ -468,6 +468,9 @@ def _render_dependency_in_workspace(
         source_revision=dependency.ref,
         target=target,
         files=files,
+        audit_roots=(Path(".agentops/runtime/gstack"),)
+        if dependency.id == "gstack"
+        else (),
     )
 
 

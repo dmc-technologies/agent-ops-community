@@ -138,9 +138,11 @@ def test_public_gstack_provider_may_own_its_reserved_runtime_only(tmp_path: Path
         "1" * 40,
         TargetSpec("prime", Framework.PRIME_AGENT, home, "public"),
         (PlannedFile(Path(".agentops/runtime/gstack/ETHOS.md"), b"ethos\n", 0o644),),
+        audit_roots=(Path(".agentops/runtime/gstack"),),
     )
     install_provider_plans((public,))
     assert (home / ".agentops/runtime/gstack/ETHOS.md").read_bytes() == b"ethos\n"
+    assert audit_provider_plans((public,)).matches
 
     private = ProviderPlan(
         "private",
