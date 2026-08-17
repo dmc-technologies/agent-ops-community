@@ -109,6 +109,7 @@ def _run_git(
     cwd: Path | None = None,
     accepted_returncodes: frozenset[int] = frozenset({0}),
     timeout: float = _DEFAULT_GIT_TIMEOUT,
+    environment: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     command = (
         "git",
@@ -128,10 +129,13 @@ def _run_git(
         "protocol.ssh.allow=always",
         *args,
     )
+    git_environment = _git_environment()
+    if environment is not None:
+        git_environment.update(environment)
     process = subprocess.Popen(
         command,
         cwd=cwd,
-        env=_git_environment(),
+        env=git_environment,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -241,11 +245,11 @@ def _canonical_local_url(url: str) -> Path | None:
     return None
 
 
-def _persisted_remote_url_and_transient_auth(url: str) -> tuple[str, tuple[str, ...]]:
-    """Keep HTTPS userinfo out of mirror config while supplying it only to fetch."""
+def _persisted_remote_url_and_transient_auth(url: str) -> tuple[str, dict[str, str]]:
+    """Keep HTTPS userinfo out of storage and process arguments."""
     parsed = urlsplit(url)
     if parsed.scheme.lower() != "https" or parsed.username is None:
-        return url, ()
+        return url, {}
     host = parsed.hostname
     if host is None:
         raise ValueError("source URL is malformed")
@@ -257,10 +261,11 @@ def _persisted_remote_url_and_transient_auth(url: str) -> tuple[str, tuple[str, 
     credentials = base64.b64encode(
         f"{unquote(parsed.username)}:{unquote(parsed.password or '')}".encode()
     ).decode("ascii")
-    return persisted, (
-        "-c",
-        f"http.{persisted}.extraHeader=Authorization: Basic {credentials}",
-    )
+    return persisted, {
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": f"http.{persisted}.extraHeader",
+        "GIT_CONFIG_VALUE_0": f"Authorization: Basic {credentials}",
+    }
 
 
 def _urls_equivalent(expected: str, observed: str) -> bool:
@@ -686,12 +691,14 @@ class SourceStore:
         *,
         cwd: Path | None = None,
         accepted_returncodes: frozenset[int] = frozenset({0}),
+        environment: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         return _run_git(
             args,
             cwd=cwd,
             accepted_returncodes=accepted_returncodes,
             timeout=self._git_timeout,
+            environment=environment,
         )
 
     @contextmanager
@@ -759,13 +766,13 @@ class SourceStore:
                 (
                     "--git-dir",
                     str(mirror),
-                    *transient_auth,
                     "fetch",
                     "--no-tags",
                     "--no-write-fetch-head",
                     "origin",
                     f"+{ref}:{candidate}",
-                )
+                ),
+                environment=transient_auth,
             )
         except _GitFailure as error:
             raise RuntimeError(f"requested Git ref {ref!r} was not found or fetched") from error

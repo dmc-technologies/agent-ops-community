@@ -121,6 +121,9 @@ Record durable architecture, workflow, and harness decisions here.
 - Applies to: `src/agent_ops/deployment/source_store.py`, deployment audit retention, and their regression tests.
 - Revisit when: the source-store adds an approved credential helper or a durable encrypted credential boundary.
 
+- Correction: Git receives transient HTTPS Basic authorization through its per-process `GIT_CONFIG_*` environment rather than a `-c` command argument. Missing audited directories are represented by the expected missing file set while every present directory remains descriptor-pinned.
+- Rationale: process arguments can be read by another local account; an absent directory cannot be opened as evidence, but repeated complete audit equality still prevents a changed result from receiving a receipt.
+
 ### YYYY-MM-DD: Decision title
 
 - Decision: what changed or what standard was chosen.

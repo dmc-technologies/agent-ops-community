@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import multiprocessing
@@ -169,6 +170,40 @@ def test_source_store_never_persists_https_credentials_in_mirror_config(
     assert "username" not in persisted
     assert "password" not in persisted
     assert "https://example.invalid/private/repository.git" in persisted
+
+
+def test_source_store_passes_https_credentials_only_in_git_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import agent_ops.deployment.source_store as source_store_module
+
+    observed: dict[str, object] = {}
+
+    def run_git(args, **kwargs):
+        if "fetch" in args:
+            observed["args"] = args
+            observed["environment"] = kwargs["environment"]
+            return subprocess.CompletedProcess(args, 0, "", "")
+        return subprocess.CompletedProcess(args, 0, "a" * 40 + "\n", "")
+
+    monkeypatch.setattr(source_store_module, "_run_git", run_git)
+    SourceStore(tmp_path / "state")._fetch_candidate(
+        tmp_path / "mirror.git",
+        "refs/heads/main",
+        "refs/agentops/candidate/test",
+        "https://username:password@example.invalid/private/repository.git",
+    )
+
+    assert "username" not in " ".join(observed["args"])
+    assert "password" not in " ".join(observed["args"])
+    environment = observed["environment"]
+    assert environment["GIT_CONFIG_COUNT"] == "1"
+    assert environment["GIT_CONFIG_KEY_0"] == (
+        "http.https://example.invalid/private/repository.git.extraHeader"
+    )
+    assert "password" in base64.b64decode(
+        environment["GIT_CONFIG_VALUE_0"].removeprefix("Authorization: Basic ")
+    ).decode()
 
 
 def test_layout_detached_head_and_old_snapshot_remains_unchanged(

@@ -3157,10 +3157,19 @@ def retain_provider_plan_evidence(
                 for item in group.files
                 if item.path.as_posix() not in missing
             )
-            pinned.extend(
-                _PinnedStatusDirectory(home_fs, item.path)
-                for item in _directories(group.files)
-            )
+            for directory in _directories(group.files):
+                try:
+                    pinned.append(_PinnedStatusDirectory(home_fs, directory.path))
+                except FileNotFoundError:
+                    covered_files = tuple(
+                        item.path.as_posix()
+                        for item in group.files
+                        if item.path.is_relative_to(directory.path)
+                    )
+                    if expected is None or not covered_files or not all(
+                        path in missing for path in covered_files
+                    ):
+                        raise
         authority = _RetainedProviderPlanEvidence(
             plans,
             pinned,

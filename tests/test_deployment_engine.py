@@ -794,6 +794,18 @@ def test_engine_audit_reports_a_missing_managed_file_as_modified(tmp_path: Path)
     assert receipt.targets[0].state is TargetState.MODIFIED
 
 
+def test_engine_audit_reports_a_missing_managed_directory_as_modified(
+    tmp_path: Path,
+) -> None:
+    engine, _registry, home = _engine_fixture(tmp_path)
+    engine.refresh(("codex",))
+    shutil.rmtree(home / "skills/example")
+
+    receipt = engine.audit(("codex",))
+
+    assert receipt.targets[0].state is TargetState.MODIFIED
+
+
 def test_launch_authorization_retains_exact_audit_and_revalidates_home(
     tmp_path: Path,
 ) -> None:
