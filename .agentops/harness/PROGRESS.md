@@ -162,3 +162,4 @@ Repository: `agent-ops-community`
   `ruff check .github/scripts/review_gate.py tests/test_review_gate.py`,
   `git diff --check`, and `agentops harness check .`.
 2026-08-17: Added the canonical stack-and-migration rule to AGENTS.md only; symlinked Claude policy files were not edited. Scoped policy/harness verification is required on this replacement head; PR33 remains unlabelled pending final reconciliation.
+2026-08-17: Removed duplicated review lifecycle text from AGENTS.md; shared global policy now governs it. Community retains only repository-specific verification instructions.
