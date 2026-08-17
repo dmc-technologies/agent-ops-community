@@ -69,6 +69,41 @@ def _legacy_plan(home: Path) -> ProviderPlan:
     )
 
 
+def _legacy_refresh_plan(home: Path) -> ProviderPlan:
+    return ProviderPlan(
+        "fixture",
+        "2" * 40,
+        TargetSpec("codex-dev", Framework.CODEX, home, "stable"),
+        (
+            PlannedFile(Path("AGENTS.md"), b"stable\n", 0o644),
+            PlannedFile(Path("skills/example/SKILL.md"), b"new\n", 0o644),
+        ),
+        legacy_link_transition=LegacyLinkTransition(
+            "fixture",
+            "codex-dev",
+            "stable",
+            Path("AGENTS.md"),
+            "configs/global/AGENTS.md",
+            b"stable\n",
+            0o644,
+        ),
+    )
+
+
+def _prepare_legacy_refresh(home: Path) -> None:
+    install_provider_plans(
+        (
+            ProviderPlan(
+                "fixture",
+                "1" * 40,
+                TargetSpec("codex-dev", Framework.CODEX, home, "stable"),
+                (PlannedFile(Path("skills/example/SKILL.md"), b"old\n", 0o600),),
+            ),
+        )
+    )
+    (home / "AGENTS.md").symlink_to("configs/global/AGENTS.md")
+
+
 def _crash_after_legacy_link_move(
     home: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -88,6 +123,60 @@ def _crash_after_legacy_link_move(
     assert process.exitcode == 91
     monkeypatch.setattr(transaction_module, "_after_legacy_link_move", original_hook)
     return next((home / ".agentops/deployment/transactions").glob("*/record.json"))
+
+
+def _crash_refresh_after_legacy_link_move(
+    home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Path:
+    _prepare_legacy_refresh(home)
+    original_hook = transaction_module._after_legacy_link_move
+
+    def terminate(*_args: object) -> None:
+        os._exit(92)
+
+    monkeypatch.setattr(transaction_module, "_after_legacy_link_move", terminate)
+    process = multiprocessing.get_context("fork").Process(
+        target=lambda: install_provider_plans((_legacy_refresh_plan(home),))
+    )
+    process.start()
+    process.join(timeout=5)
+    assert not process.is_alive()
+    assert process.exitcode == 92
+    monkeypatch.setattr(transaction_module, "_after_legacy_link_move", original_hook)
+    records = sorted(
+        (home / ".agentops/deployment/transactions").glob("*/record.json"),
+        key=lambda path: path.stat().st_mtime_ns,
+    )
+    return records[-1]
+
+
+def _crash_refresh_at_later_operation(
+    home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    hook_name: str,
+    exit_code: int,
+) -> Path:
+    _prepare_legacy_refresh(home)
+    original_hook = getattr(transaction_module, hook_name)
+
+    def terminate(_home_fs: object, _record_path: Path, operation: dict[str, object]) -> None:
+        if operation["index"] == 1:
+            os._exit(exit_code)
+
+    monkeypatch.setattr(transaction_module, hook_name, terminate)
+    process = multiprocessing.get_context("fork").Process(
+        target=lambda: install_provider_plans((_legacy_refresh_plan(home),))
+    )
+    process.start()
+    process.join(timeout=5)
+    assert not process.is_alive()
+    assert process.exitcode == exit_code
+    monkeypatch.setattr(transaction_module, hook_name, original_hook)
+    return sorted(
+        (home / ".agentops/deployment/transactions").glob("*/record.json"),
+        key=lambda path: path.stat().st_mtime_ns,
+    )[-1]
 
 
 class _FakeNativeRename:
@@ -187,6 +276,108 @@ def test_recovery_restores_legacy_link_after_power_loss_before_publish(
     assert os.readlink(destination) == "configs/global/AGENTS.md"
     assert json.loads(record_path.read_text())["state"] == "rolled-back"
     assert recover_transaction(record_path) == recovered
+
+
+def test_recovery_restores_legacy_link_before_unstarted_later_backup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    record_path = _crash_refresh_after_legacy_link_move(home, monkeypatch)
+    record = json.loads(record_path.read_text())
+    later = record["operations"][1]
+
+    assert not (home / "AGENTS.md").exists()
+    assert later["backup"] is not None
+    assert not (home / later["backup"]).exists()
+    recover_transaction(record_path)
+
+    assert (home / "AGENTS.md").is_symlink()
+    assert os.readlink(home / "AGENTS.md") == "configs/global/AGENTS.md"
+    assert (home / "skills/example/SKILL.md").read_bytes() == b"old\n"
+    assert stat.S_IMODE((home / "skills/example/SKILL.md").stat().st_mode) == 0o600
+
+
+@pytest.mark.parametrize(
+    ("hook_name", "exit_code", "expected_phase"),
+    [
+        ("_before_operation_mutation", 93, "applying"),
+        ("_after_operation_backup", 94, "backup-created"),
+        ("_after_operation_mutation", 95, "backup-created"),
+    ],
+)
+def test_recovery_rolls_back_each_later_backup_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    hook_name: str,
+    exit_code: int,
+    expected_phase: str,
+) -> None:
+    home = tmp_path / "home"
+    record_path = _crash_refresh_at_later_operation(
+        home,
+        monkeypatch,
+        hook_name,
+        exit_code,
+    )
+    record = json.loads(record_path.read_text())
+    assert record["legacy_link_transition"]["operation_cursor"] == 1
+    assert record["legacy_link_transition"]["operation_phase"] == expected_phase
+
+    recovered = recover_transaction(record_path)
+
+    assert (home / "AGENTS.md").is_symlink()
+    assert os.readlink(home / "AGENTS.md") == "configs/global/AGENTS.md"
+    assert (home / "skills/example/SKILL.md").read_bytes() == b"old\n"
+    assert recover_transaction(record_path) == recovered
+
+
+@pytest.mark.parametrize("case", ["missing", "changed"])
+def test_recovery_restores_link_before_rejecting_later_backup_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    home = tmp_path / "home"
+    record_path = _crash_refresh_at_later_operation(
+        home,
+        monkeypatch,
+        "_after_operation_backup",
+        96,
+    )
+    record = json.loads(record_path.read_text())
+    backup = home / record["operations"][1]["backup"]
+    if case == "missing":
+        backup.unlink()
+    else:
+        backup.write_bytes(b"changed backup\n")
+
+    with pytest.raises((ValueError, IncompleteRollbackError), match="backup"):
+        recover_transaction(record_path)
+
+    assert (home / "AGENTS.md").is_symlink()
+    assert os.readlink(home / "AGENTS.md") == "configs/global/AGENTS.md"
+    assert record_path.is_file()
+
+
+def test_recovery_restores_link_before_rejecting_changed_unstarted_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    record_path = _crash_refresh_at_later_operation(
+        home,
+        monkeypatch,
+        "_before_operation_mutation",
+        97,
+    )
+    prior_destination = home / "skills/example/SKILL.md"
+    prior_destination.write_bytes(b"concurrent prior change\n")
+
+    with pytest.raises(ValueError, match="backup evidence is missing"):
+        recover_transaction(record_path)
+
+    assert (home / "AGENTS.md").is_symlink()
+    assert os.readlink(home / "AGENTS.md") == "configs/global/AGENTS.md"
+    assert prior_destination.read_bytes() == b"concurrent prior change\n"
 
 
 def test_recovery_restores_legacy_link_when_staged_evidence_is_missing(
@@ -467,6 +658,8 @@ def test_legacy_link_transition_schema_downgrade_recovery_preserves_prior_link(
         ("operation_index", True),
         ("prestate_evidence", "other"),
         ("retained_entry", "other"),
+        ("operation_cursor", True),
+        ("operation_phase", True),
     ],
 )
 def test_legacy_link_transition_record_rejects_tampered_binding(
@@ -2769,8 +2962,8 @@ def test_strict_transaction_json_rejects_ambiguity(
     record_path = next((home / ".agentops/deployment/transactions").glob("*/record.json"))
     if case == "duplicate-record-key":
         content = record_path.read_text().replace(
-            '"schema_version": 4,',
-            '"schema_version": 4,\n  "schema_version": 4,',
+            '"schema_version": 5,',
+            '"schema_version": 5,\n  "schema_version": 5,',
         )
         record_path.write_text(content)
     else:

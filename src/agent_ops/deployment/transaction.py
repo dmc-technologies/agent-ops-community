@@ -45,7 +45,7 @@ __all__ = (
 )
 
 _SCHEMA_VERSION = 1
-_TRANSACTION_SCHEMA_VERSION = 4
+_TRANSACTION_SCHEMA_VERSION = 5
 _LEGACY_TRANSACTION_SCHEMA_VERSION = 3
 _DIRECTORY_EVIDENCE_SCHEMA_VERSION = 1
 _LEGACY_LINK_EVIDENCE_SCHEMA_VERSION = 1
@@ -89,6 +89,30 @@ def _after_legacy_link_move(
     _retained_entry: Path,
 ) -> None:
     """Internal fault-injection boundary after retaining the legacy link entry."""
+
+
+def _before_operation_mutation(
+    _home_fs: _HomeFS,
+    _record_path: Path,
+    _operation: dict[str, Any],
+) -> None:
+    """Internal fault-injection boundary after durable applying phase."""
+
+
+def _after_operation_backup(
+    _home_fs: _HomeFS,
+    _record_path: Path,
+    _operation: dict[str, Any],
+) -> None:
+    """Internal fault-injection boundary after a recorded backup move."""
+
+
+def _after_operation_mutation(
+    _home_fs: _HomeFS,
+    _record_path: Path,
+    _operation: dict[str, Any],
+) -> None:
+    """Internal fault-injection boundary before durable ready phase."""
 
 
 def _after_preview_status_manifest_open(_home_fs: _HomeFS, _path: Path, _descriptor: int) -> None:
@@ -1421,6 +1445,19 @@ def _verify_completed_rollback(
     manifest_path = Path(record["manifest_path"])
     legacy = record.get("legacy_link_transition")
     legacy_destination = Path(legacy["destination"]) if legacy is not None else None
+    if legacy_destination is not None and not home_fs.matches_symlink(
+        legacy_destination,
+        legacy["expected_link_text"],
+    ):
+        raise IncompleteRollbackError(
+            f"rollback completion changed legacy link: {legacy_destination}"
+        )
+    if legacy is not None and home_fs.exists(
+        _legacy_link_rollback_candidate_path(
+            _METADATA / "transactions" / record["manifest"]["transaction_id"]
+        )
+    ):
+        raise IncompleteRollbackError("rollback completion retains legacy candidate")
     if prior_data is None:
         if home_fs.exists(manifest_path):
             raise IncompleteRollbackError(
@@ -1429,10 +1466,6 @@ def _verify_completed_rollback(
         for operation in record["operations"]:
             destination = Path(operation["destination"])
             if legacy_destination is not None and destination == legacy_destination:
-                if not home_fs.matches_symlink(destination, legacy["expected_link_text"]):
-                    raise IncompleteRollbackError(
-                        f"rollback completion changed legacy link: {destination}"
-                    )
                 continue
             if operation["kind"] == "installed" and home_fs.exists(destination):
                 raise IncompleteRollbackError(
@@ -1837,6 +1870,8 @@ def _install_provider_plan_groups(
                         "operation_index": legacy_operation_index,
                         "prestate_evidence": legacy_evidence_path.as_posix(),
                         "retained_entry": legacy_entry_path.as_posix(),
+                        "operation_cursor": 0,
+                        "operation_phase": "ready",
                     }
                 ),
                 "directories": directory_records,
@@ -1867,8 +1902,19 @@ def _install_provider_plan_groups(
                 for operation in operations:
                     destination = Path(operation["destination"])
                     backup = Path(operation["backup"]) if operation["backup"] else None
+                    if legacy_active is not None:
+                        record["legacy_link_transition"]["operation_cursor"] = operation["index"]
+                        record["legacy_link_transition"]["operation_phase"] = "applying"
+                        home_fs.write_atomic(record_path, _record_bytes(record), 0o600)
+                        _before_operation_mutation(home_fs, record_path, operation)
                     if backup is not None:
                         home_fs.replace(destination, backup)
+                        if legacy_active is not None:
+                            record["legacy_link_transition"]["operation_phase"] = (
+                                "backup-created"
+                            )
+                            home_fs.write_atomic(record_path, _record_bytes(record), 0o600)
+                        _after_operation_backup(home_fs, record_path, operation)
                     if operation["kind"] == "installed":
                         staged = Path(operation["staged"])
                         try:
@@ -1897,6 +1943,13 @@ def _install_provider_plan_groups(
                             raise ValueError(
                                 f"new unmanaged destination appeared: {destination}"
                             ) from exc
+                    if legacy_active is not None:
+                        _after_operation_mutation(home_fs, record_path, operation)
+                        record["legacy_link_transition"]["operation_cursor"] = (
+                            operation["index"] + 1
+                        )
+                        record["legacy_link_transition"]["operation_phase"] = "ready"
+                        home_fs.write_atomic(record_path, _record_bytes(record), 0o600)
                 manifest_content = _manifest_bytes(manifest)
                 home_fs.write_file(
                     manifest_temp,
@@ -2165,7 +2218,7 @@ def _decode_record(
         not isinstance(record, dict)
         or type(record.get("schema_version")) is not int
         or record["schema_version"]
-        not in {_LEGACY_TRANSACTION_SCHEMA_VERSION, _TRANSACTION_SCHEMA_VERSION}
+        not in {_LEGACY_TRANSACTION_SCHEMA_VERSION, 4, _TRANSACTION_SCHEMA_VERSION}
         or record.get("state") not in {"prepared", "committed", "indeterminate", "rolled-back"}
         or not isinstance(record.get("manifest"), dict)
     ):
@@ -2183,7 +2236,7 @@ def _decode_record(
         "directories",
         "operations",
     }
-    if record["schema_version"] == _TRANSACTION_SCHEMA_VERSION:
+    if record["schema_version"] >= 4:
         record_keys.add("legacy_link_transition")
     _require_exact_keys(record, record_keys, label="transaction record")
     target, manifest = _manifest_from_data(record["manifest"], home=home)
@@ -2203,13 +2256,16 @@ def _decode_record(
     if legacy is not None:
         if not isinstance(legacy, dict):
             raise ValueError("invalid legacy link transition")
+        legacy_keys = {
+            "provider_id", "target_id", "expected_channel", "destination",
+            "expected_link_text", "replacement_fingerprint", "replacement_mode",
+            "operation_index", "prestate_evidence", "retained_entry",
+        }
+        if record["schema_version"] == _TRANSACTION_SCHEMA_VERSION:
+            legacy_keys.update({"operation_cursor", "operation_phase"})
         _require_exact_keys(
             legacy,
-            {
-                "provider_id", "target_id", "expected_channel", "destination",
-                "expected_link_text", "replacement_fingerprint", "replacement_mode",
-                "operation_index", "prestate_evidence", "retained_entry",
-            },
+            legacy_keys,
             label="legacy link transition",
         )
         if (
@@ -2282,6 +2338,19 @@ def _decode_record(
     directories = record.get("directories")
     if not isinstance(operations, list) or not isinstance(directories, list):
         raise ValueError("invalid transaction record operations")
+    if record["schema_version"] == _TRANSACTION_SCHEMA_VERSION and legacy is not None:
+        cursor = legacy["operation_cursor"]
+        phase = legacy["operation_phase"]
+        if (
+            type(cursor) is not int
+            or cursor < 0
+            or cursor > len(operations)
+            or type(phase) is not str
+            or phase not in {"ready", "applying", "backup-created"}
+            or phase in {"applying", "backup-created"}
+            and cursor == len(operations)
+        ):
+            raise ValueError("invalid legacy link operation phase")
     destinations: set[Path] = set()
     backup_paths: set[Path] = set()
     for operation in operations:
@@ -2488,6 +2557,16 @@ def _decode_record(
         raise ValueError("transaction operations are not in canonical order")
     if [item["path"] for item in directories] != sorted(item["path"] for item in directories):
         raise ValueError("transaction directories are not in canonical order")
+    if record["schema_version"] == _TRANSACTION_SCHEMA_VERSION and legacy is not None:
+        cursor = legacy["operation_cursor"]
+        phase = legacy["operation_phase"]
+        if (
+            phase == "backup-created"
+            and operations[cursor]["backup"] is None
+            or record["state"] == "committed"
+            and (phase != "ready" or cursor != len(operations))
+        ):
+            raise ValueError("invalid legacy link operation phase binding")
     return record, manifest
 
 
@@ -2513,6 +2592,102 @@ def _evidence_entries(home_fs: _HomeFS, root: Path) -> dict[Path, str]:
         raise ValueError(f"invalid transaction evidence directory: {root}") from exc
 
 
+def _operation_proven_unstarted(
+    home_fs: _HomeFS,
+    record: dict[str, Any],
+    operation: dict[str, Any],
+) -> bool:
+    legacy = record.get("legacy_link_transition")
+    if (
+        legacy is None
+        or "operation_cursor" not in legacy
+        or operation["backup"] is None
+        or not operation["prior_exists"]
+    ):
+        return False
+    cursor = legacy["operation_cursor"]
+    phase = legacy["operation_phase"]
+    index = operation["index"]
+    if index < cursor or phase == "backup-created" and index == cursor:
+        return False
+    return _file_matches(
+        home_fs,
+        Path(operation["destination"]),
+        operation["prior_fingerprint"],
+        operation["prior_mode"],
+    )
+
+
+def _validate_legacy_restoration_evidence(
+    home_fs: _HomeFS,
+    legacy: dict[str, Any],
+) -> None:
+    evidence_path = Path(legacy["prestate_evidence"])
+    retained_entry = Path(legacy["retained_entry"])
+    try:
+        evidence_stat = home_fs.stat(evidence_path)
+        evidence_content = home_fs.read_file(evidence_path)
+    except OSError as exc:
+        raise ValueError("legacy link prestate evidence is missing") from exc
+    if (
+        not stat.S_ISREG(evidence_stat.st_mode)
+        or stat.S_IMODE(evidence_stat.st_mode) != 0o600
+        or evidence_content
+        != _legacy_link_evidence_bytes(
+            Path(legacy["destination"]),
+            legacy["expected_link_text"],
+        )
+        or not home_fs.matches_symlink(
+            retained_entry,
+            legacy["expected_link_text"],
+        )
+    ):
+        raise ValueError("legacy link restoration evidence is invalid")
+
+
+def _restore_legacy_destination_before_evidence(
+    home_fs: _HomeFS,
+    record: dict[str, Any],
+    record_path: Path,
+) -> None:
+    legacy = record["legacy_link_transition"]
+    destination = Path(legacy["destination"])
+    retained_entry = Path(legacy["retained_entry"])
+    if home_fs.matches_symlink(destination, legacy["expected_link_text"]):
+        return
+    if not home_fs.matches_symlink(retained_entry, legacy["expected_link_text"]):
+        return
+    _validate_legacy_restoration_evidence(home_fs, legacy)
+    candidate = _legacy_link_rollback_candidate_path(record_path.parent)
+    if home_fs.exists(destination):
+        if not _file_matches(
+            home_fs,
+            destination,
+            legacy["replacement_fingerprint"],
+            legacy["replacement_mode"],
+        ):
+            return
+        _ensure_directory(home_fs, candidate.parent, 0o700)
+        home_fs.move_new(destination, candidate)
+        if not _file_matches(
+            home_fs,
+            candidate,
+            legacy["replacement_fingerprint"],
+            legacy["replacement_mode"],
+        ):
+            if not home_fs.exists(destination):
+                home_fs.move_new(candidate, destination)
+            raise IncompleteRollbackError(
+                "rollback incomplete: retained legacy replacement changed"
+            )
+    try:
+        home_fs.move_new(retained_entry, destination)
+    except FileExistsError as exc:
+        raise IncompleteRollbackError(
+            "rollback incomplete: concurrent legacy destination preserved"
+        ) from exc
+
+
 def _validate_transaction_evidence(
     home_fs: _HomeFS,
     record: dict[str, Any],
@@ -2534,6 +2709,16 @@ def _validate_transaction_evidence(
         raise ValueError("transaction backup evidence has invalid entries")
     actual_backups = set(backup_entries)
     missing_backups = expected_backups - actual_backups
+    missing_backups = {
+        path
+        for path in missing_backups
+        if not any(
+            Path(operation["backup"]) == path
+            and _operation_proven_unstarted(home_fs, record, operation)
+            for operation in record["operations"]
+            if operation["backup"] is not None
+        )
+    }
     if missing_backups and not allow_missing:
         missing = min(missing_backups, key=str)
         raise missing_backup_error(f"rollback incomplete: backup evidence is missing: {missing}")
@@ -2606,6 +2791,14 @@ def _validate_transaction_evidence(
             legacy["expected_link_text"],
         ):
             raise ValueError("legacy link retained entry is invalid")
+        rollback_candidate = _legacy_link_rollback_candidate_path(transaction)
+        if home_fs.exists(rollback_candidate) and not _file_matches(
+            home_fs,
+            rollback_candidate,
+            legacy["replacement_fingerprint"],
+            legacy["replacement_mode"],
+        ):
+            raise ValueError("legacy link rollback candidate is invalid")
 
     directory_root = transaction / "prestate" / "directories"
     expected_directories = {
@@ -2849,6 +3042,8 @@ def _rollback_record(
             )
         if backup is not None:
             if not home_fs.exists(backup):
+                if _operation_proven_unstarted(home_fs, record, operation):
+                    continue
                 raise IncompleteRollbackError(f"rollback incomplete: backup is missing: {backup}")
             if not _file_matches(
                 home_fs,
@@ -2880,6 +3075,17 @@ def _rollback_record(
             if operation["kind"] == "installed" and backup is None:
                 if legacy_destination is not None and destination == legacy_destination:
                     if home_fs.matches_symlink(destination, legacy["expected_link_text"]):
+                        if legacy_candidate is not None and home_fs.exists(legacy_candidate):
+                            if not _file_matches(
+                                home_fs,
+                                legacy_candidate,
+                                legacy["replacement_fingerprint"],
+                                legacy["replacement_mode"],
+                            ):
+                                raise IncompleteRollbackError(
+                                    "rollback incomplete: legacy candidate changed"
+                                )
+                            home_fs.unlink(legacy_candidate)
                         continue
                     assert legacy_entry is not None
                     assert legacy_candidate is not None
@@ -3080,8 +3286,17 @@ def recover_transaction(path: Path) -> DeploymentManifest:
             _TRANSACTION_PATHS[manifest.transaction_id] = path
             home_fs.verify_lock_identity()
             return manifest
-        _validate_transaction_evidence(home_fs, record, relative)
         legacy = record.get("legacy_link_transition")
+        if (
+            legacy is not None
+            and record["state"] in {"prepared", "indeterminate"}
+        ):
+            _restore_legacy_destination_before_evidence(
+                home_fs,
+                record,
+                relative,
+            )
+        _validate_transaction_evidence(home_fs, record, relative)
         if (
             legacy is not None
             and record["state"] in {"prepared", "indeterminate"}
