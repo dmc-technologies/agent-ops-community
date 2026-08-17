@@ -1649,11 +1649,11 @@ def _locked_provider_plan_targets(
         return
     with ExitStack() as locks:
         grouped_locks = {home: locks.enter_context(_target_lock(home)) for home in homes}
-        token = _GROUP_HOME_LOCKS.set(grouped_locks)
+        lock_context = _GROUP_HOME_LOCKS.set(grouped_locks)
         try:
             yield
         finally:
-            _GROUP_HOME_LOCKS.reset(token)
+            _GROUP_HOME_LOCKS.reset(lock_context)
 
 
 def _verify_locked_provider_plan_targets(plans: tuple[ProviderPlan, ...]) -> None:
@@ -1778,6 +1778,9 @@ def _install_provider_plan_groups(
                         raise ValueError(f"unmanaged destination conflicts with plan: {item.path}")
                     if _fingerprint(installed) != prior[0] or installed_mode != prior[1]:
                         raise ValueError(f"managed destination changed: {item.path}")
+                    if installed == item.content and installed_mode == item.mode:
+                        operations.append(_operation(item, transaction_id, index, kind="adopted"))
+                        continue
                 operation = _operation(item, transaction_id, index, kind="installed")
                 if prior is not None and destination_exists:
                     operation["backup"] = (

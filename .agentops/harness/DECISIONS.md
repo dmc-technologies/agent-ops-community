@@ -124,6 +124,13 @@ Record durable architecture, workflow, and harness decisions here.
 
 ## Template
 
+### 2026-08-17: Exact unchanged managed files retain filesystem identity
+
+- Decision: when an existing managed regular file has the exact bytes and mode required by the next plan, record it through the established non-mutating transaction operation instead of staging, backing up, and replacing it. Continue to replace any file whose bytes or mode change. Runtime Python caches remain outside managed source ownership and are accepted only by the existing source-bound bytecode validator; refresh does not delete an unrelated or invalid cache.
+- Rationale: replacing an unchanged Python source changes its modification time and inode, which invalidates a cache created by normal import even though the source bytes did not change. Reusing the existing non-mutating transaction path preserves the source/cache relationship without expanding deletion authority or changing rollback and recovery formats.
+- Applies to: shared provider-plan install, refresh, rollback, recovery, runtime-cache audit, and transaction tests.
+- Revisit when: a provider requires generated output whose validity depends on metadata beyond exact source bytes and mode, or the transaction schema gains a separately named preserved-file operation.
+
 ### 2026-08-17: Source-store state stays private and audit receipts retain their first result
 
 - Decision: require the source-store root, sources, source directory, snapshot reads, and lock directory to be owned by the effective user with exact `0700` mode. Persist an HTTPS remote without userinfo and pass that userinfo only as transient Git fetch authentication. Retain the first audit result through receipt creation and refuse any later result that differs, including a previously missing managed file.
