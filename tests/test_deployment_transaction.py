@@ -98,6 +98,38 @@ def test_transaction_installs_and_audits_exact_plan(tmp_path: Path) -> None:
     assert audit_provider_plans((plan,)).matches
 
 
+def test_audit_allows_co_resident_provider_owned_roots_only(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    private = ProviderPlan(
+        "private", "1" * 40, TargetSpec("codex-dev", Framework.CODEX, home, "feature"),
+        (PlannedFile(Path("skills/private/SKILL.md"), b"private\n", 0o644),),
+        audit_roots=(Path("skills/private"),),
+    )
+    public = _plan(
+        home, PlannedFile(Path("skills/public/SKILL.md"), b"public\n", 0o644), provider="public"
+    )
+    install_provider_plans((private, public))
+    assert audit_provider_plans((private, public)).matches
+
+
+def test_audit_allows_only_cpython_bytecode_for_a_planned_python_file(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    plan = ProviderPlan(
+        "private", "1" * 40, TargetSpec("codex-dev", Framework.CODEX, home, "feature"),
+        (PlannedFile(Path("skills/private/module.py"), b"x = 1\n", 0o644),),
+        audit_roots=(Path("skills/private"),), allow_python_bytecode=True,
+    )
+    install_provider_plans((plan,))
+    cache = home / "skills/private/__pycache__"
+    cache.mkdir()
+    (cache / "module.cpython-312.pyc").write_bytes(b"bytecode")
+    assert audit_provider_plans((plan,)).matches
+    (cache / "other.cpython-312.pyc").write_bytes(b"bytecode")
+    assert audit_provider_plans((plan,)).unexpected == (
+        "skills/private/__pycache__/other.cpython-312.pyc",
+    )
+
+
 def test_ordinary_install_rejects_prior_manifest_with_contradictory_channel(
     tmp_path: Path,
 ) -> None:

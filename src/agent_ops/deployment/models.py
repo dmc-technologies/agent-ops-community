@@ -98,6 +98,8 @@ class ProviderPlan:
     target: TargetSpec
     files: tuple[PlannedFile, ...]
     removals: tuple[Path, ...] = ()
+    audit_roots: tuple[Path, ...] = ()
+    allow_python_bytecode: bool = False
 
     def __post_init__(self) -> None:
         _nonempty(self.provider_id, "provider id")
@@ -108,6 +110,11 @@ class ProviderPlan:
             "removals",
             tuple(_repository_relative_path(path) for path in self.removals),
         )
+        object.__setattr__(
+            self, "audit_roots", tuple(_repository_relative_path(path) for path in self.audit_roots)
+        )
+        if type(self.allow_python_bytecode) is not bool:
+            raise ValueError("allow_python_bytecode must be bool")
 
 
 @dataclass(frozen=True)
