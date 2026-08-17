@@ -45,8 +45,10 @@ __all__ = (
 )
 
 _SCHEMA_VERSION = 1
-_TRANSACTION_SCHEMA_VERSION = 5
+_TRANSACTION_SCHEMA_VERSION = 7
 _LEGACY_TRANSACTION_SCHEMA_VERSION = 3
+_LEGACY_OPERATION_CURSOR_SCHEMA_VERSION = 5
+_OPERATION_CURSOR_SCHEMA_VERSION = 6
 _DIRECTORY_EVIDENCE_SCHEMA_VERSION = 1
 _LEGACY_LINK_EVIDENCE_SCHEMA_VERSION = 1
 _OWNERSHIP_MANIFEST_MODE = 0o600
@@ -55,6 +57,8 @@ _LOCK_NAME = ".agentops-deployment.lock"
 _TRANSACTION_PATHS: dict[str, Path] = {}
 _POSIX_SUPPORTED = os.name == "posix" and fcntl is not None
 _CANONICAL_HOME_IDENTITY_ERROR = "deployment canonical home identity changed"
+_RUNTIME_CACHE_REMOVAL = "runtime-cache-removal"
+_REMOVAL_KINDS = frozenset({"removal", _RUNTIME_CACHE_REMOVAL})
 
 
 class PublicationIndeterminateError(OSError):
@@ -113,6 +117,15 @@ def _after_operation_backup(
     _operation: dict[str, Any],
 ) -> None:
     """Internal fault-injection boundary after a recorded backup move."""
+
+
+def _after_runtime_cache_backup_move(
+    _home_fs: _HomeFS,
+    _destination: Path,
+    _backup: Path,
+    _operation: dict[str, Any],
+) -> None:
+    """Internal fault-injection boundary before cache backup authorization."""
 
 
 def _after_operation_mutation(
@@ -391,6 +404,26 @@ class _HomeFS:
     def stat(self, relative: Path) -> os.stat_result:
         with self.parent(relative) as (parent, leaf):
             return os.stat(leaf, dir_fd=parent, follow_symlinks=False)
+
+    def set_mtime_seconds(self, relative: Path, seconds: int) -> None:
+        self.verify_lock_identity()
+        with self.parent(relative) as (parent, leaf):
+            descriptor = os.open(
+                leaf,
+                os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW,
+                dir_fd=parent,
+            )
+            try:
+                item = os.fstat(descriptor)
+                if not stat.S_ISREG(item.st_mode):
+                    raise OSError(f"not a regular file: {relative}")
+                os.utime(
+                    descriptor,
+                    ns=(item.st_atime_ns, seconds * 1_000_000_000),
+                )
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
 
     def read_file(self, relative: Path) -> bytes:
         with self.parent(relative) as (parent, leaf):
@@ -1136,6 +1169,7 @@ class _PlanGroup:
     removals: tuple[Path, ...]
     audit_roots: tuple[Path, ...]
     runtime_python_sources: tuple[Path, ...]
+    runtime_cache_removals: tuple[tuple[Path, Path], ...]
     legacy_link_transition: LegacyLinkTransition | None
 
 
@@ -1155,6 +1189,9 @@ def _validate_and_group(
     removals: dict[tuple[str, Framework, Path, str, str], set[Path]] = {}
     audit_roots: dict[tuple[str, Framework, Path, str, str], set[Path]] = {}
     runtime_python_sources: dict[tuple[str, Framework, Path, str, str], set[Path]] = {}
+    runtime_cache_removals: dict[
+        tuple[str, Framework, Path, str, str], dict[Path, Path]
+    ] = {}
     legacy_links: dict[tuple[str, Framework, Path, str, str], LegacyLinkTransition] = {}
     target_keys: dict[str, tuple[str, Framework, Path, str, str]] = {}
     home_targets: dict[Path, str] = {}
@@ -1199,14 +1236,19 @@ def _validate_and_group(
                     raise ValueError(f"conflicting duplicate planned destination: {path}")
                 continue
             files[path] = item
-        for removal in plan.removals:
-            removal_path = _safe_relative(removal)
+        normalized_removals = tuple(_safe_relative(removal) for removal in plan.removals)
+        normalized_removal_set = set(normalized_removals)
+        cache_removal_pairs = runtime_cache_removals.setdefault(key, {})
+        for removal_path in normalized_removals:
             if removal_path.parts[0] in {
                 ".agentops",
                 _LOCK_NAME,
             } and not _public_gstack_runtime_path(plan.provider_id, removal_path):
                 raise ValueError(f"planned removal overlaps reserved metadata: {removal_path}")
             planned_removals.add(removal_path)
+            runtime_source = _runtime_python_source_for_cache(removal_path)
+            if runtime_source is not None and runtime_source in normalized_removal_set:
+                cache_removal_pairs[removal_path] = runtime_source
     for key, files in groups.items():
         file_paths = sorted(files, key=str)
         removal_paths = sorted(removals[key], key=str)
@@ -1250,6 +1292,7 @@ def _validate_and_group(
                 removals=tuple(sorted(removals[key], key=str)),
                 audit_roots=tuple(sorted(audit_roots[key], key=str)),
                 runtime_python_sources=tuple(sorted(runtime_python_sources[key], key=str)),
+                runtime_cache_removals=tuple(sorted(runtime_cache_removals[key].items())),
                 legacy_link_transition=legacy_links.get(key),
             )
         )
@@ -1407,7 +1450,7 @@ def _verify_recovery_final_state(
     removals = tuple(
         Path(operation["destination"])
         for operation in record["operations"]
-        if operation["kind"] == "removal"
+        if operation["kind"] in _REMOVAL_KINDS
     )
     try:
         home_fs.verify_lock_identity()
@@ -1512,6 +1555,23 @@ def _verify_completed_rollback(
         error_type=IncompleteRollbackError,
         context="rollback completion prior",
     )
+    for operation in record["operations"]:
+        if operation["kind"] != _RUNTIME_CACHE_REMOVAL:
+            continue
+        destination = Path(operation["destination"])
+        if not _file_matches(
+            home_fs,
+            destination,
+            operation["prior_fingerprint"],
+            operation["prior_mode"],
+        ):
+            raise IncompleteRollbackError(
+                f"rollback completion changed runtime cache: {destination}"
+            )
+        if not _recorded_runtime_cache_is_valid(home_fs, record, operation):
+            raise IncompleteRollbackError(
+                f"rollback completion has invalid runtime cache: {destination}"
+            )
 
 
 def _publication_outcome(
@@ -1730,8 +1790,53 @@ def _install_provider_plan_groups(
             for removal in group.removals:
                 prior = managed.get(removal)
                 if prior is None:
-                    if home_fs.exists(removal):
+                    if not home_fs.exists(removal):
+                        continue
+                    runtime_source = _authorized_runtime_cache_removal_source(
+                        home_fs,
+                        removal,
+                        managed=managed,
+                        authorized_sources=dict(group.runtime_cache_removals),
+                    )
+                    if runtime_source is None:
                         raise ValueError(f"refusing to remove unmanaged destination: {removal}")
+                    index = len(operations)
+                    removal_stat = home_fs.stat(removal)
+                    removal_content = home_fs.read_file(removal)
+                    source_stat = home_fs.stat(runtime_source)
+                    source_content = home_fs.read_file(runtime_source)
+                    runtime_cache_provenance = _runtime_cache_provenance(
+                        removal,
+                        runtime_source,
+                        removal_content,
+                        removal_stat,
+                        source_content,
+                        source_stat,
+                    )
+                    if runtime_cache_provenance is None:
+                        raise ValueError(f"invalid runtime cache removal: {removal}")
+                    operations.append(
+                        {
+                            "kind": _RUNTIME_CACHE_REMOVAL,
+                            "index": index,
+                            "destination": removal.as_posix(),
+                            "runtime_source": runtime_source.as_posix(),
+                            "runtime_cache_provenance": runtime_cache_provenance,
+                            "staged": None,
+                            "backup": (
+                                _METADATA
+                                / "transactions"
+                                / transaction_id
+                                / "backups"
+                                / f"{index:04d}"
+                            ).as_posix(),
+                            "expected_fingerprint": None,
+                            "expected_mode": None,
+                            "prior_fingerprint": _fingerprint(removal_content),
+                            "prior_mode": stat.S_IMODE(removal_stat.st_mode),
+                            "prior_exists": True,
+                        }
+                    )
                     continue
                 index = len(operations)
                 operation = {
@@ -1851,6 +1956,8 @@ def _install_provider_plan_groups(
             record = {
                 "schema_version": _TRANSACTION_SCHEMA_VERSION,
                 "state": "prepared",
+                "operation_cursor": 0,
+                "operation_phase": "ready",
                 "expected_prior_channel": transition.expected_prior_channel,
                 "candidate_channel": transition.candidate_channel,
                 "manifest": _manifest_to_dict(manifest),
@@ -1910,19 +2017,40 @@ def _install_provider_plan_groups(
                 for operation in operations:
                     destination = Path(operation["destination"])
                     backup = Path(operation["backup"]) if operation["backup"] else None
+                    record["operation_cursor"] = operation["index"]
+                    record["operation_phase"] = "applying"
                     if legacy_active is not None:
                         record["legacy_link_transition"]["operation_cursor"] = operation["index"]
                         record["legacy_link_transition"]["operation_phase"] = "applying"
-                        home_fs.write_atomic(record_path, _record_bytes(record), 0o600)
+                    home_fs.write_atomic(record_path, _record_bytes(record), 0o600)
+                    pinned_cache = (
+                        _PinnedRuntimeCache(home_fs, destination, operation)
+                        if operation["kind"] == _RUNTIME_CACHE_REMOVAL
+                        else None
+                    )
+                    try:
                         _before_operation_mutation(home_fs, record_path, operation)
-                    if backup is not None:
-                        home_fs.replace(destination, backup)
-                        if legacy_active is not None:
-                            record["legacy_link_transition"]["operation_phase"] = (
-                                "backup-created"
-                            )
+                        if backup is not None:
+                            if pinned_cache is not None:
+                                _retain_runtime_cache_removal(
+                                    home_fs,
+                                    destination,
+                                    backup,
+                                    operation,
+                                    pinned_cache,
+                                )
+                            else:
+                                home_fs.replace(destination, backup)
+                            record["operation_phase"] = "backup-created"
+                            if legacy_active is not None:
+                                record["legacy_link_transition"]["operation_phase"] = (
+                                    "backup-created"
+                                )
                             home_fs.write_atomic(record_path, _record_bytes(record), 0o600)
-                        _after_operation_backup(home_fs, record_path, operation)
+                            _after_operation_backup(home_fs, record_path, operation)
+                    finally:
+                        if pinned_cache is not None:
+                            pinned_cache.close()
                     if operation["kind"] == "installed":
                         staged = Path(operation["staged"])
                         try:
@@ -1951,13 +2079,15 @@ def _install_provider_plan_groups(
                             raise ValueError(
                                 f"new unmanaged destination appeared: {destination}"
                             ) from exc
+                    _after_operation_mutation(home_fs, record_path, operation)
+                    record["operation_cursor"] = operation["index"] + 1
+                    record["operation_phase"] = "ready"
                     if legacy_active is not None:
-                        _after_operation_mutation(home_fs, record_path, operation)
                         record["legacy_link_transition"]["operation_cursor"] = (
                             operation["index"] + 1
                         )
                         record["legacy_link_transition"]["operation_phase"] = "ready"
-                        home_fs.write_atomic(record_path, _record_bytes(record), 0o600)
+                    home_fs.write_atomic(record_path, _record_bytes(record), 0o600)
                 manifest_content = _manifest_bytes(manifest)
                 home_fs.write_file(
                     manifest_temp,
@@ -2112,7 +2242,17 @@ def _validate_group_current_state(
     for removal in group.removals:
         prior = managed.get(removal)
         if prior is None:
-            if home_fs.exists(removal):
+            if not home_fs.exists(removal):
+                continue
+            if (
+                _authorized_runtime_cache_removal_source(
+                    home_fs,
+                    removal,
+                    managed=managed,
+                    authorized_sources=dict(group.runtime_cache_removals),
+                )
+                is None
+            ):
                 raise ValueError(f"refusing to remove unmanaged destination: {removal}")
             continue
         if not home_fs.exists(removal):
@@ -2227,7 +2367,13 @@ def _decode_record(
         not isinstance(record, dict)
         or type(record.get("schema_version")) is not int
         or record["schema_version"]
-        not in {_LEGACY_TRANSACTION_SCHEMA_VERSION, 4, _TRANSACTION_SCHEMA_VERSION}
+        not in {
+            _LEGACY_TRANSACTION_SCHEMA_VERSION,
+            4,
+            _LEGACY_OPERATION_CURSOR_SCHEMA_VERSION,
+            6,
+            _TRANSACTION_SCHEMA_VERSION,
+        }
         or record.get("state") not in {"prepared", "committed", "indeterminate", "rolled-back"}
         or not isinstance(record.get("manifest"), dict)
     ):
@@ -2247,6 +2393,8 @@ def _decode_record(
     }
     if record["schema_version"] >= 4:
         record_keys.add("legacy_link_transition")
+    if record["schema_version"] >= _OPERATION_CURSOR_SCHEMA_VERSION:
+        record_keys.update({"operation_cursor", "operation_phase"})
     _require_exact_keys(record, record_keys, label="transaction record")
     target, manifest = _manifest_from_data(record["manifest"], home=home)
     expected_prior_channel = record.get("expected_prior_channel")
@@ -2270,7 +2418,7 @@ def _decode_record(
             "expected_link_text", "replacement_fingerprint", "replacement_mode",
             "operation_index", "prestate_evidence", "retained_entry",
         }
-        if record["schema_version"] == _TRANSACTION_SCHEMA_VERSION:
+        if record["schema_version"] >= _LEGACY_OPERATION_CURSOR_SCHEMA_VERSION:
             legacy_keys.update({"operation_cursor", "operation_phase"})
         _require_exact_keys(
             legacy,
@@ -2347,7 +2495,7 @@ def _decode_record(
     directories = record.get("directories")
     if not isinstance(operations, list) or not isinstance(directories, list):
         raise ValueError("invalid transaction record operations")
-    if record["schema_version"] == _TRANSACTION_SCHEMA_VERSION and legacy is not None:
+    if record["schema_version"] >= _LEGACY_OPERATION_CURSOR_SCHEMA_VERSION and legacy is not None:
         cursor = legacy["operation_cursor"]
         phase = legacy["operation_phase"]
         if (
@@ -2360,6 +2508,19 @@ def _decode_record(
             and cursor == len(operations)
         ):
             raise ValueError("invalid legacy link operation phase")
+    if record["schema_version"] >= _OPERATION_CURSOR_SCHEMA_VERSION:
+        cursor = record["operation_cursor"]
+        phase = record["operation_phase"]
+        if (
+            type(cursor) is not int
+            or cursor < 0
+            or cursor > len(operations)
+            or type(phase) is not str
+            or phase not in {"ready", "applying", "backup-created"}
+            or phase in {"applying", "backup-created"}
+            and cursor == len(operations)
+        ):
+            raise ValueError("invalid transaction operation phase")
     destinations: set[Path] = set()
     backup_paths: set[Path] = set()
     for operation in operations:
@@ -2367,22 +2528,28 @@ def _decode_record(
             "installed",
             "adopted",
             "removal",
+            _RUNTIME_CACHE_REMOVAL,
         }:
             raise ValueError("invalid transaction record operation")
+        operation_keys = {
+            "kind",
+            "destination",
+            "staged",
+            "backup",
+            "expected_fingerprint",
+            "expected_mode",
+            "prior_fingerprint",
+            "prior_mode",
+            "prior_exists",
+            "index",
+        }
+        if operation["kind"] == _RUNTIME_CACHE_REMOVAL:
+            operation_keys.add("runtime_source")
+            if record["schema_version"] >= _TRANSACTION_SCHEMA_VERSION:
+                operation_keys.add("runtime_cache_provenance")
         _require_exact_keys(
             operation,
-            {
-                "kind",
-                "destination",
-                "staged",
-                "backup",
-                "expected_fingerprint",
-                "expected_mode",
-                "prior_fingerprint",
-                "prior_mode",
-                "prior_exists",
-                "index",
-            },
+            operation_keys,
             label="transaction operation",
         )
         destination = _canonical_relative_text(
@@ -2397,7 +2564,7 @@ def _decode_record(
             raise ValueError("invalid transaction operation index")
         expected_fingerprint = operation.get("expected_fingerprint")
         expected_mode = operation.get("expected_mode")
-        if operation["kind"] == "removal":
+        if operation["kind"] in _REMOVAL_KINDS:
             if expected_fingerprint is not None or expected_mode is not None:
                 raise ValueError("invalid removal expectation")
         elif (
@@ -2443,6 +2610,21 @@ def _decode_record(
             raise ValueError("invalid transaction prior file")
         if prior_fingerprint is None and prior_mode is not None:
             raise ValueError("invalid transaction prior mode")
+        if operation["kind"] == _RUNTIME_CACHE_REMOVAL:
+            runtime_source = _canonical_relative_text(
+                operation.get("runtime_source"),
+                label="transaction runtime cache source",
+            )
+            if record["schema_version"] >= _TRANSACTION_SCHEMA_VERSION:
+                provenance = _decode_runtime_cache_provenance(
+                    operation.get("runtime_cache_provenance"),
+                    destination=destination,
+                    source=runtime_source,
+                )
+                if provenance["source"] != runtime_source.as_posix():
+                    raise ValueError("invalid runtime cache removal source")
+            elif _runtime_python_source_for_cache(destination) != runtime_source:
+                raise ValueError("invalid runtime cache removal source")
     manifest_files = {
         Path(item["path"]): (item["fingerprint"], item["mode"])
         for item in record["manifest"]["files"]
@@ -2474,7 +2656,8 @@ def _decode_record(
             if (
                 kind == "adopted"
                 or operation["backup"] is None
-                or prior_files.get(destination)
+                or kind != _RUNTIME_CACHE_REMOVAL
+                and prior_files.get(destination)
                 != (operation["prior_fingerprint"], operation["prior_mode"])
             ):
                 raise ValueError(
@@ -2488,6 +2671,23 @@ def _decode_record(
             raise ValueError("transaction operations prior existence does not match prior manifest")
         if kind == "removal" and destination not in prior_files:
             raise ValueError("transaction operations do not match manifests")
+        if kind == _RUNTIME_CACHE_REMOVAL and (
+            destination in prior_files
+            or operation["prior_mode"] != 0o644
+        ):
+            raise ValueError("transaction runtime cache removal does not match manifests")
+    removals_by_destination = {
+        Path(operation["destination"]): operation
+        for operation in operations
+        if operation["kind"] == "removal"
+    }
+    for operation in operations:
+        if operation["kind"] != _RUNTIME_CACHE_REMOVAL:
+            continue
+        source = Path(operation["runtime_source"])
+        source_operation = removals_by_destination.get(source)
+        if source not in prior_files or source_operation is None:
+            raise ValueError("transaction runtime cache removal is not bound to source removal")
     if installed_destinations != set(manifest_files):
         raise ValueError("transaction operations do not match manifest")
     if legacy is not None:
@@ -2560,13 +2760,14 @@ def _decode_record(
     ):
         raise ValueError("transaction operations are not in canonical order")
     operation_order = [
-        (operation["kind"] == "removal", operation["destination"]) for operation in operations
+        (operation["kind"] in _REMOVAL_KINDS, operation["destination"])
+        for operation in operations
     ]
     if operation_order != sorted(operation_order):
         raise ValueError("transaction operations are not in canonical order")
     if [item["path"] for item in directories] != sorted(item["path"] for item in directories):
         raise ValueError("transaction directories are not in canonical order")
-    if record["schema_version"] == _TRANSACTION_SCHEMA_VERSION and legacy is not None:
+    if record["schema_version"] >= _LEGACY_OPERATION_CURSOR_SCHEMA_VERSION and legacy is not None:
         cursor = legacy["operation_cursor"]
         phase = legacy["operation_phase"]
         if (
@@ -2576,6 +2777,16 @@ def _decode_record(
             and (phase != "ready" or cursor != len(operations))
         ):
             raise ValueError("invalid legacy link operation phase binding")
+    if record["schema_version"] >= _OPERATION_CURSOR_SCHEMA_VERSION:
+        cursor = record["operation_cursor"]
+        phase = record["operation_phase"]
+        if (
+            phase == "backup-created"
+            and operations[cursor]["backup"] is None
+            or record["state"] == "committed"
+            and (phase != "ready" or cursor != len(operations))
+        ):
+            raise ValueError("invalid transaction operation phase binding")
     return record, manifest
 
 
@@ -2606,6 +2817,22 @@ def _operation_proven_unstarted(
     record: dict[str, Any],
     operation: dict[str, Any],
 ) -> bool:
+    if (
+        record["schema_version"] >= _OPERATION_CURSOR_SCHEMA_VERSION
+        and operation["backup"] is not None
+        and operation["prior_exists"]
+    ):
+        cursor = record["operation_cursor"]
+        phase = record["operation_phase"]
+        index = operation["index"]
+        if index < cursor or phase == "backup-created" and index == cursor:
+            return False
+        return _file_matches(
+            home_fs,
+            Path(operation["destination"]),
+            operation["prior_fingerprint"],
+            operation["prior_mode"],
+        )
     legacy = record.get("legacy_link_transition")
     if (
         legacy is None
@@ -2697,6 +2924,93 @@ def _restore_legacy_destination_before_evidence(
         ) from exc
 
 
+def _operation_prestate_evidence_path(
+    home_fs: _HomeFS,
+    record: dict[str, Any],
+    operation: dict[str, Any],
+    *,
+    allow_missing: bool,
+) -> Path:
+    backup = Path(operation["backup"])
+    if home_fs.exists(backup):
+        return backup
+    destination = Path(operation["destination"])
+    if _operation_proven_unstarted(home_fs, record, operation) or (
+        allow_missing
+        and record["state"] == "rolled-back"
+        and _file_matches(
+            home_fs,
+            destination,
+            operation["prior_fingerprint"],
+            operation["prior_mode"],
+        )
+    ):
+        return destination
+    raise ValueError("runtime cache removal evidence is missing")
+
+
+def _validate_runtime_cache_removal_evidence(
+    home_fs: _HomeFS,
+    record: dict[str, Any],
+    *,
+    allow_missing: bool,
+) -> None:
+    operations = {
+        Path(operation["destination"]): operation for operation in record["operations"]
+    }
+    for operation in record["operations"]:
+        if operation["kind"] != _RUNTIME_CACHE_REMOVAL:
+            continue
+        source_operation = operations[Path(operation["runtime_source"])]
+        cache_evidence = _operation_prestate_evidence_path(
+            home_fs,
+            record,
+            operation,
+            allow_missing=allow_missing,
+        )
+        source_evidence = _operation_prestate_evidence_path(
+            home_fs,
+            record,
+            source_operation,
+            allow_missing=allow_missing,
+        )
+        try:
+            cache_stat = home_fs.stat(cache_evidence)
+            cache = home_fs.read_file(cache_evidence)
+            source_stat = home_fs.stat(source_evidence)
+            source = home_fs.read_file(source_evidence)
+        except OSError as exc:
+            raise ValueError("runtime cache removal evidence is unreadable") from exc
+        cache_content_valid = (
+            _runtime_cache_matches_provenance(
+                cache,
+                cache_stat,
+                source,
+                source_stat,
+                _decode_runtime_cache_provenance(
+                    operation["runtime_cache_provenance"],
+                    destination=Path(operation["destination"]),
+                    source=Path(operation["runtime_source"]),
+                ),
+            )
+            if record["schema_version"] >= _TRANSACTION_SCHEMA_VERSION
+            else _runtime_python_cache_content_is_valid(
+                cache,
+                cache_stat,
+                source,
+                source_stat,
+            )
+        )
+        if (
+            _fingerprint(cache) != operation["prior_fingerprint"]
+            or stat.S_IMODE(cache_stat.st_mode) != operation["prior_mode"]
+            or _fingerprint(source) != source_operation["prior_fingerprint"]
+            or stat.S_IMODE(source_stat.st_mode) != source_operation["prior_mode"]
+            or not cache_content_valid
+        ):
+            raise ValueError("runtime cache removal evidence is invalid")
+
+
 def _validate_transaction_evidence(
     home_fs: _HomeFS,
     record: dict[str, Any],
@@ -2724,6 +3038,10 @@ def _validate_transaction_evidence(
         if not any(
             Path(operation["backup"]) == path
             and _operation_proven_unstarted(home_fs, record, operation)
+            or Path(operation["backup"]) == path
+            and record["state"] == "rolled-back"
+            and operation["kind"] == _RUNTIME_CACHE_REMOVAL
+            and _recorded_runtime_cache_is_valid(home_fs, record, operation)
             for operation in record["operations"]
             if operation["backup"] is not None
         )
@@ -2733,6 +3051,11 @@ def _validate_transaction_evidence(
         raise missing_backup_error(f"rollback incomplete: backup evidence is missing: {missing}")
     if actual_backups - expected_backups:
         raise ValueError("transaction backup evidence has orphan entries")
+    _validate_runtime_cache_removal_evidence(
+        home_fs,
+        record,
+        allow_missing=allow_missing,
+    )
 
     legacy = record.get("legacy_link_transition")
     prestate_root = transaction / "prestate"
@@ -2861,6 +3184,53 @@ def _rollback_is_complete(
     except IncompleteRollbackError:
         return False
     return True
+
+
+def _restore_runtime_cache_source_timestamps(
+    home_fs: _HomeFS,
+    record: dict[str, Any],
+) -> None:
+    operations = {
+        Path(operation["destination"]): operation for operation in record["operations"]
+    }
+    for operation in record["operations"]:
+        if operation["kind"] != _RUNTIME_CACHE_REMOVAL:
+            continue
+        cache = Path(operation["destination"])
+        source = Path(operation["runtime_source"])
+        if _recorded_runtime_cache_is_valid(home_fs, record, operation):
+            continue
+        source_operation = operations[source]
+        if not _file_matches(
+            home_fs,
+            cache,
+            operation["prior_fingerprint"],
+            operation["prior_mode"],
+        ) or not _file_matches(
+            home_fs,
+            source,
+            source_operation["prior_fingerprint"],
+            source_operation["prior_mode"],
+        ):
+            raise IncompleteRollbackError("rollback runtime cache prestate changed")
+        if record["schema_version"] >= _TRANSACTION_SCHEMA_VERSION:
+            provenance = _decode_runtime_cache_provenance(
+                operation["runtime_cache_provenance"],
+                destination=cache,
+                source=source,
+            )
+            home_fs.set_mtime_seconds(source, provenance["timestamp"])
+        else:
+            content = home_fs.read_file(cache)
+            if (
+                len(content) < 16
+                or content[:4] != importlib.util.MAGIC_NUMBER
+                or content[4:8] != b"\0\0\0\0"
+            ):
+                raise IncompleteRollbackError("rollback runtime cache evidence is invalid")
+            home_fs.set_mtime_seconds(source, int.from_bytes(content[8:12], "little"))
+        if not _recorded_runtime_cache_is_valid(home_fs, record, operation):
+            raise IncompleteRollbackError("rollback runtime cache restoration is invalid")
 
 
 def _cleanup_rollback_evidence(
@@ -3037,7 +3407,7 @@ def _rollback_record(
                     f"rollback incomplete: retained legacy link changed: {legacy_entry}"
                 )
         if (
-            kind == "removal"
+            kind in _REMOVAL_KINDS
             and home_fs.exists(destination)
             and not _file_matches(
                 home_fs,
@@ -3049,6 +3419,25 @@ def _rollback_record(
             raise IncompleteRollbackError(
                 f"rollback incomplete: removed destination changed: {destination}"
             )
+        if (
+            kind == _RUNTIME_CACHE_REMOVAL
+            and record["schema_version"] >= _TRANSACTION_SCHEMA_VERSION
+            and home_fs.exists(destination)
+        ):
+            provenance = _decode_runtime_cache_provenance(
+                operation["runtime_cache_provenance"],
+                destination=destination,
+                source=Path(operation["runtime_source"]),
+            )
+            identity = provenance["identity"]
+            observed = home_fs.stat(destination)
+            if (observed.st_dev, observed.st_ino) != (
+                identity["device"],
+                identity["inode"],
+            ):
+                raise IncompleteRollbackError(
+                    f"rollback incomplete: removed destination identity changed: {destination}"
+                )
         if backup is not None:
             if not home_fs.exists(backup):
                 if _operation_proven_unstarted(home_fs, record, operation):
@@ -3081,6 +3470,10 @@ def _rollback_record(
         for operation in reversed(record["operations"]):
             destination = Path(operation["destination"])
             backup = Path(operation["backup"]) if operation["backup"] else None
+            if operation["kind"] == _RUNTIME_CACHE_REMOVAL and backup is not None:
+                if not home_fs.exists(destination):
+                    home_fs.publish_new(backup, destination)
+                continue
             if operation["kind"] == "installed" and backup is None:
                 if legacy_destination is not None and destination == legacy_destination:
                     if home_fs.matches_symlink(destination, legacy["expected_link_text"]):
@@ -3167,6 +3560,7 @@ def _rollback_record(
                     home_fs.replace(rollback_link, destination)
                 else:
                     home_fs.publish_new(rollback_link, destination)
+        _restore_runtime_cache_source_timestamps(home_fs, record)
         if prior_data is not None:
             _verify_manifest_files_and_directories(
                 home_fs,
@@ -3346,7 +3740,20 @@ def recover_transaction(path: Path) -> DeploymentManifest:
                 record,
                 relative,
             )
+        _restore_unauthorized_runtime_cache_before_evidence(home_fs, record)
         _validate_transaction_evidence(home_fs, record, relative)
+        if (
+            record["state"] in {"prepared", "indeterminate"}
+            and current_manifest == prior_manifest
+            and any(
+                operation["kind"] == _RUNTIME_CACHE_REMOVAL
+                for operation in record["operations"]
+            )
+        ):
+            _rollback_record(home_fs, record, relative, retain_completed=True)
+            _TRANSACTION_PATHS[manifest.transaction_id] = path
+            home_fs.verify_lock_identity()
+            return manifest
         if (
             legacy is not None
             and record["state"] in {"prepared", "indeterminate"}
@@ -3377,7 +3784,7 @@ def recover_transaction(path: Path) -> DeploymentManifest:
                 raise PublicationIndeterminateError(
                     f"transaction output changed; evidence retained: {destination}"
                 )
-            if operation["kind"] == "removal" and home_fs.exists(destination):
+            if operation["kind"] in _REMOVAL_KINDS and home_fs.exists(destination):
                 raise PublicationIndeterminateError(
                     f"transaction removal is incomplete; evidence retained: {destination}"
                 )
@@ -3464,18 +3871,33 @@ class _PinnedRecoveryManifest:
             os.close(self.descriptor)
 
 
+def _runtime_python_source_for_cache(candidate: Path) -> Path | None:
+    cache_tag = sys.implementation.cache_tag
+    if (
+        type(cache_tag) is not str
+        or not cache_tag
+        or candidate.parent.name != "__pycache__"
+    ):
+        return None
+    suffix = f".{cache_tag}.pyc"
+    if not candidate.name.endswith(suffix):
+        return None
+    source_name = candidate.name.removesuffix(suffix)
+    if not source_name:
+        return None
+    source = candidate.parent.parent / f"{source_name}.py"
+    try:
+        expected = Path(importlib.util.cache_from_source(str(source)))
+    except (NotImplementedError, ValueError):
+        return None
+    return source if expected == candidate else None
+
+
 def _is_valid_runtime_python_cache(
     home_fs: _HomeFS, candidate: Path, sources: tuple[Path, ...]
 ) -> bool:
-    if not sources or candidate.parent.name != "__pycache__" or candidate.suffix != ".pyc":
-        return False
-    stem = candidate.name.removesuffix(".pyc")
-    tag = importlib.util.cache_from_source("module.py").split("__pycache__/", 1)[1]
-    if not stem.endswith(tag.removesuffix(".pyc").removeprefix("module.")):
-        return False
-    source_name = stem.split(".", 1)[0] + ".py"
-    source = candidate.parent.parent / source_name
-    if source not in sources:
+    source = _runtime_python_source_for_cache(candidate)
+    if source is None or source not in sources:
         return False
     try:
         cache_stat = home_fs.stat(candidate)
@@ -3484,7 +3906,25 @@ def _is_valid_runtime_python_cache(
         source_bytes = home_fs.read_file(source)
     except OSError:
         return False
-    if not stat.S_ISREG(cache_stat.st_mode) or stat.S_IMODE(cache_stat.st_mode) != 0o644:
+    return _runtime_python_cache_content_is_valid(
+        cache,
+        cache_stat,
+        source_bytes,
+        source_stat,
+    )
+
+
+def _runtime_python_cache_content_is_valid(
+    cache: bytes,
+    cache_stat: os.stat_result,
+    source_bytes: bytes,
+    source_stat: os.stat_result,
+) -> bool:
+    if (
+        not stat.S_ISREG(cache_stat.st_mode)
+        or stat.S_IMODE(cache_stat.st_mode) != 0o644
+        or not stat.S_ISREG(source_stat.st_mode)
+    ):
         return False
     if len(cache) < 16 or cache[:4] != importlib.util.MAGIC_NUMBER or cache[4:8] != b"\0\0\0\0":
         return False
@@ -3500,6 +3940,278 @@ def _is_valid_runtime_python_cache(
     except (SyntaxError, ValueError, TypeError):
         return False
     return observed == expected and marshal.dumps(observed) == cache[16:]
+
+
+def _runtime_cache_provenance(
+    candidate: Path,
+    source: Path,
+    cache: bytes,
+    cache_stat: os.stat_result,
+    source_bytes: bytes,
+    source_stat: os.stat_result,
+) -> dict[str, object] | None:
+    """Return interpreter-independent evidence after live authorization."""
+    if not _runtime_python_cache_content_is_valid(cache, cache_stat, source_bytes, source_stat):
+        return None
+    cache_tag = _runtime_cache_tag_for_source(candidate, source)
+    if cache_tag is None:
+        return None
+    return {
+        "source": source.as_posix(),
+        "cache_tag": cache_tag,
+        "magic_number": cache[:4].hex(),
+        "timestamp": int.from_bytes(cache[8:12], "little"),
+        "source_size": int.from_bytes(cache[12:16], "little"),
+        "identity": {"device": cache_stat.st_dev, "inode": cache_stat.st_ino},
+    }
+
+
+def _runtime_cache_tag_for_source(candidate: Path, source: Path) -> str | None:
+    if candidate.parent != source.parent / "__pycache__":
+        return None
+    prefix = f"{source.stem}."
+    suffix = ".pyc"
+    if not candidate.name.startswith(prefix) or not candidate.name.endswith(suffix):
+        return None
+    cache_tag = candidate.name[len(prefix) : -len(suffix)]
+    if (
+        not cache_tag
+        or any(character not in "abcdefghijklmnopqrstuvwxyz0123456789_-" for character in cache_tag)
+    ):
+        return None
+    return cache_tag
+
+
+def _decode_runtime_cache_provenance(
+    value: object,
+    *,
+    destination: Path,
+    source: Path,
+) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise ValueError("invalid runtime cache removal provenance")
+    _require_exact_keys(
+        value,
+        {"source", "cache_tag", "magic_number", "timestamp", "source_size", "identity"},
+        label="runtime cache removal provenance",
+    )
+    source_text = value.get("source")
+    cache_tag = value.get("cache_tag")
+    magic_number = value.get("magic_number")
+    timestamp = value.get("timestamp")
+    source_size = value.get("source_size")
+    identity = value.get("identity")
+    if (
+        type(source_text) is not str
+        or _canonical_relative_text(source_text, label="runtime cache provenance source") != source
+        or type(cache_tag) is not str
+        or _runtime_cache_tag_for_source(destination, source) != cache_tag
+        or type(magic_number) is not str
+        or len(magic_number) != 8
+        or any(character not in "0123456789abcdef" for character in magic_number)
+        or type(timestamp) is not int
+        or not 0 <= timestamp < 2**32
+        or type(source_size) is not int
+        or not 0 <= source_size < 2**32
+        or not isinstance(identity, dict)
+    ):
+        raise ValueError("invalid runtime cache removal provenance")
+    _require_exact_keys(identity, {"device", "inode"}, label="runtime cache identity")
+    if (
+        type(identity.get("device")) is not int
+        or identity["device"] < 0
+        or type(identity.get("inode")) is not int
+        or identity["inode"] < 0
+    ):
+        raise ValueError("invalid runtime cache removal provenance")
+    return value
+
+
+def _runtime_cache_matches_provenance(
+    cache: bytes,
+    cache_stat: os.stat_result,
+    source_bytes: bytes,
+    source_stat: os.stat_result,
+    provenance: dict[str, object],
+) -> bool:
+    return (
+        stat.S_ISREG(cache_stat.st_mode)
+        and stat.S_IMODE(cache_stat.st_mode) == 0o644
+        and stat.S_ISREG(source_stat.st_mode)
+        and len(cache) >= 16
+        and (cache_stat.st_dev, cache_stat.st_ino)
+        == (
+            provenance["identity"]["device"],
+            provenance["identity"]["inode"],
+        )
+        and cache[:4].hex() == provenance["magic_number"]
+        and cache[4:8] == b"\0\0\0\0"
+        and int.from_bytes(cache[8:12], "little") == provenance["timestamp"]
+        and int.from_bytes(cache[12:16], "little") == provenance["source_size"]
+        and int(source_stat.st_mtime) == provenance["timestamp"]
+        and len(source_bytes) == provenance["source_size"]
+    )
+
+
+def _recorded_runtime_cache_is_valid(
+    home_fs: _HomeFS,
+    record: dict[str, Any],
+    operation: dict[str, Any],
+) -> bool:
+    cache = Path(operation["destination"])
+    source = Path(operation["runtime_source"])
+    if record["schema_version"] < _TRANSACTION_SCHEMA_VERSION:
+        return _is_valid_runtime_python_cache(home_fs, cache, (source,))
+    try:
+        cache_stat = home_fs.stat(cache)
+        cache_content = home_fs.read_file(cache)
+        source_stat = home_fs.stat(source)
+        source_content = home_fs.read_file(source)
+    except OSError:
+        return False
+    return _runtime_cache_matches_provenance(
+        cache_content,
+        cache_stat,
+        source_content,
+        source_stat,
+        _decode_runtime_cache_provenance(
+            operation["runtime_cache_provenance"],
+            destination=cache,
+            source=source,
+        ),
+    )
+
+
+class _PinnedRuntimeCache:
+    """No-follow cache descriptor retained across the mutation boundary."""
+
+    def __init__(self, home_fs: _HomeFS, path: Path, operation: dict[str, Any]) -> None:
+        self._home_fs = home_fs
+        self.path = path
+        self.fingerprint = operation["prior_fingerprint"]
+        self.mode = operation["prior_mode"]
+        provenance = _decode_runtime_cache_provenance(
+            operation["runtime_cache_provenance"],
+            destination=path,
+            source=Path(operation["runtime_source"]),
+        )
+        identity = provenance["identity"]
+        self.identity = identity["device"], identity["inode"]
+        with home_fs.parent(path) as (parent, leaf):
+            self.descriptor = os.open(
+                leaf,
+                os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW,
+                dir_fd=parent,
+            )
+        try:
+            os.set_inheritable(self.descriptor, False)
+            self._verify_descriptor()
+            current = home_fs.stat(path)
+            if (current.st_dev, current.st_ino) != self.identity:
+                raise ValueError(f"runtime cache removal changed before mutation: {path}")
+        except BaseException:
+            os.close(self.descriptor)
+            raise
+
+    def _verify_descriptor(self) -> None:
+        observed = os.fstat(self.descriptor)
+        if (
+            os.get_inheritable(self.descriptor)
+            or not stat.S_ISREG(observed.st_mode)
+            or stat.S_IMODE(observed.st_mode) != self.mode
+            or (observed.st_dev, observed.st_ino) != self.identity
+            or _fingerprint(_read_status_descriptor(self.descriptor)) != self.fingerprint
+        ):
+            raise ValueError(f"runtime cache removal changed before mutation: {self.path}")
+
+    def matches_backup(self, backup: Path) -> bool:
+        try:
+            self._verify_descriptor()
+            moved = self._home_fs.stat(backup)
+            return (
+                stat.S_ISREG(moved.st_mode)
+                and stat.S_IMODE(moved.st_mode) == self.mode
+                and (moved.st_dev, moved.st_ino) == self.identity
+                and self._home_fs.matches_fingerprint_file(backup, self.fingerprint, self.mode)
+            )
+        except (OSError, ValueError):
+            return False
+
+    def close(self) -> None:
+        with suppress(OSError):
+            os.close(self.descriptor)
+
+
+def _retain_runtime_cache_removal(
+    home_fs: _HomeFS,
+    destination: Path,
+    backup: Path,
+    operation: dict[str, Any],
+    pinned_cache: _PinnedRuntimeCache,
+) -> None:
+    """Move only the authorized cache; restore any replacement before failing."""
+    home_fs.replace(destination, backup)
+    _after_runtime_cache_backup_move(home_fs, destination, backup, operation)
+    if pinned_cache.matches_backup(backup):
+        return
+    if not home_fs.exists(destination):
+        home_fs.move_new(backup, destination)
+    raise ValueError(f"runtime cache removal changed during mutation: {destination}")
+
+
+def _restore_unauthorized_runtime_cache_before_evidence(
+    home_fs: _HomeFS,
+    record: dict[str, Any],
+) -> None:
+    """Keep a raced cache reachable before rejecting its transaction authority."""
+    if record["schema_version"] < _TRANSACTION_SCHEMA_VERSION:
+        return
+    for operation in record["operations"]:
+        if operation["kind"] != _RUNTIME_CACHE_REMOVAL:
+            continue
+        destination = Path(operation["destination"])
+        backup = Path(operation["backup"])
+        provenance = _decode_runtime_cache_provenance(
+            operation["runtime_cache_provenance"],
+            destination=destination,
+            source=Path(operation["runtime_source"]),
+        )
+        identity = provenance["identity"]
+        expected_identity = identity["device"], identity["inode"]
+        if home_fs.exists(backup):
+            observed = home_fs.stat(backup)
+            if (observed.st_dev, observed.st_ino) == expected_identity:
+                continue
+            if not home_fs.exists(destination):
+                with suppress(FileExistsError):
+                    home_fs.move_new(backup, destination)
+            raise IncompleteRollbackError(
+                f"rollback incomplete: unauthorized runtime cache preserved: {destination}"
+            )
+        if home_fs.exists(destination):
+            observed = home_fs.stat(destination)
+            if (observed.st_dev, observed.st_ino) != expected_identity:
+                raise IncompleteRollbackError(
+                    f"rollback incomplete: unauthorized runtime cache preserved: {destination}"
+                )
+
+
+def _authorized_runtime_cache_removal_source(
+    home_fs: _HomeFS,
+    candidate: Path,
+    *,
+    managed: dict[Path, tuple[str, int]],
+    authorized_sources: dict[Path, Path],
+) -> Path | None:
+    source = _runtime_python_source_for_cache(candidate)
+    if (
+        source is None
+        or authorized_sources.get(candidate) != source
+        or source not in managed
+        or not _is_valid_runtime_python_cache(home_fs, candidate, (source,))
+    ):
+        return None
+    return source
 
 
 def audit_provider_plans(plans: tuple[ProviderPlan, ...]) -> DeploymentAudit:
