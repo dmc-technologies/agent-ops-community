@@ -1778,6 +1778,9 @@ def _install_provider_plan_groups(
                         raise ValueError(f"unmanaged destination conflicts with plan: {item.path}")
                     if _fingerprint(installed) != prior[0] or installed_mode != prior[1]:
                         raise ValueError(f"managed destination changed: {item.path}")
+                    if installed == item.content and installed_mode == item.mode:
+                        operations.append(_operation(item, transaction_id, index, kind="adopted"))
+                        continue
                 operation = _operation(item, transaction_id, index, kind="installed")
                 if prior is not None and destination_exists:
                     operation["backup"] = (

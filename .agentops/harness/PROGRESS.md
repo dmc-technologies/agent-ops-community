@@ -4,25 +4,27 @@ Repository: `agent-ops-community`
 
 ## Current State
 
-- Branch: `fix/deployment-engine-removal-path-type`
-- Main baseline: `a5f8f72f5a6b9103dc16428d4c81a0add07d67cc`, the exact community `origin/main` selected for this correction.
-- Current handoff: the public deployment engine now accepts nonempty removal plans containing the platform's exact concrete `Path` type while continuing to reject arbitrary subclasses. The regression exercises a complete refresh that installs and then removes one managed file. No Plane work item applies.
-- Verification: the new engine regression failed first with `ValueError: provider plan removals must be exact Path values` and passes after the one-line correction. The adjacent deployment engine, model, and transaction tests pass with 361 tests. The complete suite passes with 945 passed and 3 skipped from 948 collected tests; focused Ruff and `git diff --check` pass. Final exact-commit gates and hosted Linux/Windows CI remain pending.
+- Branch: `fix/unchanged-managed-refresh`
+- Main baseline: `84c38fd811505f5a11dd2b78ecea6ab49a75d426`, the exact community `origin/main` selected for this correction.
+- Current handoff: managed refresh now preserves an existing regular file when its bytes and mode exactly match the next plan. A normally imported Python-backed skill therefore keeps its valid bytecode cache across an unchanged refresh, while changed sources still use the established replacement transaction and stale or hostile caches still fail audit. No Plane work item applies.
+- Verification: the new unchanged-refresh regression failed first because the source inode changed and passes after the transaction correction. The three focused refresh/cache nodes pass; the transaction suite passes with 239 tests; the other six deployment suites pass with 441 tests; and the complete suite passes with 947 passed and 3 skipped from 950 collected tests. Focused Ruff and `git diff --check` pass. Final exact-commit gates and hosted Linux/Windows CI remain pending.
 
 ## Current Work
 
-- Goal: allow the deployment engine to validate and execute safe nonempty removal plans on every supported platform.
-- Active task: complete the final local gates, publish one coherent community pull request, and obtain exact-head Linux and Windows CI without applying the Review Gate label or merging.
-- Files in play: `src/agent_ops/deployment/engine.py`, `tests/test_deployment_engine.py`, and this harness closeout record.
+- Goal: allow routine managed refresh after normal Python use without rewriting unchanged sources or weakening runtime-cache audit boundaries.
+- Active task: freeze the final commit, repeat the repository gates, publish one coherent community pull request, and obtain exact-head Linux and Windows CI without applying the Review Gate label or merging.
+- Files in play: `src/agent_ops/deployment/transaction.py`, `tests/test_deployment_transaction.py`, and this harness closeout record.
 - Blockers: none.
 
 ## Next Actions
 
-- Commit the coherent correction and repeat `ruff check .`, `python -m pytest -q`, `agentops harness check .`, and `git diff --check` on that exact SHA.
+- Commit the coherent correction and repeat `.venv/bin/ruff check .`, `.venv/bin/python -m pytest`, `.venv/bin/agentops harness check .`, and `git diff --check` on that exact SHA.
 - Push and open the community pull request, then obtain ordinary hosted Linux and Windows CI on its exact head.
-- Stop after CI. Dan must authorize the targeted hosted review before a person applies `ai review`; do not merge without a passing Review Gate on the unchanged final head.
+- Stop after CI without applying `ai review` or merging.
 
 ## Session Log
+
+- 2026-08-17: A transaction regression installed a Python-backed managed skill, imported it in a normal Python subprocess to create its cache, and refreshed unchanged bytes at a new source revision. The old transaction replaced the unchanged source, changed its inode and modification time, and made the retained cache fail audit. Exact existing managed bytes and mode now use the established non-mutating operation; changed source bytes still replace the file, and stale or hostile caches remain unexpected. The focused nodes, 239-test transaction suite, 441-test adjacent deployment suite, 950-test complete suite, focused Ruff, and whitespace validation pass locally; final exact-commit gates and hosted Linux/Windows CI remain.
 
 - 2026-08-17: A public `DeploymentEngine.refresh` regression reproduced that `type(Path("x"))` is the platform concrete path class rather than the `Path` factory class, causing every nonempty removal plan to fail validation. The validator now compares against `type(Path())`, preserving exact-type rejection for subclasses. The single regression, 361 adjacent deployment tests, and the 948-test complete suite pass locally; final exact-commit gates and hosted Linux/Windows CI remain.
 

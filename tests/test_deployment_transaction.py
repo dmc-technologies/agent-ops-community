@@ -11,6 +11,7 @@ import os
 import py_compile
 import socket
 import stat
+import subprocess
 import sys
 import threading
 from collections.abc import Callable
@@ -1162,6 +1163,126 @@ def test_audit_accepts_only_opted_in_exact_python_cache(tmp_path: Path) -> None:
     cache = next((home / source.parent / "__pycache__").glob("*.pyc"))
     cache.write_bytes(cache.read_bytes() + b"tampered")
     assert not audit_provider_plans((plan,)).matches
+
+
+def test_refresh_preserves_unchanged_managed_python_source_and_runtime_cache(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    target = TargetSpec("prime", Framework.PRIME_AGENT, home, "stable")
+    connector_skill = "d" + "mc-connectors"
+    module_name = "d" + "mc_connectors"
+    source = Path("skills") / connector_skill / "src" / module_name / "__init__.py"
+    initial = ProviderPlan(
+        "catalog-skills",
+        "1" * 40,
+        target,
+        (PlannedFile(source, b"VALUE = 'managed'\n", 0o644),),
+        audit_roots=(Path("skills") / connector_skill,),
+        runtime_python_sources=(source,),
+    )
+    install_provider_plans((initial,))
+    installed_source = home / source
+    fixed_mtime_ns = 1_700_000_000_000_000_000
+    os.utime(installed_source, ns=(fixed_mtime_ns, fixed_mtime_ns))
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(installed_source.parents[1])
+    environment.pop("PYTHONDONTWRITEBYTECODE", None)
+    imported = subprocess.run(
+        [
+            sys.executable,
+            "-S",
+            "-c",
+            f"import {module_name}; print({module_name}.__file__)",
+        ],
+        check=True,
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+    assert Path(imported.stdout.strip()).resolve() == installed_source.resolve()
+    cache = installed_source.parent / "__pycache__" / (
+        f"__init__.{sys.implementation.cache_tag}.pyc"
+    )
+    assert cache.is_file()
+    source_before = installed_source.stat()
+    cache_before = cache.read_bytes()
+
+    refreshed = ProviderPlan(
+        "catalog-skills",
+        "2" * 40,
+        target,
+        initial.files,
+        audit_roots=initial.audit_roots,
+        runtime_python_sources=initial.runtime_python_sources,
+    )
+    install_provider_plans((refreshed,))
+
+    source_after = installed_source.stat()
+    assert (source_after.st_dev, source_after.st_ino) == (
+        source_before.st_dev,
+        source_before.st_ino,
+    )
+    assert stat.S_IMODE(source_after.st_mode) == stat.S_IMODE(source_before.st_mode)
+    assert source_after.st_mtime_ns == source_before.st_mtime_ns
+    assert cache.read_bytes() == cache_before
+    assert audit_provider_plans((refreshed,)).matches
+
+
+def test_refresh_rewrites_changed_managed_python_source_and_rejects_stale_cache(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    target = TargetSpec("prime", Framework.PRIME_AGENT, home, "stable")
+    connector_skill = "d" + "mc-connectors"
+    module_name = "d" + "mc_connectors"
+    source = Path("skills") / connector_skill / "src" / module_name / "__init__.py"
+    initial = ProviderPlan(
+        "catalog-skills",
+        "1" * 40,
+        target,
+        (PlannedFile(source, b"VALUE = 'old'\n", 0o644),),
+        audit_roots=(Path("skills") / connector_skill,),
+        runtime_python_sources=(source,),
+    )
+    install_provider_plans((initial,))
+    installed_source = home / source
+    fixed_mtime_ns = 1_700_000_000_000_000_000
+    os.utime(installed_source, ns=(fixed_mtime_ns, fixed_mtime_ns))
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(installed_source.parents[1])
+    environment.pop("PYTHONDONTWRITEBYTECODE", None)
+    subprocess.run(
+        [sys.executable, "-S", "-c", f"import {module_name}"],
+        check=True,
+        cwd=tmp_path,
+        env=environment,
+    )
+    cache = installed_source.parent / "__pycache__" / (
+        f"__init__.{sys.implementation.cache_tag}.pyc"
+    )
+    source_before = installed_source.stat()
+    assert cache.is_file()
+
+    refreshed = ProviderPlan(
+        "catalog-skills",
+        "2" * 40,
+        target,
+        (PlannedFile(source, b"VALUE = 'new'\n", 0o644),),
+        audit_roots=initial.audit_roots,
+        runtime_python_sources=initial.runtime_python_sources,
+    )
+    install_provider_plans((refreshed,))
+
+    source_after = installed_source.stat()
+    assert (source_after.st_dev, source_after.st_ino) != (
+        source_before.st_dev,
+        source_before.st_ino,
+    )
+    audit = audit_provider_plans((refreshed,))
+    assert not audit.matches
+    assert audit.unexpected == (cache.relative_to(home).as_posix(),)
 
 
 def test_refresh_removes_exact_runtime_cache_with_its_prior_managed_source(
