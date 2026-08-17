@@ -33,9 +33,9 @@ from agent_ops.deployment.registry import (
 from agent_ops.deployment.transaction import (
     _locked_provider_plan_targets,
     _preflight_provider_plans_read_only,
-    _verify_locked_provider_plan_targets,
     audit_provider_plans,
     install_provider_plans,
+    retain_provider_plan_evidence,
     rollback_manifests,
 )
 
@@ -171,25 +171,26 @@ class PreviewEngine:
                                 "deployment audit did not match preview target "
                                 f"{target.id!r}"
                             )
-                        _verify_locked_provider_plan_targets(ordered_plans)
-                        authority.verify()
-                        registry_authority.verify()
-                        return PreviewResult(
-                            operation="preview",
-                            review_state="unreviewed-local",
-                            target_id=target.id,
-                            channel=target.channel,
-                            fingerprint=fingerprint,
-                            source_revision=fingerprint,
-                            providers=tuple(
-                                plan.provider_id for plan in ordered_plans
-                            ),
-                            paths=tuple(
-                                entry.path.as_posix()
-                                for entry in captured
-                                if entry.kind == "file"
-                            ),
-                        )
+                        with retain_provider_plan_evidence(ordered_plans) as target_authority:
+                            target_authority.verify()
+                            authority.verify()
+                            registry_authority.verify()
+                            return PreviewResult(
+                                operation="preview",
+                                review_state="unreviewed-local",
+                                target_id=target.id,
+                                channel=target.channel,
+                                fingerprint=fingerprint,
+                                source_revision=fingerprint,
+                                providers=tuple(
+                                    plan.provider_id for plan in ordered_plans
+                                ),
+                                paths=tuple(
+                                    entry.path.as_posix()
+                                    for entry in captured
+                                    if entry.kind == "file"
+                                ),
+                            )
                     except BaseException as error:
                         if manifests:
                             try:

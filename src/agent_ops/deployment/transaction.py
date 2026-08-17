@@ -3072,6 +3072,82 @@ class _PinnedStatusDirectory:
             os.close(self.descriptor)
 
 
+class _RetainedProviderPlanEvidence:
+    """Descriptor-backed audit evidence retained until terminal handoff."""
+
+    def __init__(
+        self,
+        plans: tuple[ProviderPlan, ...],
+        pinned: list[_PinnedStatusFile | _PinnedStatusDirectory],
+        *,
+        require_matches: bool,
+    ) -> None:
+        self._plans = plans
+        self._pinned = pinned
+        self._require_matches = require_matches
+
+    def verify(self) -> None:
+        _verify_locked_provider_plan_targets(self._plans)
+        try:
+            for evidence in self._pinned:
+                evidence.verify()
+            if self._require_matches:
+                for target_id in sorted({plan.target.id for plan in self._plans}):
+                    audit = audit_provider_plans(
+                        tuple(plan for plan in self._plans if plan.target.id == target_id)
+                    )
+                    if not audit.matches:
+                        raise ValueError(
+                            f"retained audit evidence no longer matches target {target_id!r}"
+                        )
+            for evidence in self._pinned:
+                evidence.verify()
+        except ValueError as error:
+            if str(error).startswith("retained audit evidence"):
+                raise
+            raise ValueError(f"retained audit evidence changed: {error}") from error
+
+
+@contextmanager
+def retain_provider_plan_evidence(
+    plans: tuple[ProviderPlan, ...],
+    *,
+    require_matches: bool = True,
+) -> Iterator[_RetainedProviderPlanEvidence]:
+    """Pin audited manifests, files, and directories through terminal success."""
+    _require_supported_platform()
+    groups = _validate_and_group(plans)
+    active = _GROUP_HOME_LOCKS.get()
+    if active is None:
+        raise RuntimeError("deployment target lock set is not active")
+    pinned: list[_PinnedStatusFile | _PinnedStatusDirectory] = []
+    try:
+        for group in groups:
+            home = _absolute_home(group.target.home)
+            try:
+                home_fs = active[home]
+            except KeyError as error:
+                raise RuntimeError(
+                    "active deployment lock set does not cover every target"
+                ) from error
+            pinned.append(
+                _PinnedStatusFile(home_fs, _manifest_path(group.target), manifest=True)
+            )
+            pinned.extend(_PinnedStatusFile(home_fs, item.path) for item in group.files)
+            pinned.extend(
+                _PinnedStatusDirectory(home_fs, item.path)
+                for item in _directories(group.files)
+            )
+        authority = _RetainedProviderPlanEvidence(
+            plans, pinned, require_matches=require_matches
+        )
+        authority.verify()
+        yield authority
+    finally:
+        for evidence in reversed(pinned):
+            evidence.close()
+
+
 def _read_preview_status_evidence(
     target: TargetSpec,
 ) -> tuple[DeploymentManifest | None, DeploymentAudit | None]:

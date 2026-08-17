@@ -777,6 +777,27 @@ def test_preview_retains_shared_registry_authority_through_terminal_success(
     assert (home / "skills/demo/SKILL.md").exists()
 
 
+def test_preview_refuses_success_when_target_bytes_change_after_audit(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from agent_ops.deployment import preview as preview_module
+
+    engine, checkout, home = _preview(tmp_path)
+    original_audit = preview_module.audit_provider_plans
+
+    def audit_then_tamper(plans):
+        audit = original_audit(plans)
+        (home / "skills/demo/SKILL.md").write_text("tampered after audit\n")
+        return audit
+
+    monkeypatch.setattr(preview_module, "audit_provider_plans", audit_then_tamper)
+
+    with pytest.raises((DeploymentRecoveryError, ValueError), match="retained audit evidence"):
+        engine.preview(checkout, ("demo",), "codex-preview")
+
+    assert _registry_receipts(tmp_path) == ()
+
+
 def test_preview_preserves_process_control_during_provider_planning(tmp_path: Path) -> None:
     checkout = _checkout(tmp_path)
     registry, home = _registry(tmp_path)

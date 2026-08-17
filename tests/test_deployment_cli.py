@@ -760,6 +760,52 @@ def test_channel_launch_refuses_unready_target(tmp_path: Path, monkeypatch) -> N
     assert engine.calls == [("launch_authorization", "codex-demo")]
 
 
+@pytest.mark.parametrize(
+    "framework",
+    [
+        Framework.CLAUDE_CODE,
+        Framework.CURSOR,
+        Framework.OPENCODE,
+        Framework.PRIME_AGENT,
+        Framework.OPENCLAW,
+    ],
+)
+def test_channel_launch_explicitly_rejects_frameworks_without_an_isolated_home_contract(
+    tmp_path: Path, monkeypatch, framework: Framework
+) -> None:
+    from agent_ops.deployment import cli as deployment_cli
+
+    _, engine = _runtime(monkeypatch, tmp_path)
+    target = TargetSpec("unsupported-demo", framework, tmp_path / framework.value, "demo")
+    registry = FakeRegistry(
+        RegistryConfig(
+            1,
+            _config().sources,
+            _config().channels,
+            (target,),
+        )
+    )
+    monkeypatch.setattr(
+        deployment_cli, "_load_runtime", lambda *_args, **_kwargs: (registry, engine)
+    )
+
+    result = runner.invoke(
+        app,
+        ["channel", "launch", "demo", "--framework", framework.value, "--json"],
+    )
+
+    assert result.exit_code == 1
+    assert json.loads(result.output) == {
+        "ok": False,
+        "error": {
+            "category": "unsupported-framework",
+            "message": f"framework {framework.value} is not supported by channel launch",
+        },
+        "exit_status": 1,
+    }
+    assert engine.calls == []
+
+
 def test_channel_launch_json_reports_unready_target_without_exec(
     tmp_path: Path, monkeypatch
 ) -> None:

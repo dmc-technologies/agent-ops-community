@@ -520,6 +520,12 @@ def launch_channel_command(
             usage=True,
         )
     selected_target = candidates[0]
+    adapter = get_adapter(selected_framework)
+    if not adapter.channel_launch_supported:
+        _fail(
+            f"framework {selected_framework.value} is not supported by channel launch",
+            category="unsupported-framework",
+        )
     authorized_json: dict[str, object] | None = None
     with _call_context(
         lambda: engine.launch_authorization(selected_target.id)
@@ -547,7 +553,6 @@ def launch_channel_command(
             _fail("audit evidence does not match the selected target channel")
         if status.state not in {TargetState.STABLE, TargetState.BRANCH}:
             _fail(f"target state {status.state.value} is not launchable")
-        adapter = get_adapter(selected_framework)
         readiness = adapter.target_readiness(target.home)
         launch_data = {
             "ok": True,

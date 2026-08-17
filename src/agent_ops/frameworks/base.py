@@ -26,6 +26,7 @@ class FrameworkAdapter(ABC):
     framework: Framework
     executable: str | None = None
     home_environment_variable: str
+    channel_launch_supported = False
 
     def available(self) -> bool:
         return bool(self.executable and shutil.which(self.executable))

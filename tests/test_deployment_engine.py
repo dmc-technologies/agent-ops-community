@@ -780,6 +780,28 @@ def test_launch_authorization_retains_exact_audit_and_revalidates_home(
     assert registry.receipts()[-1] == authorization.receipt
 
 
+def test_refresh_refuses_receipt_when_audited_target_bytes_change_before_publication(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import agent_ops.deployment.engine as engine_module
+
+    engine, registry, home = _engine_fixture(tmp_path)
+    original_audit = engine_module.audit_provider_plans
+
+    def audit_then_tamper(plans: tuple[ProviderPlan, ...]) -> DeploymentAudit:
+        audit = original_audit(plans)
+        (home / "skills/example/payload.txt").write_bytes(b"tampered after audit\n")
+        return audit
+
+    monkeypatch.setattr(engine_module, "audit_provider_plans", audit_then_tamper)
+
+    with pytest.raises(DeploymentRecoveryError, match="retained audit evidence"):
+        engine.refresh(("codex",))
+
+    assert registry.receipts() == ()
+    assert (home / "skills/example/payload.txt").read_bytes() == b"tampered after audit\n"
+
+
 @pytest.mark.parametrize("operation", ["refresh", "switch", "save"])
 def test_launch_authorization_blocks_cooperative_target_or_registry_changes(
     tmp_path: Path, operation: str

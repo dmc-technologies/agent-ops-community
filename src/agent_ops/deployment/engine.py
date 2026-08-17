@@ -47,9 +47,9 @@ from agent_ops.deployment.transaction import (
     _locked_provider_plan_targets,
     _preflight_provider_plans_read_only,
     _read_preview_status_evidence,
-    _verify_locked_provider_plan_targets,
     audit_provider_plans,
     install_provider_plans,
+    retain_provider_plan_evidence,
     rollback_manifests,
 )
 
@@ -76,9 +76,10 @@ class LaunchAuthorization:
     plan: DeploymentPlan
     registry_snapshot: RegistrySnapshot
     _registry_authority: _RegistrySnapshotAuthority
+    _deployment_authority: object
 
     def verify(self) -> None:
-        _verify_locked_provider_plan_targets(self.plan.provider_plans)
+        self._deployment_authority.verify()
         self._registry_authority.verify()
 
 
@@ -212,16 +213,17 @@ class DeploymentEngine:
             )
             try:
                 audits = self._audit_plans(plan.provider_plans, require_matches=True)
-                receipt = self._receipt(
-                    "refresh",
-                    registry_snapshot,
-                    targets,
-                    snapshots,
-                    manifests=manifests,
-                    audits=audits,
-                )
-                _verify_locked_provider_plan_targets(plan.provider_plans)
-                self._registry.append_receipt(receipt, snapshot=registry_snapshot)
+                with retain_provider_plan_evidence(plan.provider_plans) as authority:
+                    receipt = self._receipt(
+                        "refresh",
+                        registry_snapshot,
+                        targets,
+                        snapshots,
+                        manifests=manifests,
+                        audits=audits,
+                    )
+                    authority.verify()
+                    self._registry.append_receipt(receipt, snapshot=registry_snapshot)
             except BaseException as error:
                 self._rollback_after_failure(manifests, error)
                 raise
@@ -235,16 +237,19 @@ class DeploymentEngine:
         with _locked_provider_plan_targets(plan.provider_plans):
             plan = self._build_plan(registry_snapshot.config, targets, snapshots)
             audits = self._audit_plans(plan.provider_plans, require_matches=False)
-            receipt = self._receipt(
-                "audit",
-                registry_snapshot,
-                targets,
-                snapshots,
-                manifests=(),
-                audits=audits,
-            )
-            _verify_locked_provider_plan_targets(plan.provider_plans)
-            self._registry.append_receipt(receipt, snapshot=registry_snapshot)
+            with retain_provider_plan_evidence(
+                plan.provider_plans, require_matches=False
+            ) as authority:
+                receipt = self._receipt(
+                    "audit",
+                    registry_snapshot,
+                    targets,
+                    snapshots,
+                    manifests=(),
+                    audits=audits,
+                )
+                authority.verify()
+                self._registry.append_receipt(receipt, snapshot=registry_snapshot)
         return receipt
 
     @contextmanager
@@ -266,19 +271,21 @@ class DeploymentEngine:
                 manifests=(),
                 audits=audits,
             )
-            _verify_locked_provider_plan_targets(plan.provider_plans)
-            self._registry.append_receipt(receipt, snapshot=registry_snapshot)
-            with self._registry.retain_snapshot(registry_snapshot) as registry_authority:
-                authorization = LaunchAuthorization(
-                    targets[0],
-                    receipt.targets[0],
-                    receipt,
-                    plan,
-                    registry_snapshot,
-                    registry_authority,
-                )
-                authorization.verify()
-                yield authorization
+            with retain_provider_plan_evidence(plan.provider_plans) as authority:
+                authority.verify()
+                self._registry.append_receipt(receipt, snapshot=registry_snapshot)
+                with self._registry.retain_snapshot(registry_snapshot) as registry_authority:
+                    authorization = LaunchAuthorization(
+                        targets[0],
+                        receipt.targets[0],
+                        receipt,
+                        plan,
+                        registry_snapshot,
+                        registry_authority,
+                        authority,
+                    )
+                    authorization.verify()
+                    yield authorization
 
     def switch(
         self, channel: str, target_ids: tuple[str, ...]
@@ -425,20 +432,21 @@ class DeploymentEngine:
             candidate_snapshot: RegistrySnapshot | None = None
             try:
                 audits = self._audit_plans(plan.provider_plans, require_matches=True)
-                candidate_snapshot = self._registry.save(
-                    candidate,
-                    expected_snapshot=original_snapshot,
-                )
-                receipt = self._receipt(
-                    operation,
-                    candidate_snapshot,
-                    candidate_targets,
-                    snapshots,
-                    manifests=manifests,
-                    audits=audits,
-                )
-                _verify_locked_provider_plan_targets(plan.provider_plans)
-                self._registry.append_receipt(receipt, snapshot=candidate_snapshot)
+                with retain_provider_plan_evidence(plan.provider_plans) as authority:
+                    candidate_snapshot = self._registry.save(
+                        candidate,
+                        expected_snapshot=original_snapshot,
+                    )
+                    receipt = self._receipt(
+                        operation,
+                        candidate_snapshot,
+                        candidate_targets,
+                        snapshots,
+                        manifests=manifests,
+                        audits=audits,
+                    )
+                    authority.verify()
+                    self._registry.append_receipt(receipt, snapshot=candidate_snapshot)
             except BaseException as error:
                 recovery_errors: list[BaseException] = []
                 if candidate_snapshot is not None:

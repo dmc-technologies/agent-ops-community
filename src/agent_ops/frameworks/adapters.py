@@ -13,6 +13,7 @@ class LocalAdapter(FrameworkAdapter):
     framework = Framework.LOCAL
     executable = "sh"
     home_environment_variable = "AGENT_OPS_LOCAL_HOME"
+    channel_launch_supported = True
 
     def target_readiness(self, home: Path) -> TargetReadiness:
         return self.native_home_readiness(home)
@@ -51,6 +52,7 @@ class CodexAdapter(FrameworkAdapter):
     framework = Framework.CODEX
     executable = "codex"
     home_environment_variable = "CODEX_HOME"
+    channel_launch_supported = True
 
     def target_readiness(self, home: Path) -> TargetReadiness:
         return self.native_file_readiness(
