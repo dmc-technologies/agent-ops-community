@@ -4,6 +4,7 @@ import hashlib
 import json
 import multiprocessing
 import os
+import py_compile
 import socket
 import stat
 import threading
@@ -128,6 +129,43 @@ def test_audit_rejects_cpython_bytecode_and_symlinked_bytecode(tmp_path: Path) -
     assert audit_provider_plans((plan,)).unexpected == (
         "skills/private/__pycache__/module.cpython-312.pyc",
     )
+
+
+def test_public_gstack_provider_may_own_its_reserved_runtime_only(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    public = ProviderPlan(
+        "public-skill:gstack",
+        "1" * 40,
+        TargetSpec("prime", Framework.PRIME_AGENT, home, "public"),
+        (PlannedFile(Path(".agentops/runtime/gstack/ETHOS.md"), b"ethos\n", 0o644),),
+    )
+    install_provider_plans((public,))
+    assert (home / ".agentops/runtime/gstack/ETHOS.md").read_bytes() == b"ethos\n"
+
+    private = ProviderPlan(
+        "private",
+        "1" * 40,
+        TargetSpec("other", Framework.PRIME_AGENT, tmp_path / "other", "stable"),
+        (PlannedFile(Path(".agentops/runtime/gstack/ETHOS.md"), b"no\n", 0o644),),
+    )
+    with pytest.raises(ValueError, match="reserved metadata"):
+        install_provider_plans((private,))
+
+
+def test_audit_accepts_only_opted_in_exact_python_cache(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    source = Path("skills/private/src/package/module.py")
+    plan = ProviderPlan(
+        "private", "1" * 40, TargetSpec("codex", Framework.CODEX, home, "stable"),
+        (PlannedFile(source, b"value = 1\n", 0o644),),
+        audit_roots=(Path("skills/private"),), runtime_python_sources=(source,),
+    )
+    install_provider_plans((plan,))
+    py_compile.compile(home / source, doraise=True)
+    assert audit_provider_plans((plan,)).matches
+    cache = next((home / source.parent / "__pycache__").glob("*.pyc"))
+    cache.write_bytes(cache.read_bytes() + b"tampered")
+    assert not audit_provider_plans((plan,)).matches
 
 
 def test_ordinary_install_rejects_prior_manifest_with_contradictory_channel(

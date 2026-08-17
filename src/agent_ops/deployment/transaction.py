@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import importlib.util
 import json
+import marshal
 import os
 import stat
 import uuid
@@ -64,9 +66,7 @@ class UnsupportedPlatformError(RuntimeError):
 
 def _require_supported_platform() -> None:
     if not _POSIX_SUPPORTED:
-        raise UnsupportedPlatformError(
-            "deployment transactions require a supported POSIX platform"
-        )
+        raise UnsupportedPlatformError("deployment transactions require a supported POSIX platform")
 
 
 def _before_manifest_replace(
@@ -78,15 +78,11 @@ def _before_manifest_replace(
     """Internal fault-injection boundary immediately before publication."""
 
 
-def _after_preview_status_manifest_open(
-    _home_fs: _HomeFS, _path: Path, _descriptor: int
-) -> None:
+def _after_preview_status_manifest_open(_home_fs: _HomeFS, _path: Path, _descriptor: int) -> None:
     """Internal fault-injection boundary after the preview manifest is pinned."""
 
 
-def _after_preview_status_owned_open(
-    _path: Path, _kind: str, _descriptor: int
-) -> None:
+def _after_preview_status_owned_open(_path: Path, _kind: str, _descriptor: int) -> None:
     """Internal fault-injection boundary after an owned preview path is pinned."""
 
 
@@ -238,12 +234,9 @@ class _HomeFS:
     def verify_lock_identity(self) -> None:
         descriptors = (self.descriptor, self._lock_descriptor)
         if any(
-            descriptor is not None and os.get_inheritable(descriptor)
-            for descriptor in descriptors
+            descriptor is not None and os.get_inheritable(descriptor) for descriptor in descriptors
         ):
-            raise RuntimeError(
-                "retained deployment authority descriptors must be close-on-exec"
-            )
+            raise RuntimeError("retained deployment authority descriptors must be close-on-exec")
         if self._home_identity is None:
             return
         canonical_descriptor: int | None = None
@@ -387,10 +380,7 @@ class _HomeFS:
             )
             try:
                 item = os.fstat(descriptor)
-                if (
-                    not stat.S_ISREG(item.st_mode)
-                    or stat.S_IMODE(item.st_mode) != mode
-                ):
+                if not stat.S_ISREG(item.st_mode) or stat.S_IMODE(item.st_mode) != mode:
                     return False
                 chunks: list[bytes] = []
                 while chunk := os.read(descriptor, 1024 * 1024):
@@ -413,10 +403,7 @@ class _HomeFS:
             )
             try:
                 item = os.fstat(descriptor)
-                if (
-                    not stat.S_ISREG(item.st_mode)
-                    or stat.S_IMODE(item.st_mode) != mode
-                ):
+                if not stat.S_ISREG(item.st_mode) or stat.S_IMODE(item.st_mode) != mode:
                     return False
                 fingerprint_state = hashlib.sha256()
                 while chunk := os.read(descriptor, 1024 * 1024):
@@ -461,11 +448,7 @@ class _HomeFS:
         return found
 
     def scan_tree(self, relative: Path) -> set[Path]:
-        return {
-            path
-            for path, kind in self.scan_entries(relative).items()
-            if kind != "directory"
-        }
+        return {path for path, kind in self.scan_entries(relative).items() if kind != "directory"}
 
     def write_file(self, relative: Path, content: bytes, mode: int) -> None:
         self.verify_lock_identity()
@@ -601,11 +584,10 @@ def _target_lock(home: Path) -> Iterator[_HomeFS]:
                 dir_fd=parent,
                 follow_symlinks=False,
             )
-            if (
-                not stat.S_ISDIR(canonical_home.st_mode)
-                or (canonical_home.st_dev, canonical_home.st_ino)
-                != (home_stat.st_dev, home_stat.st_ino)
-            ):
+            if not stat.S_ISDIR(canonical_home.st_mode) or (
+                canonical_home.st_dev,
+                canonical_home.st_ino,
+            ) != (home_stat.st_dev, home_stat.st_ino):
                 raise ValueError("deployment home identity changed")
             lock_name = _LOCK_NAME
             lock = os.open(
@@ -656,21 +638,16 @@ def _target_read_lock(home: Path) -> Iterator[_HomeFS]:
     parent = _open_absolute_directory(home.parent, create=False)
     try:
         assert fcntl is not None
-        home_descriptor = _open_directory_at(
-            parent, home.name, create=False, mode=0o700
-        )
+        home_descriptor = _open_directory_at(parent, home.name, create=False, mode=0o700)
         try:
             os.set_inheritable(home_descriptor, False)
             home_stat = os.fstat(home_descriptor)
             fcntl.flock(home_descriptor, fcntl.LOCK_SH)
-            canonical_home = os.stat(
-                home.name, dir_fd=parent, follow_symlinks=False
-            )
-            if (
-                not stat.S_ISDIR(canonical_home.st_mode)
-                or (canonical_home.st_dev, canonical_home.st_ino)
-                != (home_stat.st_dev, home_stat.st_ino)
-            ):
+            canonical_home = os.stat(home.name, dir_fd=parent, follow_symlinks=False)
+            if not stat.S_ISDIR(canonical_home.st_mode) or (
+                canonical_home.st_dev,
+                canonical_home.st_ino,
+            ) != (home_stat.st_dev, home_stat.st_ino):
                 raise ValueError("deployment home identity changed")
             lock = os.open(
                 _LOCK_NAME,
@@ -692,11 +669,10 @@ def _target_read_lock(home: Path) -> Iterator[_HomeFS]:
                     dir_fd=home_descriptor,
                     follow_symlinks=False,
                 )
-                if (
-                    (canonical_lock.st_dev, canonical_lock.st_ino)
-                    != (lock_stat.st_dev, lock_stat.st_ino)
-                    or canonical_lock.st_mode != lock_stat.st_mode
-                ):
+                if (canonical_lock.st_dev, canonical_lock.st_ino) != (
+                    lock_stat.st_dev,
+                    lock_stat.st_ino,
+                ) or canonical_lock.st_mode != lock_stat.st_mode:
                     raise ValueError("deployment lock identity changed")
                 home_fs = _HomeFS(
                     home,
@@ -749,8 +725,7 @@ def _manifest_to_dict(manifest: DeploymentManifest) -> dict[str, Any]:
         "provider_ids": list(manifest.provider_ids),
         "transaction_id": manifest.transaction_id,
         "directories": [
-            {"path": item.path.as_posix(), "mode": item.mode}
-            for item in manifest.directories
+            {"path": item.path.as_posix(), "mode": item.mode} for item in manifest.directories
         ],
         "files": [
             {
@@ -809,28 +784,24 @@ def _validated_manifest_data(content: bytes, *, target: TargetSpec) -> dict[str,
     ):
         raise ValueError("invalid deployment manifest schema")
     manifest_keys = {
-            "schema_version",
-            "target_id",
-            "framework",
-            "channel",
-            "source_revision",
-            "provider_ids",
-            "transaction_id",
-            "files",
-            "directories",
-        }
+        "schema_version",
+        "target_id",
+        "framework",
+        "channel",
+        "source_revision",
+        "provider_ids",
+        "transaction_id",
+        "files",
+        "directories",
+    }
     data_keys = set(data)
     allowed_manifest_keys = manifest_keys | {"review_state"}
     unknown_manifest_keys = sorted(data_keys - allowed_manifest_keys)
     missing_manifest_keys = sorted(manifest_keys - data_keys)
     if unknown_manifest_keys:
-        raise ValueError(
-            f"unknown deployment manifest member: {unknown_manifest_keys[0]}"
-        )
+        raise ValueError(f"unknown deployment manifest member: {unknown_manifest_keys[0]}")
     if missing_manifest_keys:
-        raise ValueError(
-            f"missing deployment manifest member: {missing_manifest_keys[0]}"
-        )
+        raise ValueError(f"missing deployment manifest member: {missing_manifest_keys[0]}")
     review_state = data.get("review_state")
     if review_state not in {None, "unreviewed-local"}:
         raise ValueError("invalid deployment manifest review state")
@@ -1008,9 +979,7 @@ def _validated_manifest_path(value: str, *, kind: str) -> Path:
     try:
         return _canonical_relative_text(value, label=f"deployment manifest {kind}")
     except ValueError as exc:
-        raise ValueError(
-            f"invalid deployment manifest non-normalized {kind} path"
-        ) from exc
+        raise ValueError(f"invalid deployment manifest non-normalized {kind} path") from exc
 
 
 def _frontmatter_name(content: bytes) -> str | None:
@@ -1038,6 +1007,15 @@ class _PlanGroup:
     files: tuple[PlannedFile, ...]
     removals: tuple[Path, ...]
     audit_roots: tuple[Path, ...]
+    runtime_python_sources: tuple[Path, ...]
+
+
+def _public_gstack_runtime_path(provider_id: str, path: Path) -> bool:
+    return provider_id == "public-skill:gstack" and path.parts[:3] == (
+        ".agentops",
+        "runtime",
+        "gstack",
+    )
 
 
 def _validate_and_group(
@@ -1047,6 +1025,7 @@ def _validate_and_group(
     providers: dict[tuple[str, Framework, Path, str, str], set[str]] = {}
     removals: dict[tuple[str, Framework, Path, str, str], set[Path]] = {}
     audit_roots: dict[tuple[str, Framework, Path, str, str], set[Path]] = {}
+    runtime_python_sources: dict[tuple[str, Framework, Path, str, str], set[Path]] = {}
     target_keys: dict[str, tuple[str, Framework, Path, str, str]] = {}
     home_targets: dict[Path, str] = {}
     preflight_cwd = Path.cwd()
@@ -1070,9 +1049,13 @@ def _validate_and_group(
         planned_removals = removals.setdefault(key, set())
         roots = audit_roots.setdefault(key, set())
         roots.update(plan.audit_roots or (Path(item.path.parts[0]) for item in plan.files))
+        sources = runtime_python_sources.setdefault(key, set())
+        sources.update(plan.runtime_python_sources)
         for item in plan.files:
             path = _safe_relative(item.path)
-            if path.parts[0] in {".agentops", _LOCK_NAME}:
+            if path.parts[0] in {".agentops", _LOCK_NAME} and not _public_gstack_runtime_path(
+                plan.provider_id, path
+            ):
                 raise ValueError(f"planned path overlaps reserved metadata: {path}")
             if not isinstance(item.content, bytes) or not _valid_file_mode(item.mode):
                 raise ValueError(f"invalid planned file: {path}")
@@ -1084,18 +1067,18 @@ def _validate_and_group(
             files[path] = item
         for removal in plan.removals:
             removal_path = _safe_relative(removal)
-            if removal_path.parts[0] in {".agentops", _LOCK_NAME}:
-                raise ValueError(
-                    f"planned removal overlaps reserved metadata: {removal_path}"
-                )
+            if removal_path.parts[0] in {
+                ".agentops",
+                _LOCK_NAME,
+            } and not _public_gstack_runtime_path(plan.provider_id, removal_path):
+                raise ValueError(f"planned removal overlaps reserved metadata: {removal_path}")
             planned_removals.add(removal_path)
     for key, files in groups.items():
         file_paths = sorted(files, key=str)
         removal_paths = sorted(removals[key], key=str)
         for index, path in enumerate(file_paths):
             if any(
-                path in other.parents or other in path.parents
-                for other in file_paths[index + 1 :]
+                path in other.parents or other in path.parents for other in file_paths[index + 1 :]
             ):
                 raise ValueError(f"invalid plan topology at file destination: {path}")
         for index, path in enumerate(removal_paths):
@@ -1106,9 +1089,7 @@ def _validate_and_group(
                 raise ValueError(f"invalid plan topology at removal destination: {path}")
         for file_path in file_paths:
             if any(
-                file_path == removal
-                or file_path in removal.parents
-                or removal in file_path.parents
+                file_path == removal or file_path in removal.parents or removal in file_path.parents
                 for removal in removal_paths
             ):
                 raise ValueError(f"invalid plan topology across file and removal: {file_path}")
@@ -1124,6 +1105,7 @@ def _validate_and_group(
                 files=tuple(groups[key][path] for path in sorted(groups[key], key=str)),
                 removals=tuple(sorted(removals[key], key=str)),
                 audit_roots=tuple(sorted(audit_roots[key], key=str)),
+                runtime_python_sources=tuple(sorted(runtime_python_sources[key], key=str)),
             )
         )
     return tuple(results)
@@ -1167,9 +1149,7 @@ def _operation(
         "kind": kind,
         "destination": item.path.as_posix(),
         "staged": (
-            (transaction / "rendered" / item.path).as_posix()
-            if kind == "installed"
-            else None
+            (transaction / "rendered" / item.path).as_posix() if kind == "installed" else None
         ),
         "backup": None,
         "expected_fingerprint": item.fingerprint,
@@ -1277,9 +1257,7 @@ def _verify_prior_prestate(
     prior_data: dict[str, Any],
     operations: list[dict[str, Any]],
 ) -> None:
-    operations_by_path = {
-        Path(operation["destination"]): operation for operation in operations
-    }
+    operations_by_path = {Path(operation["destination"]): operation for operation in operations}
     for item in prior_data["files"]:
         path = Path(item["path"])
         operation = operations_by_path.get(path)
@@ -1401,8 +1379,7 @@ def install_provider_plans(
                     raise
                 if not isinstance(install_error, Exception):
                     install_error.add_note(
-                        "grouped rollback failed; recovery evidence retained for "
-                        "earlier targets"
+                        "grouped rollback failed; recovery evidence retained for earlier targets"
                     )
                     raise install_error from rollback_error
                 raise IncompleteRollbackError(
@@ -1428,9 +1405,7 @@ def _locked_provider_plan_targets(
         yield
         return
     with ExitStack() as locks:
-        grouped_locks = {
-            home: locks.enter_context(_target_lock(home)) for home in homes
-        }
+        grouped_locks = {home: locks.enter_context(_target_lock(home)) for home in homes}
         token = _GROUP_HOME_LOCKS.set(grouped_locks)
         try:
             yield
@@ -1452,9 +1427,7 @@ def _verify_locked_provider_plan_targets(plans: tuple[ProviderPlan, ...]) -> Non
         try:
             home_fs = active[home]
         except KeyError as error:
-            raise RuntimeError(
-                "active deployment lock set does not cover every target"
-            ) from error
+            raise RuntimeError("active deployment lock set does not cover every target") from error
         home_fs.verify_lock_identity()
 
 
@@ -1475,9 +1448,7 @@ def _install_provider_plan_groups(
             channel=target.channel,
             source_revision=group.source_revision,
             provider_ids=group.provider_ids,
-            files=tuple(
-                ManifestFile(item.path, item.fingerprint, item.mode) for item in files
-            ),
+            files=tuple(ManifestFile(item.path, item.fingerprint, item.mode) for item in files),
             directories=_directories(files),
             transaction_id=transaction_id,
             review_state=(
@@ -1509,10 +1480,14 @@ def _install_provider_plan_groups(
                     error_type=ValueError,
                     context="prior",
                 )
-            managed = {
-                Path(item["path"]): (item["fingerprint"], item["mode"])
-                for item in prior_data["files"]
-            } if prior_data is not None else {}
+            managed = (
+                {
+                    Path(item["path"]): (item["fingerprint"], item["mode"])
+                    for item in prior_data["files"]
+                }
+                if prior_data is not None
+                else {}
+            )
             for directory in manifest.directories:
                 if not home_fs.exists(directory.path):
                     continue
@@ -1541,9 +1516,7 @@ def _install_provider_plan_groups(
                                 _operation(item, transaction_id, index, kind="adopted")
                             )
                             continue
-                        raise ValueError(
-                            f"unmanaged destination conflicts with plan: {item.path}"
-                        )
+                        raise ValueError(f"unmanaged destination conflicts with plan: {item.path}")
                     if _fingerprint(installed) != prior[0] or installed_mode != prior[1]:
                         raise ValueError(f"managed destination changed: {item.path}")
                 operation = _operation(item, transaction_id, index, kind="installed")
@@ -1623,9 +1596,7 @@ def _install_provider_plan_groups(
                     raise ValueError(f"invalid managed directory mode: {directory.path}")
                 actual_directories.append(ManifestDirectory(directory.path, directory_mode))
                 evidence_path = (
-                    _directory_evidence_path(transaction, directory.path)
-                    if exists
-                    else None
+                    _directory_evidence_path(transaction, directory.path) if exists else None
                 )
                 directory_records.append(
                     {
@@ -1633,9 +1604,7 @@ def _install_provider_plan_groups(
                         "created": not exists,
                         "mode": directory_mode,
                         "prestate_evidence": (
-                            evidence_path.as_posix()
-                            if evidence_path is not None
-                            else None
+                            evidence_path.as_posix() if evidence_path is not None else None
                         ),
                     }
                 )
@@ -1686,9 +1655,7 @@ def _install_provider_plan_groups(
                     staged = Path(staged_text)
                     _ensure_staged_parents(home_fs, staged, transaction)
                     item = next(
-                        item
-                        for item in files
-                        if item.path.as_posix() == operation["destination"]
+                        item for item in files if item.path.as_posix() == operation["destination"]
                     )
                     home_fs.write_file(staged, item.content, item.mode)
                     if not _file_matches(
@@ -1823,10 +1790,7 @@ def _validate_group_current_state(
             context="prior",
         )
     managed = (
-        {
-            Path(item["path"]): (item["fingerprint"], item["mode"])
-            for item in prior_data["files"]
-        }
+        {Path(item["path"]): (item["fingerprint"], item["mode"]) for item in prior_data["files"]}
         if prior_data is not None
         else {}
     )
@@ -1974,8 +1938,7 @@ def _decode_record(
         not isinstance(record, dict)
         or type(record.get("schema_version")) is not int
         or record["schema_version"] != _TRANSACTION_SCHEMA_VERSION
-        or record.get("state")
-        not in {"prepared", "committed", "indeterminate", "rolled-back"}
+        or record.get("state") not in {"prepared", "committed", "indeterminate", "rolled-back"}
         or not isinstance(record.get("manifest"), dict)
     ):
         raise ValueError("invalid transaction record schema")
@@ -2098,9 +2061,7 @@ def _decode_record(
             else None
         )
         expected_staged = (
-            transaction / "rendered" / destination
-            if operation["kind"] == "installed"
-            else None
+            transaction / "rendered" / destination if operation["kind"] == "installed" else None
         )
         if staged_path != expected_staged:
             raise ValueError("unsafe transaction staged path")
@@ -2133,10 +2094,11 @@ def _decode_record(
         Path(item["path"]): (item["fingerprint"], item["mode"])
         for item in record["manifest"]["files"]
     }
-    prior_files = {
-        Path(item["path"]): (item["fingerprint"], item["mode"])
-        for item in prior_data["files"]
-    } if prior_data is not None else {}
+    prior_files = (
+        {Path(item["path"]): (item["fingerprint"], item["mode"]) for item in prior_data["files"]}
+        if prior_data is not None
+        else {}
+    )
     installed_destinations: set[Path] = set()
     for operation in operations:
         destination = Path(operation["destination"])
@@ -2170,9 +2132,7 @@ def _decode_record(
             or operation["prior_fingerprint"] is not None
             or operation["prior_mode"] is not None
         ):
-            raise ValueError(
-                "transaction operations prior existence does not match prior manifest"
-            )
+            raise ValueError("transaction operations prior existence does not match prior manifest")
         if kind == "removal" and destination not in prior_files:
             raise ValueError("transaction operations do not match manifests")
     if installed_destinations != set(manifest_files):
@@ -2218,9 +2178,7 @@ def _decode_record(
     manifest_directories = {
         Path(item["path"]): item["mode"] for item in record["manifest"]["directories"]
     }
-    recorded_directories = {
-        Path(item["path"]): item["mode"] for item in directories
-    }
+    recorded_directories = {Path(item["path"]): item["mode"] for item in directories}
     if recorded_directories != manifest_directories:
         raise ValueError("transaction directories do not match manifest")
     if any(
@@ -2229,14 +2187,11 @@ def _decode_record(
     ):
         raise ValueError("transaction operations are not in canonical order")
     operation_order = [
-        (operation["kind"] == "removal", operation["destination"])
-        for operation in operations
+        (operation["kind"] == "removal", operation["destination"]) for operation in operations
     ]
     if operation_order != sorted(operation_order):
         raise ValueError("transaction operations are not in canonical order")
-    if [item["path"] for item in directories] != sorted(
-        item["path"] for item in directories
-    ):
+    if [item["path"] for item in directories] != sorted(item["path"] for item in directories):
         raise ValueError("transaction directories are not in canonical order")
     return record, manifest
 
@@ -2279,18 +2234,14 @@ def _validate_transaction_evidence(
         if operation["backup"] is not None
     }
     backup_entries = _evidence_entries(home_fs, backup_root)
-    invalid_backups = {
-        path: kind for path, kind in backup_entries.items() if kind != "regular"
-    }
+    invalid_backups = {path: kind for path, kind in backup_entries.items() if kind != "regular"}
     if invalid_backups:
         raise ValueError("transaction backup evidence has invalid entries")
     actual_backups = set(backup_entries)
     missing_backups = expected_backups - actual_backups
     if missing_backups and not allow_missing:
         missing = min(missing_backups, key=str)
-        raise missing_backup_error(
-            f"rollback incomplete: backup evidence is missing: {missing}"
-        )
+        raise missing_backup_error(f"rollback incomplete: backup evidence is missing: {missing}")
     if actual_backups - expected_backups:
         raise ValueError("transaction backup evidence has orphan entries")
 
@@ -2379,9 +2330,7 @@ def _cleanup_rollback_evidence(
                 operation["expected_fingerprint"],
                 operation["expected_mode"],
             ):
-                raise IncompleteRollbackError(
-                    f"rollback cleanup staged file changed: {staged}"
-                )
+                raise IncompleteRollbackError(f"rollback cleanup staged file changed: {staged}")
             home_fs.unlink(staged)
         rollback_link = _rollback_link_path(record_path, operation)
         if home_fs.exists(rollback_link):
@@ -2403,9 +2352,7 @@ def _cleanup_rollback_evidence(
                 operation["prior_fingerprint"],
                 operation["prior_mode"],
             ):
-                raise IncompleteRollbackError(
-                    f"rollback cleanup backup changed: {backup}"
-                )
+                raise IncompleteRollbackError(f"rollback cleanup backup changed: {backup}")
             home_fs.unlink(backup)
     for directory in record["directories"]:
         evidence = directory["prestate_evidence"]
@@ -2433,17 +2380,13 @@ def _rollback_record(
     ):
         raise IncompleteRollbackError("rollback incomplete: invalid prior manifest mode")
     if prior_manifest is not None:
-        prior_raw = _strict_json_loads(
-            prior_manifest, label="prior deployment manifest"
-        )
+        prior_raw = _strict_json_loads(prior_manifest, label="prior deployment manifest")
         if (
             not isinstance(prior_raw, dict)
             or not isinstance(prior_raw.get("channel"), str)
             or not prior_raw["channel"]
         ):
-            raise IncompleteRollbackError(
-                "rollback incomplete: invalid prior manifest channel"
-            )
+            raise IncompleteRollbackError("rollback incomplete: invalid prior manifest channel")
         recovery_target = TargetSpec(
             record["manifest"]["target_id"],
             Framework(record["manifest"]["framework"]),
@@ -2462,9 +2405,7 @@ def _rollback_record(
                 expected_manifest,
             )
         except (OSError, ValueError) as exc:
-            raise IncompleteRollbackError(
-                "rollback cleanup incomplete; evidence retained"
-            ) from exc
+            raise IncompleteRollbackError("rollback cleanup incomplete; evidence retained") from exc
         home_fs.verify_lock_identity()
         return
     _validate_transaction_evidence(
@@ -2513,18 +2454,14 @@ def _rollback_record(
             )
         if backup is not None:
             if not home_fs.exists(backup):
-                raise IncompleteRollbackError(
-                    f"rollback incomplete: backup is missing: {backup}"
-                )
+                raise IncompleteRollbackError(f"rollback incomplete: backup is missing: {backup}")
             if not _file_matches(
                 home_fs,
                 backup,
                 operation["prior_fingerprint"],
                 operation["prior_mode"],
             ):
-                raise IncompleteRollbackError(
-                    f"rollback incomplete: backup changed: {backup}"
-                )
+                raise IncompleteRollbackError(f"rollback incomplete: backup changed: {backup}")
     if prior_data is not None:
         _verify_prior_prestate(home_fs, prior_data, record["operations"])
     try:
@@ -2545,11 +2482,7 @@ def _rollback_record(
         for operation in reversed(record["operations"]):
             destination = Path(operation["destination"])
             backup = Path(operation["backup"]) if operation["backup"] else None
-            if (
-                operation["kind"] == "installed"
-                and backup is None
-                and home_fs.exists(destination)
-            ):
+            if operation["kind"] == "installed" and backup is None and home_fs.exists(destination):
                 home_fs.unlink(destination)
             if backup is not None and not _file_matches(
                 home_fs,
@@ -2784,6 +2717,42 @@ def recover_transaction(path: Path) -> DeploymentManifest:
         return manifest
 
 
+def _is_valid_runtime_python_cache(
+    home_fs: _HomeFS, candidate: Path, sources: tuple[Path, ...]
+) -> bool:
+    if not sources or candidate.parent.name != "__pycache__" or candidate.suffix != ".pyc":
+        return False
+    stem = candidate.name.removesuffix(".pyc")
+    tag = importlib.util.cache_from_source("module.py").split("__pycache__/", 1)[1]
+    if not stem.endswith(tag.removesuffix(".pyc").removeprefix("module.")):
+        return False
+    source_name = stem.split(".", 1)[0] + ".py"
+    source = candidate.parent.parent / source_name
+    if source not in sources:
+        return False
+    try:
+        cache_stat = home_fs.stat(candidate)
+        source_stat = home_fs.stat(source)
+        cache = home_fs.read_file(candidate)
+        source_bytes = home_fs.read_file(source)
+    except OSError:
+        return False
+    if not stat.S_ISREG(cache_stat.st_mode) or stat.S_IMODE(cache_stat.st_mode) != 0o644:
+        return False
+    if len(cache) < 16 or cache[:4] != importlib.util.MAGIC_NUMBER or cache[4:8] != b"\0\0\0\0":
+        return False
+    timestamp = int.from_bytes(cache[8:12], "little")
+    size = int.from_bytes(cache[12:16], "little")
+    if timestamp != int(source_stat.st_mtime) or size != len(source_bytes):
+        return False
+    try:
+        expected = compile(source_bytes, str(home_fs.home / source), "exec", dont_inherit=True)
+        observed = marshal.loads(cache[16:])
+    except (SyntaxError, ValueError, TypeError):
+        return False
+    return observed == expected and marshal.dumps(observed) == cache[16:]
+
+
 def audit_provider_plans(plans: tuple[ProviderPlan, ...]) -> DeploymentAudit:
     _require_supported_platform()
     groups = _validate_and_group(plans)
@@ -2800,9 +2769,7 @@ def audit_provider_plans(plans: tuple[ProviderPlan, ...]) -> DeploymentAudit:
     duplicates: list[str] = []
     validation_errors: list[str] = []
     active = _GROUP_HOME_LOCKS.get()
-    retained_home = (
-        active.get(_absolute_home(target.home)) if active is not None else None
-    )
+    retained_home = active.get(_absolute_home(target.home)) if active is not None else None
     if retained_home is not None:
         try:
             retained_home.verify_lock_identity()
@@ -2849,9 +2816,7 @@ def audit_provider_plans(plans: tuple[ProviderPlan, ...]) -> DeploymentAudit:
             else (opened_home.st_dev, opened_home.st_ino)
         ),
         lock_name=retained_home._lock_name if retained_home is not None else None,
-        lock_identity=(
-            retained_home._lock_identity if retained_home is not None else None
-        ),
+        lock_identity=(retained_home._lock_identity if retained_home is not None else None),
     )
     with home_fs:
         manifest_path = _manifest_path(target)
@@ -2887,9 +2852,7 @@ def audit_provider_plans(plans: tuple[ProviderPlan, ...]) -> DeploymentAudit:
                 }
                 if recorded_files != expected_files:
                     validation_errors.append("deployment manifest files do not match plan")
-                expected_directory_paths = {
-                    item.path.as_posix() for item in _directories(files)
-                }
+                expected_directory_paths = {item.path.as_posix() for item in _directories(files)}
                 installed_directories: dict[str, int] = {}
                 for directory_path in expected_directory_paths:
                     try:
@@ -2897,12 +2860,9 @@ def audit_provider_plans(plans: tuple[ProviderPlan, ...]) -> DeploymentAudit:
                     except OSError:
                         continue
                     if stat.S_ISDIR(directory_stat.st_mode):
-                        installed_directories[directory_path] = stat.S_IMODE(
-                            directory_stat.st_mode
-                        )
+                        installed_directories[directory_path] = stat.S_IMODE(directory_stat.st_mode)
                 recorded_directories = {
-                    item["path"]: item["mode"]
-                    for item in manifest_data["directories"]
+                    item["path"]: item["mode"] for item in manifest_data["directories"]
                 }
                 if (
                     set(installed_directories) != expected_directory_paths
@@ -2944,6 +2904,8 @@ def audit_provider_plans(plans: tuple[ProviderPlan, ...]) -> DeploymentAudit:
             for item in installed:
                 candidate = root / item
                 if candidate in planned_paths:
+                    continue
+                if _is_valid_runtime_python_cache(home_fs, candidate, group.runtime_python_sources):
                     continue
                 unexpected.add(candidate.as_posix())
         duplicates = [
@@ -3102,9 +3064,7 @@ class _RetainedProviderPlanEvidence:
                     tuple(plan for plan in self._plans if plan.target.id == target_id)
                 )
                 expected = (
-                    None
-                    if self._expected_audits is None
-                    else self._expected_audits[target_id]
+                    None if self._expected_audits is None else self._expected_audits[target_id]
                 )
                 if expected is not None and audit != expected:
                     raise ValueError(
@@ -3148,9 +3108,7 @@ def retain_provider_plan_evidence(
                 raise RuntimeError(
                     "active deployment lock set does not cover every target"
                 ) from error
-            expected = (
-                None if expected_audits is None else expected_audits[group.target.id]
-            )
+            expected = None if expected_audits is None else expected_audits[group.target.id]
             if expected is None or not expected.validation_errors:
                 pinned.append(
                     _PinnedStatusFile(home_fs, _manifest_path(group.target), manifest=True)
@@ -3170,8 +3128,10 @@ def retain_provider_plan_evidence(
                         for item in group.files
                         if item.path.is_relative_to(directory.path)
                     )
-                    if expected is None or not covered_files or not all(
-                        path in missing for path in covered_files
+                    if (
+                        expected is None
+                        or not covered_files
+                        or not all(path in missing for path in covered_files)
                     ):
                         raise
         authority = _RetainedProviderPlanEvidence(
@@ -3202,23 +3162,16 @@ def _read_preview_status_evidence(
         with _target_read_lock(target.home) as home_fs:
             pinned: list[_PinnedStatusFile | _PinnedStatusDirectory] = []
             try:
-                manifest_pin = _PinnedStatusFile(
-                    home_fs, _manifest_path(target), manifest=True
-                )
+                manifest_pin = _PinnedStatusFile(home_fs, _manifest_path(target), manifest=True)
                 pinned.append(manifest_pin)
                 data = _validated_manifest_data(manifest_pin.content, target=target)
                 revision = data["source_revision"]
                 if (
                     data.get("review_state") != "unreviewed-local"
                     or len(revision) != 64
-                    or any(
-                        character not in "0123456789abcdef"
-                        for character in revision
-                    )
+                    or any(character not in "0123456789abcdef" for character in revision)
                 ):
-                    raise ValueError(
-                        "invalid preview manifest review state or fingerprint"
-                    )
+                    raise ValueError("invalid preview manifest review state or fingerprint")
                 manifest = DeploymentManifest(
                     schema_version=data["schema_version"],
                     target_id=target.id,
@@ -3227,9 +3180,7 @@ def _read_preview_status_evidence(
                     source_revision=revision,
                     provider_ids=tuple(data["provider_ids"]),
                     files=tuple(
-                        ManifestFile(
-                            Path(item["path"]), item["fingerprint"], item["mode"]
-                        )
+                        ManifestFile(Path(item["path"]), item["fingerprint"], item["mode"])
                         for item in data["files"]
                     ),
                     directories=tuple(
@@ -3253,8 +3204,7 @@ def _read_preview_status_evidence(
                     pinned.append(evidence)
                     if (
                         stat.S_IMODE(os.fstat(evidence.descriptor).st_mode) != item.mode
-                        or hashlib.sha256(evidence.content).hexdigest()
-                        != item.fingerprint
+                        or hashlib.sha256(evidence.content).hexdigest() != item.fingerprint
                     ):
                         changed.append(item.path.as_posix())
                 for item in manifest.directories:
