@@ -11,6 +11,9 @@ Record durable architecture, workflow, and harness decisions here.
 - Applies to: `.github/scripts/review_gate.py` and `tests/test_review_gate.py`.
 - Revisit when: Review Gate gains a versioned persistent result store that can retain backend provenance without relying on GitHub comment structure.
 
+- Correction: retain the requested model-comment body while scanning existing comments. Scanned comments are evidence only; they must never replace the body passed to the POST or PATCH request.
+- Rationale: replacement with a preflight comment would discard the signed Codex state and let a later same-head retry rediscover instead of carrying a known blocker.
+
 ### 2026-08-13: HumanLayer show-me stays an exact pinned dependency
 
 - Decision: install only `plugins/show-me/skills/show-me` from `humanlayer/skills` version 1.0.0 at commit `4d8d644ca747517973f58d7953f58d7cd07520cd` through a fingerprint-owned transactional adapter for all six managed agent hosts. Keep the upstream skill identity and core instructions, but replace its host-specific HTML opener with a portable artifact-preview fallback.

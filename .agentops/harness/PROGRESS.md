@@ -24,6 +24,8 @@ Repository: `agent-ops-community`
 
 ## Session Log
 
+- 2026-08-16: Review Gate run `31991058112` found that the preflight-evidence preservation scan shadowed the requested model-comment body. The targeted correction keeps the requested body separate, and the regression now proves the exact Codex body is posted, its `backend=codex` state is readable, and a later unchanged head reuses the blocker rather than rediscovering. Replacement CI and targeted resolution remain pending.
+
 - 2026-08-16: Issue 18 repair keeps deterministic preflight comments and their Actions evidence separate from reusable model-review state. Legacy signed and unsigned preflight state now causes an authorized same-head discovery recheck, while an actual Codex result remains reusable. Focused state and evidence-preservation regressions, the 34-test Review Gate suite, Ruff, harness check, and whitespace validation pass locally; focused pull request, hosted CI, and one discovery review remain pending.
 
 - 2026-08-13: Review Gate run `31703138089` found missing higher-precedence OpenClaw roots. Collision discovery now includes the personal compatibility root whenever the selected state is the default regardless of config location, plus default and configured agent workspace `skills` and `.agents/skills` roots.
@@ -106,6 +108,8 @@ Repository: `agent-ops-community`
   mechanical/domain, product, security, and evidence prompt into Codex.
 
 ## Verification Log
+
+- 2026-08-16: After Review Gate finding `CODEX_P1_1`, `python3 -m pytest -o addopts='' -q tests/test_review_gate.py::test_model_review_does_not_replace_preflight_evidence` passed (`1 passed`); `python3 -m pytest -o addopts='' -q tests/test_review_gate.py` passed (`34 passed`); `ruff check .`, `agentops harness check .`, and `git diff --check` passed before the replacement head.
 
 - 2026-08-16: `python3 -m pytest -o addopts='' -q tests/test_review_gate.py::test_legacy_preflight_state_is_rechecked_but_model_state_is_reused tests/test_review_gate.py::test_model_review_does_not_replace_preflight_evidence` passed (`2 passed`); `python3 -m pytest -o addopts='' -q tests/test_review_gate.py` passed (`34 passed`); `ruff check .`, `agentops harness check .`, and `git diff --check` passed.
 

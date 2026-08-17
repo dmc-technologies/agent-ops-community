@@ -782,6 +782,18 @@ def test_legacy_preflight_state_is_rechecked_but_model_state_is_reused(
 
 def test_model_review_does_not_replace_preflight_evidence(monkeypatch) -> None:
     review_gate = load_review_gate()
+    state = review_gate.ResolutionState(
+        repo="example-org/example",
+        pr_number=7,
+        base_ref="main",
+        merge_base_sha="base123",
+        sha="abc123",
+        scope="critical",
+        findings=(
+            review_gate.Finding("P1", "CODEX_P1_1", "Fix auth", "recheck this", ("x.py",)),
+        ),
+        backend="codex",
+    )
     preflight_comment = "\n".join(
         (
             review_gate.COMMENT_MARKER,
@@ -790,6 +802,10 @@ def test_model_review_does_not_replace_preflight_evidence(monkeypatch) -> None:
             "- preflight",
         )
     )
+    model_body = review_gate.build_review_comment(
+        review_gate.ReviewResult("codex", blocking=state.findings), resolution_state=state
+    )
+    comments = [{"id": 1, "body": preflight_comment, "user": {"login": "gate-bot"}}]
     calls = []
 
     def fake_run_command(args, cwd=None, env=None, input_text=None):
@@ -797,25 +813,36 @@ def test_model_review_does_not_replace_preflight_evidence(monkeypatch) -> None:
         if args[:3] == ["gh", "api", "user"]:
             return subprocess.CompletedProcess(args, 0, stdout="gate-bot\n", stderr="")
         if args[:3] == ["gh", "api", "repos/example-org/example/issues/7/comments"]:
-            return subprocess.CompletedProcess(
-                args,
-                0,
-                stdout=json.dumps(
-                    [{"id": 1, "body": preflight_comment, "user": {"login": "gate-bot"}}]
-                ),
-                stderr="",
-            )
+            if "POST" in args:
+                posted_body = next(
+                    value.removeprefix("body=") for value in args if value.startswith("body=")
+                )
+                comments.append({"id": 2, "body": posted_body, "user": {"login": "gate-bot"}})
+                return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+            return subprocess.CompletedProcess(args, 0, stdout=json.dumps(comments), stderr="")
         return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
 
     monkeypatch.setattr(review_gate, "run_command", fake_run_command)
-    review_gate.post_or_update_pr_comment("example-org/example", 7, "model result")
+    review_gate.post_or_update_pr_comment("example-org/example", 7, model_body)
 
     assert any(
         call[:3] == ["gh", "api", "repos/example-org/example/issues/7/comments"]
         and "POST" in call
+        and f"body={model_body}" in call
         for call in calls
     )
     assert not any("issues/comments/1" in call[2] for call in calls if len(call) > 2)
+    prior_state = review_gate.read_resolution_state("example-org/example", 7)
+    assert prior_state == state
+    assert review_gate.select_review_stage(
+        Path("."),
+        state.sha,
+        prior_state,
+        repo=state.repo,
+        pr_number=state.pr_number,
+        base_ref=state.base_ref,
+        merge_base_sha=state.merge_base_sha,
+    ).name == "unchanged"
 
 
 def test_changed_files_are_derived_from_the_exact_checked_out_head(monkeypatch, tmp_path) -> None:

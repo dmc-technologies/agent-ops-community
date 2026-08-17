@@ -1270,15 +1270,15 @@ def post_or_update_pr_comment(repo: str, pr_number: int, body: str) -> None:
     expected_login = expected_gate_login()
     for comment in fetch_issue_comments(repo, pr_number):
         author = str((comment.get("user") or {}).get("login") or "")
-        body = str(comment.get("body") or "")
-        exact_header = body.splitlines()[:2] == [
+        existing_body = str(comment.get("body") or "")
+        exact_header = existing_body.splitlines()[:2] == [
             COMMENT_MARKER,
             "# Review Gate agent review",
         ]
         if (
             exact_header
             and author == expected_login
-            and review_comment_backend(body) != "preflight"
+            and review_comment_backend(existing_body) != "preflight"
         ):
             comment_id = comment["id"]
             break
