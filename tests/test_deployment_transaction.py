@@ -69,6 +69,27 @@ def _legacy_plan(home: Path) -> ProviderPlan:
     )
 
 
+def _crash_after_legacy_link_move(
+    home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Path:
+    original_hook = transaction_module._after_legacy_link_move
+
+    def terminate(*_args: object) -> None:
+        os._exit(91)
+
+    monkeypatch.setattr(transaction_module, "_after_legacy_link_move", terminate)
+    process = multiprocessing.get_context("fork").Process(
+        target=lambda: install_provider_plans((_legacy_plan(home),))
+    )
+    process.start()
+    process.join(timeout=5)
+    assert not process.is_alive()
+    assert process.exitcode == 91
+    monkeypatch.setattr(transaction_module, "_after_legacy_link_move", original_hook)
+    return next((home / ".agentops/deployment/transactions").glob("*/record.json"))
+
+
 class _FakeNativeRename:
     def __init__(self, result: int) -> None:
         self.result = result
@@ -147,6 +168,120 @@ def test_legacy_link_transition_record_binds_exact_authority(tmp_path: Path) -> 
     record_path.chmod(0o600)
     with pytest.raises(ValueError, match="legacy link"):
         recover_transaction(record_path)
+
+
+def test_recovery_restores_legacy_link_after_power_loss_before_publish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    destination = home / "AGENTS.md"
+    destination.symlink_to("configs/global/AGENTS.md")
+    record_path = _crash_after_legacy_link_move(home, monkeypatch)
+
+    assert not destination.exists()
+    recovered = recover_transaction(record_path)
+
+    assert recovered.target_id == "codex-dev"
+    assert destination.is_symlink()
+    assert os.readlink(destination) == "configs/global/AGENTS.md"
+    assert json.loads(record_path.read_text())["state"] == "rolled-back"
+    assert recover_transaction(record_path) == recovered
+
+
+def test_recovery_restores_legacy_link_when_staged_evidence_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    destination = home / "AGENTS.md"
+    destination.symlink_to("configs/global/AGENTS.md")
+    record_path = _crash_after_legacy_link_move(home, monkeypatch)
+    record = json.loads(record_path.read_text())
+    staged = home / record["operations"][0]["staged"]
+    staged.unlink()
+
+    recover_transaction(record_path)
+
+    assert destination.is_symlink()
+    assert os.readlink(destination) == "configs/global/AGENTS.md"
+    assert json.loads(record_path.read_text())["state"] == "rolled-back"
+
+
+def test_recovery_restores_legacy_link_and_retains_changed_staged_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    destination = home / "AGENTS.md"
+    destination.symlink_to("configs/global/AGENTS.md")
+    record_path = _crash_after_legacy_link_move(home, monkeypatch)
+    record = json.loads(record_path.read_text())
+    staged = home / record["operations"][0]["staged"]
+    staged.write_bytes(b"changed staged evidence\n")
+
+    with pytest.raises(IncompleteRollbackError, match="staged file changed"):
+        recover_transaction(record_path)
+
+    assert destination.is_symlink()
+    assert os.readlink(destination) == "configs/global/AGENTS.md"
+    assert staged.read_bytes() == b"changed staged evidence\n"
+    assert record_path.is_file()
+
+
+def test_recovery_never_overwrites_concurrent_legacy_destination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    destination = home / "AGENTS.md"
+    destination.symlink_to("configs/global/AGENTS.md")
+    record_path = _crash_after_legacy_link_move(home, monkeypatch)
+    retained = record_path.parent / "prestate/legacy-link.entry"
+    original_move = transaction_module._HomeFS.move_new
+
+    def create_destination(home_fs: object, source: Path, target: Path) -> None:
+        if source == retained.relative_to(home) and target == Path("AGENTS.md"):
+            destination.write_bytes(b"concurrent recovery\n")
+        original_move(home_fs, source, target)
+
+    monkeypatch.setattr(transaction_module._HomeFS, "move_new", create_destination)
+
+    with pytest.raises(IncompleteRollbackError, match="rollback incomplete"):
+        recover_transaction(record_path)
+
+    assert destination.read_bytes() == b"concurrent recovery\n"
+    assert retained.is_symlink()
+    assert os.readlink(retained) == "configs/global/AGENTS.md"
+
+
+def test_recovery_preserves_process_control_after_restoring_legacy_link(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    destination = home / "AGENTS.md"
+    destination.symlink_to("configs/global/AGENTS.md")
+    record_path = _crash_after_legacy_link_move(home, monkeypatch)
+    original_move = transaction_module._HomeFS.move_new
+    process_exit = KeyboardInterrupt("stop")
+
+    def interrupt_after_restore(home_fs: object, source: Path, target: Path) -> None:
+        original_move(home_fs, source, target)
+        if source.name == "legacy-link.entry" and target == Path("AGENTS.md"):
+            raise process_exit
+
+    monkeypatch.setattr(transaction_module._HomeFS, "move_new", interrupt_after_restore)
+
+    with pytest.raises(KeyboardInterrupt) as caught:
+        recover_transaction(record_path)
+
+    assert caught.value is process_exit
+    assert destination.is_symlink()
+    assert os.readlink(destination) == "configs/global/AGENTS.md"
+    monkeypatch.setattr(transaction_module._HomeFS, "move_new", original_move)
+    recover_transaction(record_path)
+    assert json.loads(record_path.read_text())["state"] == "rolled-back"
 
 
 @pytest.mark.parametrize(

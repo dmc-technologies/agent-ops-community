@@ -3081,6 +3081,26 @@ def recover_transaction(path: Path) -> DeploymentManifest:
             home_fs.verify_lock_identity()
             return manifest
         _validate_transaction_evidence(home_fs, record, relative)
+        legacy = record.get("legacy_link_transition")
+        if (
+            legacy is not None
+            and record["state"] in {"prepared", "indeterminate"}
+            and (
+                home_fs.matches_symlink(
+                    Path(legacy["destination"]),
+                    legacy["expected_link_text"],
+                )
+                or not home_fs.exists(Path(legacy["destination"]))
+                and home_fs.matches_symlink(
+                    Path(legacy["retained_entry"]),
+                    legacy["expected_link_text"],
+                )
+            )
+        ):
+            _rollback_record(home_fs, record, relative, retain_completed=True)
+            _TRANSACTION_PATHS[manifest.transaction_id] = path
+            home_fs.verify_lock_identity()
+            return manifest
         expected_manifest = base64.b64decode(record["manifest_content"], validate=True)
         manifest_path = Path(record["manifest_path"])
         try:
