@@ -112,21 +112,21 @@ def test_audit_allows_co_resident_provider_owned_roots_only(tmp_path: Path) -> N
     assert audit_provider_plans((private, public)).matches
 
 
-def test_audit_allows_only_cpython_bytecode_for_a_planned_python_file(tmp_path: Path) -> None:
+def test_audit_rejects_cpython_bytecode_and_symlinked_bytecode(tmp_path: Path) -> None:
     home = tmp_path / "home"
     plan = ProviderPlan(
         "private", "1" * 40, TargetSpec("codex-dev", Framework.CODEX, home, "feature"),
         (PlannedFile(Path("skills/private/module.py"), b"x = 1\n", 0o644),),
-        audit_roots=(Path("skills/private"),), allow_python_bytecode=True,
+        audit_roots=(Path("skills/private"),),
     )
     install_provider_plans((plan,))
     cache = home / "skills/private/__pycache__"
     cache.mkdir()
-    (cache / "module.cpython-312.pyc").write_bytes(b"bytecode")
-    assert audit_provider_plans((plan,)).matches
-    (cache / "other.cpython-312.pyc").write_bytes(b"bytecode")
+    external = tmp_path / "external.pyc"
+    external.write_bytes(b"malicious")
+    (cache / "module.cpython-312.pyc").symlink_to(external)
     assert audit_provider_plans((plan,)).unexpected == (
-        "skills/private/__pycache__/other.cpython-312.pyc",
+        "skills/private/__pycache__/module.cpython-312.pyc",
     )
 
 

@@ -1038,7 +1038,6 @@ class _PlanGroup:
     files: tuple[PlannedFile, ...]
     removals: tuple[Path, ...]
     audit_roots: tuple[Path, ...]
-    allow_python_bytecode: bool
 
 
 def _validate_and_group(
@@ -1048,7 +1047,6 @@ def _validate_and_group(
     providers: dict[tuple[str, Framework, Path, str, str], set[str]] = {}
     removals: dict[tuple[str, Framework, Path, str, str], set[Path]] = {}
     audit_roots: dict[tuple[str, Framework, Path, str, str], set[Path]] = {}
-    bytecode: dict[tuple[str, Framework, Path, str, str], bool] = {}
     target_keys: dict[str, tuple[str, Framework, Path, str, str]] = {}
     home_targets: dict[Path, str] = {}
     preflight_cwd = Path.cwd()
@@ -1072,7 +1070,6 @@ def _validate_and_group(
         planned_removals = removals.setdefault(key, set())
         roots = audit_roots.setdefault(key, set())
         roots.update(plan.audit_roots or (Path(item.path.parts[0]) for item in plan.files))
-        bytecode[key] = bytecode.get(key, False) or plan.allow_python_bytecode
         for item in plan.files:
             path = _safe_relative(item.path)
             if path.parts[0] in {".agentops", _LOCK_NAME}:
@@ -1127,7 +1124,6 @@ def _validate_and_group(
                 files=tuple(groups[key][path] for path in sorted(groups[key], key=str)),
                 removals=tuple(sorted(removals[key], key=str)),
                 audit_roots=tuple(sorted(audit_roots[key], key=str)),
-                allow_python_bytecode=bytecode[key],
             )
         )
     return tuple(results)
@@ -2788,16 +2784,6 @@ def recover_transaction(path: Path) -> DeploymentManifest:
         return manifest
 
 
-def _is_planned_cpython_bytecode(candidate: Path, planned_paths: set[Path]) -> bool:
-    if candidate.suffix != ".pyc" or candidate.parent.name != "__pycache__":
-        return False
-    stem = candidate.name.removesuffix(".pyc")
-    module, marker, tag = stem.partition(".cpython-")
-    if not marker or not module or not tag.isdigit():
-        return False
-    return candidate.parent.parent / f"{module}.py" in planned_paths
-
-
 def audit_provider_plans(plans: tuple[ProviderPlan, ...]) -> DeploymentAudit:
     _require_supported_platform()
     groups = _validate_and_group(plans)
@@ -2958,10 +2944,6 @@ def audit_provider_plans(plans: tuple[ProviderPlan, ...]) -> DeploymentAudit:
             for item in installed:
                 candidate = root / item
                 if candidate in planned_paths:
-                    continue
-                if group.allow_python_bytecode and _is_planned_cpython_bytecode(
-                    candidate, planned_paths
-                ):
                     continue
                 unexpected.add(candidate.as_posix())
         duplicates = [
