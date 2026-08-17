@@ -2746,8 +2746,10 @@ def _is_valid_runtime_python_cache(
     if timestamp != int(source_stat.st_mtime) or size != len(source_bytes):
         return False
     try:
-        expected = compile(source_bytes, str(home_fs.home / source), "exec", dont_inherit=True)
         observed = marshal.loads(cache[16:])
+        if not isinstance(observed, type(compile("", "", "exec"))):
+            return False
+        expected = compile(source_bytes, observed.co_filename, "exec", dont_inherit=True)
     except (SyntaxError, ValueError, TypeError):
         return False
     return observed == expected and marshal.dumps(observed) == cache[16:]
