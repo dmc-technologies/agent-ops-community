@@ -54,6 +54,35 @@ def _plan(
     )
 
 
+_CPYTHON_CACHE_MAGICS = {
+    "cpython-311": bytes.fromhex("a70d0d0a"),
+    "cpython-312": bytes.fromhex("cb0d0d0a"),
+    "cpython-313": bytes.fromhex("f30d0d0a"),
+    "cpython-314": bytes.fromhex("2b0e0d0a"),
+}
+
+
+def _cache_path(source: Path, tag: str, optimization: str | None = None) -> Path:
+    suffix = f".{tag}"
+    if optimization is not None:
+        suffix += f".opt-{optimization}"
+    return source.parent / "__pycache__" / f"{source.stem}{suffix}.pyc"
+
+
+def _foreign_timestamp_cache(source: Path, tag: str, *, payload: bytes = b"code") -> bytes:
+    source_stat = source.stat()
+    source_bytes = source.read_bytes()
+    return b"".join(
+        (
+            _CPYTHON_CACHE_MAGICS[tag],
+            b"\0\0\0\0",
+            int(source_stat.st_mtime).to_bytes(4, "little"),
+            len(source_bytes).to_bytes(4, "little"),
+            payload,
+        )
+    )
+
+
 def _legacy_plan(home: Path) -> ProviderPlan:
     return ProviderPlan(
         "fixture",
@@ -1320,6 +1349,250 @@ def test_refresh_removes_exact_runtime_cache_with_its_prior_managed_source(
     assert audit_provider_plans((replacement,)).matches
 
 
+def test_retired_source_discovers_supported_default_and_optimized_caches(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    target = TargetSpec("codex", Framework.CODEX, home, "stable")
+    source = Path("skills/private/src/sitecustomize.py")
+    source_bytes = b'"""retired"""\nassert True\nvalue = "retired"\n'
+    initial = ProviderPlan(
+        "private",
+        "1" * 40,
+        target,
+        (PlannedFile(source, source_bytes, 0o644),),
+        audit_roots=(Path("skills/private"),),
+        runtime_python_sources=(source,),
+    )
+    install_provider_plans((initial,))
+    installed_source = home / source
+    os.utime(installed_source, (1_700_000_000, 1_700_000_000))
+    current_tag = sys.implementation.cache_tag
+    assert current_tag in _CPYTHON_CACHE_MAGICS
+    caches: list[Path] = []
+    for tag in _CPYTHON_CACHE_MAGICS:
+        for optimization in (None, "1", "2"):
+            cache = _cache_path(source, tag, optimization)
+            absolute_cache = home / cache
+            absolute_cache.parent.mkdir(parents=True, exist_ok=True)
+            if tag == current_tag:
+                py_compile.compile(
+                    installed_source,
+                    cfile=absolute_cache,
+                    doraise=True,
+                    optimize=-1 if optimization is None else int(optimization),
+                )
+            else:
+                absolute_cache.write_bytes(_foreign_timestamp_cache(installed_source, tag))
+                absolute_cache.chmod(0o644)
+            caches.append(cache)
+
+    replacement = ProviderPlan(
+        "private",
+        "2" * 40,
+        target,
+        (),
+        removals=(source,),
+        audit_roots=(Path("skills/private"),),
+    )
+    manifests = install_provider_plans((replacement,))
+
+    assert not installed_source.exists()
+    assert all(not (home / cache).exists() for cache in caches)
+    record_path = transaction_module._TRANSACTION_PATHS[manifests[0].transaction_id]
+    record = json.loads(record_path.read_text())
+    recorded = {
+        Path(operation["destination"])
+        for operation in record["operations"]
+        if operation["kind"] == "runtime-cache-removal"
+    }
+    assert recorded == set(caches)
+    assert audit_provider_plans((replacement,)).matches
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "wrong-stem",
+        "wrong-tag",
+        "opt-3",
+        "wrong-mode",
+        "hard-link",
+        "hash-based",
+        "wrong-timestamp",
+        "wrong-size",
+        "wrong-magic",
+        "short-header",
+        "oversized",
+        "symlink",
+    ],
+)
+def test_retired_source_preserves_untrusted_cache_candidates(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    home = tmp_path / "home"
+    target = TargetSpec("codex", Framework.CODEX, home, "stable")
+    source = Path("skills/private/src/sitecustomize.py")
+    initial = ProviderPlan(
+        "private",
+        "1" * 40,
+        target,
+        (PlannedFile(source, b"value = 'retired'\n", 0o644),),
+        audit_roots=(Path("skills/private"),),
+        runtime_python_sources=(source,),
+    )
+    install_provider_plans((initial,))
+    installed_source = home / source
+    os.utime(installed_source, (1_700_000_000, 1_700_000_000))
+    foreign_tag = next(tag for tag in _CPYTHON_CACHE_MAGICS if tag != sys.implementation.cache_tag)
+    candidate = _cache_path(source, foreign_tag)
+    if case == "wrong-stem":
+        candidate = candidate.with_name(f"other.{foreign_tag}.pyc")
+    elif case == "wrong-tag":
+        candidate = candidate.with_name(f"{source.stem}.cpython-399.pyc")
+    elif case == "opt-3":
+        candidate = _cache_path(source, foreign_tag, "3")
+    absolute_candidate = home / candidate
+    absolute_candidate.parent.mkdir(parents=True, exist_ok=True)
+    content = _foreign_timestamp_cache(installed_source, foreign_tag)
+    if case == "hash-based":
+        content = content[:4] + b"\x03\0\0\0" + content[8:]
+    elif case == "wrong-timestamp":
+        content = content[:8] + (1_700_000_001).to_bytes(4, "little") + content[12:]
+    elif case == "wrong-size":
+        wrong_size = (len(installed_source.read_bytes()) + 1).to_bytes(4, "little")
+        content = content[:12] + wrong_size + content[16:]
+    elif case == "wrong-magic":
+        content = b"BAD!" + content[4:]
+    elif case == "short-header":
+        content = content[:15]
+    elif case == "oversized":
+        content += b"x" * (16 * 1024 * 1024)
+    if case == "symlink":
+        external = tmp_path / "foreign.pyc"
+        external.write_bytes(content)
+        absolute_candidate.symlink_to(external)
+    else:
+        absolute_candidate.write_bytes(content)
+        absolute_candidate.chmod(0o600 if case == "wrong-mode" else 0o644)
+        if case == "hard-link":
+            os.link(absolute_candidate, tmp_path / "foreign.pyc")
+
+    replacement = ProviderPlan(
+        "private",
+        "2" * 40,
+        target,
+        (),
+        removals=(source,),
+        audit_roots=(Path("skills/private"),),
+    )
+    install_provider_plans((replacement,))
+
+    assert not installed_source.exists()
+    assert absolute_candidate.exists() or absolute_candidate.is_symlink()
+    audit = audit_provider_plans((replacement,))
+    assert not audit.matches
+    assert candidate.as_posix() in audit.unexpected
+
+
+def test_discovered_runtime_cache_rollback_restores_exact_prestate(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    target = TargetSpec("codex", Framework.CODEX, home, "stable")
+    source = Path("skills/private/src/sitecustomize.py")
+    initial = ProviderPlan(
+        "private",
+        "1" * 40,
+        target,
+        (PlannedFile(source, b"value = 'retired'\n", 0o644),),
+        runtime_python_sources=(source,),
+    )
+    install_provider_plans((initial,))
+    installed_source = home / source
+    os.utime(installed_source, (1_700_000_000, 1_700_000_000))
+    foreign_tag = next(tag for tag in _CPYTHON_CACHE_MAGICS if tag != sys.implementation.cache_tag)
+    caches = (_cache_path(source, foreign_tag), _cache_path(source, foreign_tag, "1"))
+    for cache in caches:
+        absolute_cache = home / cache
+        absolute_cache.parent.mkdir(parents=True, exist_ok=True)
+        absolute_cache.write_bytes(_foreign_timestamp_cache(installed_source, foreign_tag))
+        absolute_cache.chmod(0o644)
+    source_prestate = installed_source.read_bytes()
+    cache_prestates = {cache: (home / cache).read_bytes() for cache in caches}
+
+    replacement = ProviderPlan("private", "2" * 40, target, (), removals=(source,))
+    manifests = install_provider_plans((replacement,))
+    assert not installed_source.exists()
+    assert all(not (home / cache).exists() for cache in caches)
+    rollback_manifests(manifests)
+
+    assert installed_source.read_bytes() == source_prestate
+    assert {cache: (home / cache).read_bytes() for cache in caches} == cache_prestates
+
+
+def test_discovered_runtime_cache_recovery_restores_exact_prestate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    target = TargetSpec("codex", Framework.CODEX, home, "stable")
+    source = Path("skills/private/src/sitecustomize.py")
+    initial = ProviderPlan(
+        "private",
+        "1" * 40,
+        target,
+        (PlannedFile(source, b"value = 'retired'\n", 0o644),),
+        runtime_python_sources=(source,),
+    )
+    install_provider_plans((initial,))
+    installed_source = home / source
+    os.utime(installed_source, (1_700_000_000, 1_700_000_000))
+    foreign_tag = next(tag for tag in _CPYTHON_CACHE_MAGICS if tag != sys.implementation.cache_tag)
+    caches = (_cache_path(source, foreign_tag), _cache_path(source, foreign_tag, "1"))
+    for cache in caches:
+        absolute_cache = home / cache
+        absolute_cache.parent.mkdir(parents=True, exist_ok=True)
+        absolute_cache.write_bytes(_foreign_timestamp_cache(installed_source, foreign_tag))
+        absolute_cache.chmod(0o644)
+    source_prestate = installed_source.read_bytes()
+    cache_prestates = {cache: (home / cache).read_bytes() for cache in caches}
+    crash_destination = caches[-1].as_posix()
+
+    def crash_after_second_cache_backup(
+        _home_fs: object,
+        _record_path: Path,
+        operation: dict[str, object],
+    ) -> None:
+        if operation["destination"] == crash_destination:
+            os._exit(92)
+
+    monkeypatch.setattr(
+        transaction_module,
+        "_after_operation_backup",
+        crash_after_second_cache_backup,
+    )
+    replacement = ProviderPlan("private", "2" * 40, target, (), removals=(source,))
+    process = multiprocessing.get_context("fork").Process(
+        target=lambda: install_provider_plans((replacement,))
+    )
+    process.start()
+    process.join(timeout=10)
+    assert process.exitcode == 92
+    record_path = next(
+        candidate
+        for candidate in (home / ".agentops/deployment/transactions").glob("*/record.json")
+        if any(
+            operation["destination"] == crash_destination
+            for operation in json.loads(candidate.read_text())["operations"]
+        )
+    )
+
+    recover_transaction(record_path)
+
+    assert installed_source.read_bytes() == source_prestate
+    assert {cache: (home / cache).read_bytes() for cache in caches} == cache_prestates
+
+
 def test_runtime_cache_removal_rejects_forged_backup_and_record_fingerprint(
     tmp_path: Path,
 ) -> None:
@@ -1936,6 +2209,36 @@ def test_schema_six_runtime_cache_recovery_keeps_operation_cursor(
     record_path.write_text(json.dumps(record))
 
     assert recover_transaction(record_path).source_revision == "2" * 40
+
+
+def test_schema_seven_runtime_cache_provenance_remains_readable(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    target = TargetSpec("codex", Framework.CODEX, home, "stable")
+    source = Path("skills/private/src/sitecustomize.py")
+    initial = ProviderPlan(
+        "private",
+        "1" * 40,
+        target,
+        (PlannedFile(source, b"value = 'retired'\n", 0o644),),
+        runtime_python_sources=(source,),
+    )
+    install_provider_plans((initial,))
+    cache = Path(importlib.util.cache_from_source(str(source)))
+    py_compile.compile(home / source, cfile=home / cache, doraise=True)
+    replacement = ProviderPlan(
+        "private",
+        "2" * 40,
+        target,
+        (),
+        removals=(source, cache),
+    )
+    manifest = install_provider_plans((replacement,))[0]
+    record_path = transaction_module._TRANSACTION_PATHS[manifest.transaction_id]
+    record = json.loads(record_path.read_text())
+    record["schema_version"] = 7
+    record_path.write_text(json.dumps(record))
+
+    assert recover_transaction(record_path) == manifest
 
 
 def test_ordinary_install_rejects_prior_manifest_with_contradictory_channel(
@@ -3903,8 +4206,8 @@ def test_strict_transaction_json_rejects_ambiguity(
     record_path = next((home / ".agentops/deployment/transactions").glob("*/record.json"))
     if case == "duplicate-record-key":
         content = record_path.read_text().replace(
-            '"schema_version": 7,',
-            '"schema_version": 7,\n  "schema_version": 7,',
+            '"schema_version": 8,',
+            '"schema_version": 8,\n  "schema_version": 8,',
         )
         record_path.write_text(content)
     else:

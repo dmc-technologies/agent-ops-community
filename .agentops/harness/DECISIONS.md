@@ -131,6 +131,13 @@ Record durable architecture, workflow, and harness decisions here.
 - Applies to: shared provider-plan install, refresh, rollback, recovery, runtime-cache audit, and transaction tests.
 - Revisit when: a provider requires generated output whose validity depends on metadata beyond exact source bytes and mode, or the transaction schema gains a separately named preserved-file operation.
 
+### 2026-08-17: Retired managed Python sources own a finite derived-cache cleanup matrix
+
+- Decision: when a plan removes an exact Python source from the prior ownership manifest, the locked transaction checks only that source's CPython 3.11–3.14 PEP 3147 cache paths for default, `opt-1`, and `opt-2` modes. The running interpreter tag retains full code-object equality validation. Another listed tag requires its known magic, a timestamp header bound to the exact source modification time and byte length, exact derived name and parent, regular single-link `0644` identity, and a bounded file size. Each accepted cache uses the existing provenance, backup, rollback, recovery, and tamper-evidence operation. Invalid and unrelated files remain present and audit-visible.
+- Rationale: an agent update may retire source installed by another released supported CPython minor, but arbitrary cache names or foreign files must never gain deletion authority. A finite source-derived namespace closes the stale discovery path without installing another runtime or interpreting foreign marshal payloads.
+- Applies to: shared provider-plan source retirement, runtime-cache transaction evidence, rollback, recovery, audit, documentation, and transaction tests.
+- Revisit when: the repository deliberately adds or removes a released CPython minor from cache-retirement support, CPython changes the cache-name or timestamp-header contract, or Agent Ops adopts a stronger cross-version bytecode verifier.
+
 ### 2026-08-17: Source-store state stays private and audit receipts retain their first result
 
 - Decision: require the source-store root, sources, source directory, snapshot reads, and lock directory to be owned by the effective user with exact `0700` mode. Persist an HTTPS remote without userinfo and pass that userinfo only as transient Git fetch authentication. Retain the first audit result through receipt creation and refuse any later result that differs, including a previously missing managed file.
