@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import ctypes
 import errno
 import hashlib
@@ -173,6 +174,35 @@ def _crash_refresh_at_later_operation(
     assert not process.is_alive()
     assert process.exitcode == exit_code
     monkeypatch.setattr(transaction_module, hook_name, original_hook)
+    return sorted(
+        (home / ".agentops/deployment/transactions").glob("*/record.json"),
+        key=lambda path: path.stat().st_mtime_ns,
+    )[-1]
+
+
+def _crash_refresh_before_committed_record_write(
+    home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Path:
+    _prepare_legacy_refresh(home)
+    original_hook = transaction_module._before_committed_record_write
+
+    def terminate(*_args: object) -> None:
+        os._exit(98)
+
+    monkeypatch.setattr(transaction_module, "_before_committed_record_write", terminate)
+    process = multiprocessing.get_context("fork").Process(
+        target=lambda: install_provider_plans((_legacy_refresh_plan(home),))
+    )
+    process.start()
+    process.join(timeout=5)
+    assert not process.is_alive()
+    assert process.exitcode == 98
+    monkeypatch.setattr(
+        transaction_module,
+        "_before_committed_record_write",
+        original_hook,
+    )
     return sorted(
         (home / ".agentops/deployment/transactions").glob("*/record.json"),
         key=lambda path: path.stat().st_mtime_ns,
@@ -378,6 +408,117 @@ def test_recovery_restores_link_before_rejecting_changed_unstarted_destination(
     assert (home / "AGENTS.md").is_symlink()
     assert os.readlink(home / "AGENTS.md") == "configs/global/AGENTS.md"
     assert prior_destination.read_bytes() == b"concurrent prior change\n"
+
+
+def test_recovery_commits_forward_when_exact_manifest_was_published(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    record_path = _crash_refresh_before_committed_record_write(home, monkeypatch)
+    record = json.loads(record_path.read_text())
+    retained = home / record["legacy_link_transition"]["retained_entry"]
+    manifest_path = home / record["manifest_path"]
+
+    assert record["state"] == "prepared"
+    assert manifest_path.read_bytes() == base64.b64decode(record["manifest_content"])
+    assert (home / "AGENTS.md").read_bytes() == b"stable\n"
+    assert (home / "skills/example/SKILL.md").read_bytes() == b"new\n"
+    assert retained.is_symlink()
+
+    recovered = recover_transaction(record_path)
+
+    assert json.loads(record_path.read_text())["state"] == "committed"
+    assert (home / "AGENTS.md").read_bytes() == b"stable\n"
+    assert (home / "skills/example/SKILL.md").read_bytes() == b"new\n"
+    assert retained.is_symlink()
+    assert recover_transaction(record_path) == recovered
+
+
+def test_recovery_rolls_back_complete_outputs_when_candidate_manifest_is_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    record_path = _crash_refresh_before_committed_record_write(home, monkeypatch)
+    record = json.loads(record_path.read_text())
+    (home / record["manifest_path"]).unlink()
+
+    recovered = recover_transaction(record_path)
+
+    assert (home / "AGENTS.md").is_symlink()
+    assert os.readlink(home / "AGENTS.md") == "configs/global/AGENTS.md"
+    assert (home / "skills/example/SKILL.md").read_bytes() == b"old\n"
+    assert json.loads(record_path.read_text())["state"] == "rolled-back"
+    assert recover_transaction(record_path) == recovered
+
+
+@pytest.mark.parametrize("case", ["changed-output", "unexpected-manifest"])
+def test_recovery_rejects_contradictory_published_state_without_restoring_link(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    home = tmp_path / "home"
+    record_path = _crash_refresh_before_committed_record_write(home, monkeypatch)
+    record = json.loads(record_path.read_text())
+    destination = home / "AGENTS.md"
+    retained = home / record["legacy_link_transition"]["retained_entry"]
+    manifest_path = home / record["manifest_path"]
+    if case == "changed-output":
+        destination.write_bytes(b"changed concurrent output\n")
+        expected = "final state is invalid"
+    else:
+        manifest_path.write_bytes(b"{}\n")
+        expected = "unexpected manifest"
+
+    with pytest.raises(PublicationIndeterminateError, match=expected):
+        recover_transaction(record_path)
+
+    if case == "changed-output":
+        assert destination.read_bytes() == b"changed concurrent output\n"
+    else:
+        assert destination.read_bytes() == b"stable\n"
+        assert manifest_path.read_bytes() == b"{}\n"
+    assert retained.is_symlink()
+    assert os.readlink(retained) == "configs/global/AGENTS.md"
+    assert json.loads(record_path.read_text())["state"] == "prepared"
+
+
+@pytest.mark.parametrize(
+    "process_control",
+    [KeyboardInterrupt("stop"), SystemExit(71)],
+    ids=["keyboard-interrupt", "system-exit"],
+)
+def test_recovery_preserves_process_control_before_commit_record_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    process_control: BaseException,
+) -> None:
+    home = tmp_path / "home"
+    record_path = _crash_refresh_before_committed_record_write(home, monkeypatch)
+    record = json.loads(record_path.read_text())
+    retained = home / record["legacy_link_transition"]["retained_entry"]
+    original_hook = transaction_module._before_committed_record_write
+
+    def interrupt(*_args: object) -> None:
+        raise process_control
+
+    monkeypatch.setattr(transaction_module, "_before_committed_record_write", interrupt)
+
+    with pytest.raises(type(process_control)) as caught:
+        recover_transaction(record_path)
+
+    assert caught.value is process_control
+    assert (home / "AGENTS.md").read_bytes() == b"stable\n"
+    assert (home / "skills/example/SKILL.md").read_bytes() == b"new\n"
+    assert retained.is_symlink()
+    assert json.loads(record_path.read_text())["state"] == "prepared"
+    monkeypatch.setattr(
+        transaction_module,
+        "_before_committed_record_write",
+        original_hook,
+    )
+    recover_transaction(record_path)
+    assert json.loads(record_path.read_text())["state"] == "committed"
 
 
 def test_recovery_restores_legacy_link_when_staged_evidence_is_missing(

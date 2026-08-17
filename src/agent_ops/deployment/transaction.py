@@ -83,6 +83,14 @@ def _before_manifest_replace(
     """Internal fault-injection boundary immediately before publication."""
 
 
+def _before_committed_record_write(
+    _home_fs: _HomeFS,
+    _record_path: Path,
+    _record: dict[str, Any],
+) -> None:
+    """Internal fault-injection boundary after publication, before commit evidence."""
+
+
 def _after_legacy_link_move(
     _home_fs: _HomeFS,
     _destination: Path,
@@ -2015,6 +2023,7 @@ def _install_provider_plan_groups(
                         ) from publication_error
                     if not isinstance(publication_error, Exception):
                         raise
+                _before_committed_record_write(home_fs, record_path, record)
                 record["state"] = "committed"
                 home_fs.write_atomic(record_path, _record_bytes(record), 0o600)
                 _TRANSACTION_PATHS[transaction_id] = target.home / record_path
@@ -3286,6 +3295,47 @@ def recover_transaction(path: Path) -> DeploymentManifest:
             _TRANSACTION_PATHS[manifest.transaction_id] = path
             home_fs.verify_lock_identity()
             return manifest
+        expected_manifest = base64.b64decode(record["manifest_content"], validate=True)
+        manifest_path = Path(record["manifest_path"])
+        try:
+            current_manifest = home_fs.read_optional(manifest_path)
+        except OSError as exc:
+            raise PublicationIndeterminateError(
+                "manifest publication remains indeterminate; "
+                "ownership manifest is not a readable regular file"
+            ) from exc
+        if current_manifest == expected_manifest:
+            try:
+                manifest_pin = _PinnedRecoveryManifest(
+                    home_fs,
+                    manifest_path,
+                    expected_manifest,
+                )
+            except (OSError, ValueError) as exc:
+                raise PublicationIndeterminateError(
+                    "manifest publication remains indeterminate; "
+                    "ownership manifest type or mode is invalid"
+                ) from exc
+            try:
+                _validate_transaction_evidence(home_fs, record, relative)
+                _verify_recovery_final_state(home_fs, manifest, record)
+                if record["state"] != "committed":
+                    _before_committed_record_write(home_fs, relative, record)
+                    manifest_pin.verify()
+                    _verify_recovery_final_state(home_fs, manifest, record)
+                    record["state"] = "committed"
+                    home_fs.write_atomic(relative, _record_bytes(record), 0o600)
+                manifest_pin.verify()
+                _TRANSACTION_PATHS[manifest.transaction_id] = path
+                home_fs.verify_lock_identity()
+                return manifest
+            finally:
+                manifest_pin.close()
+        prior_manifest = _prior_manifest_content(record)
+        if current_manifest not in {None, prior_manifest}:
+            raise PublicationIndeterminateError(
+                "manifest publication remains indeterminate; unexpected manifest preserved"
+            )
         legacy = record.get("legacy_link_transition")
         if (
             legacy is not None
@@ -3316,41 +3366,6 @@ def recover_transaction(path: Path) -> DeploymentManifest:
             _TRANSACTION_PATHS[manifest.transaction_id] = path
             home_fs.verify_lock_identity()
             return manifest
-        expected_manifest = base64.b64decode(record["manifest_content"], validate=True)
-        manifest_path = Path(record["manifest_path"])
-        try:
-            current_manifest = home_fs.read_optional(manifest_path)
-        except OSError as exc:
-            raise PublicationIndeterminateError(
-                "manifest publication remains indeterminate; "
-                "ownership manifest is not a readable regular file"
-            ) from exc
-        if current_manifest == expected_manifest:
-            try:
-                manifest_is_exact = home_fs.matches_exact_file(
-                    manifest_path,
-                    expected_manifest,
-                    _OWNERSHIP_MANIFEST_MODE,
-                )
-            except OSError:
-                manifest_is_exact = False
-            if not manifest_is_exact:
-                raise PublicationIndeterminateError(
-                    "manifest publication remains indeterminate; "
-                    "ownership manifest type or mode is invalid"
-                )
-            _verify_recovery_final_state(home_fs, manifest, record)
-            if record["state"] != "committed":
-                record["state"] = "committed"
-                home_fs.write_atomic(relative, _record_bytes(record), 0o600)
-            _TRANSACTION_PATHS[manifest.transaction_id] = path
-            home_fs.verify_lock_identity()
-            return manifest
-        prior_manifest = _prior_manifest_content(record)
-        if current_manifest not in {None, prior_manifest}:
-            raise PublicationIndeterminateError(
-                "manifest publication remains indeterminate; unexpected manifest preserved"
-            )
         for operation in record["operations"]:
             destination = Path(operation["destination"])
             if operation["kind"] in {"installed", "adopted"} and not _file_matches(
@@ -3390,11 +3405,63 @@ def recover_transaction(path: Path) -> DeploymentManifest:
             home_fs.publish_new(recovery_temp, manifest_path)
         else:
             home_fs.replace(recovery_temp, manifest_path)
+        _before_committed_record_write(home_fs, relative, record)
         record["state"] = "committed"
         home_fs.write_atomic(relative, _record_bytes(record), 0o600)
         _TRANSACTION_PATHS[manifest.transaction_id] = path
         home_fs.verify_lock_identity()
         return manifest
+
+
+class _PinnedRecoveryManifest:
+    """Descriptor-bound candidate manifest retained through recovery classification."""
+
+    def __init__(self, home_fs: _HomeFS, path: Path, expected: bytes) -> None:
+        self._home_fs = home_fs
+        self.path = path
+        self.expected = expected
+        with home_fs.parent(path) as (parent, leaf):
+            self.descriptor = os.open(
+                leaf,
+                os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW,
+                dir_fd=parent,
+            )
+        try:
+            os.set_inheritable(self.descriptor, False)
+            observed = os.fstat(self.descriptor)
+            self.identity = _status_identity(observed)
+            if (
+                not stat.S_ISREG(observed.st_mode)
+                or observed.st_nlink != 1
+                or stat.S_IMODE(observed.st_mode) != _OWNERSHIP_MANIFEST_MODE
+                or _read_status_descriptor(self.descriptor) != expected
+            ):
+                raise ValueError("recovery ownership manifest is not exact")
+        except BaseException:
+            os.close(self.descriptor)
+            raise
+
+    def verify(self) -> None:
+        if os.get_inheritable(self.descriptor):
+            raise RuntimeError("recovery manifest descriptor must be close-on-exec")
+        try:
+            canonical = self._home_fs.stat(self.path)
+        except OSError as exc:
+            raise PublicationIndeterminateError(
+                "manifest publication changed during recovery; evidence retained"
+            ) from exc
+        if (
+            _status_identity(canonical) != self.identity
+            or _status_identity(os.fstat(self.descriptor)) != self.identity
+            or _read_status_descriptor(self.descriptor) != self.expected
+        ):
+            raise PublicationIndeterminateError(
+                "manifest publication changed during recovery; evidence retained"
+            )
+
+    def close(self) -> None:
+        with suppress(OSError):
+            os.close(self.descriptor)
 
 
 def _is_valid_runtime_python_cache(
