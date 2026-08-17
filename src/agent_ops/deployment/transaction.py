@@ -119,6 +119,15 @@ def _after_operation_backup(
     """Internal fault-injection boundary after a recorded backup move."""
 
 
+def _after_runtime_cache_backup_move(
+    _home_fs: _HomeFS,
+    _destination: Path,
+    _backup: Path,
+    _operation: dict[str, Any],
+) -> None:
+    """Internal fault-injection boundary before cache backup authorization."""
+
+
 def _after_operation_mutation(
     _home_fs: _HomeFS,
     _record_path: Path,
@@ -3731,6 +3740,7 @@ def recover_transaction(path: Path) -> DeploymentManifest:
                 record,
                 relative,
             )
+        _restore_unauthorized_runtime_cache_before_evidence(home_fs, record)
         _validate_transaction_evidence(home_fs, record, relative)
         if (
             record["state"] in {"prepared", "indeterminate"}
@@ -4141,11 +4151,49 @@ def _retain_runtime_cache_removal(
 ) -> None:
     """Move only the authorized cache; restore any replacement before failing."""
     home_fs.replace(destination, backup)
+    _after_runtime_cache_backup_move(home_fs, destination, backup, operation)
     if pinned_cache.matches_backup(backup):
         return
     if not home_fs.exists(destination):
         home_fs.move_new(backup, destination)
     raise ValueError(f"runtime cache removal changed during mutation: {destination}")
+
+
+def _restore_unauthorized_runtime_cache_before_evidence(
+    home_fs: _HomeFS,
+    record: dict[str, Any],
+) -> None:
+    """Keep a raced cache reachable before rejecting its transaction authority."""
+    if record["schema_version"] < _TRANSACTION_SCHEMA_VERSION:
+        return
+    for operation in record["operations"]:
+        if operation["kind"] != _RUNTIME_CACHE_REMOVAL:
+            continue
+        destination = Path(operation["destination"])
+        backup = Path(operation["backup"])
+        provenance = _decode_runtime_cache_provenance(
+            operation["runtime_cache_provenance"],
+            destination=destination,
+            source=Path(operation["runtime_source"]),
+        )
+        identity = provenance["identity"]
+        expected_identity = identity["device"], identity["inode"]
+        if home_fs.exists(backup):
+            observed = home_fs.stat(backup)
+            if (observed.st_dev, observed.st_ino) == expected_identity:
+                continue
+            if not home_fs.exists(destination):
+                with suppress(FileExistsError):
+                    home_fs.move_new(backup, destination)
+            raise IncompleteRollbackError(
+                f"rollback incomplete: unauthorized runtime cache preserved: {destination}"
+            )
+        if home_fs.exists(destination):
+            observed = home_fs.stat(destination)
+            if (observed.st_dev, observed.st_ino) != expected_identity:
+                raise IncompleteRollbackError(
+                    f"rollback incomplete: unauthorized runtime cache preserved: {destination}"
+                )
 
 
 def _authorized_runtime_cache_removal_source(

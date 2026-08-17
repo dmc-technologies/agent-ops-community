@@ -1537,11 +1537,13 @@ def test_runtime_cache_recovery_rejects_replaced_backup_inode(
     os.replace(replacement_backup, backup)
     assert (backup.stat().st_dev, backup.stat().st_ino) != original_identity
 
-    with pytest.raises(ValueError, match="runtime cache removal evidence"):
+    with pytest.raises(IncompleteRollbackError, match="unauthorized runtime cache preserved"):
         recover_transaction(record_path)
 
-    assert backup.read_bytes() == backup_bytes
-    assert (backup.stat().st_dev, backup.stat().st_ino) != original_identity
+    assert not backup.exists()
+    assert (home / cache).read_bytes() == backup_bytes
+    assert ((home / cache).stat().st_dev, (home / cache).stat().st_ino) != original_identity
+    assert record_path.exists()
 
 
 def test_runtime_cache_removal_preserves_replacement_after_authorization(
@@ -1598,6 +1600,94 @@ def test_runtime_cache_removal_preserves_replacement_after_authorization(
     assert (home / cache).read_bytes() == authorized_bytes
     assert ((home / cache).stat().st_dev, (home / cache).stat().st_ino) != authorized_identity
     assert (home / source).read_bytes() == b"value = 'retired'\n"
+
+
+def test_runtime_cache_recovery_restores_raced_cache_after_backup_move_crash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    target = TargetSpec("codex", Framework.CODEX, home, "stable")
+    source = Path("skills/private/src/sitecustomize.py")
+    initial = ProviderPlan(
+        "private",
+        "1" * 40,
+        target,
+        (PlannedFile(source, b"value = 'retired'\n", 0o644),),
+        runtime_python_sources=(source,),
+    )
+    install_provider_plans((initial,))
+    cache = Path(importlib.util.cache_from_source(str(source)))
+    os.utime(home / source, (1_700_000_000, 1_700_000_000))
+    py_compile.compile(home / source, cfile=home / cache, doraise=True)
+    replacement = ProviderPlan(
+        "private",
+        "2" * 40,
+        target,
+        (),
+        removals=(source, cache),
+    )
+    raced_bytes = (home / cache).read_bytes()
+
+    def replace_authorized_cache(
+        _home_fs: object,
+        _record_path: Path,
+        operation: dict[str, object],
+    ) -> None:
+        if operation["kind"] != "runtime-cache-removal":
+            return
+        candidate = home / "raced.pyc"
+        candidate.write_bytes(raced_bytes)
+        candidate.chmod(0o644)
+        os.replace(candidate, home / cache)
+
+    def crash_after_backup_move(
+        _home_fs: object,
+        _destination: Path,
+        _backup: Path,
+        _operation: dict[str, object],
+    ) -> None:
+        os._exit(95)
+
+    monkeypatch.setattr(
+        transaction_module,
+        "_before_operation_mutation",
+        replace_authorized_cache,
+    )
+    monkeypatch.setattr(
+        transaction_module,
+        "_after_runtime_cache_backup_move",
+        crash_after_backup_move,
+        raising=False,
+    )
+    process = multiprocessing.get_context("fork").Process(
+        target=lambda: install_provider_plans((replacement,))
+    )
+    process.start()
+    process.join(timeout=10)
+    assert process.exitcode == 95
+    record_path = next(
+        candidate
+        for candidate in (home / ".agentops/deployment/transactions").glob("*/record.json")
+        if any(
+            operation["kind"] == "runtime-cache-removal"
+            for operation in json.loads(candidate.read_text())["operations"]
+        )
+    )
+    record = json.loads(record_path.read_text())
+    operation = next(
+        item for item in record["operations"] if item["kind"] == "runtime-cache-removal"
+    )
+    backup = home / operation["backup"]
+
+    assert not (home / cache).exists()
+    assert backup.read_bytes() == raced_bytes
+
+    with pytest.raises(IncompleteRollbackError, match="unauthorized runtime cache preserved"):
+        recover_transaction(record_path)
+
+    assert (home / cache).read_bytes() == raced_bytes
+    assert not backup.exists()
 
 
 def test_runtime_cache_removal_recovery_uses_recorded_cache_provenance(
