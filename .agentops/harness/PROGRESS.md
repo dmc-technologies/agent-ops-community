@@ -161,3 +161,4 @@ Repository: `agent-ops-community`
 - 2026-06-19: hardening validation passed: `python -m pytest tests/test_review_gate.py tests/test_public_safety.py -q`,
   `ruff check .github/scripts/review_gate.py tests/test_review_gate.py`,
   `git diff --check`, and `agentops harness check .`.
+2026-08-17: Added the canonical stack-and-migration rule to AGENTS.md only; symlinked Claude policy files were not edited. Scoped policy/harness verification is required on this replacement head; PR33 remains unlabelled pending final reconciliation.

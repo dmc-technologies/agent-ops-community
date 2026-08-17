@@ -28,3 +28,7 @@ The local `pr-review` command is an independent advisory before hosted review; i
 A pull request may close only when exact-head CI and the hosted Review Gate pass, its plain-English description matches that head, and addressed human review conversations are resolved. Leave ambiguous or unaddressed conversations open. A behavior-changing commit invalidates prior CI and review acceptance.
 
 Dan retains merge authority unless he explicitly grants merge permission for the exact pull request or task. Preparing, pushing, labeling, or reviewing a pull request does not grant merge authority.
+
+## Stack and migration
+
+Do not introduce a new implementation language, runtime, or framework unless an existing supported boundary strictly requires it or Dan has approved a material product or operational benefit. Prefer the repository's current stack, preserve prototypes and history, and require source-backed migration plus rollback proof before replacement.
