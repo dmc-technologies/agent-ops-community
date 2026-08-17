@@ -709,7 +709,7 @@ class DeploymentEngine:
             raise ValueError("provider plan must contain files or removals")
         if any(type(item) is not PlannedFile for item in plan.files):
             raise ValueError("provider plan files must be exact PlannedFile values")
-        if any(type(path) is not Path for path in plan.removals):
+        if any(type(path) is not type(Path()) for path in plan.removals):
             raise ValueError("provider plan removals must be exact Path values")
 
     def _apply_with_one_stale_retry(

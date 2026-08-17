@@ -513,6 +513,49 @@ def test_deployment_engine_plans_without_mutation_then_refreshes_once(tmp_path: 
     assert registry.receipts() == (receipt,)
 
 
+def test_deployment_engine_refresh_accepts_exact_concrete_path_removal(tmp_path: Path) -> None:
+    class RemovingProvider(_FixtureProvider):
+        def plan(self, snapshot: SourceSnapshot, target: TargetSpec) -> ProviderPlan:
+            destination = Path("skills/example/payload.txt")
+            content = (snapshot.root / "payload.txt").read_bytes()
+            if content == b"removed\n":
+                return ProviderPlan(
+                    self.provider_id,
+                    snapshot.commit,
+                    target,
+                    (),
+                    removals=(destination,),
+                )
+            return ProviderPlan(
+                self.provider_id,
+                snapshot.commit,
+                target,
+                (PlannedFile(destination, content, 0o640),),
+            )
+
+    _engine, registry, home = _engine_fixture(tmp_path)
+    engine = DeploymentEngine(
+        registry,
+        SourceStore(tmp_path / "source-store"),
+        providers=(RemovingProvider(),),
+    )
+    engine.refresh(("codex",))
+    source = tmp_path / "source"
+    (source / "payload.txt").write_bytes(b"removed\n")
+    subprocess.run(
+        ["git", "commit", "-am", "remove payload"],
+        cwd=source,
+        check=True,
+        capture_output=True,
+    )
+
+    receipt = engine.refresh(("codex",))
+
+    assert receipt.operation == "refresh"
+    assert not (home / "skills/example/payload.txt").exists()
+    assert registry.receipts()[-1] == receipt
+
+
 def test_engine_rejects_duplicate_selection_before_source_store_mutation(
     tmp_path: Path,
 ) -> None:
