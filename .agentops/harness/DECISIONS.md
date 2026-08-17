@@ -25,6 +25,15 @@ Record durable architecture, workflow, and harness decisions here.
 - Rationale: a manifest cannot grant itself authority to move a target between stable and branch channels; only the registry-backed engine can authorize that exact transition.
 - Applies to: grouped install, managed refresh, preview, switch, deploy, rollback, recovery, transaction evidence, documentation, and tests.
 - Revisit when: a reviewed promotion operation introduces another registry-authorized channel transition.
+### 2026-08-16: Only model results may be reused as Review Gate resolution state
+
+- Decision: a preflight result never creates reusable resolution state. Legacy state comments without recorded provenance are reusable only when their trusted Review Gate comment records `Backend: codex`; new state records Codex provenance in its signed payload. Keep preflight comments separate when posting the later model result.
+- Rationale: deterministic checks can change without a pull-request commit. Replaying an old preflight finding prevents the corrected check and model from running, while replaying an actual same-head Codex result avoids unnecessary repeat discovery.
+- Applies to: `.github/scripts/review_gate.py` and `tests/test_review_gate.py`.
+- Revisit when: Review Gate gains a versioned persistent result store that can retain backend provenance without relying on GitHub comment structure.
+
+- Correction: retain the requested model-comment body while scanning existing comments. Scanned comments are evidence only; they must never replace the body passed to the POST or PATCH request.
+- Rationale: replacement with a preflight comment would discard the signed Codex state and let a later same-head retry rediscover instead of carrying a known blocker.
 
 ### 2026-08-13: HumanLayer show-me stays an exact pinned dependency
 
