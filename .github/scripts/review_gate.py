@@ -115,7 +115,7 @@ security, domain correctness, and whether the change is strictly functional to
 merge. Report only concrete, actionable findings with evidence.
 """
 SECRET_RE = re.compile(
-    r"(?i)(api[_-]?key|secret|token|password)\s*[:=]\s*['\"]?[A-Za-z0-9_./+=-]{20,}"
+    r"(?i)(api[_-]?key|secret|token|password)\s*[:=]\s*(['\"])[A-Za-z0-9_./+=-]{20,}\2"
 )
 
 
