@@ -912,6 +912,27 @@ def test_analyze_workspace_blocks_conflict_markers(tmp_path: Path) -> None:
     assert result.blocking[0].code == "MERGE_CONFLICT_MARKERS"
 
 
+def test_analyze_workspace_distinguishes_context_token_from_literal_credential(
+    tmp_path: Path,
+) -> None:
+    review_gate = load_review_gate()
+    ordinary = tmp_path / "ordinary.py"
+    ordinary.write_text(
+        "to" + "ken = " + "very_long_context_variable_name.set(value)\n"
+    )
+    credential = tmp_path / "credential.py"
+    credential.write_text(
+        "to" + "ken = " + repr("abcdefghijklmnopqrstuvwx") + "\n"
+    )
+
+    ordinary_result = review_gate.analyze_workspace(tmp_path, [ordinary.name])
+    credential_result = review_gate.analyze_workspace(tmp_path, [credential.name])
+
+    assert ordinary_result.passed
+    assert not credential_result.passed
+    assert credential_result.blocking[0].code == "POSSIBLE_SECRET"
+
+
 def test_run_codex_review_rejects_invalid_output_contract(monkeypatch, tmp_path) -> None:
     review_gate = load_review_gate()
 
