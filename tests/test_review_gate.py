@@ -921,7 +921,9 @@ def test_analyze_workspace_distinguishes_context_token_from_literal_credential(
         "token = very_long_context_variable_name.set(value)\n"
     )
     credential = tmp_path / "credential.py"
-    credential.write_text('token = "abcdefghijklmnopqrstuvwx"\n')
+    credential.write_text(
+        "token = " + repr("abcdefghijklmnopqrstuvwx") + "\n"
+    )
 
     ordinary_result = review_gate.analyze_workspace(tmp_path, [ordinary.name])
     credential_result = review_gate.analyze_workspace(tmp_path, [credential.name])
