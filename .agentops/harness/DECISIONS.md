@@ -11,6 +11,9 @@ Record durable architecture, workflow, and harness decisions here.
 - Applies to: `.github/scripts/review_gate.py`, `tests/test_review_gate.py`, and repositories using the shared Review Gate workflow.
 - Revisit when: GitHub exposes a stable machine-readable error code for self-approval or the shared workflow separates the pull-request author from the approval identity.
 
+- Correction: treat the exact GitHub CLI `Unprocessable Entity (HTTP 422)` approval response as the bounded nonfatal condition without assuming the token identity matches the pull-request author. A live shared-workflow retry proved GitHub can return the same response when those identities differ. All other approval publication errors remain fail-closed.
+- Rationale: the optional approval is not the Review Gate result. The already-published model comment and exact-head status carry that result, while GitHub can reject approval because of actor identity or repository token policy without exposing a more specific response through the CLI.
+
 ### 2026-08-16: Channel launch is limited to frameworks with a proven isolated-home contract
 
 - Decision: retain no-follow descriptors for every audited ownership manifest, managed file, and managed directory until receipt publication or launch handoff, and revalidate the retained identity, mode, topology, and bytes immediately before terminal success. Channel launch is enabled only for Local and Codex, whose isolated-home readiness contracts are implemented and tested; it rejects Claude Code, Cursor, OpenCode, Prime Agent, and OpenClaw until their native isolated-home contracts are proven.

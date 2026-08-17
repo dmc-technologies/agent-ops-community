@@ -4,21 +4,21 @@ Repository: `agent-ops-community`
 
 ## Current State
 
-- Branch: `fix/review-gate-self-approval`
-- Main baseline: `6b3110b72b2aff76c1857f5165ee321e5553cb35`, the current community `origin/main` selected for this correction.
-- Current handoff: Review Gate preserves a successful exact-head model result when GitHub returns the observed `Unprocessable Entity (HTTP 422)` approval response only after both authenticated actor and pull-request author identities resolve and match. Any other publication error or unconfirmed `422` still fails closed. No Plane work item applies.
-- Verification: the confirmed-self-approval regression failed against the baseline and passes after the correction. The focused Review Gate suite passes with 37 tests. The complete local gate passes: `ruff check .`; `python -m pytest -q` with 858 passed and 3 skipped from 861 collected tests; `agentops harness check .`; and `git diff --check`. Hosted gates remain pending.
+- Branch: `fix/review-gate-approval-422`
+- Main baseline: `5dd64c759fcbfe5956d0936c7089f330e1b289ae`, the current community `origin/main` selected for this correction.
+- Current handoff: a live downstream retry consumed the merged identity-checked correction, produced a passing model result with no blockers, and still failed on the exact optional-approval `Unprocessable Entity (HTTP 422)` response because the token actor and pull-request author differed. Review Gate now preserves a passing result for that exact response without making an unsupported identity assumption. All other approval publication failures remain fail-closed. No Plane work item applies.
+- Verification: the differing-identity `422` regression failed against the merged baseline and passes after the correction. The focused Review Gate suite passes with 37 tests. The complete local gate passes: `ruff check .`; `python -m pytest -q` with 858 passed and 3 skipped from 861 collected tests; `agentops harness check .`; and `git diff --check`. Hosted gates remain pending.
 
 ## Current Work
 
 - Goal: prevent an optional self-approval rejection from replacing a successful Review Gate result with false failure evidence.
-- Active task: complete the local gates, publish one coherent community pull request, obtain exact-head hosted CI and Review Gate, and merge when both pass.
+- Active task: complete the replacement local gates, publish one coherent community pull request, obtain exact-head hosted CI and Review Gate, merge when both pass, and rerun one downstream caller against merged `main`.
 - Files in play: `.github/scripts/review_gate.py`, `tests/test_review_gate.py`, and harness closeout records.
 - Blockers: none.
 
 ## Next Actions
 
-- Commit the coherent correction and rerun `ruff check .`, `python -m pytest -q`, `agentops harness check .`, and `git diff --check` on that exact SHA.
+- Commit the coherent correction and repeat `ruff check .`, `python -m pytest -q`, `agentops harness check .`, and `git diff --check` on that exact SHA.
 - Push and open the community pull request, then obtain ordinary hosted Linux and Windows CI on its exact head.
 - Apply `ai review` once to the unchanged final head, merge only if Review Gate passes, and prove the Structures caller succeeds with the merged shared runtime.
 

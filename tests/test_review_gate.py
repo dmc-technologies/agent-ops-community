@@ -1076,16 +1076,7 @@ def test_submit_pr_approval_accepts_confirmed_self_approval_422(monkeypatch) -> 
     assert review_gate.submit_pr_approval(
         "example-org/example", 12, "abc123", "AI review passed"
     )
-    assert calls[1:] == [
-        ["gh", "api", "user", "--jq", ".login"],
-        [
-            "gh",
-            "api",
-            "repos/example-org/example/pulls/12",
-            "--jq",
-            ".user.login",
-        ],
-    ]
+    assert len(calls) == 1
 
 
 def test_submit_pr_approval_fails_closed_for_other_publication_errors(
@@ -1108,7 +1099,7 @@ def test_submit_pr_approval_fails_closed_for_other_publication_errors(
     assert len(calls) == 1
 
 
-def test_submit_pr_approval_fails_closed_for_unconfirmed_422(monkeypatch) -> None:
+def test_submit_pr_approval_accepts_exact_422_without_actor_match(monkeypatch) -> None:
     review_gate = load_review_gate()
 
     def fake_run_command(args, cwd=None):
@@ -1129,7 +1120,7 @@ def test_submit_pr_approval_fails_closed_for_unconfirmed_422(monkeypatch) -> Non
 
     monkeypatch.setattr(review_gate, "run_command", fake_run_command)
 
-    assert not review_gate.submit_pr_approval(
+    assert review_gate.submit_pr_approval(
         "example-org/example", 12, "abc123", "AI review passed"
     )
 
