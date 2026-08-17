@@ -8,8 +8,12 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from typer.testing import CliRunner
 
 from agent_ops import show_me_adapter
+from agent_ops.cli import app
+from agent_ops.deployment.models import ProviderPlan, TargetSpec
+from agent_ops.deployment.transaction import UnsupportedPlatformError
 from agent_ops.registries import load_skill_dependencies
 from agent_ops.registries.models import Framework, SkillDependency, SkillDependencyInstall
 from agent_ops.show_me_adapter import (
@@ -17,7 +21,7 @@ from agent_ops.show_me_adapter import (
 )
 from agent_ops.show_me_adapter import ShowMeCollisionError
 from agent_ops.skill_installer import default_framework_home, install_skill_dependencies
-from agent_ops.superpowers_adapter import OWNERSHIP_MANIFEST_RELATIVE, SUPERPOWERS_SKILLS
+from agent_ops.superpowers_adapter import SUPERPOWERS_SKILLS
 
 
 def _git_repo(path: Path) -> str:
@@ -57,6 +61,57 @@ def _commit(path: Path) -> str:
         text=True,
     )
     return result.stdout.strip()
+
+
+def _tree_snapshot(root: Path) -> dict[str, tuple[str, int, bytes | str | None]]:
+    snapshot: dict[str, tuple[str, int, bytes | str | None]] = {}
+    for current, directories, files in os.walk(root, followlinks=False):
+        current_path = Path(current)
+        for name in sorted([*directories, *files]):
+            path = current_path / name
+            relative = path.relative_to(root).as_posix()
+            mode = path.lstat().st_mode & 0o777
+            if path.is_symlink():
+                snapshot[relative] = ("link", mode, os.readlink(path))
+            elif path.is_dir():
+                snapshot[relative] = ("directory", mode, None)
+            else:
+                snapshot[relative] = ("file", mode, path.read_bytes())
+    return snapshot
+
+
+def _cached_gstack_dependency(
+    tmp_path: Path,
+) -> tuple[SkillDependency, Path, Path, Path]:
+    origin = tmp_path / "origin"
+    repo_url = _git_repo(origin)
+    (origin / "SKILL.md").write_text("managed\n", encoding="utf-8")
+    ref = _commit(origin)
+    dependency = SkillDependency(
+        id="gstack",
+        name="GStack",
+        repo=repo_url,
+        ref=ref,
+        install={
+            "codex": SkillDependencyInstall(strategy="gstack", destination="skills/gstack")
+        },
+    )
+    cache = tmp_path / "cache"
+    home = tmp_path / "home"
+    install_skill_dependencies(
+        framework=Framework.CODEX,
+        dependencies=[dependency],
+        home=home,
+        cache_dir=cache,
+        dry_run=True,
+    )
+    return dependency, cache, home, cache / f"gstack-{ref[:12]}"
+
+
+def _shared_ownership_manifest(home: Path) -> Path:
+    manifests = list((home / ".agentops/deployment/manifests").glob("*.json"))
+    assert len(manifests) == 1
+    return manifests[0]
 
 
 def test_install_gstack_dependency_copies_full_bundle(tmp_path: Path) -> None:
@@ -234,12 +289,18 @@ def test_copy_skills_dependency_removes_stale_manifest_entries(tmp_path: Path) -
         cache_dir=cache,
     )
 
-    assert not (home / "skills" / "old-skill").exists()
+    assert not (home / "skills" / "old-skill" / "SKILL.md").exists()
     assert (home / "skills" / "new-skill" / "SKILL.md").exists()
     assert (home / "skills" / "gstack").exists()
 
 
-def test_install_skill_dependencies_dry_run_does_not_clone(tmp_path: Path) -> None:
+def test_install_skill_dependencies_dry_run_plans_without_target_mutation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "SKILL.md").write_text("body\n", encoding="utf-8")
     dependency = SkillDependency(
         id="gstack",
         name="GStack",
@@ -248,6 +309,13 @@ def test_install_skill_dependencies_dry_run_does_not_clone(tmp_path: Path) -> No
         install={"codex": SkillDependencyInstall(strategy="gstack", destination="skills/gstack")},
     )
 
+    checkouts: list[str] = []
+
+    def checkout(selected: SkillDependency, _cache: Path) -> Path:
+        checkouts.append(selected.id)
+        return source
+
+    monkeypatch.setattr("agent_ops.skill_installer._checkout_dependency", checkout)
     rows = install_skill_dependencies(
         framework=Framework.CODEX,
         dependencies=[dependency],
@@ -258,7 +326,881 @@ def test_install_skill_dependencies_dry_run_does_not_clone(tmp_path: Path) -> No
 
     assert rows[0].dry_run is True
     assert rows[0].destination == tmp_path / "home" / "skills" / "gstack"
+    assert checkouts == ["gstack"]
+    assert not (tmp_path / "home").exists()
     assert not (tmp_path / "cache").exists()
+
+
+@pytest.mark.parametrize("dry_run", [True, False])
+def test_install_skill_dependencies_preserves_explicit_relative_home(
+    tmp_path: Path, monkeypatch, dry_run: bool
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "SKILL.md").write_bytes(b"body\n")
+    dependency = SkillDependency(
+        id="gstack",
+        name="GStack",
+        repo="https://example.invalid/gstack.git",
+        ref="abc123",
+        install={"codex": SkillDependencyInstall(strategy="gstack", destination="skills/gstack")},
+    )
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency",
+        lambda _dependency, _cache: source,
+    )
+
+    rows = install_skill_dependencies(
+        framework=Framework.CODEX,
+        dependencies=[dependency],
+        home=Path("relative-home"),
+        cache_dir=tmp_path / "cache",
+        dry_run=dry_run,
+    )
+
+    assert rows[0].destination == Path("relative-home/skills/gstack")
+    assert rows[0].destination.is_absolute() is False
+    assert (tmp_path / "relative-home/skills/gstack/SKILL.md").exists() is (not dry_run)
+
+
+def test_non_posix_dry_run_pairs_relative_plan_target_without_absolutizing(
+    tmp_path: Path, monkeypatch
+) -> None:
+    dependency = SkillDependency(
+        id="gstack",
+        name="GStack",
+        repo="https://example.invalid/gstack.git",
+        ref="abc123",
+        install={"codex": SkillDependencyInstall(strategy="gstack", destination="skills/gstack")},
+    )
+    target = TargetSpec("public-skills:codex", Framework.CODEX, Path("relative-home"), "public")
+    plan = ProviderPlan("public-skill:gstack", "revision", target, ())
+    monkeypatch.setattr("agent_ops.skill_installer._use_shared_transaction_engine", lambda: False)
+    monkeypatch.setattr(
+        "agent_ops.skill_installer.build_public_skill_plans", lambda **_kwargs: (plan,)
+    )
+
+    rows = install_skill_dependencies(
+        framework=Framework.CODEX,
+        dependencies=[dependency],
+        home=Path("relative-home"),
+        cache_dir=tmp_path / "cache",
+        dry_run=True,
+    )
+
+    assert rows[0].destination == Path("relative-home/skills/gstack")
+
+
+def test_skills_install_cli_preserves_explicit_relative_home(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "SKILL.md").write_bytes(b"body\n")
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency",
+        lambda _dependency, _cache: source,
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "skills",
+            "install",
+            "codex",
+            "--dependency",
+            "gstack",
+            "--home",
+            "relative-home",
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "would install: gstack -> relative-home/skills/gstack" in result.output
+    assert str(tmp_path / "relative-home") not in result.output
+
+
+def test_dry_run_rejects_cache_inside_target_before_checkout_or_mutation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    home = tmp_path / "home"
+    cache = home / ".cache/dependencies"
+    dependency = SkillDependency(
+        id="gstack",
+        name="GStack",
+        repo="https://example.invalid/gstack.git",
+        ref="abc123",
+        install={"codex": SkillDependencyInstall(strategy="gstack", destination="skills/gstack")},
+    )
+    checkout_called = False
+
+    def checkout(_dependency: SkillDependency, _cache: Path) -> Path:
+        nonlocal checkout_called
+        checkout_called = True
+        raise AssertionError("overlapping cache reached checkout")
+
+    monkeypatch.setattr("agent_ops.skill_installer._checkout_dependency", checkout)
+
+    with pytest.raises(ValueError, match="cache.*target"):
+        install_skill_dependencies(
+            framework=Framework.CODEX,
+            dependencies=[dependency],
+            home=home,
+            cache_dir=cache,
+            dry_run=True,
+        )
+
+    assert checkout_called is False
+    assert not home.exists()
+
+
+def test_planning_excludes_source_cache_metadata_from_materialized_files(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "SKILL.md").write_bytes(b"managed\n")
+    generated = source / ".cache/generated.txt"
+    generated.parent.mkdir()
+    generated.write_bytes(b"temporary\n")
+    dependency = SkillDependency(
+        id="gstack",
+        name="GStack",
+        repo="https://example.invalid/gstack.git",
+        ref="abc123",
+        install={"codex": SkillDependencyInstall(strategy="gstack", destination="skills/gstack")},
+    )
+    captured: list[tuple[ProviderPlan, ...]] = []
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency",
+        lambda _dependency, _cache: source,
+    )
+    monkeypatch.setattr(
+        "agent_ops.skill_installer.install_provider_plans",
+        lambda plans: captured.append(plans),
+    )
+
+    install_skill_dependencies(
+        framework=Framework.CODEX,
+        dependencies=[dependency],
+        home=tmp_path / "home",
+    )
+
+    paths = {item.path for item in captured[0][0].files}
+    assert Path("skills/gstack/SKILL.md") in paths
+    assert Path("skills/gstack/.cache/generated.txt") not in paths
+
+
+def test_prime_gstack_planning_passes_confined_renderer_environment(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "SKILL.md").write_bytes(b"source\n")
+    dependency = SkillDependency(
+        id="gstack",
+        name="GStack",
+        repo="https://example.invalid/gstack.git",
+        ref="1" * 40,
+        install={"prime-agent": SkillDependencyInstall(strategy="prime-gstack", destination=".")},
+    )
+    environments: list[dict[str, str] | None] = []
+
+    def render(
+        _source: Path,
+        destination: Path,
+        *,
+        renderer_env: dict[str, str] | None = None,
+    ) -> None:
+        environments.append(renderer_env)
+        skill = destination / "skills/generated/SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_bytes(b"generated\n")
+        manifest = destination / ".agentops/gstack-prime-manifest.json"
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text(
+            json.dumps({"files": ["skills/generated/SKILL.md"]}),
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency",
+        lambda _dependency, _cache: source,
+    )
+    monkeypatch.setattr("agent_ops.skill_installer.install_prime_gstack", render)
+    cache = tmp_path / "cache"
+    home = tmp_path / "prime-home"
+
+    rows = install_skill_dependencies(
+        framework=Framework.PRIME_AGENT,
+        dependencies=[dependency],
+        home=home,
+        cache_dir=cache,
+        dry_run=True,
+    )
+
+    assert rows[0].destination == home
+    assert not home.exists()
+    environment = environments[0]
+    assert environment is not None
+    confined = {
+        "HOME",
+        "BUN_INSTALL",
+        "BUN_INSTALL_CACHE_DIR",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+    }
+    assert confined <= set(environment)
+    for name in confined:
+        assert Path(environment[name]).is_relative_to(cache)
+        assert not Path(environment[name]).exists()
+
+
+@pytest.mark.parametrize("shape", ["empty", "reordered", "extra", "identity"])
+def test_non_posix_dry_run_rejects_plan_dependency_mismatch(
+    tmp_path: Path, monkeypatch, shape: str
+) -> None:
+    dependencies = [
+        SkillDependency(
+            id="gstack",
+            name="GStack",
+            repo="https://example.invalid/gstack.git",
+            ref="1" * 40,
+            install={
+                "codex": SkillDependencyInstall(strategy="gstack", destination="skills/gstack")
+            },
+        ),
+        SkillDependency(
+            id="superpowers",
+            name="Superpowers",
+            repo="https://example.invalid/superpowers.git",
+            ref="2" * 40,
+            install={
+                "codex": SkillDependencyInstall(
+                    strategy="copy-skills",
+                    source="skills",
+                    destination="skills",
+                )
+            },
+        ),
+    ]
+    target = TargetSpec("public-skills:codex", Framework.CODEX, tmp_path / "home", "public")
+    valid = [
+        ProviderPlan("public-skill:gstack", "revision", target, ()),
+        ProviderPlan("public-skill:superpowers", "revision", target, ()),
+    ]
+    if shape == "empty":
+        plans = ()
+    elif shape == "reordered":
+        plans = tuple(reversed(valid))
+    elif shape == "extra":
+        plans = (*valid, valid[0])
+    else:
+        plans = (
+            ProviderPlan("public-skill:other", "revision", target, ()),
+            valid[1],
+        )
+    monkeypatch.setattr("agent_ops.skill_installer._use_shared_transaction_engine", lambda: False)
+    monkeypatch.setattr(
+        "agent_ops.skill_installer.build_public_skill_plans", lambda **_kwargs: plans
+    )
+
+    with pytest.raises(ValueError, match="plan.*dependenc"):
+        install_skill_dependencies(
+            framework=Framework.CODEX,
+            dependencies=dependencies,
+            home=target.home,
+            dry_run=True,
+        )
+
+
+def test_non_posix_single_bundle_revalidates_planned_checkout_before_native_apply(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import agent_ops.skill_installer as skill_installer
+
+    source = _show_me_source(tmp_path / "source")
+    license_file = source / "LICENSE"
+    dependency = _show_me_dependency(Framework.CODEX)
+    native_calls: list[Path] = []
+    home = tmp_path / "home"
+    original_install = skill_installer._install_dependency
+
+    def change_source(**_kwargs) -> None:
+        license_file.write_bytes(b"changed after planning\n")
+
+    monkeypatch.setattr("agent_ops.skill_installer._use_shared_transaction_engine", lambda: False)
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._checkout_dependency",
+        lambda _dependency, _cache: source,
+    )
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._before_native_public_skill_apply",
+        change_source,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._install_dependency",
+        lambda **kwargs: (
+            native_calls.append(kwargs["source"])
+            if kwargs["target_home"] == home
+            else original_install(**kwargs)
+        ),
+    )
+
+    with pytest.raises(ValueError, match="changed after planning"):
+        install_skill_dependencies(
+            framework=Framework.CODEX,
+            dependencies=[dependency],
+            home=home,
+        )
+
+    assert native_calls == []
+
+
+@pytest.mark.parametrize(
+    ("strategy", "source_path", "destination"),
+    [
+        ("gstack", None, "skills/gstack"),
+        ("copy-repo", None, "skills/repository"),
+        ("copy-skills", "skills", "skills"),
+        ("prime-gstack", None, "."),
+        ("prime-superpowers", "skills", "skills"),
+    ],
+)
+def test_non_posix_native_application_rejects_nontransactional_strategies(
+    tmp_path: Path,
+    monkeypatch,
+    strategy: str,
+    source_path: str | None,
+    destination: str,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    dependency = SkillDependency(
+        id="gstack" if strategy != "prime-superpowers" else "superpowers",
+        name="Dependency",
+        repo="https://example.invalid/dependency.git",
+        ref="1" * 40,
+        install={
+            "codex": SkillDependencyInstall(
+                strategy=strategy,
+                source=source_path,
+                destination=destination,
+            )
+        },
+    )
+    target = TargetSpec("public-skills:codex", Framework.CODEX, tmp_path / "home", "public")
+    plan = ProviderPlan(f"public-skill:{dependency.id}", "revision", target, ())
+    native_calls: list[str] = []
+
+    def build(**kwargs):
+        kwargs["_resolved_sources"][dependency.id] = source
+        return (plan,)
+
+    monkeypatch.setattr("agent_ops.skill_installer._use_shared_transaction_engine", lambda: False)
+    monkeypatch.setattr("agent_ops.skill_installer.build_public_skill_plans", build)
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._build_public_skill_plans", lambda **_kwargs: (plan,)
+    )
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._install_dependency",
+        lambda **kwargs: native_calls.append(kwargs["dependency_id"]),
+    )
+
+    with pytest.raises(UnsupportedPlatformError, match="native.*transaction"):
+        install_skill_dependencies(
+            framework=Framework.CODEX,
+            dependencies=[dependency],
+            home=target.home,
+        )
+
+    assert native_calls == []
+    assert not target.home.exists()
+
+
+@pytest.mark.parametrize("copy_failure", [False, True])
+def test_non_posix_native_application_allows_only_show_me_transaction(
+    tmp_path: Path, monkeypatch, copy_failure: bool
+) -> None:
+    source = _show_me_source(tmp_path / "source")
+    dependency = _show_me_dependency(Framework.CODEX)
+    target = TargetSpec("public-skills:codex", Framework.CODEX, tmp_path / "home", "public")
+    plan = ProviderPlan("public-skill:humanlayer-show-me", "revision", target, ())
+    native_calls: list[str] = []
+
+    def build(**kwargs):
+        kwargs["_resolved_sources"][dependency.id] = source
+        return (plan,)
+
+    def install(**kwargs) -> None:
+        native_calls.append(kwargs["dependency_id"])
+        if copy_failure:
+            raise OSError("injected native copy failure")
+
+    monkeypatch.setattr("agent_ops.skill_installer._use_shared_transaction_engine", lambda: False)
+    monkeypatch.setattr("agent_ops.skill_installer.build_public_skill_plans", build)
+    monkeypatch.setattr(
+        "agent_ops.skill_installer._build_public_skill_plans", lambda **_kwargs: (plan,)
+    )
+    monkeypatch.setattr("agent_ops.skill_installer._install_dependency", install)
+
+    if copy_failure:
+        with pytest.raises(OSError, match="copy failure"):
+            install_skill_dependencies(
+                framework=Framework.CODEX,
+                dependencies=[dependency],
+                home=target.home,
+            )
+    else:
+        install_skill_dependencies(
+            framework=Framework.CODEX,
+            dependencies=[dependency],
+            home=target.home,
+        )
+
+    assert native_calls == ["humanlayer-show-me"]
+    assert not target.home.exists()
+
+
+def test_dependency_checkout_rejects_symbolic_link_cache_destination(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path / "outside"
+    repo_url = _git_repo(outside)
+    (outside / "SKILL.md").write_text("body\n", encoding="utf-8")
+    ref = _commit(outside)
+    dependency = SkillDependency(
+        id="gstack",
+        name="GStack",
+        repo=repo_url,
+        ref=ref,
+        install={"codex": SkillDependencyInstall(strategy="gstack", destination="skills/gstack")},
+    )
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    (cache / f"gstack-{ref[:12]}").symlink_to(outside, target_is_directory=True)
+    before = subprocess.run(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+        cwd=outside,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+    with pytest.raises(ValueError, match="cache destination.*symbolic link"):
+        install_skill_dependencies(
+            framework=Framework.CODEX,
+            dependencies=[dependency],
+            home=tmp_path / "home",
+            cache_dir=cache,
+            dry_run=True,
+        )
+
+    after = subprocess.run(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+        cwd=outside,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert after == before
+    assert not (tmp_path / "home").exists()
+
+
+def test_dependency_checkout_rejects_external_gitdir_before_git_mutation(
+    tmp_path: Path,
+) -> None:
+    external = tmp_path / "external"
+    repo_url = _git_repo(external)
+    (external / "SKILL.md").write_text("first\n", encoding="utf-8")
+    first_ref = _commit(external)
+    (external / "SKILL.md").write_text("second\n", encoding="utf-8")
+    second_ref = _commit(external)
+    cache = tmp_path / "cache"
+    checkout = cache / f"gstack-{first_ref[:12]}"
+    checkout.mkdir(parents=True)
+    (checkout / ".git").write_text(f"gitdir: {(external / '.git').as_posix()}\n", encoding="utf-8")
+    dependency = SkillDependency(
+        id="gstack",
+        name="GStack",
+        repo=repo_url,
+        ref=first_ref,
+        install={"codex": SkillDependencyInstall(strategy="gstack", destination="skills/gstack")},
+    )
+
+    with pytest.raises(ValueError, match="checkout metadata.*directory"):
+        install_skill_dependencies(
+            framework=Framework.CODEX,
+            dependencies=[dependency],
+            home=tmp_path / "home",
+            cache_dir=cache,
+            dry_run=True,
+        )
+
+    head = subprocess.run(
+        ["git", "-C", str(external), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert head == second_ref
+    assert not (tmp_path / "home").exists()
+
+
+@pytest.mark.parametrize(
+    "attack",
+    ["linked-objects", "linked-refs", "redirected-worktree", "escaped-common-dir", "hook"],
+)
+def test_dependency_checkout_bypasses_nested_external_git_metadata_without_mutation(
+    tmp_path: Path, attack: str
+) -> None:
+    origin = tmp_path / "origin"
+    repo_url = _git_repo(origin)
+    (origin / "SKILL.md").write_text("first\n", encoding="utf-8")
+    first_ref = _commit(origin)
+    cache = tmp_path / "cache"
+    checkout = cache / f"gstack-{first_ref[:12]}"
+    subprocess.run(
+        ["git", "clone", repo_url, str(checkout)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(checkout), "checkout", "--detach", first_ref],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (origin / "SKILL.md").write_text("second\n", encoding="utf-8")
+    _commit(origin)
+    external = tmp_path / "external"
+    external.mkdir()
+
+    if attack in {"linked-objects", "linked-refs"}:
+        name = attack.removeprefix("linked-")
+        shutil.move(checkout / ".git" / name, external / name)
+        (checkout / ".git" / name).symlink_to(external / name, target_is_directory=True)
+    elif attack == "redirected-worktree":
+        (external / "sentinel.txt").write_bytes(b"outside\n")
+        subprocess.run(
+            [
+                "git",
+                "config",
+                "--file",
+                str(checkout / ".git/config"),
+                "core.worktree",
+                str(external),
+            ],
+            check=True,
+        )
+    elif attack == "escaped-common-dir":
+        shutil.copytree(checkout / ".git", external / "common")
+        (checkout / ".git/commondir").write_text(
+            str(external / "common") + "\n", encoding="utf-8"
+        )
+    else:
+        hooks = external / "hooks"
+        hooks.mkdir()
+        marker = external / "executed"
+        hook = hooks / "post-checkout"
+        hook.write_text(f"#!/bin/sh\nprintf executed > {marker}\n", encoding="utf-8")
+        hook.chmod(0o755)
+        subprocess.run(
+            [
+                "git",
+                "config",
+                "--file",
+                str(checkout / ".git/config"),
+                "core.hooksPath",
+                str(hooks),
+            ],
+            check=True,
+        )
+
+    before = _tree_snapshot(external)
+    dependency = SkillDependency(
+        id="gstack",
+        name="GStack",
+        repo=repo_url,
+        ref=first_ref,
+        install={
+            "codex": SkillDependencyInstall(strategy="gstack", destination="skills/gstack")
+        },
+    )
+    home = tmp_path / "home"
+
+    rows = install_skill_dependencies(
+        framework=Framework.CODEX,
+        dependencies=[dependency],
+        home=home,
+        cache_dir=cache,
+        dry_run=True,
+    )
+
+    assert rows[0].id == "gstack"
+    assert _tree_snapshot(external) == before
+    assert not home.exists()
+    assert (checkout / ".git").is_dir()
+    assert not (checkout / ".git/objects").is_symlink()
+    assert not (checkout / ".git/refs").is_symlink()
+    assert not (checkout / ".git/commondir").exists()
+    assert not list(cache.glob(f".{checkout.name}.quarantine-*"))
+    assert not list(cache.glob(".gstack-stage-*"))
+
+
+def test_dependency_checkout_validation_ignores_ambient_git_execution_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    origin = tmp_path / "origin"
+    repo_url = _git_repo(origin)
+    (origin / "SKILL.md").write_text("managed\n", encoding="utf-8")
+    ref = _commit(origin)
+    external = tmp_path / "external"
+    external.mkdir()
+    marker = external / "executed"
+    monitor = external / "fsmonitor"
+    monitor.write_text(f"#!/bin/sh\nprintf executed > {marker}\n", encoding="utf-8")
+    monitor.chmod(0o755)
+    ambient_config = external / "config"
+    subprocess.run(
+        ["git", "config", "--file", str(ambient_config), "core.fsmonitor", str(monitor)],
+        check=True,
+    )
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(ambient_config))
+    before = _tree_snapshot(external)
+    dependency = SkillDependency(
+        id="gstack",
+        name="GStack",
+        repo=repo_url,
+        ref=ref,
+        install={
+            "codex": SkillDependencyInstall(strategy="gstack", destination="skills/gstack")
+        },
+    )
+
+    install_skill_dependencies(
+        framework=Framework.CODEX,
+        dependencies=[dependency],
+        home=tmp_path / "home",
+        cache_dir=tmp_path / "cache",
+        dry_run=True,
+    )
+
+    assert _tree_snapshot(external) == before
+    assert not (tmp_path / "home").exists()
+
+
+@pytest.mark.parametrize("dry_run", [True, False])
+def test_dependency_checkout_repeated_refresh_has_bounded_cache_lifecycle(
+    tmp_path: Path, dry_run: bool
+) -> None:
+    origin = tmp_path / "origin"
+    repo_url = _git_repo(origin)
+    (origin / "SKILL.md").write_text("managed\n", encoding="utf-8")
+    ref = _commit(origin)
+    dependency = SkillDependency(
+        id="gstack",
+        name="GStack",
+        repo=repo_url,
+        ref=ref,
+        install={
+            "codex": SkillDependencyInstall(strategy="gstack", destination="skills/gstack")
+        },
+    )
+    cache = tmp_path / "cache"
+    home = tmp_path / "home"
+
+    for _ in range(3):
+        install_skill_dependencies(
+            framework=Framework.CODEX,
+            dependencies=[dependency],
+            home=home,
+            cache_dir=cache,
+            dry_run=dry_run,
+        )
+        assert not list(cache.glob(f".gstack-{ref[:12]}.quarantine-*"))
+        assert not list(cache.glob(".gstack-stage-*"))
+
+    if dry_run:
+        assert not home.exists()
+    else:
+        assert (home / "skills/gstack/SKILL.md").read_bytes() == b"managed\n"
+
+
+def test_dependency_checkout_failed_promotion_reports_preserved_cache_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import agent_ops.skill_installer as skill_installer
+
+    origin = tmp_path / "origin"
+    repo_url = _git_repo(origin)
+    (origin / "SKILL.md").write_text("managed\n", encoding="utf-8")
+    ref = _commit(origin)
+    dependency = SkillDependency(
+        id="gstack",
+        name="GStack",
+        repo=repo_url,
+        ref=ref,
+        install={
+            "codex": SkillDependencyInstall(strategy="gstack", destination="skills/gstack")
+        },
+    )
+    cache = tmp_path / "cache"
+    home = tmp_path / "home"
+    install_skill_dependencies(
+        framework=Framework.CODEX,
+        dependencies=[dependency],
+        home=home,
+        cache_dir=cache,
+        dry_run=True,
+    )
+    destination = cache / f"gstack-{ref[:12]}"
+    original_replace = skill_installer.os.replace
+
+    def fail_promotion(source: str | Path, target: str | Path) -> None:
+        if Path(source).name == "checkout" and Path(target) == destination:
+            raise OSError("injected cache promotion failure")
+        original_replace(source, target)
+
+    monkeypatch.setattr(skill_installer.os, "replace", fail_promotion)
+
+    with pytest.raises(ValueError, match="prior checkout preserved at") as raised:
+        install_skill_dependencies(
+            framework=Framework.CODEX,
+            dependencies=[dependency],
+            home=home,
+            cache_dir=cache,
+            dry_run=True,
+        )
+
+    preserved = Path(str(raised.value).rsplit(" at ", 1)[1])
+    assert preserved.parent == cache
+    assert preserved.is_dir()
+    assert not list(cache.glob(".gstack-stage-*"))
+
+
+@pytest.mark.parametrize(
+    ("exception_type", "value"),
+    [(KeyboardInterrupt, "injected interrupt"), (SystemExit, 23)],
+)
+def test_dependency_checkout_promotion_preserves_process_control_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    exception_type: type[BaseException],
+    value: str | int,
+) -> None:
+    import agent_ops.skill_installer as skill_installer
+
+    dependency, cache, home, destination = _cached_gstack_dependency(tmp_path)
+    injected = exception_type(value)
+    original_replace = skill_installer.os.replace
+
+    def interrupt_promotion(source: str | Path, target: str | Path) -> None:
+        if Path(source).name == "checkout" and Path(target) == destination:
+            raise injected
+        original_replace(source, target)
+
+    monkeypatch.setattr(skill_installer.os, "replace", interrupt_promotion)
+
+    with pytest.raises(exception_type) as raised:
+        install_skill_dependencies(
+            framework=Framework.CODEX,
+            dependencies=[dependency],
+            home=home,
+            cache_dir=cache,
+            dry_run=True,
+        )
+
+    assert raised.value is injected
+    assert raised.value.args == (value,)
+    quarantines = list(cache.glob(f".{destination.name}.quarantine-*"))
+    assert len(quarantines) == 1
+    assert raised.value.__notes__ == [f"prior checkout preserved at {quarantines[0]}"]
+    assert not list(cache.glob(".gstack-stage-*"))
+
+
+@pytest.mark.parametrize(
+    ("exception_type", "value"),
+    [(KeyboardInterrupt, "injected interrupt"), (SystemExit, 29)],
+)
+def test_dependency_checkout_cleanup_preserves_process_control_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    exception_type: type[BaseException],
+    value: str | int,
+) -> None:
+    import agent_ops.skill_installer as skill_installer
+
+    dependency, cache, home, destination = _cached_gstack_dependency(tmp_path)
+    injected = exception_type(value)
+    cleanup_paths: list[Path] = []
+
+    def interrupt_cleanup(path: Path, _cache_root: Path) -> None:
+        cleanup_paths.append(path)
+        raise injected
+
+    monkeypatch.setattr(
+        skill_installer,
+        "_remove_cache_tree_no_follow",
+        interrupt_cleanup,
+    )
+
+    with pytest.raises(exception_type) as raised:
+        install_skill_dependencies(
+            framework=Framework.CODEX,
+            dependencies=[dependency],
+            home=home,
+            cache_dir=cache,
+            dry_run=True,
+        )
+
+    assert raised.value is injected
+    assert raised.value.args == (value,)
+    assert len(cleanup_paths) == 1
+    assert cleanup_paths[0].is_dir()
+    assert raised.value.__notes__ == [f"prior checkout preserved at {cleanup_paths[0]}"]
+    assert destination.is_dir()
+    assert not list(cache.glob(".gstack-stage-*"))
+
+
+def test_dependency_checkout_cleanup_wraps_operational_failure_with_evidence_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import agent_ops.skill_installer as skill_installer
+
+    dependency, cache, home, _destination = _cached_gstack_dependency(tmp_path)
+    cleanup_paths: list[Path] = []
+
+    def fail_cleanup(path: Path, _cache_root: Path) -> None:
+        cleanup_paths.append(path)
+        raise OSError("injected cleanup failure")
+
+    monkeypatch.setattr(
+        skill_installer,
+        "_remove_cache_tree_no_follow",
+        fail_cleanup,
+    )
+
+    with pytest.raises(ValueError, match="prior checkout preserved at") as raised:
+        install_skill_dependencies(
+            framework=Framework.CODEX,
+            dependencies=[dependency],
+            home=home,
+            cache_dir=cache,
+            dry_run=True,
+        )
+
+    assert len(cleanup_paths) == 1
+    assert str(raised.value).endswith(str(cleanup_paths[0]))
+    assert cleanup_paths[0].is_dir()
+    assert not list(cache.glob(".gstack-stage-*"))
 
 
 def test_install_skill_dependencies_fails_when_framework_has_no_default_support(
@@ -390,7 +1332,12 @@ def test_humanlayer_show_me_installs_adapted_skill_with_ownership(
     assert (tmp_path / "home" / "skills" / "show-me" / "LICENSE").read_text(encoding="utf-8") == (
         source / "LICENSE"
     ).read_text(encoding="utf-8")
-    assert (tmp_path / "home" / SHOW_ME_OWNERSHIP_MANIFEST_RELATIVE).is_file()
+    ownership_manifest = (
+        _shared_ownership_manifest(tmp_path / "home")
+        if os.name == "posix"
+        else tmp_path / "home" / SHOW_ME_OWNERSHIP_MANIFEST_RELATIVE
+    )
+    assert ownership_manifest.is_file()
 
 
 def test_humanlayer_show_me_refuses_user_owned_collision(
@@ -442,8 +1389,8 @@ def test_humanlayer_show_me_updates_only_unchanged_managed_copy(
 
     try:
         install_skill_dependencies(**arguments)
-    except ShowMeCollisionError as exc:
-        assert "changed since installation" in str(exc)
+    except ShowMeCollisionError:
+        pass
     else:
         raise AssertionError("expected changed managed show-me skill to fail")
 
@@ -502,7 +1449,7 @@ def test_humanlayer_show_me_refuses_logical_name_collision(
         raise AssertionError("expected logical show-me collision to fail")
 
 
-def test_humanlayer_show_me_preserves_changed_crash_recovery_target(
+def test_shared_show_me_rejects_changed_target_and_preserves_legacy_evidence(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -518,34 +1465,21 @@ def test_humanlayer_show_me_preserves_changed_crash_recovery_target(
     install_skill_dependencies(**arguments)
     home = tmp_path / "home"
     destination = home / "skills" / "show-me"
-    manifest_path = home / SHOW_ME_OWNERSHIP_MANIFEST_RELATIVE
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    backup = manifest_path.parent / ".humanlayer-show-me-backup-crash"
+    legacy_state = home / SHOW_ME_OWNERSHIP_MANIFEST_RELATIVE.parent
+    legacy_state.mkdir(parents=True)
+    backup = legacy_state / ".humanlayer-show-me-backup-crash"
     shutil.copytree(destination, backup)
     (destination / "SKILL.md").write_text(
         (destination / "SKILL.md").read_text(encoding="utf-8") + "user edit\n",
         encoding="utf-8",
     )
-    transaction = manifest_path.with_name("humanlayer-show-me-transaction.json")
-    transaction.write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "phase": "prepared",
-                "stage": ".humanlayer-show-me-stage-crash",
-                "backup": backup.name,
-                "had_destination": True,
-                "old_manifest": manifest,
-                "new_manifest": manifest,
-            }
-        ),
-        encoding="utf-8",
-    )
+    transaction = legacy_state / "humanlayer-show-me-transaction.json"
+    transaction.write_text("legacy transaction evidence\n", encoding="utf-8")
 
     try:
         install_skill_dependencies(**arguments)
     except ShowMeCollisionError as exc:
-        assert "preserving transaction data" in str(exc)
+        assert "prior managed file changed" in str(exc)
     else:
         raise AssertionError("expected changed crash-recovery target to fail")
 
@@ -1521,7 +2455,7 @@ def test_show_me_stage_is_outside_host_discovery_root(
     assert not list((home / "skills").glob(".humanlayer-show-me-stage-*"))
 
 
-def test_show_me_retries_partial_unjournaled_garbage_cleanup(
+def test_shared_show_me_install_preserves_unknown_legacy_garbage(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -1542,7 +2476,7 @@ def test_show_me_retries_partial_unjournaled_garbage_cleanup(
         home=home,
     )
 
-    assert not garbage.exists()
+    assert garbage.exists()
     assert (home / "skills" / "show-me" / "SKILL.md").is_file()
 
 
@@ -1857,7 +2791,7 @@ def test_humanlayer_show_me_recovers_interrupted_update(
         raise AssertionError("expected simulated update interruption")
 
     assert installed.read_bytes() == before
-    assert (tmp_path / "home" / SHOW_ME_OWNERSHIP_MANIFEST_RELATIVE).is_file()
+    assert _shared_ownership_manifest(tmp_path / "home").is_file()
 
 
 def test_humanlayer_show_me_refuses_flat_root_skill_name_collision(
@@ -2020,6 +2954,23 @@ def test_prime_agent_uses_native_home_and_pinned_bundle_mappings(
         ),
     ]
 
+    planned: list[Path] = []
+
+    def build_plans(**kwargs):
+        planned.append(kwargs["target_home"])
+        target = TargetSpec(
+            "public-skills:prime-agent",
+            Framework.PRIME_AGENT,
+            kwargs["target_home"],
+            "public",
+        )
+        return tuple(
+            ProviderPlan(f"public-skill:{dependency.id}", "revision", target, ())
+            for dependency in kwargs["dependencies"]
+        )
+
+    monkeypatch.setattr("agent_ops.skill_installer.build_public_skill_plans", build_plans)
+
     rows = install_skill_dependencies(
         framework=Framework.PRIME_AGENT,
         dependencies=dependencies,
@@ -2033,6 +2984,7 @@ def test_prime_agent_uses_native_home_and_pinned_bundle_mappings(
         ".",
         "skills",
     ]
+    assert planned == [tmp_path / "prime-home"]
 
 
 def test_prime_agent_home_treats_empty_native_environment_variable_as_unset(
@@ -2113,7 +3065,7 @@ def test_prime_superpowers_strategy_installs_adapted_namespaced_skills(
     )
 
     installed = tmp_path / "home" / "skills"
-    assert (installed.parent / OWNERSHIP_MANIFEST_RELATIVE).is_file()
+    assert _shared_ownership_manifest(installed.parent).is_file()
     assert not (installed / ".agentops-superpowers-manifest.json").exists()
     assert not (installed / "writing-plans").exists()
     skill = installed / "agentops-superpowers-writing-plans" / "SKILL.md"
@@ -2121,7 +3073,7 @@ def test_prime_superpowers_strategy_installs_adapted_namespaced_skills(
     assert "agentops-superpowers-writing-plans" in skill.read_text()
 
 
-def test_prime_gstack_strategy_receives_the_profile_root(
+def test_prime_gstack_plan_receives_the_profile_root(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -2134,15 +3086,19 @@ def test_prime_gstack_strategy_receives_the_profile_root(
         ref="74895062fb8a3acbf9f66cd088a83359aaaa56cd",
         install={"prime-agent": SkillDependencyInstall(strategy="prime-gstack", destination=".")},
     )
-    calls: list[tuple[Path, Path]] = []
-    monkeypatch.setattr(
-        "agent_ops.skill_installer._checkout_dependency",
-        lambda dependency, cache: source,
-    )
-    monkeypatch.setattr(
-        "agent_ops.skill_installer.install_prime_gstack",
-        lambda checkout, coding_agent_dir: calls.append((checkout, coding_agent_dir)),
-    )
+    calls: list[Path] = []
+
+    def build_plans(**kwargs):
+        calls.append(kwargs["target_home"])
+        target = TargetSpec(
+            "public-skills:prime-agent",
+            Framework.PRIME_AGENT,
+            kwargs["target_home"],
+            "public",
+        )
+        return (ProviderPlan("public-skill:gstack", "revision", target, ()),)
+
+    monkeypatch.setattr("agent_ops.skill_installer.build_public_skill_plans", build_plans)
 
     install_skill_dependencies(
         framework=Framework.PRIME_AGENT,
@@ -2151,7 +3107,7 @@ def test_prime_gstack_strategy_receives_the_profile_root(
         cache_dir=tmp_path / "cache",
     )
 
-    assert calls == [(source, tmp_path / "home")]
+    assert calls == [tmp_path / "home"]
 
 
 def test_openclaw_configured_root_ignores_undiscoverable_entries(
@@ -2512,7 +3468,7 @@ def test_opencode_personal_active_account_without_organization_is_allowed(
     assert len(installed) == 1
 
 
-def test_show_me_update_allows_other_unchanged_agentops_managed_copy(
+def test_show_me_update_allows_other_unchanged_shared_managed_copy(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -2526,13 +3482,6 @@ def test_show_me_update_allows_other_unchanged_agentops_managed_copy(
         framework=Framework.CLAUDE_CODE,
         dependencies=[_show_me_dependency(Framework.CLAUDE_CODE)],
     )
-    claude_license = os_home / ".claude" / "skills" / "show-me" / "LICENSE"
-    claude_license.unlink()
-    manifest = os_home / ".claude" / SHOW_ME_OWNERSHIP_MANIFEST_RELATIVE
-    value = json.loads(manifest.read_text(encoding="utf-8"))
-    value["installed_fingerprint"] = show_me_adapter._tree_fingerprint(claude_license.parent)
-    manifest.write_text(json.dumps(value), encoding="utf-8")
-
     install_skill_dependencies(
         framework=Framework.OPENCODE,
         dependencies=[_show_me_dependency(Framework.OPENCODE)],

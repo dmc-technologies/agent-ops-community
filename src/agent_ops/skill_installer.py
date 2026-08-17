@@ -5,17 +5,38 @@ import os
 import re
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
+import tempfile
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
 import json5
 
+from agent_ops.deployment.models import ProviderPlan
+from agent_ops.deployment.public_skills import PROVIDER_INDEX_PATH
+from agent_ops.deployment.public_skills import build_public_skill_plans as _build_public_skill_plans
+from agent_ops.deployment.transaction import (
+    UnsupportedPlatformError,
+    _preflight_provider_plans_read_only,
+    install_provider_plans,
+)
 from agent_ops.gstack_prime import install_prime_gstack
 from agent_ops.registries.models import Framework, SkillDependency, SkillDependencyInstall
 from agent_ops.show_me_adapter import install_show_me
 from agent_ops.superpowers_adapter import install_prime_superpowers
+
+_SOURCE_METADATA_DIRECTORIES = {
+    ".cache",
+    ".git",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    "__pycache__",
+    "node_modules",
+}
 
 
 @dataclass(frozen=True)
@@ -25,6 +46,72 @@ class InstalledSkillDependency:
     destination: Path
     strategy: str
     dry_run: bool = False
+
+    @classmethod
+    def from_plan(
+        cls,
+        plan: ProviderPlan,
+        *,
+        install: SkillDependencyInstall,
+        expected_dependency: SkillDependency | None = None,
+        expected_target: Path | None = None,
+        dry_run: bool = False,
+    ) -> InstalledSkillDependency:
+        prefix = "public-skill:"
+        if not plan.provider_id.startswith(prefix) or plan.provider_id == prefix:
+            raise ValueError(f"not a public skill provider plan: {plan.provider_id}")
+        dependency_id = plan.provider_id.removeprefix(prefix)
+        if expected_dependency is not None and dependency_id != expected_dependency.id:
+            raise ValueError(
+                "public skill plan does not match requested dependency: "
+                f"expected {expected_dependency.id}, got {dependency_id}"
+            )
+        if expected_target is not None and plan.target.home != expected_target:
+            raise ValueError(
+                "public skill plan does not match requested dependency target: "
+                f"expected {expected_target}, got {plan.target.home}"
+            )
+        return cls(
+            id=dependency_id,
+            framework=plan.target.framework,
+            destination=plan.target.home / install.destination,
+            strategy=install.strategy,
+            dry_run=dry_run,
+        )
+
+
+def build_public_skill_plans(
+    *,
+    framework: Framework,
+    dependencies: list[SkillDependency],
+    target_home: Path,
+    cache_root: Path,
+    _resolved_sources: dict[str, Path] | None = None,
+):
+    def checkout(dependency: SkillDependency, cache: Path) -> Path:
+        source = _checkout_dependency(dependency, cache)
+        if _resolved_sources is not None:
+            if dependency.id in _resolved_sources:
+                raise ValueError(f"duplicate public skill dependency: {dependency.id}")
+            _resolved_sources[dependency.id] = source
+        return source
+
+    return _build_public_skill_plans(
+        framework=framework,
+        dependencies=dependencies,
+        target_home=target_home,
+        cache_root=cache_root,
+        checkout_dependency=checkout,
+        install_dependency=_install_dependency,
+    )
+
+
+def _use_shared_transaction_engine() -> bool:
+    return os.name == "posix"
+
+
+def _before_native_public_skill_apply(**_context: object) -> None:
+    """Test boundary immediately before native single-bundle revalidation."""
 
 
 def default_framework_home(framework: Framework) -> Path:
@@ -830,7 +917,12 @@ def install_skill_dependencies(
 
     target_home = (home or default_framework_home(framework)).expanduser()
     cache_root = (cache_dir or Path("~/.cache/agentops/skill-dependencies")).expanduser()
-    installed: list[InstalledSkillDependency] = []
+    captured_cwd = Path.cwd()
+    _validate_cache_target_separation(
+        cache_root=_captured_absolute_path(cache_root, cwd=captured_cwd),
+        target_home=_captured_absolute_path(target_home, cwd=captured_cwd),
+    )
+    selected_dependencies: list[tuple[SkillDependency, SkillDependencyInstall]] = []
 
     show_me_selected = any(
         dependency.id == "humanlayer-show-me"
@@ -847,71 +939,529 @@ def install_skill_dependencies(
         install = dependency.install.get(framework.value)
         if install is None:
             continue
-        destination = target_home / install.destination
-        installed.append(
-            InstalledSkillDependency(
-                id=dependency.id,
-                framework=framework,
-                destination=destination,
-                strategy=install.strategy,
-                dry_run=dry_run,
-            )
-        )
+        selected_dependencies.append((dependency, install))
+
+    resolved_sources: dict[str, Path] = {}
+    plans = build_public_skill_plans(
+        framework=framework,
+        dependencies=[dependency for dependency, _install in selected_dependencies],
+        target_home=target_home,
+        cache_root=cache_root,
+        _resolved_sources=resolved_sources,
+    )
+    installed = _installed_dependencies_from_plans(
+        plans=plans,
+        selected_dependencies=selected_dependencies,
+        framework=framework,
+        target_home=target_home,
+        dry_run=dry_run,
+    )
+    if _use_shared_transaction_engine():
         if dry_run:
-            continue
-        source = _checkout_dependency(dependency, cache_root)
-        _install_dependency(
-            framework=framework,
-            target_home=target_home,
-            dependency_id=dependency.id,
-            source=source,
-            destination=destination,
-            install=install,
+            _preflight_provider_plans_read_only(plans)
+        else:
+            install_provider_plans(plans)
+        return installed
+
+    # The shared descriptor-bound transaction is POSIX-only. Render first, then
+    # keep the verified single-bundle native Windows adapters explicit until it
+    # has a Windows backend. Multi-bundle application fails before mutation.
+    if dry_run:
+        return installed
+    if len(selected_dependencies) > 1 or len(plans) > 1:
+        raise UnsupportedPlatformError(
+            "atomic multi-bundle public skill installation requires the POSIX shared transaction"
         )
+    dependency, install = selected_dependencies[0]
+    if install.strategy != "humanlayer-show-me":
+        raise UnsupportedPlatformError(
+            "native public skill application requires a demonstrated rollback transaction; "
+            f"strategy {install.strategy!r} is unsupported until a shared native backend exists"
+        )
+    try:
+        source = resolved_sources[dependency.id]
+    except KeyError as exc:
+        raise ValueError(
+            f"public skill plan did not retain source for dependency: {dependency.id}"
+        ) from exc
+    _before_native_public_skill_apply(
+        dependency=dependency,
+        source=source,
+        target_home=target_home,
+    )
+    revalidated = _build_public_skill_plans(
+        framework=framework,
+        dependencies=[dependency],
+        target_home=target_home,
+        cache_root=cache_root,
+        checkout_dependency=lambda _dependency, _cache: source,
+        install_dependency=_install_dependency,
+    )
+    if revalidated != plans:
+        raise ValueError(f"public skill source changed after planning: {dependency.id}")
+    _install_dependency(
+        framework=framework,
+        target_home=target_home,
+        dependency_id=dependency.id,
+        source=source,
+        destination=target_home / install.destination,
+        install=install,
+    )
 
     return installed
 
 
+def _captured_absolute_path(path: Path, *, cwd: Path) -> Path:
+    expanded = path.expanduser()
+    if not expanded.is_absolute():
+        expanded = cwd / expanded
+    return Path(os.path.normcase(os.path.abspath(os.fspath(expanded))))
+
+
+def _validate_cache_target_separation(*, cache_root: Path, target_home: Path) -> None:
+    candidates = [(cache_root, target_home)]
+    with suppress(OSError, RuntimeError):
+        candidates.append((cache_root.resolve(strict=False), target_home.resolve(strict=False)))
+    for cache, target in candidates:
+        if cache == target or cache.is_relative_to(target) or target.is_relative_to(cache):
+            raise ValueError(
+                "dependency cache and selected target home must not overlap: "
+                f"cache={cache_root}, target={target_home}"
+            )
+
+
+def _installed_dependencies_from_plans(
+    *,
+    plans: tuple[ProviderPlan, ...],
+    selected_dependencies: list[tuple[SkillDependency, SkillDependencyInstall]],
+    framework: Framework,
+    target_home: Path,
+    dry_run: bool,
+) -> list[InstalledSkillDependency]:
+    expected_ids = [f"public-skill:{dependency.id}" for dependency, _ in selected_dependencies]
+    by_provider = {plan.provider_id: plan for plan in plans}
+    if len(by_provider) != len(plans) or any(
+        provider_id not in by_provider for provider_id in expected_ids
+    ):
+        raise ValueError("public skill plans do not match requested dependencies")
+    if (
+        len(plans) == len(selected_dependencies)
+        and [plan.provider_id for plan in plans] != expected_ids
+    ):
+        raise ValueError("public skill plan order does not match requested dependencies")
+    index_files = [
+        item for plan in plans for item in plan.files if item.path == PROVIDER_INDEX_PATH
+    ]
+    if index_files:
+        _validate_planned_provider_ownership(plans, index_files[0].content)
+    elif len(plans) != len(selected_dependencies):
+        raise ValueError("extra public skill plan does not have provider ownership")
+    expected_target_id = f"public-skills:{framework.value}"
+    installed: list[InstalledSkillDependency] = []
+    for dependency, install in selected_dependencies:
+        plan = by_provider[f"public-skill:{dependency.id}"]
+        if (
+            plan.target.id != expected_target_id
+            or plan.target.framework is not framework
+            or plan.target.channel != "public"
+        ):
+            raise ValueError(
+                f"public skill plan target does not match requested dependency: {dependency.id}"
+            )
+        installed.append(
+            InstalledSkillDependency.from_plan(
+                plan,
+                install=install,
+                expected_dependency=dependency,
+                expected_target=target_home,
+                dry_run=dry_run,
+            )
+        )
+    return installed
+
+
+def _validate_planned_provider_ownership(plans: tuple[ProviderPlan, ...], content: bytes) -> None:
+    if sum(item.path == PROVIDER_INDEX_PATH for plan in plans for item in plan.files) != 1:
+        raise ValueError("invalid planned public provider ownership index count")
+    try:
+        data = json.loads(content)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid planned public provider ownership") from exc
+    target = plans[0].target
+    if (
+        not isinstance(data, dict)
+        or set(data) != {"schema_version", "target_id", "framework", "providers"}
+        or type(data["schema_version"]) is not int
+        or data["schema_version"] != 1
+        or data["target_id"] != target.id
+        or data["framework"] != target.framework.value
+        or not isinstance(data["providers"], list)
+    ):
+        raise ValueError("invalid planned public provider ownership")
+    expected = {
+        plan.provider_id: sorted(
+            item.path.as_posix() for item in plan.files if item.path != PROVIDER_INDEX_PATH
+        )
+        for plan in plans
+    }
+    observed: dict[str, list[str]] = {}
+    order: list[str] = []
+    for entry in data["providers"]:
+        if (
+            not isinstance(entry, dict)
+            or set(entry)
+            != {"provider_id", "source_revision", "source_descriptor", "paths"}
+            or not isinstance(entry["provider_id"], str)
+            or not isinstance(entry["source_revision"], str)
+            or not entry["source_revision"]
+            or not isinstance(entry["source_descriptor"], dict)
+            or not isinstance(entry["paths"], list)
+            or any(
+                not isinstance(value, str)
+                or not value
+                or "\\" in value
+                or value.startswith("/")
+                or any(part in {"", ".", ".."} for part in value.split("/"))
+                for value in entry["paths"]
+            )
+            or entry["paths"] != sorted(set(entry["paths"]))
+        ):
+            raise ValueError("invalid planned public provider ownership")
+        provider_id = entry["provider_id"]
+        if provider_id in observed:
+            raise ValueError("invalid planned public provider ownership")
+        order.append(provider_id)
+        observed[provider_id] = entry["paths"]
+    if order != sorted(expected) or observed != expected:
+        raise ValueError("planned public provider ownership does not match plans")
+
+
 def _checkout_dependency(dependency: SkillDependency, cache_root: Path) -> Path:
     destination = cache_root / f"{dependency.id}-{dependency.ref[:12]}"
-    if not (destination / ".git").exists():
-        if destination.exists():
-            shutil.rmtree(destination)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.run(
-            ["git", "clone", dependency.repo, str(destination)],
-            check=True,
-            text=True,
-            capture_output=True,
+    if cache_root.is_symlink():
+        raise ValueError(f"dependency cache root is a symbolic link: {cache_root}")
+    if destination.is_symlink():
+        raise ValueError(f"dependency cache destination is a symbolic link: {destination}")
+    if destination.exists() and not destination.is_dir():
+        raise ValueError(f"dependency cache destination is not a directory: {destination}")
+    existing_git_directory = destination / ".git"
+    if existing_git_directory.exists() or existing_git_directory.is_symlink():
+        metadata = existing_git_directory.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError(
+                "dependency checkout metadata must be a no-follow directory: "
+                f"{existing_git_directory}"
+            )
+
+    cache_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix=f".{dependency.id}-stage-", dir=cache_root
+    ) as temporary:
+        workspace = Path(temporary)
+        staged = workspace / "checkout"
+        environment = _dependency_git_environment(workspace)
+        reusable = False
+        if destination.exists() and existing_git_directory.is_dir():
+            try:
+                _validate_checkout_git_metadata(
+                    destination,
+                    cache_root,
+                    environment=environment,
+                    require_self_contained=False,
+                )
+            except (OSError, ValueError, subprocess.SubprocessError):
+                reusable = False
+            else:
+                reusable = True
+
+        clone_source = destination if reusable else dependency.repo
+        _run_dependency_git(
+            ["clone", "--no-hardlinks", "--no-checkout", str(clone_source), str(staged)],
+            environment=environment,
         )
-    subprocess.run(
-        ["git", "-C", str(destination), "fetch", "--all", "--tags"],
-        check=True,
-        text=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "-C", str(destination), "checkout", "--detach", dependency.ref],
-        check=True,
-        text=True,
-        capture_output=True,
-    )
+        _run_dependency_git(
+            ["-C", str(staged), "remote", "set-url", "origin", dependency.repo],
+            environment=environment,
+        )
+        has_revision = _run_dependency_git(
+            ["-C", str(staged), "cat-file", "-e", f"{dependency.ref}^{{commit}}"],
+            environment=environment,
+            check=False,
+        )
+        if has_revision.returncode:
+            _run_dependency_git(
+                ["-C", str(staged), "fetch", "--force", "--tags", dependency.repo],
+                environment=environment,
+            )
+        _run_dependency_git(
+            ["-C", str(staged), "checkout", "--detach", dependency.ref],
+            environment=environment,
+        )
+        _validate_checkout_git_metadata(
+            staged,
+            cache_root,
+            environment=environment,
+            require_self_contained=True,
+        )
+        _promote_dependency_checkout(staged, destination, cache_root)
     return destination
+
+
+def _dependency_git_environment(workspace: Path) -> dict[str, str]:
+    inherited = (
+        "PATH",
+        "PATHEXT",
+        "SYSTEMROOT",
+        "COMSPEC",
+        "WINDIR",
+        "LANG",
+        "LC_ALL",
+        "TZ",
+    )
+    environment = {name: os.environ[name] for name in inherited if name in os.environ}
+    locations = {
+        "HOME": workspace / "home",
+        "XDG_CONFIG_HOME": workspace / "xdg-config",
+        "TMPDIR": workspace / "tmp",
+        "TMP": workspace / "tmp",
+        "TEMP": workspace / "tmp",
+    }
+    for path in set(locations.values()):
+        path.mkdir(parents=True, exist_ok=True)
+    hooks = workspace / "hooks"
+    hooks.mkdir()
+    global_config = workspace / "global-config"
+    global_config.write_bytes(b"")
+    environment.update({name: str(path) for name, path in locations.items()})
+    environment.update(
+        {
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": str(global_config),
+            "GIT_CONFIG_COUNT": "2",
+            "GIT_CONFIG_KEY_0": "core.hooksPath",
+            "GIT_CONFIG_VALUE_0": str(hooks),
+            "GIT_CONFIG_KEY_1": "protocol.file.allow",
+            "GIT_CONFIG_VALUE_1": "always",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+    )
+    return environment
+
+
+def _run_dependency_git(
+    arguments: list[str],
+    *,
+    environment: dict[str, str],
+    check: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", *arguments],
+        check=check,
+        text=True,
+        capture_output=True,
+        env=environment,
+    )
+
+
+def _validate_checkout_git_metadata(
+    destination: Path,
+    cache_root: Path,
+    *,
+    environment: dict[str, str],
+    require_self_contained: bool,
+) -> None:
+    git_directory = destination / ".git"
+    metadata_stat = git_directory.lstat()
+    if stat.S_ISLNK(metadata_stat.st_mode) or not stat.S_ISDIR(metadata_stat.st_mode):
+        raise ValueError(
+            f"dependency checkout metadata must be a no-follow directory: {git_directory}"
+        )
+    cache = _captured_absolute_path(cache_root, cwd=Path.cwd()).resolve(strict=True)
+    checkout = destination.resolve(strict=True)
+    if not checkout.is_relative_to(cache):
+        raise ValueError(f"dependency checkout escapes declared cache: {checkout}")
+    cache_device = cache.stat().st_dev
+    for current, directories, files in os.walk(git_directory, followlinks=False):
+        for name in [*directories, *files]:
+            path = Path(current) / name
+            path_stat = path.lstat()
+            if stat.S_ISLNK(path_stat.st_mode) or not (
+                stat.S_ISDIR(path_stat.st_mode) or stat.S_ISREG(path_stat.st_mode)
+            ):
+                raise ValueError(
+                    f"dependency checkout Git metadata contains a nonregular entry: {path}"
+                )
+            if path_stat.st_dev != cache_device:
+                raise ValueError(
+                    f"dependency checkout Git metadata crosses a filesystem boundary: {path}"
+                )
+            resolved = path.resolve(strict=True)
+            if not resolved.is_relative_to(cache):
+                raise ValueError(
+                    f"dependency checkout Git metadata escapes declared cache: {resolved}"
+                )
+            if (
+                require_self_contained
+                and stat.S_ISREG(path_stat.st_mode)
+                and path_stat.st_nlink != 1
+            ):
+                raise ValueError(
+                    f"dependency checkout Git metadata contains an aliased file: {path}"
+                )
+
+    forbidden_metadata = (
+        git_directory / "commondir",
+        git_directory / "gitdir",
+        git_directory / "config.worktree",
+        git_directory / "objects/info/alternates",
+        git_directory / "objects/info/http-alternates",
+    )
+    if any(path.exists() or path.is_symlink() for path in forbidden_metadata):
+        raise ValueError("dependency checkout uses redirected Git metadata")
+    if (git_directory / "worktrees").exists():
+        raise ValueError("dependency checkout uses linked Git worktree metadata")
+
+    config = git_directory / "config"
+    configured = _run_dependency_git(
+        ["config", "--file", str(config), "--no-includes", "--get-regexp", "."],
+        environment=environment,
+        check=False,
+    )
+    if configured.returncode not in {0, 1}:
+        raise ValueError("dependency checkout Git configuration is unreadable")
+    dangerous_exact = {
+        "core.attributesfile",
+        "core.fsmonitor",
+        "core.hookspath",
+        "core.sshcommand",
+        "core.worktree",
+        "extensions.worktreeconfig",
+    }
+    for line in configured.stdout.splitlines():
+        key = line.split(maxsplit=1)[0].lower()
+        if (
+            key in dangerous_exact
+            or key.startswith(("include.", "includeif."))
+            or key.startswith("filter.")
+            and key.rsplit(".", 1)[-1] in {"clean", "smudge", "process"}
+            or key == "credential.helper"
+            or key.startswith("credential.")
+            and key.endswith(".helper")
+            or key.startswith("remote.")
+            and key.endswith(".uploadpack")
+        ):
+            raise ValueError(f"dependency checkout Git configuration is unsafe: {key}")
+
+
+def _promote_dependency_checkout(staged: Path, destination: Path, cache_root: Path) -> None:
+    quarantine: Path | None = None
+    if destination.exists():
+        quarantine = Path(
+            tempfile.mkdtemp(prefix=f".{destination.name}.quarantine-", dir=cache_root)
+        )
+        quarantine.rmdir()
+        os.replace(destination, quarantine)
+    try:
+        os.replace(staged, destination)
+    except (KeyboardInterrupt, SystemExit) as exc:
+        if quarantine is not None:
+            exc.add_note(f"prior checkout preserved at {quarantine}")
+        raise
+    except Exception as exc:
+        if quarantine is None:
+            raise
+        raise ValueError(
+            f"dependency cache promotion failed; prior checkout preserved at {quarantine}"
+        ) from exc
+    if quarantine is not None:
+        try:
+            _remove_cache_tree_no_follow(quarantine, cache_root)
+        except (KeyboardInterrupt, SystemExit) as exc:
+            exc.add_note(f"prior checkout preserved at {quarantine}")
+            raise
+        except Exception as exc:
+            raise ValueError(
+                "dependency cache promotion cleanup failed; prior checkout preserved at "
+                f"{quarantine}"
+            ) from exc
+
+
+def _remove_cache_tree_no_follow(path: Path, cache_root: Path) -> None:
+    captured_cwd = Path.cwd()
+    captured_cache = _captured_absolute_path(cache_root, cwd=captured_cwd)
+    cache = captured_cache.resolve(strict=True)
+    candidate = _captured_absolute_path(path, cwd=captured_cwd)
+    if candidate.parent != captured_cache or path.parent.resolve(strict=True) != cache:
+        raise ValueError(f"cache cleanup path escapes declared cache: {path}")
+    item = path.lstat()
+    if stat.S_ISLNK(item.st_mode) or not stat.S_ISDIR(item.st_mode):
+        raise ValueError(f"cache cleanup path is not a no-follow directory: {path}")
+
+    if os.name != "posix":  # pragma: no cover - exercised on Windows
+        shutil.rmtree(path)
+        return
+
+    cache_descriptor = os.open(
+        cache,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
+    try:
+        descriptor = os.open(
+            path.name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=cache_descriptor,
+        )
+        try:
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino) != (item.st_dev, item.st_ino):
+                raise ValueError(f"cache cleanup directory changed before deletion: {path}")
+            _remove_cache_directory_contents(descriptor, opened.st_dev)
+        finally:
+            os.close(descriptor)
+        os.rmdir(path.name, dir_fd=cache_descriptor)
+    finally:
+        os.close(cache_descriptor)
+
+
+def _remove_cache_directory_contents(descriptor: int, device: int) -> None:
+    with os.scandir(descriptor) as entries:
+        names = sorted(entry.name for entry in entries)
+    for name in names:
+        item = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        if stat.S_ISDIR(item.st_mode):
+            if item.st_dev != device:
+                raise ValueError(f"cache cleanup directory crosses a filesystem boundary: {name}")
+            child = os.open(
+                name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=descriptor,
+            )
+            try:
+                _remove_cache_directory_contents(child, device)
+            finally:
+                os.close(child)
+            os.rmdir(name, dir_fd=descriptor)
+        else:
+            os.unlink(name, dir_fd=descriptor)
 
 
 def _install_dependency(
     *,
     framework: Framework,
     target_home: Path,
+    context_home: Path | None = None,
     dependency_id: str,
     source: Path,
     destination: Path,
     install: SkillDependencyInstall,
+    renderer_env: dict[str, str] | None = None,
 ) -> None:
+    context_home = context_home or target_home
     if install.strategy == "prime-gstack":
         if dependency_id != "gstack":
             raise ValueError("prime-gstack strategy is only valid for gstack")
-        install_prime_gstack(source, destination)
+        install_prime_gstack(source, destination, renderer_env=renderer_env)
         return
     if install.strategy in {"gstack", "copy-repo"}:
         _replace_tree(source, destination)
@@ -928,12 +1478,12 @@ def _install_dependency(
         collision_allowed_symlink_targets: tuple[Path, ...] = ()
         if framework is Framework.OPENCLAW:
             collision_limits, collision_allowed_symlink_targets = _openclaw_collision_options(
-                target_home
+                context_home
             )
         install_show_me(
             source,
             destination / "show-me",
-            collision_roots=_show_me_collision_roots(framework, target_home),
+            collision_roots=_show_me_collision_roots(framework, context_home),
             flat_markdown=framework is Framework.OPENCODE,
             collision_policy=_show_me_collision_policy(framework),
             collision_limits=collision_limits,
@@ -947,7 +1497,11 @@ def _install_dependency(
         if not skill_source.exists():
             raise FileNotFoundError(skill_source)
         destination.mkdir(parents=True, exist_ok=True)
-        children = sorted(child.name for child in skill_source.iterdir())
+        children = sorted(
+            child.name
+            for child in skill_source.iterdir()
+            if child.name not in _SOURCE_METADATA_DIRECTORIES
+        )
         for stale in sorted(set(_read_manifest(destination, dependency_id)) - set(children)):
             _remove_path(destination / stale)
         for child_name in children:
@@ -970,7 +1524,7 @@ def _replace_tree(source: Path, destination: Path) -> None:
     shutil.copytree(
         source,
         destination,
-        ignore=shutil.ignore_patterns(".git", "node_modules"),
+        ignore=shutil.ignore_patterns(*sorted(_SOURCE_METADATA_DIRECTORIES)),
     )
 
 

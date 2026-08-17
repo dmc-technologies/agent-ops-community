@@ -3,15 +3,24 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import typer
 from pydantic import ValidationError
+from typer import _click
+from typer.core import TyperGroup
 
 from agent_ops.bootstrap import SUPPORTED_BOOTSTRAPS, write_all_bootstraps, write_bootstrap
 from agent_ops.context import build_context_pack
 from agent_ops.contracts.job import load_job
 from agent_ops.contracts.result import RunResult
+from agent_ops.deployment.cli import (
+    channel_app,
+    deployment_app,
+    emit_json_usage_error,
+    json_output_scope,
+)
+from agent_ops.deployment.transaction import UnsupportedPlatformError
 from agent_ops.frameworks import ADAPTERS, get_adapter
 from agent_ops.harness import check_harness, default_verification, init_harness
 from agent_ops.plugins import run_with_plugins
@@ -26,13 +35,40 @@ from agent_ops.registries import (
 from agent_ops.skill_installer import install_skill_dependencies
 from agent_ops.verify import run_verification
 
-app = typer.Typer(help="Community agent operations control plane.")
+
+def _deployment_json_requested(arguments: list[str]) -> bool:
+    if not arguments or arguments[0] not in {"deployment", "channel"}:
+        return False
+    try:
+        delimiter = arguments.index("--")
+    except ValueError:
+        delimiter = len(arguments)
+    return "--json" in arguments[1:delimiter]
+
+
+class _AgentOpsGroup(TyperGroup):
+    def invoke(self, ctx: typer.Context) -> Any:
+        arguments = [*ctx._protected_args, *ctx.args]
+        json_requested = _deployment_json_requested(arguments)
+        with json_output_scope(json_requested):
+            try:
+                return super().invoke(ctx)
+            except _click.exceptions.UsageError as error:
+                if not json_requested:
+                    raise
+                emit_json_usage_error(error.format_message())
+        raise AssertionError("unreachable")
+
+
+app = typer.Typer(cls=_AgentOpsGroup, help="Community agent operations control plane.")
 capabilities_app = typer.Typer(help="Portable capability registry.")
 skills_app = typer.Typer(help="Portable skill registry.")
 tools_app = typer.Typer(help="Portable tool registry.")
 context_app = typer.Typer(help="Build portable context packs.")
 frameworks_app = typer.Typer(help="Framework adapter commands.")
 harness_app = typer.Typer(help="Repository harness checks.")
+app.add_typer(deployment_app, name="deployment")
+app.add_typer(channel_app, name="channel")
 app.add_typer(capabilities_app, name="capabilities")
 app.add_typer(skills_app, name="skills")
 app.add_typer(tools_app, name="tools")
@@ -250,7 +286,12 @@ def install_skills(
             cache_dir=cache_dir,
             dry_run=dry_run,
         )
-    except (FileNotFoundError, ValueError, subprocess.CalledProcessError) as exc:
+    except (
+        FileNotFoundError,
+        UnsupportedPlatformError,
+        ValueError,
+        subprocess.CalledProcessError,
+    ) as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(1) from exc
 

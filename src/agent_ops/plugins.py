@@ -8,6 +8,8 @@ from typing import Protocol
 from agent_ops.contracts.job import AgentJob
 from agent_ops.contracts.result import RunResult, RunStatus
 
+_RUNNER_PLUGIN_GROUP = "agent_ops.plugins"
+
 
 def _value(value: object) -> str:
     return getattr(value, "value", str(value))
@@ -30,7 +32,7 @@ class AgentOpsPlugin:
 
 def load_plugins() -> list[AgentOpsPlugin]:
     plugins: list[AgentOpsPlugin] = []
-    for entry_point in entry_points(group="agent_ops.plugins"):
+    for entry_point in entry_points(group=_RUNNER_PLUGIN_GROUP):
         plugin = entry_point.load()()
         plugins.append(plugin)
     return plugins

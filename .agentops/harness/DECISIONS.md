@@ -4,6 +4,34 @@ Repository: `agent-ops-community`
 
 Record durable architecture, workflow, and harness decisions here.
 
+### 2026-08-16: Channel launch is limited to frameworks with a proven isolated-home contract
+
+- Decision: retain no-follow descriptors for every audited ownership manifest, managed file, and managed directory until receipt publication or launch handoff, and revalidate the retained identity, mode, topology, and bytes immediately before terminal success. Channel launch is enabled only for Local and Codex, whose isolated-home readiness contracts are implemented and tested; it rejects Claude Code, Cursor, OpenCode, Prime Agent, and OpenClaw until their native isolated-home contracts are proven.
+- Rationale: a cooperative target lock alone cannot stop an external writer from changing an audited target, and the unsupported framework adapters previously supplied setup commands that could not establish authoritative readiness. Refusal prevents false success and avoids placing runtime state outside the selected target.
+- Applies to: deployment transaction evidence, engine terminal operations, preview, channel launch, framework adapters, and their tests.
+- Revisit when: each excluded framework has an exact native home selector, precedence-clearing environment, and readiness probe verified against its real runtime.
+
+### 2026-08-15: Branch channels are machine-local data selections over one shared transaction
+
+- Decision: keep executable deployment authority in the reviewed installed community package. Treat stable and branch repositories as provider-declared data sources, give every target an isolated framework home, keep registry, source store, locks, and receipts machine-local, and use one grouped descriptor-bound transaction, audit, and reverse recovery path for every provider and target.
+- Rationale: one implementation prevents provider-specific installation drift, while independent machine state permits rapid branch deployment without making branch content executable or coupling machines through locks or receipts.
+- Applies to: deployment models, provider discovery, source store, registry, transaction engine, orchestration, CLI, launch adapters, documentation, and acceptance tests.
+- Revisit when: a supported framework cannot isolate native state by home, or a provider needs executable source behavior that cannot remain in the reviewed package.
+
+### 2026-08-15: Local preview is selected unreviewed data and cannot become a managed channel
+
+- Decision: preview requires an explicit authored checkout, explicit skill selection, and an existing preview-reserved target. Installed providers must bind every requested name exactly once to a canonical skill identity and exclusively owned paths; omit providers that own none of the selection. Permit only the exact internal read-only Git metadata command allowlist with executable configuration disabled. Retain descriptor authority for the selected paths and parents plus Git index and HEAD through provider planning; after target locks, repeat planning and retain shared authority for the exact original registry snapshot through terminal success. Revalidate the target channel, home, framework, registry bytes and identity, source path, mode, byte, tracked state, and commit before installation and after install and audit. Treat any terminal mismatch as a primary failure inside the same reverse recovery boundary, retaining both failures and transaction evidence when recovery is incomplete. Fingerprint the selected closure as SHA-256, mark the result `unreviewed-local`, and apply it through the shared transaction without fetching, publishing, building, importing, or writing a managed source snapshot. Persist the exact target channel in every strict ownership manifest. Preview status takes the established target lock cooperatively and retains descriptor authority for the manifest and every owned path through terminal identity, mode, and content validation without managed fetch or receipts. Reject managed plan, refresh, audit, deploy, switch, and launch treatment of preview targets.
+
+- Rationale: authors can try local skill edits quickly while the target remains isolated and visibly outside stable or branch review state. The content fingerprint and transaction evidence preserve exact local facts without granting the working tree code authority.
+- Applies to: local preview, managed engine selection, deployment CLI, documentation, and tests.
+- Revisit when: a reviewed promotion workflow can bind an unreviewed preview fingerprint to an immutable committed source without weakening the current boundary.
+
+### 2026-08-15: Every transaction authorizes one exact channel pair
+
+- Decision: default grouped installs, refresh, and preview require an existing prior ownership manifest to use the current planned target channel. Switch and deploy must instead supply the original registry target channel and candidate plan channel. Persist and validate both values through grouped apply, rollback, and recovery; reject any other prior manifest, candidate manifest, or transaction-record combination before mutation.
+- Rationale: a manifest cannot grant itself authority to move a target between stable and branch channels; only the registry-backed engine can authorize that exact transition.
+- Applies to: grouped install, managed refresh, preview, switch, deploy, rollback, recovery, transaction evidence, documentation, and tests.
+- Revisit when: a reviewed promotion operation introduces another registry-authorized channel transition.
 ### 2026-08-16: Only model results may be reused as Review Gate resolution state
 
 - Decision: a preflight result never creates reusable resolution state. Legacy state comments without recorded provenance are reusable only when their trusted Review Gate comment records `Backend: codex`; new state records Codex provenance in its signed payload. Keep preflight comments separate when posting the later model result.
@@ -85,6 +113,16 @@ Record durable architecture, workflow, and harness decisions here.
 - Revisit when: a supported host changes global skill discovery, OpenClaw changes state/config precedence, or Python exposes a stronger Windows directory-relative filesystem API.
 
 ## Template
+
+### 2026-08-17: Source-store state stays private and audit receipts retain their first result
+
+- Decision: require the source-store root, sources, source directory, snapshot reads, and lock directory to be owned by the effective user with exact `0700` mode. Persist an HTTPS remote without userinfo and pass that userinfo only as transient Git fetch authentication. Retain the first audit result through receipt creation and refuse any later result that differs, including a previously missing managed file.
+- Rationale: local source mirrors can contain private repository data, and their configuration must not retain reusable credentials. A receipt represents the audit that authorized it, not a later changed target state.
+- Applies to: `src/agent_ops/deployment/source_store.py`, deployment audit retention, and their regression tests.
+- Revisit when: the source-store adds an approved credential helper or a durable encrypted credential boundary.
+
+- Correction: Git receives transient HTTPS Basic authorization through its per-process `GIT_CONFIG_*` environment rather than a `-c` command argument. Missing audited directories are represented by the expected missing file set while every present directory remains descriptor-pinned.
+- Rationale: process arguments can be read by another local account; an absent directory cannot be opened as evidence, but repeated complete audit equality still prevents a changed result from receiving a receipt.
 
 ### YYYY-MM-DD: Decision title
 

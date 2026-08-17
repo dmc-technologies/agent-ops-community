@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import re
@@ -9,6 +10,7 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -82,9 +84,14 @@ def _file_sha256(path: Path) -> str:
     return _sha256(path.read_bytes())
 
 
-def _run(command: list[str], *, cwd: Path | None = None) -> subprocess.CompletedProcess[bytes]:
+def _run(
+    command: list[str],
+    *,
+    cwd: Path | None = None,
+    env: Mapping[str, str] | None = None,
+) -> subprocess.CompletedProcess[bytes]:
     try:
-        return subprocess.run(command, cwd=cwd, check=True, capture_output=True)
+        return subprocess.run(command, cwd=cwd, env=env, check=True, capture_output=True)
     except FileNotFoundError as exc:
         raise GstackPrimeSourceError(f"Bun executable is unavailable: {command[0]}") from exc
     except (OSError, subprocess.CalledProcessError) as exc:
@@ -96,29 +103,33 @@ def _run(command: list[str], *, cwd: Path | None = None) -> subprocess.Completed
         ) from exc
 
 
-def _extract_pinned_checkout(checkout: Path, destination: Path) -> None:
+def _extract_pinned_checkout(
+    checkout: Path,
+    destination: Path,
+    *,
+    environment: Mapping[str, str] | None,
+) -> None:
     checkout = checkout.resolve()
     probe = subprocess.run(
         ["git", "-C", str(checkout), "cat-file", "-e", f"{PINNED_GSTACK_REF}^{{commit}}"],
         capture_output=True,
+        env=environment,
     )
     if probe.returncode:
         raise GstackPrimeSourceError(
             f"checkout does not contain pinned gstack commit {PINNED_GSTACK_REF}"
         )
     archive = _run(
-        ["git", "-C", str(checkout), "archive", "--format=tar", PINNED_GSTACK_REF]
+        ["git", "-C", str(checkout), "archive", "--format=tar", PINNED_GSTACK_REF],
+        env=environment,
     ).stdout
     destination.mkdir()
-    with tempfile.NamedTemporaryFile(suffix=".tar") as archive_file:
-        archive_file.write(archive)
-        archive_file.flush()
-        with tarfile.open(archive_file.name) as tar:
-            for member in tar.getmembers():
-                member_path = PurePosixPath(member.name)
-                if member_path.is_absolute() or ".." in member_path.parts:
-                    raise GstackPrimeSourceError("pinned archive contains an unsafe path")
-            tar.extractall(destination, filter="data")
+    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as tar:
+        for member in tar.getmembers():
+            member_path = PurePosixPath(member.name)
+            if member_path.is_absolute() or ".." in member_path.parts:
+                raise GstackPrimeSourceError("pinned archive contains an unsafe path")
+        tar.extractall(destination, filter="data")
 
 
 def _add_prime_host(source: Path) -> None:
@@ -1034,6 +1045,7 @@ def install_prime_gstack(
     coding_agent_dir: Path | None = None,
     *,
     bun: str | Path = "bun",
+    renderer_env: Mapping[str, str] | None = None,
 ) -> GstackPrimeInstallResult:
     """Build and safely install Prime-native skills from the pinned gstack commit."""
     if coding_agent_dir is None:
@@ -1052,14 +1064,22 @@ def install_prime_gstack(
         pristine = temporary_root / "pristine"
         legacy_expected = temporary_root / "legacy-expected"
         source = temporary_root / "source"
-        _extract_pinned_checkout(checkout, pristine)
+        _extract_pinned_checkout(checkout, pristine, environment=renderer_env)
         shutil.copytree(pristine, legacy_expected)
         shutil.copytree(pristine, source)
         _add_prime_host(source)
         _patch_browse_runtime(source)
-        _run([str(bun), "install", "--frozen-lockfile"], cwd=source)
-        _run([str(bun), "run", "gen:skill-docs", "--host", "prime"], cwd=source)
-        _run([str(bun), "run", "build"], cwd=source)
+        _run(
+            [str(bun), "install", "--frozen-lockfile"],
+            cwd=source,
+            env=renderer_env,
+        )
+        _run(
+            [str(bun), "run", "gen:skill-docs", "--host", "prime"],
+            cwd=source,
+            env=renderer_env,
+        )
+        _run([str(bun), "run", "build"], cwd=source, env=renderer_env)
         _run(
             [
                 str(bun),
@@ -1078,6 +1098,7 @@ def install_prime_gstack(
                 "@ngrok/ngrok",
             ],
             cwd=source,
+            env=renderer_env,
         )
         missing = [
             relative for relative in _REQUIRED_EXECUTABLES if not (source / relative).is_file()
