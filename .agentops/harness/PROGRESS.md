@@ -4,24 +4,26 @@ Repository: `agent-ops-community`
 
 ## Current State
 
-- Branch: `fix/managed-pyc-cache-matrix`
-- Main baseline: `fd3a26243b0e2786f8ec8073a746252f87cd4d3c`, current Community `origin/main` at clock-in.
-- Current handoff: a source-only retirement plan now discovers the exact CPython 3.11–3.14 default, `opt-1`, and `opt-2` PEP 3147 cache paths for an exact prior-manifest Python source under the retained target lock. Valid derived caches receive ordinary transaction backup, rollback, crash recovery, and tamper evidence. Invalid or unrelated candidates remain present and audit-visible. No Plane work item applies.
-- Verification: the exact RED command `uv run --extra dev pytest tests/test_deployment_transaction.py::test_retired_source_discovers_supported_default_and_optimized_caches -q` failed before the implementation because caches remained. After implementation, the 36 focused cache tests and the 255-test affected transaction file passed. Ruff on the two affected Python files passed. Final repository checks, the one selected broad suite, independent targeted review, publication, and merge remain.
+- Branch: `fix/prime-legacy-adoption`
+- Main baseline: `ffd074f0335797c047988661a158db934172f545`, exact Community `origin/main` at clock-in.
+- Current handoff: the shared transaction can adopt the exact retired Prime gstack owner manifest once, replace same-ref rendered bytes, remove that legacy manifest with rollback evidence, preserve unrelated files, and restore the exact old files and manifest after a late failure or crash. Invalid schema, owner, source ref, path set, file content, file mode, or manifest mode fails before replacement. No Plane work item applies.
+- Verification: the primary RED command `uv run --extra dev pytest tests/test_deployment_engine.py::test_prime_gstack_adopts_exact_legacy_owner_manifest_in_shared_transaction -q` failed with `unmanaged destination conflicts with plan` before implementation and now passes. Fifteen focused adoption cases pass. The affected command `uv run --extra dev pytest tests/test_deployment_models.py tests/test_deployment_transaction.py tests/test_deployment_engine.py tests/test_skill_installer.py -q` passed 509 tests with 3 existing skips. Repository-wide Ruff, harness check, and whitespace validation pass. One independent targeted review, publication, and merge remain. A read-only dry-run against `/home/dmc-openclaw/.prime/agent` accepted the actual 734-file legacy evidence and reported `would install: gstack` without target replacement.
 
 ## Current Work
 
-- Goal: let Agent Ops retire every strictly bounded supported CPython cache for a retired managed source without granting deletion authority over foreign files.
-- Active task: freeze a minimal commit, obtain independent targeted resolution review and one broad final evidence source, then publish and merge under the approved exact-head closure policy.
-- Files in play: the shared deployment transaction, its focused tests, public architecture and usage documentation, and harness closeout records. Review Gate and global policy files are excluded.
+- Goal: let the current Prime profile enter shared Agent Ops deployment ownership without accepting unproven legacy content.
+- Active task: freeze one commit, obtain one independent targeted review, then publish and merge under exact-head acceptance.
+- Files in play: deployment models, public skill planning, the shared transaction, focused tests, Prime and architecture documentation, and harness closeout records. Review Gate and global policy files are excluded.
 - Blockers: none.
 
 ## Next Actions
 
-- Run final narrow repository checks, commit the frozen head, and request one independent targeted review of the cache-name correction.
-- After targeted acceptance, use exactly one broad final evidence source, publish the coherent pull request, require zero unresolved GitHub conversations, and merge immediately when accepted.
+- Commit the frozen head and obtain exactly one independent targeted review of the Prime adoption and recovery boundary.
+- Publish one coherent pull request, require exact-head hosted CI and zero unresolved GitHub conversations, apply `ai review` once after local acceptance, and merge when the final review accepts.
 
 ## Session Log
+
+- 2026-08-17: Began from exact Community main `ffd074f0335797c047988661a158db934172f545` in an isolated worktree. The primary behavioral test reproduced the current Prime failure: the shared transaction treated legacy-owned changed renderer output as unmanaged. A Prime-only typed transition now binds the installed public provider, target, public channel, complete planned destinations, and exact gstack source descriptor/ref. Under the retained lock it validates the strict legacy owner manifest plus each current file fingerprint, mode, regular-file type, and link count. The legacy manifest is removed through an ordinary backed-up removal; automatic rollback and prepared-record recovery restore its exact bytes and mode plus all prior files. Nine invalid-evidence cases and two additional fail-closed decoder/source-binding cases have behavioral regressions. The actual Prime dry-run command `uv run --extra dev agentops skills install prime-agent --dep gstack --home /home/dmc-openclaw/.prime/agent --dry-run` completed with `would install: gstack -> /home/dmc-openclaw/.prime/agent`; it did not replace target content.
 
 - 2026-08-17: Began from Community main `fd3a26243b0e2786f8ec8073a746252f87cd4d3c` in an isolated worktree. The exact source-only retirement test failed because the transaction recognized only the running interpreter's default cache path. The correction uses a finite 12-path matrix per retired exact prior-manifest source: CPython 3.11–3.14 across default, `opt-1`, and `opt-2`. The running tag still requires compiled code equality. Another listed tag requires known magic, exact timestamp and source-length binding, safe regular single-link `0644` identity, canonical source-derived name and parent, and a 16 MiB bound. Twelve invalid or foreign cases remain present and make audit fail. Focused cache tests passed 36 tests; the affected transaction file passed 255 tests, including schema 6 and 7 recovery compatibility; affected Ruff passed. The single broad final suite and independent targeted review remain.
 

@@ -25,6 +25,7 @@ from agent_ops.deployment import transaction as transaction_module
 from agent_ops.deployment.models import (
     LegacyLinkTransition,
     PlannedFile,
+    PrimeGstackLegacyAdoption,
     ProviderPlan,
     TargetChannelTransition,
     TargetSpec,
@@ -1176,6 +1177,258 @@ def test_public_gstack_provider_may_own_its_reserved_runtime_only(tmp_path: Path
     )
     with pytest.raises(ValueError, match="reserved metadata"):
         install_provider_plans((private,))
+
+
+def _prime_gstack_legacy_plan(
+    home: Path,
+) -> tuple[ProviderPlan, Path, Path, Path, bytes]:
+    source_ref = "74895062fb8a3acbf9f66cd088a83359aaaa56cd"
+    runtime_relative = Path(".agentops/runtime/gstack/bin/gstack-global-discover")
+    skill_relative = Path("skills/agentops-gstack-review/SKILL.md")
+    runtime = home / runtime_relative
+    skill = home / skill_relative
+    runtime.parent.mkdir(parents=True)
+    skill.parent.mkdir(parents=True)
+    runtime.write_bytes(b"legacy executable\n")
+    runtime.chmod(0o755)
+    skill.write_bytes(b"legacy skill\n")
+    skill.chmod(0o644)
+    legacy_manifest = home / ".agentops/gstack-prime-manifest.json"
+    legacy_manifest_bytes = (
+        json.dumps(
+            {
+                "schema_version": 1,
+                "owner": "agent-ops-community:gstack-prime",
+                "upstream_ref": source_ref,
+                "files": {
+                    runtime_relative.as_posix(): hashlib.sha256(runtime.read_bytes()).hexdigest(),
+                    skill_relative.as_posix(): hashlib.sha256(skill.read_bytes()).hexdigest(),
+                },
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode()
+    legacy_manifest.write_bytes(legacy_manifest_bytes)
+    legacy_manifest.chmod(0o644)
+    target = TargetSpec(
+        "public-skills:prime-agent",
+        Framework.PRIME_AGENT,
+        home,
+        "public",
+    )
+    source_revision = "public-skills:" + json.dumps(
+        [
+            {
+                "id": "gstack",
+                "repo": "https://github.com/garrytan/gstack.git",
+                "ref": source_ref,
+                "install": {
+                    "strategy": "prime-gstack",
+                    "source": None,
+                    "destination": ".",
+                },
+            }
+        ],
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    plan = ProviderPlan(
+        "public-skill:gstack",
+        source_revision,
+        target,
+        (
+            PlannedFile(runtime_relative, b"current executable\n", 0o755),
+            PlannedFile(skill_relative, b"current skill\n", 0o644),
+        ),
+        audit_roots=(Path(".agentops/runtime/gstack"), Path("skills")),
+        prime_gstack_legacy_adoption=PrimeGstackLegacyAdoption(
+            target.id,
+            target.channel,
+            source_ref,
+            tuple(sorted((runtime_relative, skill_relative), key=lambda path: path.as_posix())),
+        ),
+    )
+    return plan, runtime, skill, legacy_manifest, legacy_manifest_bytes
+
+
+def test_prime_gstack_legacy_manifest_decoder_rejects_non_gstack_path() -> None:
+    source_ref = "74895062fb8a3acbf9f66cd088a83359aaaa56cd"
+    foreign = Path("skills/foreign/SKILL.md")
+    content = json.dumps(
+        {
+            "schema_version": 1,
+            "owner": "agent-ops-community:gstack-prime",
+            "upstream_ref": source_ref,
+            "files": {foreign.as_posix(): "0" * 64},
+        }
+    ).encode()
+
+    with pytest.raises(ValueError, match="legacy manifest file"):
+        transaction_module._decode_prime_gstack_legacy_manifest(
+            content,
+            source_ref=source_ref,
+            expected_paths=(foreign,),
+        )
+
+
+def test_prime_gstack_legacy_source_binding_requires_exact_install_descriptor() -> None:
+    source_ref = "74895062fb8a3acbf9f66cd088a83359aaaa56cd"
+    revision = "public-skills:" + json.dumps(
+        [
+            {
+                "id": "gstack",
+                "repo": "https://github.com/garrytan/gstack.git",
+                "ref": source_ref,
+                "install": {
+                    "strategy": "prime-gstack",
+                    "source": "skills",
+                    "destination": ".",
+                },
+            }
+        ],
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+    assert not transaction_module._source_revision_binds_prime_gstack_ref(
+        revision,
+        source_ref,
+    )
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "wrong-schema",
+        "wrong-owner",
+        "wrong-ref",
+        "wrong-plan-ref",
+        "extra-path",
+        "missing-path",
+        "modified-file",
+        "missing-file",
+        "wrong-file-mode",
+        "wrong-manifest-mode",
+    ),
+)
+def test_prime_gstack_legacy_adoption_refuses_inexact_evidence_without_replacement(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    home = tmp_path / "home"
+    plan, runtime, skill, legacy_manifest, original_manifest = _prime_gstack_legacy_plan(home)
+    data = json.loads(original_manifest)
+    if case == "wrong-schema":
+        data["schema_version"] = 2
+    elif case == "wrong-owner":
+        data["owner"] = "another-owner"
+    elif case == "wrong-ref":
+        data["upstream_ref"] = "0" * 40
+    elif case == "wrong-plan-ref":
+        plan = ProviderPlan(
+            plan.provider_id,
+            plan.source_revision.replace(
+                "74895062fb8a3acbf9f66cd088a83359aaaa56cd",
+                "0" * 40,
+            ),
+            plan.target,
+            plan.files,
+            audit_roots=plan.audit_roots,
+            prime_gstack_legacy_adoption=plan.prime_gstack_legacy_adoption,
+        )
+    elif case == "extra-path":
+        data["files"]["skills/agentops-gstack-extra/SKILL.md"] = "0" * 64
+    elif case == "missing-path":
+        del data["files"]["skills/agentops-gstack-review/SKILL.md"]
+    elif case == "modified-file":
+        runtime.write_bytes(b"locally modified\n")
+    elif case == "missing-file":
+        runtime.unlink()
+    elif case == "wrong-file-mode":
+        runtime.chmod(0o744)
+    elif case == "wrong-manifest-mode":
+        legacy_manifest.chmod(0o600)
+    if case in {"wrong-schema", "wrong-owner", "wrong-ref", "extra-path", "missing-path"}:
+        legacy_manifest.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+        legacy_manifest.chmod(0o644)
+    runtime_before = runtime.read_bytes() if runtime.exists() else None
+    runtime_mode = stat.S_IMODE(runtime.stat().st_mode) if runtime.exists() else None
+    skill_before = skill.read_bytes()
+    manifest_before = legacy_manifest.read_bytes()
+    manifest_mode = stat.S_IMODE(legacy_manifest.stat().st_mode)
+
+    with pytest.raises((OSError, ValueError)):
+        install_provider_plans((plan,))
+
+    assert (runtime.read_bytes() if runtime.exists() else None) == runtime_before
+    assert (stat.S_IMODE(runtime.stat().st_mode) if runtime.exists() else None) == runtime_mode
+    assert skill.read_bytes() == skill_before
+    assert legacy_manifest.read_bytes() == manifest_before
+    assert stat.S_IMODE(legacy_manifest.stat().st_mode) == manifest_mode
+    assert not list((home / ".agentops/deployment/manifests").glob("*.json"))
+
+
+def test_prime_gstack_legacy_adoption_rolls_back_exact_prestate_after_late_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    plan, runtime, skill, legacy_manifest, legacy_manifest_bytes = _prime_gstack_legacy_plan(home)
+
+    def fail_before_manifest(*_args: object) -> None:
+        raise OSError("injected late adoption failure")
+
+    monkeypatch.setattr(transaction_module, "_before_manifest_replace", fail_before_manifest)
+
+    with pytest.raises(OSError, match="injected late adoption failure"):
+        install_provider_plans((plan,))
+
+    assert runtime.read_bytes() == b"legacy executable\n"
+    assert stat.S_IMODE(runtime.stat().st_mode) == 0o755
+    assert skill.read_bytes() == b"legacy skill\n"
+    assert stat.S_IMODE(skill.stat().st_mode) == 0o644
+    assert legacy_manifest.read_bytes() == legacy_manifest_bytes
+    assert stat.S_IMODE(legacy_manifest.stat().st_mode) == 0o644
+    assert not list((home / ".agentops/deployment/manifests").glob("*.json"))
+
+
+def test_prime_gstack_legacy_adoption_recovery_restores_exact_prestate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    plan, runtime, skill, legacy_manifest, legacy_manifest_bytes = _prime_gstack_legacy_plan(home)
+    control = SystemExit(82)
+
+    def interrupt_after_backup(*_args: object) -> None:
+        raise control
+
+    def interrupt_automatic_rollback(*_args: object, **_kwargs: object) -> None:
+        raise SystemExit(83)
+
+    original_rollback = transaction_module._rollback_record
+    monkeypatch.setattr(transaction_module, "_after_operation_backup", interrupt_after_backup)
+    monkeypatch.setattr(transaction_module, "_rollback_record", interrupt_automatic_rollback)
+
+    with pytest.raises(SystemExit):
+        install_provider_plans((plan,))
+
+    records = list((home / ".agentops/deployment/transactions").glob("*/record.json"))
+    assert len(records) == 1
+    monkeypatch.setattr(transaction_module, "_rollback_record", original_rollback)
+    monkeypatch.setattr(transaction_module, "_after_operation_backup", lambda *_args: None)
+
+    recover_transaction(records[0])
+
+    assert runtime.read_bytes() == b"legacy executable\n"
+    assert stat.S_IMODE(runtime.stat().st_mode) == 0o755
+    assert skill.read_bytes() == b"legacy skill\n"
+    assert stat.S_IMODE(skill.stat().st_mode) == 0o644
+    assert legacy_manifest.read_bytes() == legacy_manifest_bytes
+    assert stat.S_IMODE(legacy_manifest.stat().st_mode) == 0o644
+    assert not list((home / ".agentops/deployment/manifests").glob("*.json"))
 
 
 def test_audit_accepts_only_opted_in_exact_python_cache(tmp_path: Path) -> None:

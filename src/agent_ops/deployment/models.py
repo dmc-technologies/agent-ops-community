@@ -95,6 +95,45 @@ class LegacyLinkTransition:
 
 
 @dataclass(frozen=True)
+class PrimeGstackLegacyAdoption:
+    """One-time migration from Prime gstack's retired owner-only manifest."""
+
+    target_id: str
+    expected_channel: str
+    source_ref: str
+    paths: tuple[Path, ...]
+
+    def __post_init__(self) -> None:
+        if self.target_id != "public-skills:prime-agent":
+            raise ValueError("Prime gstack legacy adoption requires the public Prime target")
+        if self.expected_channel != "public":
+            raise ValueError("Prime gstack legacy adoption requires the public channel")
+        if (
+            type(self.source_ref) is not str
+            or len(self.source_ref) != 40
+            or any(character not in "0123456789abcdef" for character in self.source_ref)
+        ):
+            raise ValueError("Prime gstack legacy adoption requires an exact commit ref")
+        if type(self.paths) is not tuple or not self.paths:
+            raise ValueError("Prime gstack legacy adoption requires owned paths")
+        normalized = tuple(_repository_relative_path(path) for path in self.paths)
+        if normalized != tuple(sorted(set(normalized), key=lambda path: path.as_posix())):
+            raise ValueError("Prime gstack legacy adoption paths must be unique and canonical")
+        for path in normalized:
+            allowed = path.parts[:3] == (".agentops", "runtime", "gstack") or (
+                path.parts[:1] == ("skills",)
+                and len(path.parts) >= 3
+                and (
+                    path.parts[1] == "agentops-gstack"
+                    or path.parts[1].startswith("agentops-gstack-")
+                )
+            )
+            if not allowed:
+                raise ValueError(f"Prime gstack legacy adoption path is outside its roots: {path}")
+        object.__setattr__(self, "paths", normalized)
+
+
+@dataclass(frozen=True)
 class ManifestFile:
     path: Path
     fingerprint: str
@@ -123,6 +162,7 @@ class ProviderPlan:
     audit_roots: tuple[Path, ...] = ()
     runtime_python_sources: tuple[Path, ...] = ()
     legacy_link_transition: LegacyLinkTransition | None = None
+    prime_gstack_legacy_adoption: PrimeGstackLegacyAdoption | None = None
 
     def __post_init__(self) -> None:
         _nonempty(self.provider_id, "provider id")
@@ -149,6 +189,24 @@ class ProviderPlan:
                 raise ValueError("legacy link transition must belong to its provider plan")
             if transition.expected_channel != self.target.channel:
                 raise ValueError("legacy link transition channel must match its provider plan")
+        if self.prime_gstack_legacy_adoption is not None:
+            adoption = self.prime_gstack_legacy_adoption
+            if type(adoption) is not PrimeGstackLegacyAdoption:
+                raise ValueError("Prime gstack legacy adoption must be an exact immutable value")
+            if (
+                self.provider_id != "public-skill:gstack"
+                or self.target.framework is not Framework.PRIME_AGENT
+                or adoption.target_id != self.target.id
+                or adoption.expected_channel != self.target.channel
+            ):
+                raise ValueError("Prime gstack legacy adoption must belong to its public plan")
+            planned_paths = {item.path for item in self.files}
+            allowed_addition = Path("skills/.agentops-public-provider-index.json")
+            if planned_paths not in (
+                set(adoption.paths),
+                set(adoption.paths) | {allowed_addition},
+            ):
+                raise ValueError("Prime gstack legacy adoption must bind its planned destinations")
 
 
 @dataclass(frozen=True)

@@ -23,6 +23,8 @@ The adapters preflight every managed target before writing. A path can be update
 
 The first safe install can migrate the earlier raw Agent Ops copies. Migration occurs only when `skills/gstack` or the old flat Superpowers directories match the exact pinned upstream source, including directory structure and executable behavior where relevant. Any local change causes a refusal instead of deletion.
 
+Profiles created by the earlier Prime gstack installer can also move into the shared deployment transaction once. The transaction requires the exact legacy owner, pinned source ref, complete gstack-only path set, file fingerprints, and planned modes while the target lock is retained. It removes the retired owner-only manifest only as a rollback-backed operation. Modified, missing, extra, wrong-owner, wrong-ref, or unsafe evidence stops the refresh without replacing the legacy files, and a later failure or crash restores the exact prior files and manifest.
+
 The dependency registry pins all three upstream repositories to exact Git commits. The HumanLayer dependency selects only `plugins/show-me/skills/show-me` from its repository, tracks its installed fingerprint, refuses unowned or modified collisions, and replaces the upstream `Bash(open ...)` line with a host-neutral artifact-preview fallback. gstack generation runs `bun install --frozen-lockfile`, and installation stops before profile writes if Bun, generation, or required runtime compilation fails.
 
 ## Context handoff

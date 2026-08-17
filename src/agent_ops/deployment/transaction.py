@@ -31,6 +31,7 @@ from agent_ops.deployment.models import (
     ManifestDirectory,
     ManifestFile,
     PlannedFile,
+    PrimeGstackLegacyAdoption,
     ProviderPlan,
     TargetChannelTransition,
     TargetSpec,
@@ -45,7 +46,7 @@ __all__ = (
 )
 
 _SCHEMA_VERSION = 1
-_TRANSACTION_SCHEMA_VERSION = 8
+_TRANSACTION_SCHEMA_VERSION = 9
 _RUNTIME_CACHE_PROVENANCE_SCHEMA_VERSION = 7
 _FINITE_RUNTIME_CACHE_MATRIX_SCHEMA_VERSION = 8
 _LEGACY_TRANSACTION_SCHEMA_VERSION = 3
@@ -69,6 +70,10 @@ _SUPPORTED_CPYTHON_CACHE_MAGICS = {
 }
 _SUPPORTED_CPYTHON_CACHE_OPTIMIZATIONS = (None, "1", "2")
 _MAX_RUNTIME_CACHE_BYTES = 16 * 1024 * 1024
+_PRIME_GSTACK_LEGACY_MANIFEST = Path(".agentops/gstack-prime-manifest.json")
+_PRIME_GSTACK_LEGACY_OWNER = "agent-ops-community:gstack-prime"
+_PRIME_GSTACK_LEGACY_MANIFEST_MODE = 0o644
+_PUBLIC_PROVIDER_INDEX = Path("skills/.agentops-public-provider-index.json")
 
 
 class PublicationIndeterminateError(OSError):
@@ -974,6 +979,228 @@ def _require_exact_keys(
         raise ValueError(f"missing {label} member: {missing[0]}")
 
 
+def _decode_prime_gstack_legacy_manifest(
+    content: bytes,
+    *,
+    source_ref: str,
+    expected_paths: tuple[Path, ...],
+) -> dict[Path, str]:
+    data = _strict_json_loads(content, label="Prime gstack legacy manifest")
+    if not isinstance(data, dict):
+        raise ValueError("invalid Prime gstack legacy manifest schema")
+    _require_exact_keys(
+        data,
+        {"schema_version", "owner", "upstream_ref", "files"},
+        label="Prime gstack legacy manifest",
+    )
+    if (
+        type(data["schema_version"]) is not int
+        or data["schema_version"] != 1
+        or type(data["owner"]) is not str
+        or data["owner"] != _PRIME_GSTACK_LEGACY_OWNER
+        or type(data["upstream_ref"]) is not str
+        or data["upstream_ref"] != source_ref
+        or not isinstance(data["files"], dict)
+        or not data["files"]
+    ):
+        raise ValueError("invalid Prime gstack legacy manifest identity")
+    files: dict[Path, str] = {}
+    for authored, fingerprint in data["files"].items():
+        path = _canonical_relative_text(authored, label="Prime gstack legacy file")
+        if (
+            path in files
+            or not _prime_gstack_legacy_path_allowed(path)
+            or type(fingerprint) is not str
+            or len(fingerprint) != 64
+            or any(character not in "0123456789abcdef" for character in fingerprint)
+        ):
+            raise ValueError("invalid Prime gstack legacy manifest file")
+        files[path] = fingerprint
+    if set(files) != set(expected_paths):
+        raise ValueError("Prime gstack legacy manifest paths do not match the planned bundle")
+    return files
+
+
+def _prime_gstack_legacy_path_allowed(path: Path) -> bool:
+    return path.parts[:3] == (".agentops", "runtime", "gstack") or (
+        path.parts[:1] == ("skills",)
+        and len(path.parts) >= 3
+        and (
+            path.parts[1] == "agentops-gstack"
+            or path.parts[1].startswith("agentops-gstack-")
+        )
+    )
+
+
+def _prime_gstack_adoption_prestate(
+    home_fs: _HomeFS,
+    group: _PlanGroup,
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    adoption = group.prime_gstack_legacy_adoption
+    if adoption is None:
+        return None
+    if group.target.framework is not Framework.PRIME_AGENT or group.target.channel != "public":
+        raise ValueError("Prime gstack legacy adoption target is invalid")
+    manifest_stat = home_fs.stat(_PRIME_GSTACK_LEGACY_MANIFEST)
+    if (
+        not stat.S_ISREG(manifest_stat.st_mode)
+        or manifest_stat.st_nlink != 1
+        or stat.S_IMODE(manifest_stat.st_mode) != _PRIME_GSTACK_LEGACY_MANIFEST_MODE
+    ):
+        raise ValueError("Prime gstack legacy manifest type or mode is invalid")
+    manifest_content = home_fs.read_file(_PRIME_GSTACK_LEGACY_MANIFEST)
+    legacy_files = _decode_prime_gstack_legacy_manifest(
+        manifest_content,
+        source_ref=adoption.source_ref,
+        expected_paths=adoption.paths,
+    )
+    planned = {item.path: item for item in group.files}
+    recorded_files = []
+    for path in adoption.paths:
+        item = planned.get(path)
+        if item is None:
+            raise ValueError("Prime gstack legacy manifest path is not planned")
+        try:
+            installed_stat = home_fs.stat(path)
+            installed_content = home_fs.read_file(path)
+        except OSError as exc:
+            raise ValueError(f"Prime gstack legacy owned file is missing: {path}") from exc
+        installed_mode = stat.S_IMODE(installed_stat.st_mode)
+        if (
+            not stat.S_ISREG(installed_stat.st_mode)
+            or installed_stat.st_nlink != 1
+            or _fingerprint(installed_content) != legacy_files[path]
+            or installed_mode != item.mode
+        ):
+            raise ValueError(f"Prime gstack legacy owned file changed: {path}")
+        recorded_files.append(
+            {
+                "path": path.as_posix(),
+                "fingerprint": legacy_files[path],
+                "mode": installed_mode,
+            }
+        )
+    manifest_file = {
+        "path": _PRIME_GSTACK_LEGACY_MANIFEST.as_posix(),
+        "fingerprint": _fingerprint(manifest_content),
+        "mode": _PRIME_GSTACK_LEGACY_MANIFEST_MODE,
+    }
+    prior_data = {
+        "files": sorted([*recorded_files, manifest_file], key=lambda item: item["path"]),
+        "directories": [],
+    }
+    record = {
+        "provider_id": "public-skill:gstack",
+        "target_id": adoption.target_id,
+        "expected_channel": adoption.expected_channel,
+        "owner": _PRIME_GSTACK_LEGACY_OWNER,
+        "source_ref": adoption.source_ref,
+        "manifest_path": _PRIME_GSTACK_LEGACY_MANIFEST.as_posix(),
+        "manifest_content": base64.b64encode(manifest_content).decode(),
+        "manifest_mode": _PRIME_GSTACK_LEGACY_MANIFEST_MODE,
+        "files": recorded_files,
+    }
+    return prior_data, record
+
+
+def _decode_prime_gstack_adoption_record(
+    value: object,
+    *,
+    manifest: DeploymentManifest,
+) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("invalid Prime gstack legacy adoption record")
+    _require_exact_keys(
+        value,
+        {
+            "provider_id",
+            "target_id",
+            "expected_channel",
+            "owner",
+            "source_ref",
+            "manifest_path",
+            "manifest_content",
+            "manifest_mode",
+            "files",
+        },
+        label="Prime gstack legacy adoption",
+    )
+    if (
+        value["provider_id"] != "public-skill:gstack"
+        or value["provider_id"] not in manifest.provider_ids
+        or value["target_id"] != manifest.target_id
+        or value["expected_channel"] != manifest.channel
+        or value["owner"] != _PRIME_GSTACK_LEGACY_OWNER
+        or _canonical_relative_text(
+            value["manifest_path"], label="Prime gstack legacy manifest"
+        )
+        != _PRIME_GSTACK_LEGACY_MANIFEST
+        or value["manifest_mode"] != _PRIME_GSTACK_LEGACY_MANIFEST_MODE
+        or type(value["source_ref"]) is not str
+        or not _source_revision_binds_prime_gstack_ref(
+            manifest.source_revision,
+            value["source_ref"],
+        )
+        or not isinstance(value["files"], list)
+        or not value["files"]
+    ):
+        raise ValueError("invalid Prime gstack legacy adoption identity")
+    try:
+        manifest_content = base64.b64decode(value["manifest_content"], validate=True)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid Prime gstack legacy manifest content") from exc
+    paths = []
+    recorded: dict[Path, tuple[str, int]] = {}
+    for item in value["files"]:
+        if not isinstance(item, dict):
+            raise ValueError("invalid Prime gstack legacy adoption file")
+        _require_exact_keys(
+            item,
+            {"path", "fingerprint", "mode"},
+            label="Prime gstack legacy adoption file",
+        )
+        path = _canonical_relative_text(item["path"], label="Prime gstack legacy file")
+        if (
+            path in recorded
+            or type(item["fingerprint"]) is not str
+            or len(item["fingerprint"]) != 64
+            or any(character not in "0123456789abcdef" for character in item["fingerprint"])
+            or not _valid_file_mode(item["mode"])
+        ):
+            raise ValueError("invalid Prime gstack legacy adoption file")
+        paths.append(path)
+        recorded[path] = (item["fingerprint"], item["mode"])
+    if paths != sorted(paths, key=lambda path: path.as_posix()):
+        raise ValueError("Prime gstack legacy adoption files are not canonical")
+    legacy_files = _decode_prime_gstack_legacy_manifest(
+        manifest_content,
+        source_ref=value["source_ref"],
+        expected_paths=tuple(paths),
+    )
+    final_files = {item.path: item for item in manifest.files}
+    for path, (fingerprint, mode) in recorded.items():
+        if (
+            fingerprint != legacy_files[path]
+            or path not in final_files
+            or final_files[path].mode != mode
+        ):
+            raise ValueError("Prime gstack legacy adoption does not match the final manifest")
+    prior_files = [dict(item) for item in value["files"]]
+    prior_files.append(
+        {
+            "path": _PRIME_GSTACK_LEGACY_MANIFEST.as_posix(),
+            "fingerprint": _fingerprint(manifest_content),
+            "mode": _PRIME_GSTACK_LEGACY_MANIFEST_MODE,
+        }
+    )
+    return {
+        "files": sorted(prior_files, key=lambda item: item["path"]),
+        "directories": [],
+    }
+
+
 def _validated_manifest_data(content: bytes, *, target: TargetSpec) -> dict[str, Any]:
     data = _strict_json_loads(content, label="deployment manifest")
     if (
@@ -1209,6 +1436,44 @@ class _PlanGroup:
     runtime_python_sources: tuple[Path, ...]
     runtime_cache_removals: tuple[tuple[Path, Path], ...]
     legacy_link_transition: LegacyLinkTransition | None
+    prime_gstack_legacy_adoption: PrimeGstackLegacyAdoption | None
+
+
+def _source_revision_binds_prime_gstack_ref(source_revision: str, source_ref: str) -> bool:
+    prefix = "public-skills:"
+    if not source_revision.startswith(prefix):
+        return False
+    try:
+        descriptors = json.loads(source_revision.removeprefix(prefix))
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(descriptors, list):
+        return False
+    matches = []
+    for descriptor in descriptors:
+        if not isinstance(descriptor, dict) or set(descriptor) != {
+            "id",
+            "repo",
+            "ref",
+            "install",
+        }:
+            return False
+        if descriptor.get("id") == "gstack":
+            matches.append(descriptor)
+    if len(matches) != 1:
+        return False
+    descriptor = matches[0]
+    install = descriptor.get("install")
+    return (
+        descriptor.get("ref") == source_ref
+        and isinstance(descriptor.get("repo"), str)
+        and bool(descriptor["repo"])
+        and isinstance(install, dict)
+        and set(install) == {"strategy", "source", "destination"}
+        and install.get("strategy") == "prime-gstack"
+        and install.get("source") is None
+        and install.get("destination") == "."
+    )
 
 
 def _public_gstack_runtime_path(provider_id: str, path: Path) -> bool:
@@ -1231,6 +1496,9 @@ def _validate_and_group(
         tuple[str, Framework, Path, str, str], dict[Path, Path]
     ] = {}
     legacy_links: dict[tuple[str, Framework, Path, str, str], LegacyLinkTransition] = {}
+    prime_adoptions: dict[
+        tuple[str, Framework, Path, str, str], PrimeGstackLegacyAdoption
+    ] = {}
     target_keys: dict[str, tuple[str, Framework, Path, str, str]] = {}
     home_targets: dict[Path, str] = {}
     preflight_cwd = Path.cwd()
@@ -1260,6 +1528,21 @@ def _validate_and_group(
             if key in legacy_links:
                 raise ValueError("only one legacy link transition is allowed per target")
             legacy_links[key] = plan.legacy_link_transition
+        if plan.prime_gstack_legacy_adoption is not None:
+            if key in prime_adoptions:
+                raise ValueError("only one Prime gstack legacy adoption is allowed per target")
+            adoption = plan.prime_gstack_legacy_adoption
+            planned = {item.path for item in plan.files}
+            if planned != set(adoption.paths) | (
+                {_PUBLIC_PROVIDER_INDEX} if _PUBLIC_PROVIDER_INDEX in planned else set()
+            ):
+                raise ValueError("Prime gstack legacy adoption must bind its planned destinations")
+            if not _source_revision_binds_prime_gstack_ref(
+                plan.source_revision,
+                adoption.source_ref,
+            ):
+                raise ValueError("Prime gstack legacy adoption source ref does not match its plan")
+            prime_adoptions[key] = adoption
         for item in plan.files:
             path = _safe_relative(item.path)
             if path.parts[0] in {".agentops", _LOCK_NAME} and not _public_gstack_runtime_path(
@@ -1287,6 +1570,10 @@ def _validate_and_group(
             runtime_source = _runtime_python_source_for_cache(removal_path)
             if runtime_source is not None and runtime_source in normalized_removal_set:
                 cache_removal_pairs[removal_path] = runtime_source
+    for key in prime_adoptions:
+        if _PRIME_GSTACK_LEGACY_MANIFEST in groups[key]:
+            raise ValueError("Prime gstack legacy manifest cannot be a planned destination")
+        removals[key].add(_PRIME_GSTACK_LEGACY_MANIFEST)
     for key, files in groups.items():
         file_paths = sorted(files, key=str)
         removal_paths = sorted(removals[key], key=str)
@@ -1332,6 +1619,7 @@ def _validate_and_group(
                 runtime_python_sources=tuple(sorted(runtime_python_sources[key], key=str)),
                 runtime_cache_removals=tuple(sorted(runtime_cache_removals[key].items())),
                 legacy_link_transition=legacy_links.get(key),
+                prime_gstack_legacy_adoption=prime_adoptions.get(key),
             )
         )
     return tuple(results)
@@ -1576,7 +1864,18 @@ def _verify_completed_rollback(
                     f"rollback completion has created owned directory: {path}"
                 )
         return
-    assert prior_manifest is not None
+    if prior_manifest is None:
+        if home_fs.exists(manifest_path):
+            raise IncompleteRollbackError(
+                "rollback completion does not match absent prior shared manifest"
+            )
+        _verify_manifest_files_and_directories(
+            home_fs,
+            prior_data,
+            error_type=IncompleteRollbackError,
+            context="rollback completion Prime legacy prior",
+        )
+        return
     try:
         manifest_matches = home_fs.matches_exact_file(
             manifest_path,
@@ -1757,7 +2056,10 @@ def _install_provider_plan_groups(
             prior_manifest_content = home_fs.read_optional(manifest_path)
             prior_data = None
             prior_manifest_mode = None
+            prime_adoption_record = None
             if prior_manifest_content is not None:
+                if group.prime_gstack_legacy_adoption is not None:
+                    raise ValueError("Prime gstack legacy adoption conflicts with shared ownership")
                 prior_manifest_stat = home_fs.stat(manifest_path)
                 _validate_ownership_manifest_stat(prior_manifest_stat)
                 prior_manifest_mode = stat.S_IMODE(prior_manifest_stat.st_mode)
@@ -1772,6 +2074,10 @@ def _install_provider_plan_groups(
                     error_type=ValueError,
                     context="prior",
                 )
+            elif group.prime_gstack_legacy_adoption is not None:
+                adoption_prestate = _prime_gstack_adoption_prestate(home_fs, group)
+                assert adoption_prestate is not None
+                prior_data, prime_adoption_record = adoption_prestate
             managed = (
                 {
                     Path(item["path"]): (item["fingerprint"], item["mode"])
@@ -2003,7 +2309,11 @@ def _install_provider_plan_groups(
             else:
                 legacy_operation_index = None
             record = {
-                "schema_version": _TRANSACTION_SCHEMA_VERSION,
+                "schema_version": (
+                    _TRANSACTION_SCHEMA_VERSION
+                    if prime_adoption_record is not None
+                    else _FINITE_RUNTIME_CACHE_MATRIX_SCHEMA_VERSION
+                ),
                 "state": "prepared",
                 "operation_cursor": 0,
                 "operation_phase": "ready",
@@ -2041,6 +2351,8 @@ def _install_provider_plan_groups(
                 "directories": directory_records,
                 "operations": operations,
             }
+            if prime_adoption_record is not None:
+                record["prime_gstack_legacy_adoption"] = prime_adoption_record
             home_fs.write_file(record_path, _record_bytes(record), 0o600)
             try:
                 for directory in manifest.directories:
@@ -2238,6 +2550,8 @@ def _validate_group_current_state(
     prior_content = home_fs.read_optional(manifest_path)
     prior_data = None
     if prior_content is not None:
+        if group.prime_gstack_legacy_adoption is not None:
+            raise ValueError("Prime gstack legacy adoption conflicts with shared ownership")
         _validate_ownership_manifest_stat(home_fs.stat(manifest_path))
         prior_data = _validated_prior_manifest_data(
             prior_content,
@@ -2250,6 +2564,10 @@ def _validate_group_current_state(
             error_type=ValueError,
             context="prior",
         )
+    elif group.prime_gstack_legacy_adoption is not None:
+        adoption_prestate = _prime_gstack_adoption_prestate(home_fs, group)
+        assert adoption_prestate is not None
+        prior_data, _adoption_record = adoption_prestate
     managed = (
         {Path(item["path"]): (item["fingerprint"], item["mode"]) for item in prior_data["files"]}
         if prior_data is not None
@@ -2422,6 +2740,7 @@ def _decode_record(
             _LEGACY_OPERATION_CURSOR_SCHEMA_VERSION,
             6,
             _RUNTIME_CACHE_PROVENANCE_SCHEMA_VERSION,
+            _FINITE_RUNTIME_CACHE_MATRIX_SCHEMA_VERSION,
             _TRANSACTION_SCHEMA_VERSION,
         }
         or record.get("state") not in {"prepared", "committed", "indeterminate", "rolled-back"}
@@ -2443,6 +2762,8 @@ def _decode_record(
     }
     if record["schema_version"] >= 4:
         record_keys.add("legacy_link_transition")
+    if record["schema_version"] >= 9:
+        record_keys.add("prime_gstack_legacy_adoption")
     if record["schema_version"] >= _OPERATION_CURSOR_SCHEMA_VERSION:
         record_keys.update({"operation_cursor", "operation_phase"})
     _require_exact_keys(record, record_keys, label="transaction record")
@@ -2459,6 +2780,10 @@ def _decode_record(
         raise ValueError("invalid transaction record channel transition")
     if manifest.transaction_id != transaction_id:
         raise ValueError("invalid transaction record identifier")
+    prime_adoption_prior = _decode_prime_gstack_adoption_record(
+        record.get("prime_gstack_legacy_adoption"),
+        manifest=manifest,
+    )
     legacy = record.get("legacy_link_transition")
     if legacy is not None:
         if not isinstance(legacy, dict):
@@ -2526,6 +2851,8 @@ def _decode_record(
     prior_encoded = record.get("prior_manifest_content")
     prior_data: dict[str, Any] | None = None
     if prior_encoded is not None:
+        if prime_adoption_prior is not None:
+            raise ValueError("transaction cannot combine shared and Prime legacy ownership")
         if not isinstance(prior_encoded, str):
             raise ValueError("invalid transaction record prior manifest")
         try:
@@ -2541,6 +2868,8 @@ def _decode_record(
             raise ValueError("invalid transaction record prior manifest mode")
     elif record.get("prior_manifest_mode") is not None:
         raise ValueError("invalid transaction record prior manifest mode")
+    elif prime_adoption_prior is not None:
+        prior_data = prime_adoption_prior
     operations = record.get("operations")
     directories = record.get("directories")
     if not isinstance(operations, list) or not isinstance(directories, list):
@@ -3395,6 +3724,15 @@ def _rollback_record(
             prior_raw["channel"],
         )
         prior_data = _validated_manifest_data(prior_manifest, target=recovery_target)
+    else:
+        _target, candidate_manifest = _manifest_from_data(
+            record["manifest"],
+            home=home_fs.home,
+        )
+        prior_data = _decode_prime_gstack_adoption_record(
+            record.get("prime_gstack_legacy_adoption"),
+            manifest=candidate_manifest,
+        )
     expected_manifest = base64.b64decode(record["manifest_content"], validate=True)
     legacy = record.get("legacy_link_transition")
     legacy_destination = Path(legacy["destination"]) if legacy is not None else None
@@ -3810,9 +4148,12 @@ def recover_transaction(path: Path) -> DeploymentManifest:
         if (
             record["state"] in {"prepared", "indeterminate"}
             and current_manifest == prior_manifest
-            and any(
-                operation["kind"] == _RUNTIME_CACHE_REMOVAL
-                for operation in record["operations"]
+            and (
+                record.get("prime_gstack_legacy_adoption") is not None
+                or any(
+                    operation["kind"] == _RUNTIME_CACHE_REMOVAL
+                    for operation in record["operations"]
+                )
             )
         ):
             _rollback_record(home_fs, record, relative, retain_completed=True)
