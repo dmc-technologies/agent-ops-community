@@ -1573,7 +1573,7 @@ def test_prime_gstack_adopts_exact_legacy_owner_manifest_in_shared_transaction(
     dependency = SkillDependency(
         id="gstack",
         name="gstack",
-        repo="https://example.invalid/gstack.git",
+        repo="https://github.com/garrytan/gstack.git",
         ref="74895062fb8a3acbf9f66cd088a83359aaaa56cd",
         install={
             "prime-agent": SkillDependencyInstall(

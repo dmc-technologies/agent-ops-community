@@ -1298,6 +1298,31 @@ def test_prime_gstack_legacy_source_binding_requires_exact_install_descriptor() 
     )
 
 
+def test_prime_gstack_legacy_source_binding_rejects_foreign_repository() -> None:
+    source_ref = "74895062fb8a3acbf9f66cd088a83359aaaa56cd"
+    revision = "public-skills:" + json.dumps(
+        [
+            {
+                "id": "gstack",
+                "repo": "https://attacker.invalid/not-public-gstack.git",
+                "ref": source_ref,
+                "install": {
+                    "strategy": "prime-gstack",
+                    "source": None,
+                    "destination": ".",
+                },
+            }
+        ],
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+    assert not transaction_module._source_revision_binds_prime_gstack_ref(
+        revision,
+        source_ref,
+    )
+
+
 @pytest.mark.parametrize(
     "case",
     (
@@ -1305,6 +1330,7 @@ def test_prime_gstack_legacy_source_binding_requires_exact_install_descriptor() 
         "wrong-owner",
         "wrong-ref",
         "wrong-plan-ref",
+        "wrong-plan-repository",
         "extra-path",
         "missing-path",
         "modified-file",
@@ -1332,6 +1358,18 @@ def test_prime_gstack_legacy_adoption_refuses_inexact_evidence_without_replaceme
             plan.source_revision.replace(
                 "74895062fb8a3acbf9f66cd088a83359aaaa56cd",
                 "0" * 40,
+            ),
+            plan.target,
+            plan.files,
+            audit_roots=plan.audit_roots,
+            prime_gstack_legacy_adoption=plan.prime_gstack_legacy_adoption,
+        )
+    elif case == "wrong-plan-repository":
+        plan = ProviderPlan(
+            plan.provider_id,
+            plan.source_revision.replace(
+                "https://github.com/garrytan/gstack.git",
+                "https://attacker.invalid/not-public-gstack.git",
             ),
             plan.target,
             plan.files,

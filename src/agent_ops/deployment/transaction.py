@@ -73,6 +73,7 @@ _MAX_RUNTIME_CACHE_BYTES = 16 * 1024 * 1024
 _PRIME_GSTACK_LEGACY_MANIFEST = Path(".agentops/gstack-prime-manifest.json")
 _PRIME_GSTACK_LEGACY_OWNER = "agent-ops-community:gstack-prime"
 _PRIME_GSTACK_LEGACY_MANIFEST_MODE = 0o644
+_PRIME_GSTACK_REPOSITORY = "https://github.com/garrytan/gstack.git"
 _PUBLIC_PROVIDER_INDEX = Path("skills/.agentops-public-provider-index.json")
 
 
@@ -1466,8 +1467,7 @@ def _source_revision_binds_prime_gstack_ref(source_revision: str, source_ref: st
     install = descriptor.get("install")
     return (
         descriptor.get("ref") == source_ref
-        and isinstance(descriptor.get("repo"), str)
-        and bool(descriptor["repo"])
+        and descriptor.get("repo") == _PRIME_GSTACK_REPOSITORY
         and isinstance(install, dict)
         and set(install) == {"strategy", "source", "destination"}
         and install.get("strategy") == "prime-gstack"
