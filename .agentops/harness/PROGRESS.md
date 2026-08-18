@@ -4,25 +4,27 @@ Repository: `agent-ops-community`
 
 ## Current State
 
-- Branch: `fix/windows-verification-current`
-- Main baseline: `b97b2b44b2411d5541cb610ef67ff3d786ad86dd`, exact Community `origin/main` at clock-in.
-- Current handoff: pull request 39 replaces pull request 8 on current `main`. Verification obtains the absolute trusted `cmd.exe` path from the native Windows system-directory API and preserves `/bin/sh -lc` on POSIX. The portable smoke job runs `echo agent-ops-local-smoke`, and the existing focused Windows CI job exercises the shell-selection tests plus the public verification command. Review Gate, global policy, deployment transactions, and obsolete full-Windows pytest scope are unchanged. No Plane work item applies.
-- Verification: the first RED command `uv run --extra dev pytest tests/test_verify.py::test_run_verification_uses_cmd_on_windows -q` failed because current `main` invoked `/bin/sh -lc`. Hosted Review Gate then proved that a bare `cmd.exe` could execute an attacker-supplied file from the invoking directory. The replacement RED placed `cmd.exe` in the current directory and `PATH`; it failed because verification still passed the bare name and now passes with the absolute trusted system path. `uv run --extra dev pytest tests/test_verify.py tests/test_cli.py -q` passes 12 tests, and affected Ruff passes. Fresh hosted Linux and Windows CI, one independent targeted resolution review, the hosted resolution check, zero-conversation readback, merge, and pull request 8 closure remain.
+- Branch: `feat/windows-shared-deployment`
+- Main baseline: `6ba099e99f01e932898a6b3ad43494e60430d873`, exact Community `origin/main` after pull request 39 merged and was reconciled into this branch.
+- Current handoff: pull request 40 adds the native Windows backend to the shared Community deployment engine. Native Windows now uses the same registry, managed Git source-store, planning, first installation, identical refresh, managed removal, audit, rollback, and interrupted-recovery path as POSIX. Retained no-delete-sharing ancestor handles, reparse-point rejection, and a native process lock protect target paths from junction replacement and concurrent writers. Review Gate and global policy are unchanged. No Plane work item applies.
+- Verification: three behavior-first REDs proved that transaction, registry, and source-store entrypoints still selected POSIX behavior on Windows. Each focused test passed after native dispatch was implemented. After reconciliation, the affected deployment and verification tests passed, and `uv run --extra dev pytest` passed 1,002 tests with 11 skipped. Affected Ruff, Python compilation, the harness check, and the diff check pass. Hosted Linux and native Windows CI plus one independent exact-head targeted review remain before merge.
 
 ## Current Work
 
-- Goal: make the public verification command work through the native shell on Windows without widening Windows test scope.
-- Active task: publish the trusted-command-processor correction, obtain replacement exact-head CI and targeted resolution review, then dispatch hosted resolution and merge after acceptance.
-- Files in play: `src/agent_ops/verify.py`, `tests/test_verify.py`, `examples/local-smoke.yaml`, the existing Windows CI job, and this progress record. Review Gate and global policy files are excluded.
+- Goal: complete the shared Community deployment engine's native Windows path so private Agent Ops can consume it without restoring the retired private installer.
+- Active task: freeze pull request 40 on current Community main, rerun local and hosted Linux and Windows evidence, obtain one independent targeted review, and merge the accepted exact head.
+- Files in play: the Community deployment transaction, registry, and source-store backends; Windows behavior tests; architecture; and this progress record. Review Gate and global policy files are excluded.
 - Blockers: none.
 
 ## Next Actions
 
-- Publish the trusted-command-processor correction to pull request 39 and freeze its head.
-- Require hosted Linux and focused Windows CI plus one independent targeted resolution review.
-- Dispatch the hosted resolution check without reapplying `ai review`, require accepted Review Gate and zero conversations, merge pull request 39, then close pull request 8 as replaced.
+- Commit and publish the reconciled Community closeout head for pull request 40.
+- Require affected tests, one broad suite, hosted Linux and native Windows CI, and one independent targeted exact-head review.
+- Merge pull request 40 after exact-head acceptance, then implement and review the small private provider integration against the Community merge.
 
 ## Session Log
+
+- 2026-08-17: Issue 81 now names the shared Community engine as Windows deployment authority and retains native first install, identical refresh, complete policy, portable hook and skill deployment, removals, audit, rollback, interrupted recovery, process locking, and junction-race safety as acceptance. Obsolete private pull request 82 was closed because its outcome moved to issue 81 and the current architecture. Community pull request 40 began from `b97b2b44b2411d5541cb610ef67ff3d786ad86dd`; transaction, registry, and source-store dispatch each produced a focused RED before implementation. Native hosted Windows CI passed the first three published implementation heads. After pull request 39 merged, its exact merge commit `6ba099e99f01e932898a6b3ad43494e60430d873` was merged into this branch before final verification.
 
 - 2026-08-17: Hosted Review Gate on pull request 39 found that passing bare `cmd.exe` to `subprocess.run` lets the invoking directory replace the Windows command processor. The replacement regression creates an attacker-controlled current-directory and `PATH` entry and requires the absolute trusted command processor. Verification now calls the native Windows system-directory API and refuses an API failure, an oversized result, or a non-absolute system directory before running a command. POSIX selection is unchanged.
 
