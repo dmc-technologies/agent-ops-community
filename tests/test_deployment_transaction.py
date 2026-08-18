@@ -1686,6 +1686,81 @@ def test_prime_gstack_concurrent_entry_recovery_restores_live_path_after_process
         assert not runtime.exists()
 
 
+def test_prime_gstack_concurrent_entry_recovery_restores_after_backup_move_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    plan, runtime, skill, legacy_manifest, legacy_manifest_bytes = _prime_gstack_legacy_plan(home)
+    concurrent_content = b"concurrent future skill before backup exit\n"
+    runtime_before = runtime.read_bytes()
+    runtime_relative = runtime.relative_to(home).as_posix()
+    skill_relative = skill.relative_to(home)
+    changed = False
+
+    def replace_skill_after_runtime(
+        _home_fs: object,
+        _record_path: Path,
+        operation: dict[str, object],
+    ) -> None:
+        nonlocal changed
+        if changed or operation["destination"] != runtime_relative:
+            return
+        concurrent = skill.with_name(f"{skill.name}.concurrent")
+        concurrent.write_bytes(concurrent_content)
+        concurrent.chmod(0o644)
+        os.replace(concurrent, skill)
+        changed = True
+
+    original_replace = transaction_module._HomeFS.replace
+
+    def exit_after_concurrent_backup_move(
+        home_fs: object,
+        source: Path,
+        destination: Path,
+    ) -> None:
+        original_replace(home_fs, source, destination)
+        if source == skill_relative and destination.parts[-2:] == ("backups", "0001"):
+            os._exit(85)
+
+    monkeypatch.setattr(
+        transaction_module,
+        "_after_operation_mutation",
+        replace_skill_after_runtime,
+    )
+    monkeypatch.setattr(
+        transaction_module._HomeFS,
+        "replace",
+        exit_after_concurrent_backup_move,
+    )
+    process = multiprocessing.get_context("fork").Process(
+        target=lambda: install_provider_plans((plan,))
+    )
+    process.start()
+    process.join(timeout=10)
+    assert process.exitcode == 85
+
+    record_path = next((home / ".agentops/deployment/transactions").glob("*/record.json"))
+    concurrent = json.loads(record_path.read_text())["prime_gstack_concurrent_mutation"]
+    assert concurrent["destination"] == skill_relative.as_posix()
+    assert concurrent["kind"] == "regular"
+    assert concurrent["identity"]["inode"] > 0
+    monkeypatch.setattr(transaction_module._HomeFS, "replace", original_replace)
+    monkeypatch.setattr(transaction_module, "_after_operation_mutation", lambda *_args: None)
+
+    recover_transaction(record_path)
+
+    assert runtime.read_bytes() == runtime_before
+    assert skill.read_bytes() == concurrent_content
+    assert legacy_manifest.read_bytes() == legacy_manifest_bytes
+    assert not list((home / ".agentops/deployment/manifests").glob("*.json"))
+
+    recover_transaction(record_path)
+
+    assert runtime.read_bytes() == runtime_before
+    assert skill.read_bytes() == concurrent_content
+
+
 def test_prime_gstack_legacy_adoption_recovery_restores_exact_prestate(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
