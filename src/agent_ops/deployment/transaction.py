@@ -2402,6 +2402,7 @@ def _install_provider_plan_groups(
             if prime_adoption_record is not None:
                 record["prime_gstack_legacy_adoption"] = prime_adoption_record
                 record["prime_gstack_concurrent_mutation"] = None
+                record["prime_gstack_move_authority"] = None
             prime_adoption_paths = (
                 {
                     Path(item["path"])
@@ -2863,7 +2864,9 @@ def _decode_record(
     if record["schema_version"] >= _PRIME_GSTACK_ADOPTION_SCHEMA_VERSION:
         record_keys.add("prime_gstack_legacy_adoption")
     if record["schema_version"] >= _TRANSACTION_SCHEMA_VERSION:
-        record_keys.add("prime_gstack_concurrent_mutation")
+        record_keys.update(
+            {"prime_gstack_concurrent_mutation", "prime_gstack_move_authority"}
+        )
     if record["schema_version"] >= _OPERATION_CURSOR_SCHEMA_VERSION:
         record_keys.update({"operation_cursor", "operation_phase"})
     _require_exact_keys(record, record_keys, label="transaction record")
@@ -3174,6 +3177,66 @@ def _decode_record(
         prime_prior_paths = {Path(item["path"]) for item in prime_adoption_prior["files"]}
         if concurrent_destination not in prime_prior_paths:
             raise ValueError("Prime gstack concurrent mutation is outside legacy ownership")
+    move_authority = record.get("prime_gstack_move_authority")
+    if move_authority is not None:
+        if not isinstance(move_authority, dict) or prime_adoption_prior is None:
+            raise ValueError("invalid Prime gstack move authority")
+        _require_exact_keys(
+            move_authority,
+            {
+                "operation_index",
+                "destination",
+                "fingerprint",
+                "mode",
+                "identity",
+            },
+            label="Prime gstack move authority",
+        )
+        authority_index = move_authority["operation_index"]
+        authority_destination = _canonical_relative_text(
+            move_authority["destination"],
+            label="Prime gstack move authority destination",
+        )
+        identity = move_authority["identity"]
+        if (
+            type(authority_index) is not int
+            or authority_index < 0
+            or authority_index >= len(operations)
+            or operations[authority_index]["index"] != authority_index
+            or Path(operations[authority_index]["destination"]) != authority_destination
+            or operations[authority_index]["backup"] is None
+            or not operations[authority_index]["prior_exists"]
+            or type(move_authority["fingerprint"]) is not str
+            or len(move_authority["fingerprint"]) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in move_authority["fingerprint"]
+            )
+            or not _valid_file_mode(move_authority["mode"])
+            or not isinstance(identity, dict)
+            or record["state"] in {"committed", "indeterminate", "rolled-back"}
+        ):
+            raise ValueError("invalid Prime gstack move authority binding")
+        _require_exact_keys(
+            identity,
+            {"device", "inode"},
+            label="Prime gstack move authority identity",
+        )
+        if (
+            type(identity["device"]) is not int
+            or identity["device"] < 0
+            or type(identity["inode"]) is not int
+            or identity["inode"] <= 0
+        ):
+            raise ValueError("invalid Prime gstack move authority identity")
+        prime_prior_paths = {Path(item["path"]) for item in prime_adoption_prior["files"]}
+        if authority_destination not in prime_prior_paths:
+            raise ValueError("Prime gstack move authority is outside legacy ownership")
+        if concurrent is not None and (
+            concurrent["operation_index"] != authority_index
+            or concurrent["destination"] != authority_destination.as_posix()
+        ):
+            raise ValueError("Prime gstack move authority conflicts with concurrent mutation")
     manifest_files = {
         Path(item["path"]): (item["fingerprint"], item["mode"])
         for item in record["manifest"]["files"]
@@ -3907,6 +3970,7 @@ def _rollback_record(
             record.get("prime_gstack_legacy_adoption"),
             manifest=candidate_manifest,
         )
+    _resolve_prime_gstack_move_authority(home_fs, record, record_path)
     _restore_prime_gstack_concurrent_before_evidence(home_fs, record)
     prior_data = _prior_data_without_prime_concurrent(prior_data, record)
     expected_manifest = base64.b64decode(record["manifest_content"], validate=True)
@@ -4325,6 +4389,7 @@ def recover_transaction(path: Path) -> DeploymentManifest:
                 record,
                 relative,
             )
+        _resolve_prime_gstack_move_authority(home_fs, record, relative)
         _restore_prime_gstack_concurrent_before_evidence(home_fs, record)
         _restore_unauthorized_runtime_cache_before_evidence(home_fs, record)
         _validate_transaction_evidence(home_fs, record, relative)
@@ -4917,9 +4982,153 @@ class _PinnedPrimeGstackCurrentFile:
         except (OSError, ValueError):
             return False
 
+    def matches_authority(self, authority: dict[str, Any]) -> bool:
+        try:
+            self._verified_descriptor()
+            identity = authority["identity"]
+            return (
+                self.fingerprint == authority["fingerprint"]
+                and self.mode == authority["mode"]
+                and self.identity == (identity["device"], identity["inode"])
+            )
+        except (KeyError, OSError, ValueError):
+            return False
+
     def close(self) -> None:
         with suppress(OSError):
             os.close(self.descriptor)
+
+
+def _prime_gstack_file_authority(
+    operation: dict[str, Any],
+    destination: Path,
+    pinned: _PinnedPrimeGstackCurrentFile,
+) -> dict[str, Any]:
+    return {
+        "operation_index": operation["index"],
+        "destination": destination.as_posix(),
+        "fingerprint": pinned.fingerprint,
+        "mode": pinned.mode,
+        "identity": {
+            "device": pinned.identity[0],
+            "inode": pinned.identity[1],
+        },
+    }
+
+
+def _prime_gstack_concurrent_regular(
+    operation: dict[str, Any],
+    destination: Path,
+    pinned: _PinnedPrimeGstackCurrentFile,
+) -> dict[str, Any]:
+    return {
+        **_prime_gstack_file_authority(operation, destination, pinned),
+        "kind": "regular",
+    }
+
+
+def _prime_gstack_move_authority(record: dict[str, Any]) -> dict[str, Any] | None:
+    value = record.get("prime_gstack_move_authority")
+    return value if isinstance(value, dict) else None
+
+
+def _resolve_prime_gstack_move_authority(
+    home_fs: _HomeFS,
+    record: dict[str, Any],
+    record_path: Path,
+) -> None:
+    """Resolve one journaled Prime move without replacing another live entry."""
+    authority = _prime_gstack_move_authority(record)
+    if authority is None:
+        return
+    operation = record["operations"][authority["operation_index"]]
+    destination = Path(authority["destination"])
+    backup = Path(operation["backup"])
+    destination_exists = home_fs.exists(destination)
+    backup_exists = home_fs.exists(backup)
+    if destination_exists and backup_exists:
+        raise IncompleteRollbackError(
+            f"Prime gstack move recovery found both live and backup entries: {destination}"
+        )
+    if destination_exists:
+        try:
+            pinned = _PinnedPrimeGstackCurrentFile(home_fs, destination)
+        except (OSError, ValueError) as exc:
+            raise IncompleteRollbackError(
+                f"Prime gstack move recovery found an unsafe live entry: {destination}"
+            ) from exc
+        try:
+            concurrent = _prime_gstack_concurrent_mutation(record)
+            if not pinned.matches_authority(authority):
+                record["prime_gstack_concurrent_mutation"] = (
+                    _prime_gstack_concurrent_regular(operation, destination, pinned)
+                )
+            elif concurrent is not None and (
+                concurrent["kind"] != "regular"
+                or not pinned.matches_authority(concurrent)
+            ):
+                raise IncompleteRollbackError(
+                    f"Prime gstack move recovery conflicts with live authority: {destination}"
+                )
+            record["prime_gstack_move_authority"] = None
+            home_fs.write_atomic(record_path, _record_bytes(record), 0o600)
+            return
+        finally:
+            pinned.close()
+    if not backup_exists:
+        record["prime_gstack_concurrent_mutation"] = {
+            "operation_index": operation["index"],
+            "destination": destination.as_posix(),
+            "kind": "missing",
+            "fingerprint": None,
+            "mode": None,
+            "identity": None,
+        }
+        record["prime_gstack_move_authority"] = None
+        home_fs.write_atomic(record_path, _record_bytes(record), 0o600)
+        return
+    try:
+        pinned = _PinnedPrimeGstackCurrentFile(home_fs, backup)
+    except (OSError, ValueError) as exc:
+        raise IncompleteRollbackError(
+            f"Prime gstack move recovery found an unsafe backup entry: {backup}"
+        ) from exc
+    try:
+        concurrent = _prime_gstack_concurrent_mutation(record)
+        if not pinned.matches_authority(authority):
+            record["prime_gstack_concurrent_mutation"] = _prime_gstack_concurrent_regular(
+                operation,
+                destination,
+                pinned,
+            )
+            home_fs.write_atomic(record_path, _record_bytes(record), 0o600)
+            concurrent = _prime_gstack_concurrent_mutation(record)
+        elif concurrent is None:
+            record["prime_gstack_move_authority"] = None
+            home_fs.write_atomic(record_path, _record_bytes(record), 0o600)
+            return
+        elif concurrent["kind"] != "regular" or not pinned.matches_authority(concurrent):
+            raise IncompleteRollbackError(
+                f"Prime gstack move recovery conflicts with backup authority: {backup}"
+            )
+        if not pinned.matches_path(backup):
+            raise IncompleteRollbackError(
+                f"Prime gstack move backup changed before restoration: {backup}"
+            )
+        try:
+            home_fs.move_new(backup, destination)
+        except FileExistsError as exc:
+            raise IncompleteRollbackError(
+                f"Prime gstack move recovery preserved a newer live entry: {destination}"
+            ) from exc
+        if not pinned.matches_path(destination):
+            raise IncompleteRollbackError(
+                f"Prime gstack move recovery changed during restoration: {destination}"
+            )
+        record["prime_gstack_move_authority"] = None
+        home_fs.write_atomic(record_path, _record_bytes(record), 0o600)
+    finally:
+        pinned.close()
 
 
 def _retain_prime_gstack_legacy_file(
@@ -4949,40 +5158,24 @@ def _retain_prime_gstack_legacy_file(
         _after_prime_gstack_concurrent_journal(home_fs, record_path, record)
         raise _PrimeGstackConcurrentMutation(destination) from None
     try:
-        if current.matches_legacy(pinned):
-            home_fs.replace(destination, backup)
-            if pinned.matches_backup(backup):
-                return
-            if not home_fs.exists(destination) and home_fs.exists(backup):
-                home_fs.move_new(backup, destination)
-            raise IncompleteRollbackError(
-                f"Prime gstack legacy entry changed during backup move: {destination}"
-            )
-        record["prime_gstack_concurrent_mutation"] = {
-            "operation_index": operation["index"],
-            "destination": destination.as_posix(),
-            "kind": "regular",
-            "fingerprint": current.fingerprint,
-            "mode": current.mode,
-            "identity": {
-                "device": current.identity[0],
-                "inode": current.identity[1],
-            },
-        }
+        record["prime_gstack_move_authority"] = _prime_gstack_file_authority(
+            operation,
+            destination,
+            current,
+        )
         home_fs.write_atomic(record_path, _record_bytes(record), 0o600)
-        _after_prime_gstack_concurrent_journal(home_fs, record_path, record)
-        if not current.matches_path(destination):
-            raise IncompleteRollbackError(
-                f"Prime gstack concurrent entry changed before backup move: {destination}"
+        matches_legacy = current.matches_legacy(pinned)
+        if not matches_legacy:
+            record["prime_gstack_concurrent_mutation"] = (
+                _prime_gstack_concurrent_regular(operation, destination, current)
             )
+            home_fs.write_atomic(record_path, _record_bytes(record), 0o600)
+            _after_prime_gstack_concurrent_journal(home_fs, record_path, record)
         home_fs.replace(destination, backup)
-        if not current.matches_path(backup):
-            if not home_fs.exists(destination) and home_fs.exists(backup):
-                home_fs.move_new(backup, destination)
-            raise IncompleteRollbackError(
-                f"Prime gstack concurrent entry changed during backup move: {destination}"
-            )
-        _restore_prime_gstack_concurrent_before_evidence(home_fs, record)
+        if matches_legacy and current.matches_path(backup):
+            record["prime_gstack_move_authority"] = None
+            return
+        _resolve_prime_gstack_move_authority(home_fs, record, record_path)
         raise _PrimeGstackConcurrentMutation(destination)
     finally:
         current.close()

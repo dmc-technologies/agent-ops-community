@@ -1761,6 +1761,77 @@ def test_prime_gstack_concurrent_entry_recovery_restores_after_backup_move_exit(
     assert skill.read_bytes() == concurrent_content
 
 
+def test_prime_gstack_concurrent_entry_recovery_restores_after_classification_race(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    plan, runtime, skill, legacy_manifest, legacy_manifest_bytes = _prime_gstack_legacy_plan(home)
+    concurrent_content = b"concurrent skill after legacy classification\n"
+    runtime_before = runtime.read_bytes()
+    skill_relative = skill.relative_to(home)
+    original_matches_legacy = transaction_module._PinnedPrimeGstackCurrentFile.matches_legacy
+    original_replace = transaction_module._HomeFS.replace
+
+    def replace_after_legacy_classification(
+        current: object,
+        pinned: object,
+    ) -> bool:
+        matches = original_matches_legacy(current, pinned)
+        if matches and current.path == skill_relative:
+            concurrent = skill.with_name(f"{skill.name}.concurrent")
+            concurrent.write_bytes(concurrent_content)
+            concurrent.chmod(0o644)
+            os.replace(concurrent, skill)
+        return matches
+
+    def exit_after_concurrent_backup_move(
+        home_fs: object,
+        source: Path,
+        destination: Path,
+    ) -> None:
+        original_replace(home_fs, source, destination)
+        if source == skill_relative and destination.parts[-2:] == ("backups", "0001"):
+            os._exit(86)
+
+    monkeypatch.setattr(
+        transaction_module._PinnedPrimeGstackCurrentFile,
+        "matches_legacy",
+        replace_after_legacy_classification,
+    )
+    monkeypatch.setattr(
+        transaction_module._HomeFS,
+        "replace",
+        exit_after_concurrent_backup_move,
+    )
+    process = multiprocessing.get_context("fork").Process(
+        target=lambda: install_provider_plans((plan,))
+    )
+    process.start()
+    process.join(timeout=10)
+    assert process.exitcode == 86
+
+    record_path = next((home / ".agentops/deployment/transactions").glob("*/record.json"))
+    monkeypatch.setattr(transaction_module._HomeFS, "replace", original_replace)
+    monkeypatch.setattr(
+        transaction_module._PinnedPrimeGstackCurrentFile,
+        "matches_legacy",
+        original_matches_legacy,
+    )
+
+    recover_transaction(record_path)
+
+    assert runtime.read_bytes() == runtime_before
+    assert skill.read_bytes() == concurrent_content
+    assert legacy_manifest.read_bytes() == legacy_manifest_bytes
+    assert not list((home / ".agentops/deployment/manifests").glob("*.json"))
+
+    recover_transaction(record_path)
+
+    assert runtime.read_bytes() == runtime_before
+    assert skill.read_bytes() == concurrent_content
+
+
 def test_prime_gstack_legacy_adoption_recovery_restores_exact_prestate(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
