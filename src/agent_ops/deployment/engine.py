@@ -683,7 +683,8 @@ class DeploymentEngine:
                     if kind == "directory"
                     else stat.S_ISREG(item.st_mode)
                 )
-                if not valid_kind or stat.S_IMODE(item.st_mode) != mode:
+                mode_changed = os.name != "nt" and stat.S_IMODE(item.st_mode) != mode
+                if not valid_kind or mode_changed:
                     raise RuntimeError("provider changed the restricted source snapshot")
                 if kind == "file" and path.read_bytes() != content:
                     raise RuntimeError("provider changed the restricted source snapshot")

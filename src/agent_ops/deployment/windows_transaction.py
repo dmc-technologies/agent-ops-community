@@ -20,7 +20,7 @@ from agent_ops.deployment.models import (
     TargetChannelTransition,
     TargetSpec,
 )
-from agent_ops.deployment.windows_fs import WindowsTargetLock
+from agent_ops.deployment.windows_fs import WindowsTargetLock, WindowsTargetView
 
 _METADATA = Path(".agentops/deployment")
 _PATHS: dict[str, Path] = {}
@@ -106,6 +106,79 @@ def _verify_prior(lock: WindowsTargetLock, prior: dict[str, Any]) -> None:
             lock.identity(path, directory=True)
         except (FileNotFoundError, OSError, ValueError) as error:
             raise ValueError(f"prior managed directory is missing or unsafe: {path}") from error
+
+
+def _validate_group_current_state(
+    lock: WindowsTargetLock,
+    group: Any,
+    transition: TargetChannelTransition,
+) -> None:
+    lock.verify()
+    if group.legacy_link_transition is not None and lock.exists(
+        group.legacy_link_transition.destination
+    ):
+        raise ValueError("Windows deployment does not adopt symbolic-link policy state")
+    if group.prime_gstack_legacy_adoption is not None:
+        raise ValueError("Prime gstack legacy adoption is not a Windows deployment path")
+    prior_content = lock.read_optional(_manifest_path(group.target))
+    prior = None
+    if prior_content is not None:
+        prior = _decode_prior(
+            prior_content,
+            target=group.target,
+            expected_channel=transition.expected_prior_channel,
+        )
+        _verify_prior(lock, prior)
+    managed = (
+        {Path(item["path"]): (item["fingerprint"], item["mode"]) for item in prior["files"]}
+        if prior is not None
+        else {}
+    )
+    planned = {item.path for item in group.files}
+    for item in group.files:
+        current = lock.read_optional(item.path)
+        prior_item = managed.get(item.path)
+        if current is not None and prior_item is None and current != item.content:
+            raise ValueError(f"unmanaged destination conflicts with plan: {item.path}")
+        if (
+            current is not None
+            and prior_item is not None
+            and _fingerprint(current) != prior_item[0]
+        ):
+            raise ValueError(f"managed destination changed: {item.path}")
+    for path in sorted(set(group.removals), key=lambda item: item.as_posix()):
+        if path in planned:
+            raise ValueError(f"planned file is also removed: {path}")
+        prior_item = managed.get(path)
+        current = lock.read_optional(path)
+        if prior_item is None and current is not None:
+            raise ValueError(f"refusing to remove unmanaged destination: {path}")
+        if (
+            current is not None
+            and prior_item is not None
+            and _fingerprint(current) != prior_item[0]
+        ):
+            raise ValueError(f"managed destination changed: {path}")
+
+
+def preflight_provider_plans_read_only(
+    plans: tuple[ProviderPlan, ...],
+    *,
+    channel_transitions: tuple[TargetChannelTransition, ...] | None = None,
+) -> None:
+    groups = _tx()._validate_and_group(plans)
+    transitions = _tx()._channel_transitions(groups, channel_transitions)
+    for group in groups:
+        try:
+            with WindowsTargetView(group.target.home) as view:
+                lock_path = Path(_tx()._LOCK_NAME)
+                if view.exists(lock_path):
+                    identity = view.identity(lock_path)
+                    if identity.is_directory or identity.is_reparse_point or identity.links != 1:
+                        raise ValueError("deployment lock is not a regular single-link file")
+                _validate_group_current_state(view, group, transitions[group.target.id])
+        except FileNotFoundError:
+            continue
 
 
 def _record_manifest(record: dict[str, Any]) -> DeploymentManifest:

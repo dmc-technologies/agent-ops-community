@@ -2760,6 +2760,12 @@ def _preflight_provider_plans_read_only(
 ) -> None:
     """Validate every live-apply precondition without creating target state."""
     _require_supported_platform()
+    if _WINDOWS_SUPPORTED and not _POSIX_SUPPORTED:
+        _windows_transaction_backend().preflight_provider_plans_read_only(
+            plans,
+            channel_transitions=channel_transitions,
+        )
+        return
     groups = _validate_and_group(plans)
     transitions = _channel_transitions(groups, channel_transitions)
     for group in groups:

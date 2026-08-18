@@ -214,16 +214,20 @@ class WindowsPathPins:
         self.identities: list[WindowsIdentity] = []
         windows = PureWindowsPath(self.path)
         current = Path(windows.anchor)
-        self._pin_directory(current)
-        for part in windows.parts[1:]:
-            current /= part
-            try:
-                self._pin_directory(current)
-            except FileNotFoundError:
-                if not create:
-                    raise
-                os.mkdir(current)
-                self._pin_directory(current)
+        try:
+            self._pin_directory(current)
+            for part in windows.parts[1:]:
+                current /= part
+                try:
+                    self._pin_directory(current)
+                except FileNotFoundError:
+                    if not create:
+                        raise
+                    os.mkdir(current)
+                    self._pin_directory(current)
+        except BaseException:
+            self._stack.close()
+            raise
 
     def _pin_directory(self, path: Path) -> None:
         handle = self._stack.enter_context(
@@ -311,10 +315,7 @@ class WindowsTargetLock:
             raise ValueError("deployment lock identity changed")
         with WindowsPathPins(self.home, create=False) as observed:
             current_home = observed.identities[-1]
-            if (current_home.volume, current_home.index) != (
-                self.home_identity.volume,
-                self.home_identity.index,
-            ):
+            if not _same_object(current_home, self.home_identity):
                 raise ValueError("deployment canonical home identity changed")
 
     @contextmanager
@@ -512,6 +513,20 @@ class WindowsTargetLock:
         relative = safe_relative(relative)
         found: dict[Path, str] = {}
 
+        with (
+            self.pin_parent(relative),
+            _open(
+                self.home / relative,
+                access=FILE_READ_ATTRIBUTES,
+                directory=True,
+            ) as root,
+        ):
+            root_identity = root.identity()
+            if root_identity.is_reparse_point:
+                raise ValueError(f"reparse-point managed entry is not allowed: {relative}")
+            if not root_identity.is_directory:
+                return {Path("."): "regular"}
+
         def visit(prefix: Path) -> None:
             with (
                 self.open_entry(relative / prefix, directory=True),
@@ -534,6 +549,30 @@ class WindowsTargetLock:
 
         visit(Path("."))
         return found
+
+
+class WindowsTargetView(WindowsTargetLock):
+    """Read-only retained target authority used before lock acquisition."""
+
+    def __init__(self, home: Path) -> None:
+        super().__init__(home, shared=True, create=False)
+
+    def __enter__(self) -> WindowsTargetView:
+        pins = self._stack.enter_context(WindowsPathPins(self.home, create=False))
+        self.home_identity = pins.identities[-1]
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self._stack.close()
+
+    def verify(self) -> None:
+        with WindowsPathPins(self.home, create=False) as observed:
+            if not _same_object(observed.identities[-1], self.home_identity):
+                raise ValueError("deployment canonical home identity changed")
+
+
+def _same_object(left: WindowsIdentity, right: WindowsIdentity) -> bool:
+    return (left.volume, left.index) == (right.volume, right.index)
 
 
 def safe_relative(path: Path) -> Path:

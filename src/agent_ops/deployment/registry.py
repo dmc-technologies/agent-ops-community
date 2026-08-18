@@ -681,6 +681,15 @@ def _validate_home(path: Path, label: str) -> tuple[tuple[int, int] | None, str]
     if os.sep == "/" and normalized.startswith("//"):
         normalized = f"/{normalized.lstrip('/')}"
     normalized = os.path.normcase(normalized)
+    if _WINDOWS_SUPPORTED:
+        from agent_ops.deployment.windows_fs import WindowsPathPins
+
+        try:
+            with WindowsPathPins(path, create=False) as pins:
+                identity = pins.identities[-1]
+                return (identity.volume, identity.index), normalized
+        except FileNotFoundError:
+            return None, normalized
     current = Path(path.anchor)
     for part in path.parts[1:]:
         current /= part
