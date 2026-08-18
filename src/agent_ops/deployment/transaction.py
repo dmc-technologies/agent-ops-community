@@ -60,6 +60,7 @@ _METADATA = Path(".agentops/deployment")
 _LOCK_NAME = ".agentops-deployment.lock"
 _TRANSACTION_PATHS: dict[str, Path] = {}
 _POSIX_SUPPORTED = os.name == "posix" and fcntl is not None
+_WINDOWS_SUPPORTED = os.name == "nt"
 _CANONICAL_HOME_IDENTITY_ERROR = "deployment canonical home identity changed"
 _RUNTIME_CACHE_REMOVAL = "runtime-cache-removal"
 _REMOVAL_KINDS = frozenset({"removal", _RUNTIME_CACHE_REMOVAL})
@@ -99,8 +100,16 @@ class _PrimeGstackConcurrentMutation(ValueError):
 
 
 def _require_supported_platform() -> None:
-    if not _POSIX_SUPPORTED:
-        raise UnsupportedPlatformError("deployment transactions require a supported POSIX platform")
+    if not (_POSIX_SUPPORTED or _WINDOWS_SUPPORTED):
+        raise UnsupportedPlatformError(
+            "deployment transactions require a supported POSIX or native Windows platform"
+        )
+
+
+def _windows_transaction_backend() -> Any:
+    from agent_ops.deployment import windows_transaction
+
+    return windows_transaction
 
 
 def _before_manifest_replace(
@@ -1983,6 +1992,11 @@ def install_provider_plans(
     channel_transitions: tuple[TargetChannelTransition, ...] | None = None,
 ) -> tuple[DeploymentManifest, ...]:
     _require_supported_platform()
+    if _WINDOWS_SUPPORTED and not _POSIX_SUPPORTED:
+        return _windows_transaction_backend().install_provider_plans(
+            plans,
+            channel_transitions=channel_transitions,
+        )
     manifests: list[DeploymentManifest] = []
     groups = _validate_and_group(plans)
     transitions = _channel_transitions(groups, channel_transitions)
@@ -2020,6 +2034,10 @@ def _locked_provider_plan_targets(
 ) -> Iterator[None]:
     """Hold one sorted home-lock set for a caller-defined grouped operation."""
     _require_supported_platform()
+    if _WINDOWS_SUPPORTED and not _POSIX_SUPPORTED:
+        with _windows_transaction_backend().locked_provider_plan_targets(plans):
+            yield
+        return
     groups = _validate_and_group(plans)
     homes = tuple(_absolute_home(group.target.home) for group in groups)
     active = _GROUP_HOME_LOCKS.get()
@@ -2039,6 +2057,9 @@ def _locked_provider_plan_targets(
 
 def _verify_locked_provider_plan_targets(plans: tuple[ProviderPlan, ...]) -> None:
     """Revalidate every retained home and lock identity for grouped success."""
+    if _WINDOWS_SUPPORTED and not _POSIX_SUPPORTED:
+        _windows_transaction_backend().verify_locked_provider_plan_targets(plans)
+        return
     groups = _validate_and_group(plans)
     active = _GROUP_HOME_LOCKS.get()
     if active is None:
@@ -4297,6 +4318,9 @@ def _prune_transaction_directories(
 
 def rollback_manifests(manifests: tuple[DeploymentManifest, ...]) -> None:
     _require_supported_platform()
+    if _WINDOWS_SUPPORTED and not _POSIX_SUPPORTED:
+        _windows_transaction_backend().rollback_manifests(manifests)
+        return
     for manifest in reversed(manifests):
         path = _TRANSACTION_PATHS.get(manifest.transaction_id)
         if path is None:
@@ -4325,6 +4349,8 @@ def rollback_manifests(manifests: tuple[DeploymentManifest, ...]) -> None:
 
 def recover_transaction(path: Path) -> DeploymentManifest:
     _require_supported_platform()
+    if _WINDOWS_SUPPORTED and not _POSIX_SUPPORTED:
+        return _windows_transaction_backend().recover_transaction(path)
     home, relative, _record, manifest = _read_validated_record(path)
     with _target_lock(home) as home_fs:
         content = home_fs.read_file(relative)
@@ -5457,6 +5483,8 @@ def _discover_runtime_cache_removals(
 
 def audit_provider_plans(plans: tuple[ProviderPlan, ...]) -> DeploymentAudit:
     _require_supported_platform()
+    if _WINDOWS_SUPPORTED and not _POSIX_SUPPORTED:
+        return _windows_transaction_backend().audit_provider_plans(plans)
     groups = _validate_and_group(plans)
     if not groups:
         return DeploymentAudit(target_id="none", matches=True)
@@ -5801,6 +5829,14 @@ def retain_provider_plan_evidence(
 ) -> Iterator[_RetainedProviderPlanEvidence]:
     """Pin audited manifests, files, and directories through terminal success."""
     _require_supported_platform()
+    if _WINDOWS_SUPPORTED and not _POSIX_SUPPORTED:
+        with _windows_transaction_backend().retain_provider_plan_evidence(
+            plans,
+            require_matches=require_matches,
+            expected_audits=expected_audits,
+        ) as authority:
+            yield authority
+        return
     groups = _validate_and_group(plans)
     active = _GROUP_HOME_LOCKS.get()
     if active is None:
