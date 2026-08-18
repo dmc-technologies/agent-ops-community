@@ -13,7 +13,14 @@ import pytest
 
 from agent_ops.deployment import transaction as transaction_module
 from agent_ops.deployment.engine import DeploymentEngine
-from agent_ops.deployment.models import PlannedFile, ProviderPlan, SourceSpec, TargetSpec
+from agent_ops.deployment.models import (
+    DeploymentManifest,
+    ManifestFile,
+    PlannedFile,
+    ProviderPlan,
+    SourceSpec,
+    TargetSpec,
+)
 from agent_ops.deployment.registry import (
     ChannelSpec,
     DeploymentRegistry,
@@ -27,6 +34,223 @@ from agent_ops.deployment.transaction import (
     rollback_manifests,
 )
 from agent_ops.registries.models import Framework
+
+
+@pytest.mark.parametrize(
+    "authored",
+    (
+        "skills/example/SKILL.md:payload",
+        "skills/example/CON.txt",
+        "skills/example/name.",
+        "skills/example/name ",
+    ),
+)
+def test_windows_managed_paths_reject_ntfs_aliases(authored: str) -> None:
+    from agent_ops.deployment.windows_fs import safe_relative
+
+    with pytest.raises(ValueError, match="unsafe managed path"):
+        safe_relative(Path(authored))
+
+
+def test_windows_preflight_rejects_ntfs_stream_before_target_creation(tmp_path: Path) -> None:
+    from agent_ops.deployment import windows_transaction
+
+    home = tmp_path / "codex"
+    plan = ProviderPlan(
+        "fixture",
+        "1" * 40,
+        TargetSpec("codex-windows", Framework.CODEX, home, "stable"),
+        (PlannedFile(Path("skills/example/SKILL.md:payload"), b"payload", 0o644),),
+    )
+
+    with pytest.raises(ValueError, match="unsafe managed path"):
+        windows_transaction.preflight_provider_plans_read_only((plan,))
+
+    assert not home.exists()
+
+
+def test_windows_transaction_record_rejects_ntfs_stream() -> None:
+    from agent_ops.deployment import windows_transaction
+
+    transaction_id = "a" * 32
+    path = Path("skills/example/SKILL.md:payload")
+    manifest = DeploymentManifest(
+        1,
+        "codex-windows",
+        Framework.CODEX,
+        "stable",
+        "1" * 40,
+        ("fixture",),
+        (ManifestFile(path, "2" * 64, 0o644),),
+        (),
+        transaction_id,
+    )
+    record = {
+        "schema_version": 1,
+        "state": "prepared",
+        "home": "C:/managed",
+        "manifest": windows_transaction._manifest_data(manifest),
+        "manifest_path": ".agentops/deployment/manifests/codex-windows.json",
+        "manifest_content": "",
+        "prior_manifest_content": None,
+        "created_directories": [],
+        "operations": [],
+    }
+
+    with pytest.raises(ValueError, match="unsafe managed path"):
+        windows_transaction._validate_record(record, transaction_id=transaction_id)
+
+
+def test_windows_recovery_rejects_noncanonical_record_path_before_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent_ops.deployment import windows_transaction
+
+    class UnexpectedLock:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            raise AssertionError("recovery acquired a lock for an invalid path")
+
+    monkeypatch.setattr(windows_transaction, "WindowsTargetLock", UnexpectedLock)
+
+    invalid = tmp_path / "not-agentops/deployment/transactions" / ("a" * 32) / "record.json"
+    with pytest.raises(ValueError, match="recovery path"):
+        windows_transaction.recover_transaction(invalid)
+
+
+def test_windows_rollback_accepts_interruption_before_backup_move() -> None:
+    from agent_ops.deployment import windows_transaction
+
+    destination = Path("managed.txt")
+    prior = b"prior bytes\n"
+    record_path = Path(".agentops/deployment/transactions") / ("a" * 32) / "record.json"
+
+    class FakeLock:
+        def __init__(self) -> None:
+            self.files = {destination: prior}
+
+        def write_atomic(self, path: Path, content: bytes) -> None:
+            if path != record_path:
+                self.files[path] = content
+
+        def read_optional(self, path: Path) -> bytes | None:
+            return self.files.get(path)
+
+        def exists(self, path: Path) -> bool:
+            return path in self.files
+
+        def read_file(self, path: Path) -> bytes:
+            return self.files[path]
+
+        def unlink(self, path: Path) -> None:
+            del self.files[path]
+
+        def replace(self, source: Path, target: Path, *, replace: bool) -> None:
+            assert not replace
+            self.files[target] = self.files.pop(source)
+
+        def remove_empty_dir(self, _path: Path) -> None:
+            return
+
+        def verify(self) -> None:
+            return
+
+    record = {
+        "state": "applying",
+        "manifest_path": ".agentops/deployment/manifests/codex.json",
+        "manifest_content": "",
+        "prior_manifest_content": None,
+        "created_directories": [],
+        "operations": [
+            {
+                "kind": "write",
+                "destination": destination.as_posix(),
+                "backup": ".agentops/deployment/transactions/" + ("a" * 32) + "/backup/0",
+                "prior": windows_transaction._fingerprint(prior),
+                "expected": windows_transaction._fingerprint(b"replacement\n"),
+                "phase": "applying",
+            }
+        ],
+    }
+    lock = FakeLock()
+
+    windows_transaction._rollback_record(lock, record_path, record, retain=True)
+
+    assert lock.files[destination] == prior
+    assert record["state"] == "rolled-back"
+
+
+def test_windows_accepted_ref_reconciles_to_durable_metadata() -> None:
+    from agent_ops.deployment import windows_source_store
+
+    previous = "1" * 40
+    observed = "2" * 40
+    calls: list[tuple[str, ...]] = []
+
+    class Store:
+        def _git(
+            self,
+            arguments: tuple[str, ...],
+            *,
+            accepted_returncodes: frozenset[int] = frozenset({0}),
+        ) -> SimpleNamespace:
+            del accepted_returncodes
+            calls.append(arguments)
+            if "rev-parse" in arguments:
+                return SimpleNamespace(returncode=0, stdout=observed + "\n")
+            return SimpleNamespace(returncode=0, stdout="")
+
+        def _history_error(self, *_args: object) -> None:
+            raise AssertionError("durable commit should be available")
+
+    source = SourceSpec("private", "https://example.invalid/private.git", "refs/heads/main")
+    accepted_ref = "refs/agentops/accepted/test"
+
+    result = windows_source_store._reconcile_accepted_ref(
+        Store(), Path("mirror.git"), accepted_ref, previous, "refs/heads/main", source
+    )
+
+    assert result == previous
+    assert calls[-1] == (
+        "--git-dir",
+        "mirror.git",
+        "update-ref",
+        accepted_ref,
+        previous,
+        observed,
+    )
+
+
+def test_windows_provider_read_fails_on_premature_eof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent_ops.deployment import windows_fs, windows_source_store
+
+    identity = SimpleNamespace(size=1)
+
+    class Handle:
+        value = 1
+
+        def identity(self) -> SimpleNamespace:
+            return identity
+
+    class Kernel:
+        def ReadFile(self, *_args: object) -> int:
+            return 1
+
+    monkeypatch.setattr(windows_fs, "_kernel32", lambda: Kernel())
+    entry = windows_source_store._Entry(
+        Path("root"),
+        Path("file"),
+        Handle(),
+        kind="file",
+        mode=0o644,
+        expected_blob="0" * 40,
+        object_format="sha1",
+    )
+
+    with pytest.raises(RuntimeError, match="changed during consumption"):
+        entry.read_bytes()
 
 
 def _windows_plan(home: Path) -> ProviderPlan:

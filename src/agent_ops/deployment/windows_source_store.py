@@ -160,9 +160,9 @@ def fetch(
         mirror = _prepare_mirror(store, lock, source.id, url)
         previous = _read_ref(lock, source.id, ref)
         accepted_ref = f"refs/agentops/accepted/{hashlib.sha256(ref.encode()).hexdigest()}"
-        accepted_before = _read_git_ref(store, mirror, accepted_ref)
-        if previous is not None and accepted_before not in {None, previous}:
-            raise RuntimeError("accepted Git ref differs from durable source ref metadata")
+        accepted_before = _reconcile_accepted_ref(
+            store, mirror, accepted_ref, previous, ref, source
+        )
         candidate = f"refs/agentops/candidate/{uuid.uuid4().hex}"
         _, transient_auth = module._persisted_remote_url_and_transient_auth(url)
         try:
@@ -215,6 +215,39 @@ def _read_git_ref(store: Any, mirror: Path, ref: str) -> str | None:
     if result.returncode == 128:
         return None
     return module._normalize_commit(result.stdout.strip())
+
+
+def _reconcile_accepted_ref(
+    store: Any,
+    mirror: Path,
+    accepted_ref: str,
+    previous: str | None,
+    ref: str,
+    source: SourceSpec,
+) -> str | None:
+    observed = _read_git_ref(store, mirror, accepted_ref)
+    if observed == previous:
+        return observed
+    if previous is None:
+        if observed is not None:
+            store._git(("--git-dir", str(mirror), "update-ref", "-d", accepted_ref))
+        return None
+    module = _source_module()
+    try:
+        store._git(("--git-dir", str(mirror), "cat-file", "-e", f"{previous}^{{commit}}"))
+    except module._GitFailure as error:
+        store._history_error(source, ref, error)
+    store._git(
+        (
+            "--git-dir",
+            str(mirror),
+            "update-ref",
+            accepted_ref,
+            previous,
+            observed or "0" * 40,
+        )
+    )
+    return previous
 
 
 def _check_refresh(
@@ -404,6 +437,8 @@ class _Entry:
                 None,
             ):
                 raise ctypes.WinError(ctypes.get_last_error())
+            if read.value == 0:
+                raise RuntimeError("provider data changed during consumption")
             chunks.append(buffer.raw[: read.value])
             remaining -= read.value
         content = b"".join(chunks)

@@ -33,6 +33,12 @@ CREATE_NEW = 1
 LOCKFILE_EXCLUSIVE_LOCK = 0x00000002
 ERROR_LOCK_VIOLATION = 33
 INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+_INVALID_WINDOWS_CHARS = frozenset('<>:"|?*')
+_RESERVED_WINDOWS_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{index}" for index in range(1, 10)}
+    | {f"LPT{index}" for index in range(1, 10)}
+)
 
 
 class _ByHandleFileInformation(ctypes.Structure):
@@ -577,6 +583,7 @@ def _same_object(left: WindowsIdentity, right: WindowsIdentity) -> bool:
 
 def safe_relative(path: Path) -> Path:
     windows = PureWindowsPath(path)
+    authored = str(path)
     if (
         path.is_absolute()
         or windows.is_absolute()
@@ -586,6 +593,13 @@ def safe_relative(path: Path) -> Path:
         or path == Path(".")
         or any(part in {"", ".", ".."} for part in path.parts)
         or any(part == ".." for part in windows.parts)
+        or (os.name != "nt" and "\\" in authored)
+        or any(
+            part.endswith((".", " "))
+            or part.split(".", 1)[0].upper() in _RESERVED_WINDOWS_NAMES
+            or any(character in _INVALID_WINDOWS_CHARS or ord(character) < 32 for character in part)
+            for part in path.parts
+        )
     ):
         raise ValueError(f"unsafe managed path: {path}")
     return path

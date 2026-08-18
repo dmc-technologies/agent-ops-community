@@ -20,7 +20,7 @@ from agent_ops.deployment.models import (
     TargetChannelTransition,
     TargetSpec,
 )
-from agent_ops.deployment.windows_fs import WindowsTargetLock, WindowsTargetView
+from agent_ops.deployment.windows_fs import WindowsTargetLock, WindowsTargetView, safe_relative
 
 _METADATA = Path(".agentops/deployment")
 _PATHS: dict[str, Path] = {}
@@ -42,6 +42,23 @@ def _fingerprint(content: bytes) -> str:
 
 def _absolute(path: Path) -> Path:
     return _tx()._absolute_home(path)
+
+
+def _validated_groups(plans: tuple[ProviderPlan, ...]) -> tuple[Any, ...]:
+    groups = _tx()._validate_and_group(plans)
+    for group in groups:
+        for item in group.files:
+            safe_relative(item.path)
+        for path in (
+            *group.removals,
+            *group.audit_roots,
+            *group.runtime_python_sources,
+        ):
+            safe_relative(path)
+        for cache, source in group.runtime_cache_removals:
+            safe_relative(cache)
+            safe_relative(source)
+    return groups
 
 
 def _manifest_path(target: Any) -> Path:
@@ -166,7 +183,7 @@ def preflight_provider_plans_read_only(
     *,
     channel_transitions: tuple[TargetChannelTransition, ...] | None = None,
 ) -> None:
-    groups = _tx()._validate_and_group(plans)
+    groups = _validated_groups(plans)
     transitions = _tx()._channel_transitions(groups, channel_transitions)
     for group in groups:
         try:
@@ -185,7 +202,7 @@ def _record_manifest(record: dict[str, Any]) -> DeploymentManifest:
     data = record["manifest"]
     from agent_ops.registries.models import Framework
 
-    return DeploymentManifest(
+    manifest = DeploymentManifest(
         schema_version=data["schema_version"],
         target_id=data["target_id"],
         framework=Framework(data["framework"]),
@@ -203,6 +220,11 @@ def _record_manifest(record: dict[str, Any]) -> DeploymentManifest:
         transaction_id=data["transaction_id"],
         review_state=data.get("review_state"),
     )
+    for item in manifest.files:
+        safe_relative(item.path)
+    for item in manifest.directories:
+        safe_relative(item.path)
+    return manifest
 
 
 def _validate_record(record: object, *, transaction_id: str | None = None) -> dict[str, Any]:
@@ -260,7 +282,11 @@ def _validate_record(record: object, *, transaction_id: str | None = None) -> di
         for key in ("destination", "staged", "backup"):
             value = operation.get(key)
             if value is not None:
-                _tx()._canonical_relative_text(value, label="Windows transaction")
+                relative = _tx()._canonical_relative_text(value, label="Windows transaction")
+                safe_relative(relative)
+    for value in record["created_directories"]:
+        relative = _tx()._canonical_relative_text(value, label="Windows transaction")
+        safe_relative(relative)
     record["_expected_manifest"] = expected
     record["_prior_manifest"] = prior
     return record
@@ -273,7 +299,7 @@ def _write_record(lock: WindowsTargetLock, path: Path, record: dict[str, Any]) -
 
 @contextmanager
 def locked_provider_plan_targets(plans: tuple[ProviderPlan, ...]) -> Iterator[None]:
-    groups = _tx()._validate_and_group(plans)
+    groups = _validated_groups(plans)
     homes = tuple(sorted({_absolute(group.target.home) for group in groups}, key=str))
     active = _LOCKS.get()
     if active is not None:
@@ -294,7 +320,7 @@ def verify_locked_provider_plan_targets(plans: tuple[ProviderPlan, ...]) -> None
     active = _LOCKS.get()
     if active is None:
         raise RuntimeError("Windows deployment target lock set is not active")
-    for group in _tx()._validate_and_group(plans):
+    for group in _validated_groups(plans):
         active[_absolute(group.target.home)].verify()
 
 
@@ -310,7 +336,7 @@ def install_provider_plans(
     *,
     channel_transitions: tuple[TargetChannelTransition, ...] | None = None,
 ) -> tuple[DeploymentManifest, ...]:
-    groups = _tx()._validate_and_group(plans)
+    groups = _validated_groups(plans)
     transitions = _tx()._channel_transitions(groups, channel_transitions)
     manifests: list[DeploymentManifest] = []
     with locked_provider_plan_targets(plans):
@@ -566,20 +592,45 @@ def _rollback_record(
             continue
         destination = Path(operation["destination"])
         backup = None if operation["backup"] is None else Path(operation["backup"])
-        if operation["kind"] == "write" and lock.exists(destination):
-            if _fingerprint(lock.read_file(destination)) != operation["expected"]:
+        destination_content = lock.read_optional(destination)
+        backup_content = None if backup is None else lock.read_optional(backup)
+        destination_fingerprint = (
+            None if destination_content is None else _fingerprint(destination_content)
+        )
+        backup_fingerprint = None if backup_content is None else _fingerprint(backup_content)
+        prior_fingerprint = operation["prior"]
+        if backup_fingerprint is not None and backup_fingerprint != prior_fingerprint:
+            raise _tx().IncompleteRollbackError(f"Windows rollback backup changed: {backup}")
+        if operation["kind"] == "write":
+            if backup_content is not None:
+                if destination_fingerprint == operation["expected"]:
+                    lock.unlink(destination)
+                elif destination_content is not None:
+                    raise _tx().IncompleteRollbackError(
+                        f"Windows rollback destination changed: {destination}"
+                    )
+                lock.replace(backup, destination, replace=False)
+            elif prior_fingerprint is None:
+                if destination_fingerprint == operation["expected"]:
+                    lock.unlink(destination)
+                elif destination_content is not None:
+                    raise _tx().IncompleteRollbackError(
+                        f"Windows rollback destination changed: {destination}"
+                    )
+            elif destination_fingerprint != prior_fingerprint:
                 raise _tx().IncompleteRollbackError(
-                    f"Windows rollback destination changed: {destination}"
+                    f"Windows rollback prior destination is unavailable: {destination}"
                 )
-            lock.unlink(destination)
-        if backup is not None and lock.exists(backup):
-            if lock.exists(destination):
+        elif backup_content is not None:
+            if destination_content is not None:
                 raise _tx().IncompleteRollbackError(
                     f"Windows rollback destination is occupied: {destination}"
                 )
-            if _fingerprint(lock.read_file(backup)) != operation["prior"]:
-                raise _tx().IncompleteRollbackError(f"Windows rollback backup changed: {backup}")
             lock.replace(backup, destination, replace=False)
+        elif prior_fingerprint is not None and destination_fingerprint != prior_fingerprint:
+            raise _tx().IncompleteRollbackError(
+                f"Windows rollback prior destination is unavailable: {destination}"
+            )
     for authored in sorted(
         record["created_directories"],
         key=lambda item: len(Path(item).parts),
@@ -626,13 +677,24 @@ def rollback_manifests(manifests: tuple[DeploymentManifest, ...]) -> None:
 
 
 def recover_transaction(path: Path) -> DeploymentManifest:
-    path = _absolute(Path(path))
-    if path.name != "record.json" or path.parents[1].name != "transactions":
+    authored = Path(path)
+    parts = authored.parts
+    if (
+        len(parts) < 6
+        or tuple(parts[-5:-2]) != (".agentops", "deployment", "transactions")
+        or parts[-1] != "record.json"
+        or len(parts[-2]) != 32
+        or any(character not in "0123456789abcdef" for character in parts[-2])
+    ):
         raise ValueError("invalid Windows transaction recovery path")
+    path = _absolute(authored)
     home = path.parents[4]
     relative = path.relative_to(home)
     with WindowsTargetLock(home) as lock:
-        record = _validate_record(json.loads(lock.read_file(relative).decode("utf-8")))
+        record = _validate_record(
+            json.loads(lock.read_file(relative).decode("utf-8")),
+            transaction_id=parts[-2],
+        )
         manifest = _record_manifest(record)
         if record["state"] == "rolled-back":
             return manifest
@@ -655,7 +717,7 @@ def recover_transaction(path: Path) -> DeploymentManifest:
 
 
 def audit_provider_plans(plans: tuple[ProviderPlan, ...]) -> DeploymentAudit:
-    groups = _tx()._validate_and_group(plans)
+    groups = _validated_groups(plans)
     if not groups:
         return DeploymentAudit(target_id="none", matches=True)
     if len(groups) != 1:
@@ -754,7 +816,7 @@ class _Evidence:
 
     def verify(self) -> None:
         verify_locked_provider_plan_targets(self.plans)
-        groups = _tx()._validate_and_group(self.plans)
+        groups = _validated_groups(self.plans)
         for group in groups:
             audit = _audit_group(_target_lock(group.target.home), group)
             if self.require_matches and not audit.matches:

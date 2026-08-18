@@ -204,8 +204,8 @@ def receipt_records(registry: Any) -> tuple[Any, ...]:
             fingerprint, receipt = module._parse_receipt_wrapper(
                 lock.read_file(receipts / name, maximum=module._MAX_RECEIPT_BYTES)
             )
-            if fingerprint != snapshot.fingerprint:
-                raise RuntimeError("receipt history fingerprint differs from registry")
             records.append(module.ReceiptRecord(sequence, fingerprint, receipt))
+        if _snapshot(registry, lock) != snapshot:
+            raise RuntimeError("registry changed during receipt history read")
         lock.verify()
         return tuple(records)
