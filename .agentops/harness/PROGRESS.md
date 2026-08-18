@@ -6,23 +6,25 @@ Repository: `agent-ops-community`
 
 - Branch: `fix/windows-verification-current`
 - Main baseline: `b97b2b44b2411d5541cb610ef67ff3d786ad86dd`, exact Community `origin/main` at clock-in.
-- Current handoff: pull request 39 replaces pull request 8 on current `main`. Verification uses `cmd.exe /d /s /c` on native Windows and preserves `/bin/sh -lc` on POSIX. The portable smoke job runs `echo agent-ops-local-smoke`, and the existing focused Windows CI job exercises the shell-selection tests plus the public verification command. Review Gate, global policy, deployment transactions, and obsolete full-Windows pytest scope are unchanged. No Plane work item applies.
-- Verification: the primary RED command `uv run --extra dev pytest tests/test_verify.py::test_run_verification_uses_cmd_on_windows -q` failed because current `main` invoked `/bin/sh -lc` instead of `cmd.exe /d /s /c`; the same node passes after the correction. `uv run --extra dev pytest tests/test_verify.py tests/test_cli.py -q` passed 12 tests. `uv run --extra dev agentops verify examples/local-smoke.yaml --json` passed and printed `agent-ops-local-smoke`. Affected Ruff, the Agent Ops harness check, and `git diff --check` passed. Exact-head hosted Linux and Windows CI, one independent review, the one-time `ai review` request, accepted Review Gate, zero-conversation readback, merge, and pull request 8 closure remain.
+- Current handoff: pull request 39 replaces pull request 8 on current `main`. Verification obtains the absolute trusted `cmd.exe` path from the native Windows system-directory API and preserves `/bin/sh -lc` on POSIX. The portable smoke job runs `echo agent-ops-local-smoke`, and the existing focused Windows CI job exercises the shell-selection tests plus the public verification command. Review Gate, global policy, deployment transactions, and obsolete full-Windows pytest scope are unchanged. No Plane work item applies.
+- Verification: the first RED command `uv run --extra dev pytest tests/test_verify.py::test_run_verification_uses_cmd_on_windows -q` failed because current `main` invoked `/bin/sh -lc`. Hosted Review Gate then proved that a bare `cmd.exe` could execute an attacker-supplied file from the invoking directory. The replacement RED placed `cmd.exe` in the current directory and `PATH`; it failed because verification still passed the bare name and now passes with the absolute trusted system path. `uv run --extra dev pytest tests/test_verify.py tests/test_cli.py -q` passes 12 tests, and affected Ruff passes. Fresh hosted Linux and Windows CI, one independent targeted resolution review, the hosted resolution check, zero-conversation readback, merge, and pull request 8 closure remain.
 
 ## Current Work
 
 - Goal: make the public verification command work through the native shell on Windows without widening Windows test scope.
-- Active task: publish pull request 39's final closeout commit, obtain exact-head CI and independent review, then request Review Gate once and merge after acceptance.
+- Active task: publish the trusted-command-processor correction, obtain replacement exact-head CI and targeted resolution review, then dispatch hosted resolution and merge after acceptance.
 - Files in play: `src/agent_ops/verify.py`, `tests/test_verify.py`, `examples/local-smoke.yaml`, the existing Windows CI job, and this progress record. Review Gate and global policy files are excluded.
 - Blockers: none.
 
 ## Next Actions
 
-- Publish the closeout commit to pull request 39 and freeze its head.
-- Require hosted Linux and focused Windows CI plus one independent exact-head review.
-- Apply `ai review` once, require accepted Review Gate and zero conversations, merge pull request 39, then close pull request 8 as replaced.
+- Publish the trusted-command-processor correction to pull request 39 and freeze its head.
+- Require hosted Linux and focused Windows CI plus one independent targeted resolution review.
+- Dispatch the hosted resolution check without reapplying `ai review`, require accepted Review Gate and zero conversations, merge pull request 39, then close pull request 8 as replaced.
 
 ## Session Log
+
+- 2026-08-17: Hosted Review Gate on pull request 39 found that passing bare `cmd.exe` to `subprocess.run` lets the invoking directory replace the Windows command processor. The replacement regression creates an attacker-controlled current-directory and `PATH` entry and requires the absolute trusted command processor. Verification now calls the native Windows system-directory API and refuses an API failure, an oversized result, or a non-absolute system directory before running a command. POSIX selection is unchanged.
 
 - 2026-08-17: Began from exact Community main `b97b2b44b2411d5541cb610ef67ff3d786ad86dd` in an isolated worktree. The Windows behavior test failed because verification always selected `/bin/sh -lc`. Verification now selects native `cmd.exe /d /s /c` on Windows while retaining the POSIX shell. The public smoke command is portable, and the existing Windows job adds only two focused shell-selection tests and the smoke command. Pull request 39 replaces the 169-commit-old pull request 8 without restoring its obsolete complete-Windows-suite job.
 

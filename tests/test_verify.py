@@ -6,6 +6,9 @@ from agent_ops.contracts.job import AgentJob, VerificationCommand
 
 def test_run_verification_uses_cmd_on_windows(tmp_path, monkeypatch) -> None:
     commands: list[list[str]] = []
+    command_processor = r"C:\Windows\System32\cmd.exe"
+    attacker_command_processor = tmp_path / "cmd.exe"
+    attacker_command_processor.write_bytes(b"attacker supplied")
 
     def run_command(command, **_kwargs):
         commands.append(command)
@@ -17,6 +20,14 @@ def test_run_verification_uses_cmd_on_windows(tmp_path, monkeypatch) -> None:
         )
 
     monkeypatch.setattr(verify_module, "os", SimpleNamespace(name="nt"), raising=False)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.setattr(
+        verify_module,
+        "_windows_command_processor",
+        lambda: command_processor,
+        raising=False,
+    )
     monkeypatch.setattr(verify_module, "run_command", run_command)
     job = AgentJob(
         id="windows-shell",
@@ -29,7 +40,7 @@ def test_run_verification_uses_cmd_on_windows(tmp_path, monkeypatch) -> None:
     verify_module.run_verification(job, tmp_path)
 
     assert commands == [
-        ["cmd.exe", "/d", "/s", "/c", "echo agent-ops-local-smoke"]
+        [command_processor, "/d", "/s", "/c", "echo agent-ops-local-smoke"]
     ]
 
 
