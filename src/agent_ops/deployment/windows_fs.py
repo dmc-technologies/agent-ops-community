@@ -310,7 +310,11 @@ class WindowsTargetLock:
         if self.lock.identity() != self.lock_identity:
             raise ValueError("deployment lock identity changed")
         with WindowsPathPins(self.home, create=False) as observed:
-            if observed.identities[-1] != self.home_identity:
+            current_home = observed.identities[-1]
+            if (current_home.volume, current_home.index) != (
+                self.home_identity.volume,
+                self.home_identity.index,
+            ):
                 raise ValueError("deployment canonical home identity changed")
 
     @contextmanager

@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlsplit, urlunsplit
+from urllib.request import url2pathname
 
 from agent_ops.deployment.models import RewriteAcceptance, SourceSnapshot, SourceSpec
 
@@ -214,7 +215,7 @@ def _normalize_source_url(url: str) -> str:
             if parsed.netloc not in {"", "localhost"} or parsed.query or parsed.fragment:
                 raise ValueError("source URL must be a safe local file URL")
             try:
-                local = Path(unquote(parsed.path)).resolve(strict=True)
+                local = Path(url2pathname(parsed.path)).resolve(strict=True)
             except OSError as error:
                 raise ValueError("source URL local path does not exist") from error
             if not local.is_dir():
@@ -240,7 +241,7 @@ def _canonical_local_url(url: str) -> Path | None:
     parsed = urlsplit(url)
     try:
         if parsed.scheme == "file" and parsed.netloc in {"", "localhost"}:
-            return Path(unquote(parsed.path)).resolve(strict=True)
+            return Path(url2pathname(parsed.path)).resolve(strict=True)
         if not parsed.scheme and not _SCP_URL.fullmatch(url):
             return Path(url).resolve(strict=True)
     except OSError:
