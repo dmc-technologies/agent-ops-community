@@ -522,7 +522,10 @@ class WindowsTargetLock:
                     authored = relative / child
                     if entry.is_symlink():
                         raise ValueError(f"reparse-point managed entry is not allowed: {authored}")
-                    identity = self.identity(authored, directory=entry.is_dir(False))
+                    identity = self.identity(
+                        authored,
+                        directory=entry.is_dir(follow_symlinks=False),
+                    )
                     if identity.is_directory:
                         found[child] = "directory"
                         visit(child)
