@@ -34,11 +34,6 @@ LOCKFILE_EXCLUSIVE_LOCK = 0x00000002
 ERROR_LOCK_VIOLATION = 33
 INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 _INVALID_WINDOWS_CHARS = frozenset('<>:"|?*')
-_RESERVED_WINDOWS_NAMES = frozenset(
-    {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"}
-    | {f"COM{index}" for index in (*range(1, 10), "¹", "²", "³")}
-    | {f"LPT{index}" for index in (*range(1, 10), "¹", "²", "³")}
-)
 
 
 class _ByHandleFileInformation(ctypes.Structure):
@@ -596,7 +591,7 @@ def safe_relative(path: Path) -> Path:
         or (os.name != "nt" and "\\" in authored)
         or any(
             part.endswith((".", " "))
-            or part.split(".", 1)[0].upper() in _RESERVED_WINDOWS_NAMES
+            or PureWindowsPath(part).is_reserved()
             or any(character in _INVALID_WINDOWS_CHARS or ord(character) < 32 for character in part)
             for part in path.parts
         )

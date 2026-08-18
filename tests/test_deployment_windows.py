@@ -35,17 +35,15 @@ from agent_ops.deployment.transaction import (
 )
 from agent_ops.registries.models import Framework
 
+_WINDOWS_RESERVED_ALIASES = ("CONIN$", "CONOUT$", "COM¹.txt", "LPT².log", "COM³")
+
 
 @pytest.mark.parametrize(
     "authored",
     (
         "skills/example/SKILL.md:payload",
         "skills/example/CON.txt",
-        "skills/example/CONIN$",
-        "skills/example/CONOUT$",
-        "skills/example/COM¹.txt",
-        "skills/example/LPT².log",
-        "skills/example/COM³",
+        *(f"skills/example/{name}" for name in _WINDOWS_RESERVED_ALIASES),
         "skills/example/name.",
         "skills/example/name ",
     ),
@@ -57,7 +55,11 @@ def test_windows_managed_paths_reject_ntfs_aliases(authored: str) -> None:
         safe_relative(Path(authored))
 
 
-def test_windows_preflight_rejects_ntfs_stream_before_target_creation(tmp_path: Path) -> None:
+@pytest.mark.parametrize("name", _WINDOWS_RESERVED_ALIASES)
+def test_windows_preflight_rejects_reserved_device_before_target_creation(
+    tmp_path: Path,
+    name: str,
+) -> None:
     from agent_ops.deployment import windows_transaction
 
     home = tmp_path / "codex"
@@ -65,7 +67,7 @@ def test_windows_preflight_rejects_ntfs_stream_before_target_creation(tmp_path: 
         "fixture",
         "1" * 40,
         TargetSpec("codex-windows", Framework.CODEX, home, "stable"),
-        (PlannedFile(Path("skills/example/SKILL.md:payload"), b"payload", 0o644),),
+        (PlannedFile(Path("skills/example") / name, b"payload", 0o644),),
     )
 
     with pytest.raises(ValueError, match="unsafe managed path"):
@@ -74,11 +76,12 @@ def test_windows_preflight_rejects_ntfs_stream_before_target_creation(tmp_path: 
     assert not home.exists()
 
 
-def test_windows_transaction_record_rejects_ntfs_stream() -> None:
+@pytest.mark.parametrize("name", _WINDOWS_RESERVED_ALIASES)
+def test_windows_transaction_record_rejects_reserved_device(name: str) -> None:
     from agent_ops.deployment import windows_transaction
 
     transaction_id = "a" * 32
-    path = Path("skills/example/SKILL.md:payload")
+    path = Path("skills/example") / name
     manifest = DeploymentManifest(
         1,
         "codex-windows",
