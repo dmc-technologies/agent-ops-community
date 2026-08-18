@@ -4,25 +4,29 @@ Repository: `agent-ops-community`
 
 ## Current State
 
-- Branch: `fix/prime-legacy-adoption`
-- Main baseline: `ffd074f0335797c047988661a158db934172f545`, exact Community `origin/main` at clock-in.
-- Current handoff: the shared transaction can adopt the exact retired Prime gstack owner manifest once, replace same-ref rendered bytes, remove that legacy manifest with rollback evidence, preserve unrelated files, and restore the exact old files and manifest after a late failure or crash. Invalid schema, owner, source ref, path set, file content, file mode, or manifest mode fails before replacement. Every accepted legacy file and manifest now retains no-follow descriptor authority before the first mutation and has a backup-backed operation, including a file already equal to its planned bytes. Every move first persists exact operation, path, fingerprint, mode, and filesystem identity. Recovery classifies the recorded entry live, in an exact prior backup, in a mismatched concurrent backup, deleted, or already restored; it journals a mismatched safe backup before no-replace restoration, rolls back earlier replacements, and publishes no shared ownership. No Plane work item applies.
-- Verification: the primary RED command `uv run --extra dev pytest tests/test_deployment_engine.py::test_prime_gstack_adopts_exact_legacy_owner_manifest_in_shared_transaction -q` failed with `unmanaged destination conflicts with plan` before implementation and now passes. The first independent review found that the source descriptor accepted any nonempty repository; the forged-repository RED test proved it, and the correction now requires exact `https://github.com/garrytan/gstack.git` before mutation. Hosted Review Gate then reproduced concurrent replacement and found that corrections opened later descriptors too late, omitted an unchanged accepted path, did not durably journal preservation state before the backup move, and left a replacement window after legacy classification. The strict race group failed at each exact boundary; all 17 cases now pass. All 34 focused Prime adoption cases and the 288-test affected transaction suite pass. The prior read-only dry-run against the installed Prime target accepted its 734-file legacy evidence and reported `would install: gstack` without target replacement. Final Ruff, harness, whitespace, targeted resolution review, and hosted acceptance remain.
+- Branch: `fix/windows-verification-current`
+- Main baseline: `b97b2b44b2411d5541cb610ef67ff3d786ad86dd`, exact Community `origin/main` at clock-in.
+- Current handoff: pull request 39 replaces pull request 8 on current `main`. Verification obtains the absolute trusted `cmd.exe` path from the native Windows system-directory API and preserves `/bin/sh -lc` on POSIX. The portable smoke job runs `echo agent-ops-local-smoke`, and the existing focused Windows CI job exercises the shell-selection tests plus the public verification command. Review Gate, global policy, deployment transactions, and obsolete full-Windows pytest scope are unchanged. No Plane work item applies.
+- Verification: the first RED command `uv run --extra dev pytest tests/test_verify.py::test_run_verification_uses_cmd_on_windows -q` failed because current `main` invoked `/bin/sh -lc`. Hosted Review Gate then proved that a bare `cmd.exe` could execute an attacker-supplied file from the invoking directory. The replacement RED placed `cmd.exe` in the current directory and `PATH`; it failed because verification still passed the bare name and now passes with the absolute trusted system path. `uv run --extra dev pytest tests/test_verify.py tests/test_cli.py -q` passes 12 tests, and affected Ruff passes. Fresh hosted Linux and Windows CI, one independent targeted resolution review, the hosted resolution check, zero-conversation readback, merge, and pull request 8 closure remain.
 
 ## Current Work
 
-- Goal: let the current Prime profile enter shared Agent Ops deployment ownership without accepting unproven legacy content.
-- Active task: freeze the journaled all-entry authority correction, obtain targeted resolution review of the two hosted findings only, then complete exact-head hosted acceptance.
-- Files in play: deployment models, public skill planning, the shared transaction, focused tests, Prime and architecture documentation, and harness closeout records. Review Gate and global policy files are excluded.
+- Goal: make the public verification command work through the native shell on Windows without widening Windows test scope.
+- Active task: publish the trusted-command-processor correction, obtain replacement exact-head CI and targeted resolution review, then dispatch hosted resolution and merge after acceptance.
+- Files in play: `src/agent_ops/verify.py`, `tests/test_verify.py`, `examples/local-smoke.yaml`, the existing Windows CI job, and this progress record. Review Gate and global policy files are excluded.
 - Blockers: none.
 
 ## Next Actions
 
-- Run final narrow checks and commit the concurrent-mutation correction.
-- Send the same reviewer only the hosted finding and replacement delta, then publish replacement exact-head CI.
-- After CI and targeted review pass, update the pull-request evidence, apply `ai review` once on the replacement, require zero unresolved GitHub conversations, and merge when the hosted review accepts.
+- Publish the trusted-command-processor correction to pull request 39 and freeze its head.
+- Require hosted Linux and focused Windows CI plus one independent targeted resolution review.
+- Dispatch the hosted resolution check without reapplying `ai review`, require accepted Review Gate and zero conversations, merge pull request 39, then close pull request 8 as replaced.
 
 ## Session Log
+
+- 2026-08-17: Hosted Review Gate on pull request 39 found that passing bare `cmd.exe` to `subprocess.run` lets the invoking directory replace the Windows command processor. The replacement regression creates an attacker-controlled current-directory and `PATH` entry and requires the absolute trusted command processor. Verification now calls the native Windows system-directory API and refuses an API failure, an oversized result, or a non-absolute system directory before running a command. POSIX selection is unchanged.
+
+- 2026-08-17: Began from exact Community main `b97b2b44b2411d5541cb610ef67ff3d786ad86dd` in an isolated worktree. The Windows behavior test failed because verification always selected `/bin/sh -lc`. Verification now selects native `cmd.exe /d /s /c` on Windows while retaining the POSIX shell. The public smoke command is portable, and the existing Windows job adds only two focused shell-selection tests and the smoke command. Pull request 39 replaces the 169-commit-old pull request 8 without restoring its obsolete complete-Windows-suite job.
 
 - 2026-08-17: Hosted Review Gate on pull request 38 first found that a non-cooperating process could replace a validated legacy file or retired manifest before its backup rename. Later exact-head reviews proved that later entries were not pinned before earlier replacements, an unchanged accepted file had no backup-backed operation, concurrent preservation was not journaled before the backup move, and a path could change after legacy classification. The replacement opens every adoption-backed regular single-link entry without following links before the first mutation and retains all descriptors through the transaction. Every accepted legacy path uses a backup-backed operation, including a file already equal to the plan, and each move first persists exact authority. Recovery distinguishes an unstarted move, exact prior backup, mismatched concurrent backup, deletion, or restored entry. It journals a mismatched safe backup before no-replace restoration, rolls back earlier operations, and never overwrites another live entry. Seventeen focused race cases, 34 Prime cases, and the 288-test transaction suite pass.
 
