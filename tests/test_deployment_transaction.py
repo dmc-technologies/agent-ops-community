@@ -1493,6 +1493,148 @@ def test_prime_gstack_legacy_adoption_preserves_concurrent_entry_before_backup(
         assert runtime.read_bytes() == runtime_before
         assert skill.read_bytes() == skill_before
     assert not list((home / ".agentops/deployment/manifests").glob("*.json"))
+    assert not list((home / ".agentops/deployment/transactions").glob("*/record.json"))
+
+
+@pytest.mark.parametrize("future_entry", ("skill", "legacy-manifest"))
+@pytest.mark.parametrize("race_kind", ("replacement", "missing"))
+def test_prime_gstack_legacy_adoption_rolls_back_when_future_entry_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    future_entry: str,
+    race_kind: str,
+) -> None:
+    home = tmp_path / "home"
+    plan, runtime, skill, legacy_manifest, legacy_manifest_bytes = _prime_gstack_legacy_plan(home)
+    future_path = skill if future_entry == "skill" else legacy_manifest
+    concurrent_content = f"concurrent future {future_entry}\n".encode()
+    runtime_before = runtime.read_bytes()
+    changed = False
+
+    def replace_after_earlier_operation(
+        _home_fs: object,
+        _record_path: Path,
+        operation: dict[str, object],
+    ) -> None:
+        nonlocal changed
+        if changed or operation["destination"] != runtime.relative_to(home).as_posix():
+            return
+        if race_kind == "replacement":
+            concurrent = future_path.with_name(f"{future_path.name}.concurrent")
+            concurrent.write_bytes(concurrent_content)
+            concurrent.chmod(0o644)
+            os.replace(concurrent, future_path)
+        else:
+            future_path.unlink()
+        changed = True
+
+    monkeypatch.setattr(
+        transaction_module,
+        "_after_operation_mutation",
+        replace_after_earlier_operation,
+    )
+
+    with pytest.raises((OSError, ValueError)):
+        install_provider_plans((plan,))
+
+    assert changed
+    assert runtime.read_bytes() == runtime_before
+    if race_kind == "replacement":
+        assert future_path.read_bytes() == concurrent_content
+    else:
+        assert not future_path.exists()
+    if future_entry == "skill":
+        assert legacy_manifest.read_bytes() == legacy_manifest_bytes
+    assert not list((home / ".agentops/deployment/manifests").glob("*.json"))
+    assert not list((home / ".agentops/deployment/transactions").glob("*/record.json"))
+
+
+@pytest.mark.parametrize("exit_point", ("journaled-backup", "restored-destination"))
+@pytest.mark.parametrize("race_kind", ("replacement", "missing"))
+def test_prime_gstack_concurrent_entry_recovery_restores_live_path_after_process_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    exit_point: str,
+    race_kind: str,
+) -> None:
+    home = tmp_path / "home"
+    plan, runtime, skill, legacy_manifest, legacy_manifest_bytes = _prime_gstack_legacy_plan(home)
+    concurrent_content = b"concurrent runtime before recovery\n"
+    runtime_relative = runtime.relative_to(home).as_posix()
+
+    def replace_before_backup(
+        _home_fs: object,
+        _record_path: Path,
+        operation: dict[str, object],
+    ) -> None:
+        if operation["destination"] != runtime_relative:
+            return
+        if race_kind == "replacement":
+            concurrent = runtime.with_name(f"{runtime.name}.concurrent")
+            concurrent.write_bytes(concurrent_content)
+            concurrent.chmod(0o755)
+            os.replace(concurrent, runtime)
+        else:
+            runtime.unlink()
+
+    original_rollback = transaction_module._rollback_record
+
+    def exit_after_journal(*_args: object) -> None:
+        if exit_point == "journaled-backup":
+            os._exit(84)
+
+    def exit_after_concurrent_retention(
+        home_fs: object,
+        record: dict[str, object],
+        record_path: Path,
+        **kwargs: object,
+    ) -> None:
+        if (
+            exit_point == "restored-destination"
+            and record.get("prime_gstack_concurrent_mutation") is not None
+        ):
+            os._exit(84)
+        original_rollback(home_fs, record, record_path, **kwargs)
+
+    monkeypatch.setattr(transaction_module, "_before_operation_mutation", replace_before_backup)
+    monkeypatch.setattr(
+        transaction_module,
+        "_after_prime_gstack_concurrent_journal",
+        exit_after_journal,
+    )
+    monkeypatch.setattr(transaction_module, "_rollback_record", exit_after_concurrent_retention)
+    process = multiprocessing.get_context("fork").Process(
+        target=lambda: install_provider_plans((plan,))
+    )
+    process.start()
+    process.join(timeout=10)
+    assert process.exitcode == 84
+
+    record_path = next((home / ".agentops/deployment/transactions").glob("*/record.json"))
+    monkeypatch.setattr(transaction_module, "_rollback_record", original_rollback)
+    monkeypatch.setattr(transaction_module, "_before_operation_mutation", lambda *_args: None)
+    monkeypatch.setattr(
+        transaction_module,
+        "_after_prime_gstack_concurrent_journal",
+        lambda *_args: None,
+    )
+
+    recover_transaction(record_path)
+
+    if race_kind == "replacement":
+        assert runtime.read_bytes() == concurrent_content
+    else:
+        assert not runtime.exists()
+    assert skill.read_bytes() == b"legacy skill\n"
+    assert legacy_manifest.read_bytes() == legacy_manifest_bytes
+    assert not list((home / ".agentops/deployment/manifests").glob("*.json"))
+
+    recover_transaction(record_path)
+
+    if race_kind == "replacement":
+        assert runtime.read_bytes() == concurrent_content
+    else:
+        assert not runtime.exists()
 
 
 def test_prime_gstack_legacy_adoption_recovery_restores_exact_prestate(

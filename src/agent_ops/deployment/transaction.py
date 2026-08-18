@@ -46,7 +46,8 @@ __all__ = (
 )
 
 _SCHEMA_VERSION = 1
-_TRANSACTION_SCHEMA_VERSION = 9
+_TRANSACTION_SCHEMA_VERSION = 10
+_PRIME_GSTACK_ADOPTION_SCHEMA_VERSION = 9
 _RUNTIME_CACHE_PROVENANCE_SCHEMA_VERSION = 7
 _FINITE_RUNTIME_CACHE_MATRIX_SCHEMA_VERSION = 8
 _LEGACY_TRANSACTION_SCHEMA_VERSION = 3
@@ -92,21 +93,9 @@ class UnsupportedPlatformError(RuntimeError):
 class _PrimeGstackConcurrentMutation(ValueError):
     """A legacy entry changed after adoption validation."""
 
-    def __init__(
-        self,
-        destination: Path,
-        *,
-        concurrent_fingerprint: str,
-        concurrent_mode: int,
-        prior_content: bytes,
-        prior_mode: int,
-    ) -> None:
+    def __init__(self, destination: Path) -> None:
         super().__init__(f"Prime gstack legacy file changed during mutation: {destination}")
         self.destination = destination
-        self.concurrent_fingerprint = concurrent_fingerprint
-        self.concurrent_mode = concurrent_mode
-        self.prior_content = prior_content
-        self.prior_mode = prior_mode
 
 
 def _require_supported_platform() -> None:
@@ -162,6 +151,14 @@ def _after_runtime_cache_backup_move(
     _operation: dict[str, Any],
 ) -> None:
     """Internal fault-injection boundary before cache backup authorization."""
+
+
+def _after_prime_gstack_concurrent_journal(
+    _home_fs: _HomeFS,
+    _record_path: Path,
+    _record: dict[str, Any],
+) -> None:
+    """Internal fault-injection boundary after concurrent-entry journaling."""
 
 
 def _after_operation_mutation(
@@ -1833,12 +1830,39 @@ def _verify_prior_prestate(
             raise IncompleteRollbackError(f"prior owned directory changed: {path}")
 
 
+def _prior_data_without_prime_concurrent(
+    prior_data: dict[str, Any] | None,
+    record: dict[str, Any],
+) -> dict[str, Any] | None:
+    concurrent = _prime_gstack_concurrent_mutation(record)
+    if prior_data is None or concurrent is None:
+        return prior_data
+    destination = concurrent["destination"]
+    return {
+        "files": [item for item in prior_data["files"] if item["path"] != destination],
+        "directories": list(prior_data["directories"]),
+    }
+
+
+def _verify_prime_gstack_concurrent_restored(
+    home_fs: _HomeFS,
+    record: dict[str, Any],
+) -> None:
+    concurrent = _prime_gstack_concurrent_mutation(record)
+    if concurrent is not None and not _prime_gstack_concurrent_is_restored(home_fs, record):
+        raise IncompleteRollbackError(
+            f"Prime gstack concurrent entry is not restored: {concurrent['destination']}"
+        )
+
+
 def _verify_completed_rollback(
     home_fs: _HomeFS,
     record: dict[str, Any],
     prior_data: dict[str, Any] | None,
     prior_manifest: bytes | None,
 ) -> None:
+    prior_data = _prior_data_without_prime_concurrent(prior_data, record)
+    _verify_prime_gstack_concurrent_restored(home_fs, record)
     manifest_path = Path(record["manifest_path"])
     legacy = record.get("legacy_link_transition")
     legacy_destination = Path(legacy["destination"]) if legacy is not None else None
@@ -2373,6 +2397,7 @@ def _install_provider_plan_groups(
             }
             if prime_adoption_record is not None:
                 record["prime_gstack_legacy_adoption"] = prime_adoption_record
+                record["prime_gstack_concurrent_mutation"] = None
             prime_adoption_paths = (
                 {
                     Path(item["path"])
@@ -2382,7 +2407,32 @@ def _install_provider_plan_groups(
                 if prime_adoption_record is not None
                 else set()
             )
-            home_fs.write_file(record_path, _record_bytes(record), 0o600)
+            prime_adoption_pins: dict[Path, _PinnedPrimeGstackLegacyFile] = {}
+            try:
+                for operation in operations:
+                    destination = Path(operation["destination"])
+                    if operation["backup"] is None or destination not in prime_adoption_paths:
+                        continue
+                    prime_adoption_pins[destination] = _PinnedPrimeGstackLegacyFile(
+                        home_fs,
+                        destination,
+                        operation,
+                    )
+            except BaseException:
+                for pinned in prime_adoption_pins.values():
+                    pinned.close()
+                for directory in directory_records:
+                    evidence = directory["prestate_evidence"]
+                    if evidence is not None and home_fs.exists(Path(evidence)):
+                        home_fs.unlink(Path(evidence))
+                _prune_transaction_directories(home_fs, transaction, record)
+                raise
+            try:
+                home_fs.write_file(record_path, _record_bytes(record), 0o600)
+            except BaseException:
+                for pinned in prime_adoption_pins.values():
+                    pinned.close()
+                raise
             try:
                 for directory in manifest.directories:
                     if not home_fs.exists(directory.path):
@@ -2418,11 +2468,7 @@ def _install_provider_plan_groups(
                         if operation["kind"] == _RUNTIME_CACHE_REMOVAL
                         else None
                     )
-                    pinned_prime_legacy = (
-                        _PinnedPrimeGstackLegacyFile(home_fs, destination, operation)
-                        if backup is not None and destination in prime_adoption_paths
-                        else None
-                    )
+                    pinned_prime_legacy = prime_adoption_pins.get(destination)
                     try:
                         _before_operation_mutation(home_fs, record_path, operation)
                         if backup is not None:
@@ -2440,6 +2486,9 @@ def _install_provider_plan_groups(
                                     destination,
                                     backup,
                                     pinned_prime_legacy,
+                                    record,
+                                    record_path,
+                                    operation,
                                 )
                             else:
                                 home_fs.replace(destination, backup)
@@ -2453,8 +2502,6 @@ def _install_provider_plan_groups(
                     finally:
                         if pinned_cache is not None:
                             pinned_cache.close()
-                        if pinned_prime_legacy is not None:
-                            pinned_prime_legacy.close()
                     if operation["kind"] == "installed":
                         staged = Path(operation["staged"])
                         try:
@@ -2565,21 +2612,6 @@ def _install_provider_plan_groups(
             except BaseException as install_error:
                 if record.get("state") == "indeterminate":
                     raise
-                if isinstance(install_error, _PrimeGstackConcurrentMutation):
-                    try:
-                        _rollback_prime_gstack_concurrent_mutation(
-                            home_fs,
-                            record,
-                            record_path,
-                            install_error,
-                        )
-                    except BaseException as rollback_error:
-                        _TRANSACTION_PATHS[transaction_id] = target.home / record_path
-                        raise IncompleteRollbackError(
-                            f"installation failed: {install_error}; rollback incomplete; "
-                            f"evidence retained at {target.home / record_path}"
-                        ) from rollback_error
-                    raise
                 try:
                     _rollback_record(home_fs, record, record_path)
                 except BaseException as rollback_error:
@@ -2595,6 +2627,9 @@ def _install_provider_plan_groups(
                         f"evidence retained at {target.home / record_path}"
                     ) from rollback_error
                 raise
+            finally:
+                for pinned in prime_adoption_pins.values():
+                    pinned.close()
         manifests.append(manifest)
 
 
@@ -2799,6 +2834,7 @@ def _decode_record(
             6,
             _RUNTIME_CACHE_PROVENANCE_SCHEMA_VERSION,
             _FINITE_RUNTIME_CACHE_MATRIX_SCHEMA_VERSION,
+            _PRIME_GSTACK_ADOPTION_SCHEMA_VERSION,
             _TRANSACTION_SCHEMA_VERSION,
         }
         or record.get("state") not in {"prepared", "committed", "indeterminate", "rolled-back"}
@@ -2820,8 +2856,10 @@ def _decode_record(
     }
     if record["schema_version"] >= 4:
         record_keys.add("legacy_link_transition")
-    if record["schema_version"] >= 9:
+    if record["schema_version"] >= _PRIME_GSTACK_ADOPTION_SCHEMA_VERSION:
         record_keys.add("prime_gstack_legacy_adoption")
+    if record["schema_version"] >= _TRANSACTION_SCHEMA_VERSION:
+        record_keys.add("prime_gstack_concurrent_mutation")
     if record["schema_version"] >= _OPERATION_CURSOR_SCHEMA_VERSION:
         record_keys.update({"operation_cursor", "operation_phase"})
     _require_exact_keys(record, record_keys, label="transaction record")
@@ -3065,6 +3103,49 @@ def _decode_record(
                     raise ValueError("invalid runtime cache removal source")
             elif _runtime_python_source_for_cache(destination) != runtime_source:
                 raise ValueError("invalid runtime cache removal source")
+    concurrent = record.get("prime_gstack_concurrent_mutation")
+    if concurrent is not None:
+        if not isinstance(concurrent, dict) or prime_adoption_prior is None:
+            raise ValueError("invalid Prime gstack concurrent mutation")
+        _require_exact_keys(
+            concurrent,
+            {"operation_index", "destination", "kind", "fingerprint", "mode"},
+            label="Prime gstack concurrent mutation",
+        )
+        concurrent_index = concurrent["operation_index"]
+        concurrent_destination = _canonical_relative_text(
+            concurrent["destination"],
+            label="Prime gstack concurrent destination",
+        )
+        if (
+            type(concurrent_index) is not int
+            or concurrent_index < 0
+            or concurrent_index >= len(operations)
+            or operations[concurrent_index]["index"] != concurrent_index
+            or Path(operations[concurrent_index]["destination"]) != concurrent_destination
+            or operations[concurrent_index]["backup"] is None
+            or not operations[concurrent_index]["prior_exists"]
+            or type(concurrent["kind"]) is not str
+            or concurrent["kind"] not in {"regular", "missing"}
+            or record["state"] in {"committed", "indeterminate"}
+        ):
+            raise ValueError("invalid Prime gstack concurrent mutation binding")
+        if concurrent["kind"] == "regular":
+            if (
+                type(concurrent["fingerprint"]) is not str
+                or len(concurrent["fingerprint"]) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in concurrent["fingerprint"]
+                )
+                or not _valid_file_mode(concurrent["mode"])
+            ):
+                raise ValueError("invalid Prime gstack concurrent regular file")
+        elif concurrent["fingerprint"] is not None or concurrent["mode"] is not None:
+            raise ValueError("invalid Prime gstack concurrent deletion")
+        prime_prior_paths = {Path(item["path"]) for item in prime_adoption_prior["files"]}
+        if concurrent_destination not in prime_prior_paths:
+            raise ValueError("Prime gstack concurrent mutation is outside legacy ownership")
     manifest_files = {
         Path(item["path"]): (item["fingerprint"], item["mode"])
         for item in record["manifest"]["files"]
@@ -3257,6 +3338,13 @@ def _operation_proven_unstarted(
     record: dict[str, Any],
     operation: dict[str, Any],
 ) -> bool:
+    concurrent = _prime_gstack_concurrent_mutation(record)
+    if (
+        concurrent is not None
+        and _prime_gstack_concurrent_operation(record, operation)
+        and _prime_gstack_concurrent_is_restored(home_fs, record)
+    ):
+        return True
     if (
         record["schema_version"] >= _OPERATION_CURSOR_SCHEMA_VERSION
         and operation["backup"] is not None
@@ -3791,6 +3879,8 @@ def _rollback_record(
             record.get("prime_gstack_legacy_adoption"),
             manifest=candidate_manifest,
         )
+    _restore_prime_gstack_concurrent_before_evidence(home_fs, record)
+    prior_data = _prior_data_without_prime_concurrent(prior_data, record)
     expected_manifest = base64.b64decode(record["manifest_content"], validate=True)
     legacy = record.get("legacy_link_transition")
     legacy_destination = Path(legacy["destination"]) if legacy is not None else None
@@ -3827,6 +3917,9 @@ def _rollback_record(
         destination = Path(operation["destination"])
         backup = Path(operation["backup"]) if operation["backup"] else None
         kind = operation["kind"]
+        if _prime_gstack_concurrent_operation(record, operation):
+            _verify_prime_gstack_concurrent_restored(home_fs, record)
+            continue
         if kind == "installed" and home_fs.exists(destination):
             if (
                 legacy_destination is not None
@@ -3931,6 +4024,9 @@ def _rollback_record(
         for operation in reversed(record["operations"]):
             destination = Path(operation["destination"])
             backup = Path(operation["backup"]) if operation["backup"] else None
+            if _prime_gstack_concurrent_operation(record, operation):
+                _verify_prime_gstack_concurrent_restored(home_fs, record)
+                continue
             if operation["kind"] == _RUNTIME_CACHE_REMOVAL and backup is not None:
                 if not home_fs.exists(destination):
                     home_fs.publish_new(backup, destination)
@@ -4201,6 +4297,7 @@ def recover_transaction(path: Path) -> DeploymentManifest:
                 record,
                 relative,
             )
+        _restore_prime_gstack_concurrent_before_evidence(home_fs, record)
         _restore_unauthorized_runtime_cache_before_evidence(home_fs, record)
         _validate_transaction_evidence(home_fs, record, relative)
         if (
@@ -4682,7 +4779,7 @@ class _PinnedPrimeGstackLegacyFile:
             )
         try:
             os.set_inheritable(self.descriptor, False)
-            observed, self.content = self._verified_descriptor()
+            observed = self._verified_descriptor()
             self.identity = observed.st_dev, observed.st_ino
             current = home_fs.stat(path)
             if (current.st_dev, current.st_ino) != self.identity:
@@ -4691,7 +4788,7 @@ class _PinnedPrimeGstackLegacyFile:
             os.close(self.descriptor)
             raise
 
-    def _verified_descriptor(self) -> tuple[os.stat_result, bytes]:
+    def _verified_descriptor(self) -> os.stat_result:
         observed = os.fstat(self.descriptor)
         content = _read_status_descriptor(self.descriptor)
         if (
@@ -4702,7 +4799,7 @@ class _PinnedPrimeGstackLegacyFile:
             or _fingerprint(content) != self.fingerprint
         ):
             raise ValueError(f"Prime gstack legacy file changed before mutation: {self.path}")
-        return observed, content
+        return observed
 
     def matches_backup(self, backup: Path) -> bool:
         try:
@@ -4732,16 +4829,31 @@ def _retain_prime_gstack_legacy_file(
     destination: Path,
     backup: Path,
     pinned: _PinnedPrimeGstackLegacyFile,
+    record: dict[str, Any],
+    record_path: Path,
+    operation: dict[str, Any],
 ) -> None:
-    """Move only the retained legacy entry; restore a concurrent replacement."""
-    home_fs.replace(destination, backup)
+    """Move only retained legacy authority; journal and restore a raced entry."""
+    try:
+        home_fs.replace(destination, backup)
+    except FileNotFoundError:
+        if home_fs.exists(destination) or home_fs.exists(backup):
+            raise
+        record["prime_gstack_concurrent_mutation"] = {
+            "operation_index": operation["index"],
+            "destination": destination.as_posix(),
+            "kind": "missing",
+            "fingerprint": None,
+            "mode": None,
+        }
+        home_fs.write_atomic(record_path, _record_bytes(record), 0o600)
+        _after_prime_gstack_concurrent_journal(home_fs, record_path, record)
+        raise _PrimeGstackConcurrentMutation(destination) from None
     if pinned.matches_backup(backup):
         return
-    if not home_fs.exists(destination):
-        home_fs.move_new(backup, destination)
     try:
-        concurrent_stat = home_fs.stat(destination)
-        concurrent_content = home_fs.read_file(destination)
+        concurrent_stat = home_fs.stat(backup)
+        concurrent_content = home_fs.read_file(backup)
     except OSError as exc:
         raise IncompleteRollbackError(
             f"Prime gstack concurrent entry could not be retained: {destination}"
@@ -4755,99 +4867,109 @@ def _retain_prime_gstack_legacy_file(
         raise IncompleteRollbackError(
             f"Prime gstack concurrent entry requires manual recovery: {destination}"
         )
-    raise _PrimeGstackConcurrentMutation(
-        destination,
-        concurrent_fingerprint=_fingerprint(concurrent_content),
-        concurrent_mode=concurrent_mode,
-        prior_content=pinned.content,
-        prior_mode=pinned.mode,
-    )
+    record["prime_gstack_concurrent_mutation"] = {
+        "operation_index": operation["index"],
+        "destination": destination.as_posix(),
+        "kind": "regular",
+        "fingerprint": _fingerprint(concurrent_content),
+        "mode": concurrent_mode,
+    }
+    home_fs.write_atomic(record_path, _record_bytes(record), 0o600)
+    _after_prime_gstack_concurrent_journal(home_fs, record_path, record)
+    _restore_prime_gstack_concurrent_before_evidence(home_fs, record)
+    raise _PrimeGstackConcurrentMutation(destination)
 
 
-def _rollback_prime_gstack_concurrent_mutation(
+def _prime_gstack_concurrent_mutation(record: dict[str, Any]) -> dict[str, Any] | None:
+    value = record.get("prime_gstack_concurrent_mutation")
+    return value if isinstance(value, dict) else None
+
+
+def _prime_gstack_concurrent_operation(
+    record: dict[str, Any],
+    operation: dict[str, Any],
+) -> bool:
+    concurrent = _prime_gstack_concurrent_mutation(record)
+    return concurrent is not None and concurrent["operation_index"] == operation["index"]
+
+
+def _prime_gstack_concurrent_file_matches(
+    home_fs: _HomeFS,
+    path: Path,
+    concurrent: dict[str, Any],
+) -> bool:
+    if concurrent["kind"] != "regular":
+        return False
+    try:
+        observed = home_fs.stat(path)
+        return (
+            stat.S_ISREG(observed.st_mode)
+            and observed.st_nlink == 1
+            and _file_matches(
+                home_fs,
+                path,
+                concurrent["fingerprint"],
+                concurrent["mode"],
+            )
+        )
+    except OSError:
+        return False
+
+
+def _prime_gstack_concurrent_is_restored(
     home_fs: _HomeFS,
     record: dict[str, Any],
-    record_path: Path,
-    error: _PrimeGstackConcurrentMutation,
+) -> bool:
+    concurrent = _prime_gstack_concurrent_mutation(record)
+    if concurrent is None:
+        return True
+    operation = record["operations"][concurrent["operation_index"]]
+    destination = Path(concurrent["destination"])
+    backup = Path(operation["backup"])
+    if concurrent["kind"] == "missing":
+        return not home_fs.exists(destination) and not home_fs.exists(backup)
+    return _prime_gstack_concurrent_file_matches(
+        home_fs,
+        destination,
+        concurrent,
+    ) and not home_fs.exists(backup)
+
+
+def _restore_prime_gstack_concurrent_before_evidence(
+    home_fs: _HomeFS,
+    record: dict[str, Any],
 ) -> None:
-    """Roll back earlier operations while preserving the raced entry."""
-    destination = error.destination
-    quarantine = record_path.parent / "prime-gstack-concurrent.entry"
-    home_fs.verify_lock_identity()
-    if home_fs.exists(quarantine) or not _file_matches(
+    """Restore journaled concurrent content before rollback classification."""
+    concurrent = _prime_gstack_concurrent_mutation(record)
+    if concurrent is None:
+        return
+    operation = record["operations"][concurrent["operation_index"]]
+    destination = Path(concurrent["destination"])
+    backup = Path(operation["backup"])
+    if concurrent["kind"] == "missing":
+        if home_fs.exists(destination) or home_fs.exists(backup):
+            raise IncompleteRollbackError(
+                f"Prime gstack concurrent deletion recovery is ambiguous: {destination}"
+            )
+        return
+    destination_matches = _prime_gstack_concurrent_file_matches(
         home_fs,
         destination,
-        error.concurrent_fingerprint,
-        error.concurrent_mode,
-    ):
-        raise IncompleteRollbackError(
-            f"Prime gstack concurrent entry changed before rollback: {destination}"
-        )
-    home_fs.move_new(destination, quarantine)
-    if not _file_matches(
-        home_fs,
-        quarantine,
-        error.concurrent_fingerprint,
-        error.concurrent_mode,
-    ):
-        if not home_fs.exists(destination):
-            home_fs.move_new(quarantine, destination)
-        raise IncompleteRollbackError(
-            f"Prime gstack concurrent entry changed during retention: {destination}"
-        )
-    home_fs.write_file(destination, error.prior_content, error.prior_mode)
-    if not _file_matches(
-        home_fs,
-        destination,
-        _fingerprint(error.prior_content),
-        error.prior_mode,
-    ):
-        raise IncompleteRollbackError(
-            f"Prime gstack prior entry could not be reconstructed: {destination}"
-        )
-    restored_prior = _PinnedPrimeGstackLegacyFile(
-        home_fs,
-        destination,
-        {
-            "prior_fingerprint": _fingerprint(error.prior_content),
-            "prior_mode": error.prior_mode,
-        },
+        concurrent,
     )
-    rollback_entry = record_path.parent / "prime-gstack-rollback.entry"
-    try:
-        _rollback_record(home_fs, record, record_path, retain_completed=True)
-        if home_fs.exists(rollback_entry):
-            raise IncompleteRollbackError(
-                f"Prime gstack rollback retention path already exists: {rollback_entry}"
-            )
-        home_fs.replace(destination, rollback_entry)
-        if not restored_prior.matches_backup(rollback_entry):
-            if not home_fs.exists(destination):
-                home_fs.move_new(rollback_entry, destination)
-            raise IncompleteRollbackError(
-                f"Prime gstack rollback destination changed: {destination}"
-            )
-        try:
-            home_fs.move_new(quarantine, destination)
-        except FileExistsError as exc:
-            raise IncompleteRollbackError(
-                f"Prime gstack concurrent destination appeared: {destination}"
-            ) from exc
-        if not _file_matches(
+    backup_matches = _prime_gstack_concurrent_file_matches(home_fs, backup, concurrent)
+    if backup_matches and not home_fs.exists(destination):
+        home_fs.move_new(backup, destination)
+        destination_matches = _prime_gstack_concurrent_file_matches(
             home_fs,
             destination,
-            error.concurrent_fingerprint,
-            error.concurrent_mode,
-        ):
-            raise IncompleteRollbackError(
-                f"Prime gstack concurrent entry changed during restoration: {destination}"
-            )
-        home_fs.unlink(rollback_entry)
-    finally:
-        restored_prior.close()
-    home_fs.unlink(record_path)
-    _prune_transaction_directories(home_fs, record_path.parent, record)
-    home_fs.verify_lock_identity()
+            concurrent,
+        )
+        backup_matches = False
+    if not destination_matches or backup_matches or home_fs.exists(backup):
+        raise IncompleteRollbackError(
+            f"Prime gstack concurrent entry recovery is ambiguous: {destination}"
+        )
 
 
 class _PinnedRuntimeCache:
