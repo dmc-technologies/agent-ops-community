@@ -246,10 +246,20 @@ class WindowsPathPins:
 
 
 class WindowsTargetLock:
-    def __init__(self, home: Path, *, shared: bool = False, create: bool = True) -> None:
+    def __init__(
+        self,
+        home: Path,
+        *,
+        shared: bool = False,
+        create: bool = True,
+        lock_name: str = ".agentops-deployment.lock",
+    ) -> None:
         self.home = _normal_absolute(home)
         self.shared = shared
         self.create = create
+        if not lock_name or Path(lock_name).name != lock_name:
+            raise ValueError("Windows lock name must be one path component")
+        self.lock_name = lock_name
         self._stack = ExitStack()
         self._overlapped = _Overlapped()
         self._locked = False
@@ -257,7 +267,7 @@ class WindowsTargetLock:
     def __enter__(self) -> WindowsTargetLock:
         home_pins = self._stack.enter_context(WindowsPathPins(self.home, create=self.create))
         self.home_identity = home_pins.identities[-1]
-        lock_path = self.home / ".agentops-deployment.lock"
+        lock_path = self.home / self.lock_name
         lock = self._stack.enter_context(
             _open(
                 lock_path,
@@ -312,9 +322,19 @@ class WindowsTargetLock:
             yield parent
 
     def exists(self, relative: Path) -> bool:
+        relative = safe_relative(relative)
         try:
-            with self.open_entry(relative):
-                return True
+            with (
+                self.pin_parent(relative),
+                _open(
+                    self.home / relative,
+                    access=FILE_READ_ATTRIBUTES,
+                    directory=True,
+                ) as handle,
+            ):
+                if handle.identity().is_reparse_point:
+                    raise ValueError(f"reparse-point managed entry is not allowed: {relative}")
+            return True
         except FileNotFoundError:
             return False
 
@@ -451,6 +471,38 @@ class WindowsTargetLock:
                     return False
                 raise
             return True
+
+    def move_directory(self, source: Path, destination: Path) -> None:
+        source = safe_relative(source)
+        destination = safe_relative(destination)
+        with ExitStack() as pins:
+            pins.enter_context(self.pin_parent(source))
+            pins.enter_context(self.pin_parent(destination, create=True))
+            source_identity = self.identity(source, directory=True)
+            if self.exists(destination):
+                raise FileExistsError(destination)
+            os.replace(self.home / source, self.home / destination)
+            if self.identity(destination, directory=True) != source_identity:
+                raise OSError(f"directory move identity changed: {destination}")
+
+    def remove_tree(self, relative: Path) -> None:
+        relative = safe_relative(relative)
+        if not self.exists(relative):
+            return
+        entries = self.scan(relative)
+        for child, kind in sorted(
+            entries.items(),
+            key=lambda item: len(item[0].parts),
+            reverse=True,
+        ):
+            path = relative / child
+            if kind == "directory":
+                if not self.remove_empty_dir(path):
+                    raise OSError(f"managed directory is not empty: {path}")
+            else:
+                self.unlink(path)
+        if not self.remove_empty_dir(relative):
+            raise OSError(f"managed directory is not empty: {relative}")
 
     def scan(self, relative: Path) -> dict[Path, str]:
         relative = safe_relative(relative)

@@ -29,6 +29,14 @@ try:
 except ImportError:  # pragma: no cover - non-POSIX hosts fail closed
     fcntl = None  # type: ignore[assignment]
 
+_WINDOWS_SUPPORTED = os.name == "nt"
+
+
+def _windows_source_store_backend() -> Any:
+    from agent_ops.deployment import windows_source_store
+
+    return windows_source_store
+
 
 _SOURCE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 _COMMIT = re.compile(r"[0-9a-fA-F]{40}\Z")
@@ -178,8 +186,7 @@ def _validate_ref(ref: str) -> None:
     )
     if not invalid:
         invalid = any(
-            not part or part.startswith(".") or part.endswith(".lock")
-            for part in ref.split("/")
+            not part or part.startswith(".") or part.endswith(".lock") for part in ref.split("/")
         )
     if invalid:
         raise ValueError("source ref must be a fully qualified Git ref")
@@ -196,11 +203,7 @@ def _normalize_source_url(url: str) -> str:
         raise ValueError("source URL must be a supported safe Git location")
     if url.startswith("-") or _REMOTE_HELPER.match(url):
         raise ValueError("source URL must be a supported safe Git location")
-    if (
-        "://" not in url
-        and not _DRIVE_PATH.match(url)
-        and _SCP_URL.fullmatch(url)
-    ):
+    if "://" not in url and not _DRIVE_PATH.match(url) and _SCP_URL.fullmatch(url):
         if url.rsplit(":", 1)[1].startswith("-"):
             raise ValueError("source URL contains an option-like remote path")
         return url
@@ -313,9 +316,7 @@ def _require_owner_only_directory(path: Path, label: str, *, create: bool = Fals
 def _ensure_store_root(state_root: Path) -> Path:
     _require_owner_only_directory(state_root, "source store root", create=True)
     sources = state_root / "sources"
-    _require_owner_only_directory(
-        sources, "source store sources directory", create=True
-    )
+    _require_owner_only_directory(sources, "source store sources directory", create=True)
     return sources
 
 
@@ -382,8 +383,7 @@ def _read_json_at(
 
 def _canonical_json(value: dict[str, str]) -> bytes:
     return (
-        json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
-        + "\n"
+        json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n"
     ).encode()
 
 
@@ -455,9 +455,7 @@ def _fsync_tree(root: Path) -> None:
                 finally:
                     os.close(descriptor)
         child_directories[:] = [
-            name
-            for name in child_directories
-            if not (current_path / name).is_symlink()
+            name for name in child_directories if not (current_path / name).is_symlink()
         ]
     for path in reversed(directories):
         descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -480,9 +478,7 @@ class _HeadEntry:
 
 
 def _head_entries(root: Path, *, timeout: float) -> dict[str, _HeadEntry]:
-    listing = _run_git(
-        ("ls-tree", "-rz", "--full-tree", "HEAD"), cwd=root, timeout=timeout
-    ).stdout
+    listing = _run_git(("ls-tree", "-rz", "--full-tree", "HEAD"), cwd=root, timeout=timeout).stdout
     result: dict[str, _HeadEntry] = {}
     for record in listing.split("\0"):
         if not record:
@@ -527,9 +523,7 @@ def _worktree_entries(
                 dir_fd=directory_fd,
             )
             try:
-                children, child_directories = _worktree_entries(
-                    child_fd, prefix=path
-                )
+                children, child_directories = _worktree_entries(child_fd, prefix=path)
             finally:
                 os.close(child_fd)
             entries.update(children)
@@ -549,13 +543,13 @@ def _worktree_entries(
     return entries, directories
 
 
-def _verify_exact_checkout(
-    root: Path, commit: str, *, timeout: float
-) -> dict[str, _HeadEntry]:
+def _verify_exact_checkout(root: Path, commit: str, *, timeout: float) -> dict[str, _HeadEntry]:
     _require_directory(root / ".git", "snapshot Git directory")
-    observed = _run_git(
-        ("rev-parse", "--verify", "HEAD^{commit}"), cwd=root, timeout=timeout
-    ).stdout.strip().lower()
+    observed = (
+        _run_git(("rev-parse", "--verify", "HEAD^{commit}"), cwd=root, timeout=timeout)
+        .stdout.strip()
+        .lower()
+    )
     if observed != commit:
         raise RuntimeError("snapshot HEAD does not match requested commit")
     symbolic = _run_git(
@@ -587,8 +581,7 @@ def _verify_exact_checkout(
     if set(actual) != set(expected):
         raise RuntimeError("snapshot worktree paths do not exactly match HEAD")
     if any(
-        not any(path.startswith(f"{directory}/") for path in expected)
-        for directory in directories
+        not any(path.startswith(f"{directory}/") for path in expected) for directory in directories
     ):
         raise RuntimeError("snapshot worktree contains an untracked directory")
     algorithm = _run_git(
@@ -628,6 +621,13 @@ class SourceStore:
         *,
         rewrite: RewriteAcceptance | None = None,
     ) -> SourceSnapshot:
+        if _WINDOWS_SUPPORTED:
+            return _windows_source_store_backend().fetch(
+                self,
+                source,
+                ref,
+                rewrite=rewrite,
+            )
         _validate_source_id(source.id)
         _validate_ref(source.stable_ref)
         _validate_ref(ref)
@@ -671,11 +671,11 @@ class SourceStore:
                 return snapshot
             finally:
                 with suppress(_GitFailure):
-                    self._git(
-                        ("--git-dir", str(mirror), "update-ref", "-d", candidate)
-                    )
+                    self._git(("--git-dir", str(mirror), "update-ref", "-d", candidate))
 
     def snapshot(self, source_id: str, commit: str) -> SourceSnapshot:
+        if _WINDOWS_SUPPORTED:
+            return _windows_source_store_backend().snapshot(self, source_id, commit)
         _validate_source_id(source_id)
         normalized = _normalize_commit(commit)
         _require_owner_only_directory(self._state_root, "source store root")
@@ -828,9 +828,7 @@ class SourceStore:
         except _GitFailure as error:
             self._history_error(source, ref, error)
         expected = observed or ("0" * 40)
-        self._git(
-            ("--git-dir", str(mirror), "update-ref", accepted_ref, previous, expected)
-        )
+        self._git(("--git-dir", str(mirror), "update-ref", accepted_ref, previous, expected))
         return previous
 
     def _history_error(self, source: SourceSpec, ref: str, error: Exception) -> None:
@@ -870,9 +868,7 @@ class SourceStore:
         if ref == source.stable_ref:
             raise RuntimeError("stable ref rejected a non-fast-forward rewrite")
         if not (
-            rewrite is not None
-            and rewrite.old_commit == previous
-            and rewrite.new_commit == commit
+            rewrite is not None and rewrite.old_commit == previous and rewrite.new_commit == commit
         ):
             raise RuntimeError(
                 "development ref rewrite acceptance must exactly match the prior and new commits"
@@ -881,14 +877,10 @@ class SourceStore:
     def _ref_path(self, source_root: Path, ref: str) -> tuple[Path, str]:
         return source_root / "refs", f"{hashlib.sha256(ref.encode()).hexdigest()}.json"
 
-    def _read_ref_state(
-        self, source_root: Path, source_id: str, ref: str
-    ) -> str | None:
+    def _read_ref_state(self, source_root: Path, source_id: str, ref: str) -> str | None:
         directory, name = self._ref_path(source_root, ref)
         _require_directory(directory, "source ref state directory", create=True)
-        directory_fd = os.open(
-            directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-        )
+        directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
             try:
                 value = _read_json_at(
@@ -910,9 +902,7 @@ class SourceStore:
             raise RuntimeError("invalid source ref metadata: noncanonical commit")
         return normalized
 
-    def _write_ref_state(
-        self, source_root: Path, source_id: str, ref: str, commit: str
-    ) -> None:
+    def _write_ref_state(self, source_root: Path, source_id: str, ref: str, commit: str) -> None:
         directory, name = self._ref_path(source_root, ref)
         _write_json_atomic(
             directory,
@@ -928,9 +918,7 @@ class SourceStore:
         destination = snapshots / commit
         legacy_root = source_root / "snapshot-metadata"
         if legacy_root.exists() or legacy_root.is_symlink():
-            _require_directory(
-                legacy_root, "legacy snapshot metadata directory"
-            )
+            _require_directory(legacy_root, "legacy snapshot metadata directory")
         legacy = legacy_root / f"{commit}.json"
         if destination.exists() or destination.is_symlink():
             try:
@@ -985,9 +973,7 @@ class SourceStore:
             _remove_owned_tree(staging)
         return self._load_snapshot(source_root, source_id, commit)
 
-    def _load_snapshot(
-        self, source_root: Path, source_id: str, commit: str
-    ) -> SourceSnapshot:
+    def _load_snapshot(self, source_root: Path, source_id: str, commit: str) -> SourceSnapshot:
         root = source_root / "snapshots" / commit
         _require_directory(root, "snapshot directory")
         git_path = root / ".git"
@@ -1090,17 +1076,11 @@ class _PinnedClosure:
         _validate_source_id(snapshot.source_id)
         _validate_ref(snapshot.ref)
         commit = _normalize_commit(snapshot.commit)
-        self._root_fd = os.open(
-            self._root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-        )
+        self._root_fd = os.open(self._root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         self._root_identity = _identity(os.fstat(self._root_fd))
         try:
-            expected = _verify_exact_checkout(
-                self._root, commit, timeout=_DEFAULT_GIT_TIMEOUT
-            )
-            if _identity(os.stat(self._root, follow_symlinks=False)) != (
-                self._root_identity
-            ):
+            expected = _verify_exact_checkout(self._root, commit, timeout=_DEFAULT_GIT_TIMEOUT)
+            if _identity(os.stat(self._root, follow_symlinks=False)) != (self._root_identity):
                 raise RuntimeError("snapshot root changed during verification")
             object_format = _run_git(
                 ("rev-parse", "--show-object-format"),
@@ -1110,9 +1090,7 @@ class _PinnedClosure:
             raw_paths = [str(path) for path in declared]
             if len(raw_paths) != len(set(raw_paths)):
                 raise ValueError("provider data closure contains duplicate paths")
-            entries = [
-                self._open_entry(path, expected, object_format) for path in declared
-            ]
+            entries = [self._open_entry(path, expected, object_format) for path in declared]
         except BaseException:
             self.close()
             raise
@@ -1206,11 +1184,21 @@ def _open_provider_data_closure(
 ) -> _PinnedClosure:
     if not isinstance(declared, tuple):
         raise ValueError("provider data closure must be a tuple of paths")
+    if _WINDOWS_SUPPORTED:
+        return _windows_source_store_backend().open_provider_data_closure(
+            snapshot,
+            declared,
+        )
     return _PinnedClosure(snapshot, declared)
 
 
 def _validate_provider_data_closure(
     snapshot: SourceSnapshot, declared: tuple[Path, ...]
 ) -> tuple[_ClosureEntryInfo, ...]:
+    if _WINDOWS_SUPPORTED:
+        return _windows_source_store_backend().validate_provider_data_closure(
+            snapshot,
+            declared,
+        )
     with _open_provider_data_closure(snapshot, declared) as closure:
         return tuple(entry.info for entry in closure.entries)
