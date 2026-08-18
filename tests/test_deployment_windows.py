@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import json
+import multiprocessing
 import os
+import queue
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,7 +20,12 @@ from agent_ops.deployment.registry import (
     RegistryConfig,
 )
 from agent_ops.deployment.source_store import SourceStore
-from agent_ops.deployment.transaction import audit_provider_plans, install_provider_plans
+from agent_ops.deployment.transaction import (
+    audit_provider_plans,
+    install_provider_plans,
+    recover_transaction,
+    rollback_manifests,
+)
 from agent_ops.registries.models import Framework
 
 
@@ -39,6 +48,13 @@ def _windows_plan(home: Path) -> ProviderPlan:
             ),
         ),
     )
+
+
+def _acquire_native_windows_lock(home: str, messages: object) -> None:
+    from agent_ops.deployment.windows_fs import WindowsTargetLock
+
+    with WindowsTargetLock(Path(home)):
+        messages.put("acquired")
 
 
 def test_public_transaction_api_dispatches_to_native_windows_backend(
@@ -231,3 +247,121 @@ def test_native_windows_first_install_and_identical_refresh_are_complete_and_aud
     assert {item.path: (home / item.path).read_bytes() for item in plan.files} == first_bytes
     assert (home / "AGENTS.md").read_text(encoding="utf-8") == "Use “UTF-8” policy.\n"
     assert audit_provider_plans((plan,)).matches
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows")
+def test_native_windows_refresh_removes_retired_owned_file_and_rolls_back_exactly(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "codex"
+    original = _windows_plan(home)
+    install_provider_plans((original,))
+    neighbor = home / "skills/operator-owned/notes.txt"
+    neighbor.parent.mkdir(parents=True)
+    neighbor.write_text("preserve\n", encoding="utf-8")
+    replacement = ProviderPlan(
+        "fixture",
+        "2" * 40,
+        original.target,
+        tuple(item for item in original.files if item.path.name != "SKILL.md"),
+        removals=(Path("skills/example/SKILL.md"),),
+        audit_roots=(Path("skills/example"),),
+    )
+
+    manifests = install_provider_plans((replacement,))
+
+    assert not (home / "skills/example/SKILL.md").exists()
+    assert neighbor.read_text(encoding="utf-8") == "preserve\n"
+    assert audit_provider_plans((replacement,)).matches
+
+    rollback_manifests(manifests)
+    assert (home / "skills/example/SKILL.md").read_bytes() == original.files[2].content
+    assert neighbor.read_text(encoding="utf-8") == "preserve\n"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows")
+def test_native_windows_recovery_accepts_exact_published_output_after_record_interruption(
+    tmp_path: Path,
+) -> None:
+    from agent_ops.deployment import windows_transaction
+
+    plan = _windows_plan(tmp_path / "codex")
+    manifest = install_provider_plans((plan,))[0]
+    record_path = windows_transaction._PATHS[manifest.transaction_id]
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    record["state"] = "applying"
+    record_path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    recovered = recover_transaction(record_path)
+
+    assert recovered == manifest
+    assert json.loads(record_path.read_text(encoding="utf-8"))["state"] == "committed"
+    assert audit_provider_plans((plan,)).matches
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows")
+def test_native_windows_target_lock_serializes_processes(tmp_path: Path) -> None:
+    from agent_ops.deployment.windows_fs import WindowsTargetLock
+
+    home = tmp_path / "codex"
+    context = multiprocessing.get_context("spawn")
+    messages = context.Queue()
+    with WindowsTargetLock(home):
+        process = context.Process(
+            target=_acquire_native_windows_lock,
+            args=(str(home), messages),
+        )
+        process.start()
+        with pytest.raises(queue.Empty):
+            messages.get(timeout=0.5)
+    assert messages.get(timeout=5) == "acquired"
+    process.join(timeout=5)
+    assert process.exitcode == 0
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows")
+def test_native_windows_install_rejects_junction_in_managed_path(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    home = tmp_path / "codex"
+    home.mkdir()
+    subprocess.run(
+        ("cmd", "/c", "mklink", "/J", str(home / "skills"), str(outside)),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    with pytest.raises(ValueError, match="reparse-point"):
+        install_provider_plans((_windows_plan(home),))
+
+    assert not list(outside.iterdir())
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows")
+def test_native_windows_parent_pin_blocks_concurrent_directory_replacement(
+    tmp_path: Path,
+) -> None:
+    from agent_ops.deployment.windows_fs import WindowsTargetLock
+
+    home = tmp_path / "codex"
+    displaced = tmp_path / "displaced-skills"
+    with (
+        WindowsTargetLock(home) as lock,
+        lock.pin_parent(Path("skills/example/SKILL.md"), create=True),
+    ):
+        attempt = subprocess.run(
+            (
+                sys.executable,
+                "-c",
+                "import os,sys; os.replace(sys.argv[1], sys.argv[2])",
+                str(home / "skills"),
+                str(displaced),
+            ),
+            capture_output=True,
+            text=True,
+        )
+
+        assert attempt.returncode != 0
+        assert (home / "skills").is_dir()
+        assert not displaced.exists()
