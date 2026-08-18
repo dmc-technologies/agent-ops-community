@@ -25,6 +25,7 @@ from agent_ops.deployment import transaction as transaction_module
 from agent_ops.deployment.models import (
     LegacyLinkTransition,
     PlannedFile,
+    PrimeGstackLegacyAdoption,
     ProviderPlan,
     TargetChannelTransition,
     TargetSpec,
@@ -1176,6 +1177,696 @@ def test_public_gstack_provider_may_own_its_reserved_runtime_only(tmp_path: Path
     )
     with pytest.raises(ValueError, match="reserved metadata"):
         install_provider_plans((private,))
+
+
+def _prime_gstack_legacy_plan(
+    home: Path,
+) -> tuple[ProviderPlan, Path, Path, Path, bytes]:
+    source_ref = "74895062fb8a3acbf9f66cd088a83359aaaa56cd"
+    runtime_relative = Path(".agentops/runtime/gstack/bin/gstack-global-discover")
+    skill_relative = Path("skills/agentops-gstack-review/SKILL.md")
+    runtime = home / runtime_relative
+    skill = home / skill_relative
+    runtime.parent.mkdir(parents=True)
+    skill.parent.mkdir(parents=True)
+    runtime.write_bytes(b"legacy executable\n")
+    runtime.chmod(0o755)
+    skill.write_bytes(b"legacy skill\n")
+    skill.chmod(0o644)
+    legacy_manifest = home / ".agentops/gstack-prime-manifest.json"
+    legacy_manifest_bytes = (
+        json.dumps(
+            {
+                "schema_version": 1,
+                "owner": "agent-ops-community:gstack-prime",
+                "upstream_ref": source_ref,
+                "files": {
+                    runtime_relative.as_posix(): hashlib.sha256(runtime.read_bytes()).hexdigest(),
+                    skill_relative.as_posix(): hashlib.sha256(skill.read_bytes()).hexdigest(),
+                },
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode()
+    legacy_manifest.write_bytes(legacy_manifest_bytes)
+    legacy_manifest.chmod(0o644)
+    target = TargetSpec(
+        "public-skills:prime-agent",
+        Framework.PRIME_AGENT,
+        home,
+        "public",
+    )
+    source_revision = "public-skills:" + json.dumps(
+        [
+            {
+                "id": "gstack",
+                "repo": "https://github.com/garrytan/gstack.git",
+                "ref": source_ref,
+                "install": {
+                    "strategy": "prime-gstack",
+                    "source": None,
+                    "destination": ".",
+                },
+            }
+        ],
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    plan = ProviderPlan(
+        "public-skill:gstack",
+        source_revision,
+        target,
+        (
+            PlannedFile(runtime_relative, b"current executable\n", 0o755),
+            PlannedFile(skill_relative, b"current skill\n", 0o644),
+        ),
+        audit_roots=(Path(".agentops/runtime/gstack"), Path("skills")),
+        prime_gstack_legacy_adoption=PrimeGstackLegacyAdoption(
+            target.id,
+            target.channel,
+            source_ref,
+            tuple(sorted((runtime_relative, skill_relative), key=lambda path: path.as_posix())),
+        ),
+    )
+    return plan, runtime, skill, legacy_manifest, legacy_manifest_bytes
+
+
+def test_prime_gstack_legacy_manifest_decoder_rejects_non_gstack_path() -> None:
+    source_ref = "74895062fb8a3acbf9f66cd088a83359aaaa56cd"
+    foreign = Path("skills/foreign/SKILL.md")
+    content = json.dumps(
+        {
+            "schema_version": 1,
+            "owner": "agent-ops-community:gstack-prime",
+            "upstream_ref": source_ref,
+            "files": {foreign.as_posix(): "0" * 64},
+        }
+    ).encode()
+
+    with pytest.raises(ValueError, match="legacy manifest file"):
+        transaction_module._decode_prime_gstack_legacy_manifest(
+            content,
+            source_ref=source_ref,
+            expected_paths=(foreign,),
+        )
+
+
+def test_prime_gstack_legacy_source_binding_requires_exact_install_descriptor() -> None:
+    source_ref = "74895062fb8a3acbf9f66cd088a83359aaaa56cd"
+    revision = "public-skills:" + json.dumps(
+        [
+            {
+                "id": "gstack",
+                "repo": "https://github.com/garrytan/gstack.git",
+                "ref": source_ref,
+                "install": {
+                    "strategy": "prime-gstack",
+                    "source": "skills",
+                    "destination": ".",
+                },
+            }
+        ],
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+    assert not transaction_module._source_revision_binds_prime_gstack_ref(
+        revision,
+        source_ref,
+    )
+
+
+def test_prime_gstack_legacy_source_binding_rejects_foreign_repository() -> None:
+    source_ref = "74895062fb8a3acbf9f66cd088a83359aaaa56cd"
+    revision = "public-skills:" + json.dumps(
+        [
+            {
+                "id": "gstack",
+                "repo": "https://attacker.invalid/not-public-gstack.git",
+                "ref": source_ref,
+                "install": {
+                    "strategy": "prime-gstack",
+                    "source": None,
+                    "destination": ".",
+                },
+            }
+        ],
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+    assert not transaction_module._source_revision_binds_prime_gstack_ref(
+        revision,
+        source_ref,
+    )
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "wrong-schema",
+        "wrong-owner",
+        "wrong-ref",
+        "wrong-plan-ref",
+        "wrong-plan-repository",
+        "extra-path",
+        "missing-path",
+        "modified-file",
+        "missing-file",
+        "wrong-file-mode",
+        "wrong-manifest-mode",
+    ),
+)
+def test_prime_gstack_legacy_adoption_refuses_inexact_evidence_without_replacement(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    home = tmp_path / "home"
+    plan, runtime, skill, legacy_manifest, original_manifest = _prime_gstack_legacy_plan(home)
+    data = json.loads(original_manifest)
+    if case == "wrong-schema":
+        data["schema_version"] = 2
+    elif case == "wrong-owner":
+        data["owner"] = "another-owner"
+    elif case == "wrong-ref":
+        data["upstream_ref"] = "0" * 40
+    elif case == "wrong-plan-ref":
+        plan = ProviderPlan(
+            plan.provider_id,
+            plan.source_revision.replace(
+                "74895062fb8a3acbf9f66cd088a83359aaaa56cd",
+                "0" * 40,
+            ),
+            plan.target,
+            plan.files,
+            audit_roots=plan.audit_roots,
+            prime_gstack_legacy_adoption=plan.prime_gstack_legacy_adoption,
+        )
+    elif case == "wrong-plan-repository":
+        plan = ProviderPlan(
+            plan.provider_id,
+            plan.source_revision.replace(
+                "https://github.com/garrytan/gstack.git",
+                "https://attacker.invalid/not-public-gstack.git",
+            ),
+            plan.target,
+            plan.files,
+            audit_roots=plan.audit_roots,
+            prime_gstack_legacy_adoption=plan.prime_gstack_legacy_adoption,
+        )
+    elif case == "extra-path":
+        data["files"]["skills/agentops-gstack-extra/SKILL.md"] = "0" * 64
+    elif case == "missing-path":
+        del data["files"]["skills/agentops-gstack-review/SKILL.md"]
+    elif case == "modified-file":
+        runtime.write_bytes(b"locally modified\n")
+    elif case == "missing-file":
+        runtime.unlink()
+    elif case == "wrong-file-mode":
+        runtime.chmod(0o744)
+    elif case == "wrong-manifest-mode":
+        legacy_manifest.chmod(0o600)
+    if case in {"wrong-schema", "wrong-owner", "wrong-ref", "extra-path", "missing-path"}:
+        legacy_manifest.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+        legacy_manifest.chmod(0o644)
+    runtime_before = runtime.read_bytes() if runtime.exists() else None
+    runtime_mode = stat.S_IMODE(runtime.stat().st_mode) if runtime.exists() else None
+    skill_before = skill.read_bytes()
+    manifest_before = legacy_manifest.read_bytes()
+    manifest_mode = stat.S_IMODE(legacy_manifest.stat().st_mode)
+
+    with pytest.raises((OSError, ValueError)):
+        install_provider_plans((plan,))
+
+    assert (runtime.read_bytes() if runtime.exists() else None) == runtime_before
+    assert (stat.S_IMODE(runtime.stat().st_mode) if runtime.exists() else None) == runtime_mode
+    assert skill.read_bytes() == skill_before
+    assert legacy_manifest.read_bytes() == manifest_before
+    assert stat.S_IMODE(legacy_manifest.stat().st_mode) == manifest_mode
+    assert not list((home / ".agentops/deployment/manifests").glob("*.json"))
+
+
+def test_prime_gstack_legacy_adoption_rolls_back_exact_prestate_after_late_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    plan, runtime, skill, legacy_manifest, legacy_manifest_bytes = _prime_gstack_legacy_plan(home)
+
+    def fail_before_manifest(*_args: object) -> None:
+        raise OSError("injected late adoption failure")
+
+    monkeypatch.setattr(transaction_module, "_before_manifest_replace", fail_before_manifest)
+
+    with pytest.raises(OSError, match="injected late adoption failure"):
+        install_provider_plans((plan,))
+
+    assert runtime.read_bytes() == b"legacy executable\n"
+    assert stat.S_IMODE(runtime.stat().st_mode) == 0o755
+    assert skill.read_bytes() == b"legacy skill\n"
+    assert stat.S_IMODE(skill.stat().st_mode) == 0o644
+    assert legacy_manifest.read_bytes() == legacy_manifest_bytes
+    assert stat.S_IMODE(legacy_manifest.stat().st_mode) == 0o644
+    assert not list((home / ".agentops/deployment/manifests").glob("*.json"))
+
+
+@pytest.mark.parametrize("raced_entry", ("runtime", "legacy-manifest"))
+@pytest.mark.parametrize("race_kind", ("replacement", "content", "mode"))
+def test_prime_gstack_legacy_adoption_preserves_concurrent_entry_before_backup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    raced_entry: str,
+    race_kind: str,
+) -> None:
+    home = tmp_path / "home"
+    plan, runtime, skill, legacy_manifest, legacy_manifest_bytes = _prime_gstack_legacy_plan(home)
+    raced_path = runtime if raced_entry == "runtime" else legacy_manifest
+    raced_relative = raced_path.relative_to(home)
+    concurrent_content = f"concurrent {raced_entry}\n".encode()
+    runtime_before = runtime.read_bytes()
+    skill_before = skill.read_bytes()
+    original_content = raced_path.read_bytes()
+    original_mode = stat.S_IMODE(raced_path.stat().st_mode)
+    concurrent_mode = (
+        0o700 if raced_entry == "runtime" else 0o600
+    ) if race_kind == "mode" else original_mode
+    expected_content = original_content if race_kind == "mode" else concurrent_content
+    changed = False
+
+    def replace_before_backup(
+        _home_fs: object,
+        _record_path: Path,
+        operation: dict[str, object],
+    ) -> None:
+        nonlocal changed
+        if changed or operation["destination"] != raced_relative.as_posix():
+            return
+        if race_kind == "replacement":
+            concurrent = raced_path.with_name(f"{raced_path.name}.concurrent")
+            concurrent.write_bytes(concurrent_content)
+            concurrent.chmod(original_mode)
+            os.replace(concurrent, raced_path)
+        elif race_kind == "content":
+            raced_path.write_bytes(concurrent_content)
+        else:
+            raced_path.chmod(concurrent_mode)
+        changed = True
+
+    monkeypatch.setattr(
+        transaction_module,
+        "_before_operation_mutation",
+        replace_before_backup,
+    )
+
+    with pytest.raises((OSError, ValueError)):
+        install_provider_plans((plan,))
+
+    assert changed
+    assert raced_path.read_bytes() == expected_content
+    assert stat.S_IMODE(raced_path.stat().st_mode) == concurrent_mode
+    if raced_entry == "runtime":
+        assert skill.read_bytes() == skill_before
+        assert legacy_manifest.read_bytes() == legacy_manifest_bytes
+    else:
+        assert runtime.read_bytes() == runtime_before
+        assert skill.read_bytes() == skill_before
+    assert not list((home / ".agentops/deployment/manifests").glob("*.json"))
+    assert not list((home / ".agentops/deployment/transactions").glob("*/record.json"))
+
+
+@pytest.mark.parametrize("future_entry", ("skill", "legacy-manifest"))
+@pytest.mark.parametrize("race_kind", ("replacement", "missing"))
+def test_prime_gstack_legacy_adoption_rolls_back_when_future_entry_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    future_entry: str,
+    race_kind: str,
+) -> None:
+    home = tmp_path / "home"
+    plan, runtime, skill, legacy_manifest, legacy_manifest_bytes = _prime_gstack_legacy_plan(home)
+    future_path = skill if future_entry == "skill" else legacy_manifest
+    concurrent_content = f"concurrent future {future_entry}\n".encode()
+    runtime_before = runtime.read_bytes()
+    changed = False
+
+    def replace_after_earlier_operation(
+        _home_fs: object,
+        _record_path: Path,
+        operation: dict[str, object],
+    ) -> None:
+        nonlocal changed
+        if changed or operation["destination"] != runtime.relative_to(home).as_posix():
+            return
+        if race_kind == "replacement":
+            concurrent = future_path.with_name(f"{future_path.name}.concurrent")
+            concurrent.write_bytes(concurrent_content)
+            concurrent.chmod(0o644)
+            os.replace(concurrent, future_path)
+        else:
+            future_path.unlink()
+        changed = True
+
+    monkeypatch.setattr(
+        transaction_module,
+        "_after_operation_mutation",
+        replace_after_earlier_operation,
+    )
+
+    with pytest.raises((OSError, ValueError)):
+        install_provider_plans((plan,))
+
+    assert changed
+    assert runtime.read_bytes() == runtime_before
+    if race_kind == "replacement":
+        assert future_path.read_bytes() == concurrent_content
+    else:
+        assert not future_path.exists()
+    if future_entry == "skill":
+        assert legacy_manifest.read_bytes() == legacy_manifest_bytes
+    assert not list((home / ".agentops/deployment/manifests").glob("*.json"))
+    assert not list((home / ".agentops/deployment/transactions").glob("*/record.json"))
+
+
+def test_prime_gstack_legacy_adoption_rolls_back_when_future_unchanged_entry_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    plan, runtime, skill, legacy_manifest, legacy_manifest_bytes = _prime_gstack_legacy_plan(home)
+    plan = ProviderPlan(
+        plan.provider_id,
+        plan.source_revision,
+        plan.target,
+        (plan.files[0], PlannedFile(plan.files[1].path, skill.read_bytes(), 0o644)),
+        audit_roots=plan.audit_roots,
+        prime_gstack_legacy_adoption=plan.prime_gstack_legacy_adoption,
+    )
+    runtime_before = runtime.read_bytes()
+    concurrent_content = b"concurrent unchanged skill\n"
+    changed = False
+
+    def replace_after_earlier_operation(
+        _home_fs: object,
+        _record_path: Path,
+        operation: dict[str, object],
+    ) -> None:
+        nonlocal changed
+        if changed or operation["destination"] != runtime.relative_to(home).as_posix():
+            return
+        concurrent = skill.with_name(f"{skill.name}.concurrent")
+        concurrent.write_bytes(concurrent_content)
+        concurrent.chmod(0o644)
+        os.replace(concurrent, skill)
+        changed = True
+
+    monkeypatch.setattr(
+        transaction_module,
+        "_after_operation_mutation",
+        replace_after_earlier_operation,
+    )
+
+    with pytest.raises((OSError, ValueError)):
+        install_provider_plans((plan,))
+
+    assert changed
+    assert runtime.read_bytes() == runtime_before
+    assert skill.read_bytes() == concurrent_content
+    assert legacy_manifest.read_bytes() == legacy_manifest_bytes
+    assert not list((home / ".agentops/deployment/manifests").glob("*.json"))
+    assert not list((home / ".agentops/deployment/transactions").glob("*/record.json"))
+
+
+@pytest.mark.parametrize("exit_point", ("journaled-backup", "restored-destination"))
+@pytest.mark.parametrize("race_kind", ("replacement", "missing"))
+def test_prime_gstack_concurrent_entry_recovery_restores_live_path_after_process_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    exit_point: str,
+    race_kind: str,
+) -> None:
+    home = tmp_path / "home"
+    plan, runtime, skill, legacy_manifest, legacy_manifest_bytes = _prime_gstack_legacy_plan(home)
+    concurrent_content = b"concurrent runtime before recovery\n"
+    runtime_relative = runtime.relative_to(home).as_posix()
+
+    def replace_before_backup(
+        _home_fs: object,
+        _record_path: Path,
+        operation: dict[str, object],
+    ) -> None:
+        if operation["destination"] != runtime_relative:
+            return
+        if race_kind == "replacement":
+            concurrent = runtime.with_name(f"{runtime.name}.concurrent")
+            concurrent.write_bytes(concurrent_content)
+            concurrent.chmod(0o755)
+            os.replace(concurrent, runtime)
+        else:
+            runtime.unlink()
+
+    original_rollback = transaction_module._rollback_record
+
+    def exit_after_journal(*_args: object) -> None:
+        if exit_point == "journaled-backup":
+            os._exit(84)
+
+    def exit_after_concurrent_retention(
+        home_fs: object,
+        record: dict[str, object],
+        record_path: Path,
+        **kwargs: object,
+    ) -> None:
+        if (
+            exit_point == "restored-destination"
+            and record.get("prime_gstack_concurrent_mutation") is not None
+        ):
+            os._exit(84)
+        original_rollback(home_fs, record, record_path, **kwargs)
+
+    monkeypatch.setattr(transaction_module, "_before_operation_mutation", replace_before_backup)
+    monkeypatch.setattr(
+        transaction_module,
+        "_after_prime_gstack_concurrent_journal",
+        exit_after_journal,
+    )
+    monkeypatch.setattr(transaction_module, "_rollback_record", exit_after_concurrent_retention)
+    process = multiprocessing.get_context("fork").Process(
+        target=lambda: install_provider_plans((plan,))
+    )
+    process.start()
+    process.join(timeout=10)
+    assert process.exitcode == 84
+
+    record_path = next((home / ".agentops/deployment/transactions").glob("*/record.json"))
+    monkeypatch.setattr(transaction_module, "_rollback_record", original_rollback)
+    monkeypatch.setattr(transaction_module, "_before_operation_mutation", lambda *_args: None)
+    monkeypatch.setattr(
+        transaction_module,
+        "_after_prime_gstack_concurrent_journal",
+        lambda *_args: None,
+    )
+
+    recover_transaction(record_path)
+
+    if race_kind == "replacement":
+        assert runtime.read_bytes() == concurrent_content
+    else:
+        assert not runtime.exists()
+    assert skill.read_bytes() == b"legacy skill\n"
+    assert legacy_manifest.read_bytes() == legacy_manifest_bytes
+    assert not list((home / ".agentops/deployment/manifests").glob("*.json"))
+
+    recover_transaction(record_path)
+
+    if race_kind == "replacement":
+        assert runtime.read_bytes() == concurrent_content
+    else:
+        assert not runtime.exists()
+
+
+def test_prime_gstack_concurrent_entry_recovery_restores_after_backup_move_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    plan, runtime, skill, legacy_manifest, legacy_manifest_bytes = _prime_gstack_legacy_plan(home)
+    concurrent_content = b"concurrent future skill before backup exit\n"
+    runtime_before = runtime.read_bytes()
+    runtime_relative = runtime.relative_to(home).as_posix()
+    skill_relative = skill.relative_to(home)
+    changed = False
+
+    def replace_skill_after_runtime(
+        _home_fs: object,
+        _record_path: Path,
+        operation: dict[str, object],
+    ) -> None:
+        nonlocal changed
+        if changed or operation["destination"] != runtime_relative:
+            return
+        concurrent = skill.with_name(f"{skill.name}.concurrent")
+        concurrent.write_bytes(concurrent_content)
+        concurrent.chmod(0o644)
+        os.replace(concurrent, skill)
+        changed = True
+
+    original_replace = transaction_module._HomeFS.replace
+
+    def exit_after_concurrent_backup_move(
+        home_fs: object,
+        source: Path,
+        destination: Path,
+    ) -> None:
+        original_replace(home_fs, source, destination)
+        if source == skill_relative and destination.parts[-2:] == ("backups", "0001"):
+            os._exit(85)
+
+    monkeypatch.setattr(
+        transaction_module,
+        "_after_operation_mutation",
+        replace_skill_after_runtime,
+    )
+    monkeypatch.setattr(
+        transaction_module._HomeFS,
+        "replace",
+        exit_after_concurrent_backup_move,
+    )
+    process = multiprocessing.get_context("fork").Process(
+        target=lambda: install_provider_plans((plan,))
+    )
+    process.start()
+    process.join(timeout=10)
+    assert process.exitcode == 85
+
+    record_path = next((home / ".agentops/deployment/transactions").glob("*/record.json"))
+    concurrent = json.loads(record_path.read_text())["prime_gstack_concurrent_mutation"]
+    assert concurrent["destination"] == skill_relative.as_posix()
+    assert concurrent["kind"] == "regular"
+    assert concurrent["identity"]["inode"] > 0
+    monkeypatch.setattr(transaction_module._HomeFS, "replace", original_replace)
+    monkeypatch.setattr(transaction_module, "_after_operation_mutation", lambda *_args: None)
+
+    recover_transaction(record_path)
+
+    assert runtime.read_bytes() == runtime_before
+    assert skill.read_bytes() == concurrent_content
+    assert legacy_manifest.read_bytes() == legacy_manifest_bytes
+    assert not list((home / ".agentops/deployment/manifests").glob("*.json"))
+
+    recover_transaction(record_path)
+
+    assert runtime.read_bytes() == runtime_before
+    assert skill.read_bytes() == concurrent_content
+
+
+def test_prime_gstack_concurrent_entry_recovery_restores_after_classification_race(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    plan, runtime, skill, legacy_manifest, legacy_manifest_bytes = _prime_gstack_legacy_plan(home)
+    concurrent_content = b"concurrent skill after legacy classification\n"
+    runtime_before = runtime.read_bytes()
+    skill_relative = skill.relative_to(home)
+    original_matches_legacy = transaction_module._PinnedPrimeGstackCurrentFile.matches_legacy
+    original_replace = transaction_module._HomeFS.replace
+
+    def replace_after_legacy_classification(
+        current: object,
+        pinned: object,
+    ) -> bool:
+        matches = original_matches_legacy(current, pinned)
+        if matches and current.path == skill_relative:
+            concurrent = skill.with_name(f"{skill.name}.concurrent")
+            concurrent.write_bytes(concurrent_content)
+            concurrent.chmod(0o644)
+            os.replace(concurrent, skill)
+        return matches
+
+    def exit_after_concurrent_backup_move(
+        home_fs: object,
+        source: Path,
+        destination: Path,
+    ) -> None:
+        original_replace(home_fs, source, destination)
+        if source == skill_relative and destination.parts[-2:] == ("backups", "0001"):
+            os._exit(86)
+
+    monkeypatch.setattr(
+        transaction_module._PinnedPrimeGstackCurrentFile,
+        "matches_legacy",
+        replace_after_legacy_classification,
+    )
+    monkeypatch.setattr(
+        transaction_module._HomeFS,
+        "replace",
+        exit_after_concurrent_backup_move,
+    )
+    process = multiprocessing.get_context("fork").Process(
+        target=lambda: install_provider_plans((plan,))
+    )
+    process.start()
+    process.join(timeout=10)
+    assert process.exitcode == 86
+
+    record_path = next((home / ".agentops/deployment/transactions").glob("*/record.json"))
+    monkeypatch.setattr(transaction_module._HomeFS, "replace", original_replace)
+    monkeypatch.setattr(
+        transaction_module._PinnedPrimeGstackCurrentFile,
+        "matches_legacy",
+        original_matches_legacy,
+    )
+
+    recover_transaction(record_path)
+
+    assert runtime.read_bytes() == runtime_before
+    assert skill.read_bytes() == concurrent_content
+    assert legacy_manifest.read_bytes() == legacy_manifest_bytes
+    assert not list((home / ".agentops/deployment/manifests").glob("*.json"))
+
+    recover_transaction(record_path)
+
+    assert runtime.read_bytes() == runtime_before
+    assert skill.read_bytes() == concurrent_content
+
+
+def test_prime_gstack_legacy_adoption_recovery_restores_exact_prestate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    plan, runtime, skill, legacy_manifest, legacy_manifest_bytes = _prime_gstack_legacy_plan(home)
+    control = SystemExit(82)
+
+    def interrupt_after_backup(*_args: object) -> None:
+        raise control
+
+    def interrupt_automatic_rollback(*_args: object, **_kwargs: object) -> None:
+        raise SystemExit(83)
+
+    original_rollback = transaction_module._rollback_record
+    monkeypatch.setattr(transaction_module, "_after_operation_backup", interrupt_after_backup)
+    monkeypatch.setattr(transaction_module, "_rollback_record", interrupt_automatic_rollback)
+
+    with pytest.raises(SystemExit):
+        install_provider_plans((plan,))
+
+    records = list((home / ".agentops/deployment/transactions").glob("*/record.json"))
+    assert len(records) == 1
+    monkeypatch.setattr(transaction_module, "_rollback_record", original_rollback)
+    monkeypatch.setattr(transaction_module, "_after_operation_backup", lambda *_args: None)
+
+    recover_transaction(records[0])
+
+    assert runtime.read_bytes() == b"legacy executable\n"
+    assert stat.S_IMODE(runtime.stat().st_mode) == 0o755
+    assert skill.read_bytes() == b"legacy skill\n"
+    assert stat.S_IMODE(skill.stat().st_mode) == 0o644
+    assert legacy_manifest.read_bytes() == legacy_manifest_bytes
+    assert stat.S_IMODE(legacy_manifest.stat().st_mode) == 0o644
+    assert not list((home / ".agentops/deployment/manifests").glob("*.json"))
 
 
 def test_audit_accepts_only_opted_in_exact_python_cache(tmp_path: Path) -> None:

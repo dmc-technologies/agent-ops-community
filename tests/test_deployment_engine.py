@@ -1529,6 +1529,114 @@ def test_gstack_audit_retains_owned_roots_but_ignores_transaction_metadata(
     )
 
 
+def test_prime_gstack_adopts_exact_legacy_owner_manifest_in_shared_transaction(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    home = tmp_path / "prime-agent"
+    runtime = home / ".agentops/runtime/gstack/bin/gstack-global-discover"
+    skill = home / "skills/agentops-gstack-review/SKILL.md"
+    runtime.parent.mkdir(parents=True)
+    skill.parent.mkdir(parents=True)
+    runtime.write_bytes(b"legacy executable\n")
+    runtime.chmod(0o755)
+    skill.write_bytes(b"legacy skill\n")
+    skill.chmod(0o644)
+    neighbor = home / "notes/user-authored.txt"
+    neighbor.parent.mkdir(parents=True)
+    neighbor.write_bytes(b"user content\n")
+    legacy_manifest = home / ".agentops/gstack-prime-manifest.json"
+    legacy_manifest.parent.mkdir(parents=True, exist_ok=True)
+    legacy_manifest_bytes = (
+        json.dumps(
+            {
+                "schema_version": 1,
+                "owner": "agent-ops-community:gstack-prime",
+                "upstream_ref": "74895062fb8a3acbf9f66cd088a83359aaaa56cd",
+                "files": {
+                    ".agentops/runtime/gstack/bin/gstack-global-discover": hashlib.sha256(
+                        runtime.read_bytes()
+                    ).hexdigest(),
+                    "skills/agentops-gstack-review/SKILL.md": hashlib.sha256(
+                        skill.read_bytes()
+                    ).hexdigest(),
+                },
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode()
+    legacy_manifest.write_bytes(legacy_manifest_bytes)
+    legacy_manifest.chmod(0o644)
+    dependency = SkillDependency(
+        id="gstack",
+        name="gstack",
+        repo="https://github.com/garrytan/gstack.git",
+        ref="74895062fb8a3acbf9f66cd088a83359aaaa56cd",
+        install={
+            "prime-agent": SkillDependencyInstall(
+                strategy="prime-gstack",
+                destination=".",
+            )
+        },
+    )
+
+    def render_replacement(**kwargs: object) -> None:
+        target_home = kwargs["target_home"]
+        assert isinstance(target_home, Path)
+        rendered_runtime = (
+            target_home / ".agentops/runtime/gstack/bin/gstack-global-discover"
+        )
+        rendered_skill = target_home / "skills/agentops-gstack-review/SKILL.md"
+        rendered_runtime.parent.mkdir(parents=True, exist_ok=True)
+        rendered_skill.parent.mkdir(parents=True, exist_ok=True)
+        rendered_runtime.write_bytes(b"current executable\n")
+        rendered_runtime.chmod(0o755)
+        rendered_skill.write_bytes(b"current skill\n")
+        rendered_skill.chmod(0o644)
+        rendered_manifest = target_home / ".agentops/gstack-prime-manifest.json"
+        rendered_manifest.parent.mkdir(parents=True, exist_ok=True)
+        rendered_manifest.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "owner": "agent-ops-community:gstack-prime",
+                    "upstream_ref": dependency.ref,
+                    "files": {
+                        ".agentops/runtime/gstack/bin/gstack-global-discover": hashlib.sha256(
+                            rendered_runtime.read_bytes()
+                        ).hexdigest(),
+                        "skills/agentops-gstack-review/SKILL.md": hashlib.sha256(
+                            rendered_skill.read_bytes()
+                        ).hexdigest(),
+                    },
+                },
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+
+    plans = build_public_skill_plans(
+        framework=Framework.PRIME_AGENT,
+        dependencies=[dependency],
+        target_home=home,
+        cache_root=tmp_path / "cache",
+        checkout_dependency=lambda _dependency, _cache: source,
+        install_dependency=render_replacement,
+    )
+
+    apply_provider_plans(plans)
+
+    assert runtime.read_bytes() == b"current executable\n"
+    assert stat.S_IMODE(runtime.stat().st_mode) == 0o755
+    assert skill.read_bytes() == b"current skill\n"
+    assert neighbor.read_bytes() == b"user content\n"
+    assert not legacy_manifest.exists()
+    assert audit_provider_plans(plans).matches
+
+
 def test_public_plan_builder_rejects_cache_overlap_before_checkout(tmp_path: Path) -> None:
     home = tmp_path / "home"
     dependency = _dependency("gstack", ref="1" * 40, strategy="gstack", destination="skills/gstack")

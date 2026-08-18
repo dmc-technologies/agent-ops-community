@@ -12,7 +12,12 @@ from contextlib import suppress
 from dataclasses import replace
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
-from agent_ops.deployment.models import PlannedFile, ProviderPlan, TargetSpec
+from agent_ops.deployment.models import (
+    PlannedFile,
+    PrimeGstackLegacyAdoption,
+    ProviderPlan,
+    TargetSpec,
+)
 from agent_ops.registries.models import Framework, SkillDependency, SkillDependencyInstall
 from agent_ops.show_me_adapter import ShowMeCollisionError
 
@@ -463,12 +468,28 @@ def _render_dependency_in_workspace(
         shadow_home=shadow_home,
         target_home=target.home,
     )
+    legacy_manifest = target.home / ".agentops/gstack-prime-manifest.json"
+    legacy_adoption = (
+        PrimeGstackLegacyAdoption(
+            target_id=target.id,
+            expected_channel=target.channel,
+            source_ref=dependency.ref,
+            paths=tuple(sorted((item.path for item in files), key=lambda path: path.as_posix())),
+        )
+        if framework is Framework.PRIME_AGENT
+        and dependency.id == "gstack"
+        and install.strategy == "prime-gstack"
+        and not prior_paths
+        and (legacy_manifest.exists() or legacy_manifest.is_symlink())
+        else None
+    )
     return ProviderPlan(
         provider_id=f"public-skill:{dependency.id}",
         source_revision=dependency.ref,
         target=target,
         files=files,
         audit_roots=_audit_roots_for_dependency(dependency, files),
+        prime_gstack_legacy_adoption=legacy_adoption,
     )
 
 

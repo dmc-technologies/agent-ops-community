@@ -31,6 +31,7 @@ from agent_ops.deployment.models import (
     ManifestDirectory,
     ManifestFile,
     PlannedFile,
+    PrimeGstackLegacyAdoption,
     ProviderPlan,
     TargetChannelTransition,
     TargetSpec,
@@ -45,7 +46,8 @@ __all__ = (
 )
 
 _SCHEMA_VERSION = 1
-_TRANSACTION_SCHEMA_VERSION = 8
+_TRANSACTION_SCHEMA_VERSION = 10
+_PRIME_GSTACK_ADOPTION_SCHEMA_VERSION = 9
 _RUNTIME_CACHE_PROVENANCE_SCHEMA_VERSION = 7
 _FINITE_RUNTIME_CACHE_MATRIX_SCHEMA_VERSION = 8
 _LEGACY_TRANSACTION_SCHEMA_VERSION = 3
@@ -69,6 +71,11 @@ _SUPPORTED_CPYTHON_CACHE_MAGICS = {
 }
 _SUPPORTED_CPYTHON_CACHE_OPTIMIZATIONS = (None, "1", "2")
 _MAX_RUNTIME_CACHE_BYTES = 16 * 1024 * 1024
+_PRIME_GSTACK_LEGACY_MANIFEST = Path(".agentops/gstack-prime-manifest.json")
+_PRIME_GSTACK_LEGACY_OWNER = "agent-ops-community:gstack-prime"
+_PRIME_GSTACK_LEGACY_MANIFEST_MODE = 0o644
+_PRIME_GSTACK_REPOSITORY = "https://github.com/garrytan/gstack.git"
+_PUBLIC_PROVIDER_INDEX = Path("skills/.agentops-public-provider-index.json")
 
 
 class PublicationIndeterminateError(OSError):
@@ -81,6 +88,14 @@ class IncompleteRollbackError(OSError):
 
 class UnsupportedPlatformError(RuntimeError):
     """Descriptor-bound deployment transactions require a POSIX platform."""
+
+
+class _PrimeGstackConcurrentMutation(ValueError):
+    """A legacy entry changed after adoption validation."""
+
+    def __init__(self, destination: Path) -> None:
+        super().__init__(f"Prime gstack legacy file changed during mutation: {destination}")
+        self.destination = destination
 
 
 def _require_supported_platform() -> None:
@@ -136,6 +151,14 @@ def _after_runtime_cache_backup_move(
     _operation: dict[str, Any],
 ) -> None:
     """Internal fault-injection boundary before cache backup authorization."""
+
+
+def _after_prime_gstack_concurrent_journal(
+    _home_fs: _HomeFS,
+    _record_path: Path,
+    _record: dict[str, Any],
+) -> None:
+    """Internal fault-injection boundary after concurrent-entry journaling."""
 
 
 def _after_operation_mutation(
@@ -974,6 +997,228 @@ def _require_exact_keys(
         raise ValueError(f"missing {label} member: {missing[0]}")
 
 
+def _decode_prime_gstack_legacy_manifest(
+    content: bytes,
+    *,
+    source_ref: str,
+    expected_paths: tuple[Path, ...],
+) -> dict[Path, str]:
+    data = _strict_json_loads(content, label="Prime gstack legacy manifest")
+    if not isinstance(data, dict):
+        raise ValueError("invalid Prime gstack legacy manifest schema")
+    _require_exact_keys(
+        data,
+        {"schema_version", "owner", "upstream_ref", "files"},
+        label="Prime gstack legacy manifest",
+    )
+    if (
+        type(data["schema_version"]) is not int
+        or data["schema_version"] != 1
+        or type(data["owner"]) is not str
+        or data["owner"] != _PRIME_GSTACK_LEGACY_OWNER
+        or type(data["upstream_ref"]) is not str
+        or data["upstream_ref"] != source_ref
+        or not isinstance(data["files"], dict)
+        or not data["files"]
+    ):
+        raise ValueError("invalid Prime gstack legacy manifest identity")
+    files: dict[Path, str] = {}
+    for authored, fingerprint in data["files"].items():
+        path = _canonical_relative_text(authored, label="Prime gstack legacy file")
+        if (
+            path in files
+            or not _prime_gstack_legacy_path_allowed(path)
+            or type(fingerprint) is not str
+            or len(fingerprint) != 64
+            or any(character not in "0123456789abcdef" for character in fingerprint)
+        ):
+            raise ValueError("invalid Prime gstack legacy manifest file")
+        files[path] = fingerprint
+    if set(files) != set(expected_paths):
+        raise ValueError("Prime gstack legacy manifest paths do not match the planned bundle")
+    return files
+
+
+def _prime_gstack_legacy_path_allowed(path: Path) -> bool:
+    return path.parts[:3] == (".agentops", "runtime", "gstack") or (
+        path.parts[:1] == ("skills",)
+        and len(path.parts) >= 3
+        and (
+            path.parts[1] == "agentops-gstack"
+            or path.parts[1].startswith("agentops-gstack-")
+        )
+    )
+
+
+def _prime_gstack_adoption_prestate(
+    home_fs: _HomeFS,
+    group: _PlanGroup,
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    adoption = group.prime_gstack_legacy_adoption
+    if adoption is None:
+        return None
+    if group.target.framework is not Framework.PRIME_AGENT or group.target.channel != "public":
+        raise ValueError("Prime gstack legacy adoption target is invalid")
+    manifest_stat = home_fs.stat(_PRIME_GSTACK_LEGACY_MANIFEST)
+    if (
+        not stat.S_ISREG(manifest_stat.st_mode)
+        or manifest_stat.st_nlink != 1
+        or stat.S_IMODE(manifest_stat.st_mode) != _PRIME_GSTACK_LEGACY_MANIFEST_MODE
+    ):
+        raise ValueError("Prime gstack legacy manifest type or mode is invalid")
+    manifest_content = home_fs.read_file(_PRIME_GSTACK_LEGACY_MANIFEST)
+    legacy_files = _decode_prime_gstack_legacy_manifest(
+        manifest_content,
+        source_ref=adoption.source_ref,
+        expected_paths=adoption.paths,
+    )
+    planned = {item.path: item for item in group.files}
+    recorded_files = []
+    for path in adoption.paths:
+        item = planned.get(path)
+        if item is None:
+            raise ValueError("Prime gstack legacy manifest path is not planned")
+        try:
+            installed_stat = home_fs.stat(path)
+            installed_content = home_fs.read_file(path)
+        except OSError as exc:
+            raise ValueError(f"Prime gstack legacy owned file is missing: {path}") from exc
+        installed_mode = stat.S_IMODE(installed_stat.st_mode)
+        if (
+            not stat.S_ISREG(installed_stat.st_mode)
+            or installed_stat.st_nlink != 1
+            or _fingerprint(installed_content) != legacy_files[path]
+            or installed_mode != item.mode
+        ):
+            raise ValueError(f"Prime gstack legacy owned file changed: {path}")
+        recorded_files.append(
+            {
+                "path": path.as_posix(),
+                "fingerprint": legacy_files[path],
+                "mode": installed_mode,
+            }
+        )
+    manifest_file = {
+        "path": _PRIME_GSTACK_LEGACY_MANIFEST.as_posix(),
+        "fingerprint": _fingerprint(manifest_content),
+        "mode": _PRIME_GSTACK_LEGACY_MANIFEST_MODE,
+    }
+    prior_data = {
+        "files": sorted([*recorded_files, manifest_file], key=lambda item: item["path"]),
+        "directories": [],
+    }
+    record = {
+        "provider_id": "public-skill:gstack",
+        "target_id": adoption.target_id,
+        "expected_channel": adoption.expected_channel,
+        "owner": _PRIME_GSTACK_LEGACY_OWNER,
+        "source_ref": adoption.source_ref,
+        "manifest_path": _PRIME_GSTACK_LEGACY_MANIFEST.as_posix(),
+        "manifest_content": base64.b64encode(manifest_content).decode(),
+        "manifest_mode": _PRIME_GSTACK_LEGACY_MANIFEST_MODE,
+        "files": recorded_files,
+    }
+    return prior_data, record
+
+
+def _decode_prime_gstack_adoption_record(
+    value: object,
+    *,
+    manifest: DeploymentManifest,
+) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("invalid Prime gstack legacy adoption record")
+    _require_exact_keys(
+        value,
+        {
+            "provider_id",
+            "target_id",
+            "expected_channel",
+            "owner",
+            "source_ref",
+            "manifest_path",
+            "manifest_content",
+            "manifest_mode",
+            "files",
+        },
+        label="Prime gstack legacy adoption",
+    )
+    if (
+        value["provider_id"] != "public-skill:gstack"
+        or value["provider_id"] not in manifest.provider_ids
+        or value["target_id"] != manifest.target_id
+        or value["expected_channel"] != manifest.channel
+        or value["owner"] != _PRIME_GSTACK_LEGACY_OWNER
+        or _canonical_relative_text(
+            value["manifest_path"], label="Prime gstack legacy manifest"
+        )
+        != _PRIME_GSTACK_LEGACY_MANIFEST
+        or value["manifest_mode"] != _PRIME_GSTACK_LEGACY_MANIFEST_MODE
+        or type(value["source_ref"]) is not str
+        or not _source_revision_binds_prime_gstack_ref(
+            manifest.source_revision,
+            value["source_ref"],
+        )
+        or not isinstance(value["files"], list)
+        or not value["files"]
+    ):
+        raise ValueError("invalid Prime gstack legacy adoption identity")
+    try:
+        manifest_content = base64.b64decode(value["manifest_content"], validate=True)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid Prime gstack legacy manifest content") from exc
+    paths = []
+    recorded: dict[Path, tuple[str, int]] = {}
+    for item in value["files"]:
+        if not isinstance(item, dict):
+            raise ValueError("invalid Prime gstack legacy adoption file")
+        _require_exact_keys(
+            item,
+            {"path", "fingerprint", "mode"},
+            label="Prime gstack legacy adoption file",
+        )
+        path = _canonical_relative_text(item["path"], label="Prime gstack legacy file")
+        if (
+            path in recorded
+            or type(item["fingerprint"]) is not str
+            or len(item["fingerprint"]) != 64
+            or any(character not in "0123456789abcdef" for character in item["fingerprint"])
+            or not _valid_file_mode(item["mode"])
+        ):
+            raise ValueError("invalid Prime gstack legacy adoption file")
+        paths.append(path)
+        recorded[path] = (item["fingerprint"], item["mode"])
+    if paths != sorted(paths, key=lambda path: path.as_posix()):
+        raise ValueError("Prime gstack legacy adoption files are not canonical")
+    legacy_files = _decode_prime_gstack_legacy_manifest(
+        manifest_content,
+        source_ref=value["source_ref"],
+        expected_paths=tuple(paths),
+    )
+    final_files = {item.path: item for item in manifest.files}
+    for path, (fingerprint, mode) in recorded.items():
+        if (
+            fingerprint != legacy_files[path]
+            or path not in final_files
+            or final_files[path].mode != mode
+        ):
+            raise ValueError("Prime gstack legacy adoption does not match the final manifest")
+    prior_files = [dict(item) for item in value["files"]]
+    prior_files.append(
+        {
+            "path": _PRIME_GSTACK_LEGACY_MANIFEST.as_posix(),
+            "fingerprint": _fingerprint(manifest_content),
+            "mode": _PRIME_GSTACK_LEGACY_MANIFEST_MODE,
+        }
+    )
+    return {
+        "files": sorted(prior_files, key=lambda item: item["path"]),
+        "directories": [],
+    }
+
+
 def _validated_manifest_data(content: bytes, *, target: TargetSpec) -> dict[str, Any]:
     data = _strict_json_loads(content, label="deployment manifest")
     if (
@@ -1209,6 +1454,43 @@ class _PlanGroup:
     runtime_python_sources: tuple[Path, ...]
     runtime_cache_removals: tuple[tuple[Path, Path], ...]
     legacy_link_transition: LegacyLinkTransition | None
+    prime_gstack_legacy_adoption: PrimeGstackLegacyAdoption | None
+
+
+def _source_revision_binds_prime_gstack_ref(source_revision: str, source_ref: str) -> bool:
+    prefix = "public-skills:"
+    if not source_revision.startswith(prefix):
+        return False
+    try:
+        descriptors = json.loads(source_revision.removeprefix(prefix))
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(descriptors, list):
+        return False
+    matches = []
+    for descriptor in descriptors:
+        if not isinstance(descriptor, dict) or set(descriptor) != {
+            "id",
+            "repo",
+            "ref",
+            "install",
+        }:
+            return False
+        if descriptor.get("id") == "gstack":
+            matches.append(descriptor)
+    if len(matches) != 1:
+        return False
+    descriptor = matches[0]
+    install = descriptor.get("install")
+    return (
+        descriptor.get("ref") == source_ref
+        and descriptor.get("repo") == _PRIME_GSTACK_REPOSITORY
+        and isinstance(install, dict)
+        and set(install) == {"strategy", "source", "destination"}
+        and install.get("strategy") == "prime-gstack"
+        and install.get("source") is None
+        and install.get("destination") == "."
+    )
 
 
 def _public_gstack_runtime_path(provider_id: str, path: Path) -> bool:
@@ -1231,6 +1513,9 @@ def _validate_and_group(
         tuple[str, Framework, Path, str, str], dict[Path, Path]
     ] = {}
     legacy_links: dict[tuple[str, Framework, Path, str, str], LegacyLinkTransition] = {}
+    prime_adoptions: dict[
+        tuple[str, Framework, Path, str, str], PrimeGstackLegacyAdoption
+    ] = {}
     target_keys: dict[str, tuple[str, Framework, Path, str, str]] = {}
     home_targets: dict[Path, str] = {}
     preflight_cwd = Path.cwd()
@@ -1260,6 +1545,21 @@ def _validate_and_group(
             if key in legacy_links:
                 raise ValueError("only one legacy link transition is allowed per target")
             legacy_links[key] = plan.legacy_link_transition
+        if plan.prime_gstack_legacy_adoption is not None:
+            if key in prime_adoptions:
+                raise ValueError("only one Prime gstack legacy adoption is allowed per target")
+            adoption = plan.prime_gstack_legacy_adoption
+            planned = {item.path for item in plan.files}
+            if planned != set(adoption.paths) | (
+                {_PUBLIC_PROVIDER_INDEX} if _PUBLIC_PROVIDER_INDEX in planned else set()
+            ):
+                raise ValueError("Prime gstack legacy adoption must bind its planned destinations")
+            if not _source_revision_binds_prime_gstack_ref(
+                plan.source_revision,
+                adoption.source_ref,
+            ):
+                raise ValueError("Prime gstack legacy adoption source ref does not match its plan")
+            prime_adoptions[key] = adoption
         for item in plan.files:
             path = _safe_relative(item.path)
             if path.parts[0] in {".agentops", _LOCK_NAME} and not _public_gstack_runtime_path(
@@ -1287,6 +1587,10 @@ def _validate_and_group(
             runtime_source = _runtime_python_source_for_cache(removal_path)
             if runtime_source is not None and runtime_source in normalized_removal_set:
                 cache_removal_pairs[removal_path] = runtime_source
+    for key in prime_adoptions:
+        if _PRIME_GSTACK_LEGACY_MANIFEST in groups[key]:
+            raise ValueError("Prime gstack legacy manifest cannot be a planned destination")
+        removals[key].add(_PRIME_GSTACK_LEGACY_MANIFEST)
     for key, files in groups.items():
         file_paths = sorted(files, key=str)
         removal_paths = sorted(removals[key], key=str)
@@ -1332,6 +1636,7 @@ def _validate_and_group(
                 runtime_python_sources=tuple(sorted(runtime_python_sources[key], key=str)),
                 runtime_cache_removals=tuple(sorted(runtime_cache_removals[key].items())),
                 legacy_link_transition=legacy_links.get(key),
+                prime_gstack_legacy_adoption=prime_adoptions.get(key),
             )
         )
     return tuple(results)
@@ -1525,12 +1830,39 @@ def _verify_prior_prestate(
             raise IncompleteRollbackError(f"prior owned directory changed: {path}")
 
 
+def _prior_data_without_prime_concurrent(
+    prior_data: dict[str, Any] | None,
+    record: dict[str, Any],
+) -> dict[str, Any] | None:
+    concurrent = _prime_gstack_concurrent_mutation(record)
+    if prior_data is None or concurrent is None:
+        return prior_data
+    destination = concurrent["destination"]
+    return {
+        "files": [item for item in prior_data["files"] if item["path"] != destination],
+        "directories": list(prior_data["directories"]),
+    }
+
+
+def _verify_prime_gstack_concurrent_restored(
+    home_fs: _HomeFS,
+    record: dict[str, Any],
+) -> None:
+    concurrent = _prime_gstack_concurrent_mutation(record)
+    if concurrent is not None and not _prime_gstack_concurrent_is_restored(home_fs, record):
+        raise IncompleteRollbackError(
+            f"Prime gstack concurrent entry is not restored: {concurrent['destination']}"
+        )
+
+
 def _verify_completed_rollback(
     home_fs: _HomeFS,
     record: dict[str, Any],
     prior_data: dict[str, Any] | None,
     prior_manifest: bytes | None,
 ) -> None:
+    prior_data = _prior_data_without_prime_concurrent(prior_data, record)
+    _verify_prime_gstack_concurrent_restored(home_fs, record)
     manifest_path = Path(record["manifest_path"])
     legacy = record.get("legacy_link_transition")
     legacy_destination = Path(legacy["destination"]) if legacy is not None else None
@@ -1576,7 +1908,18 @@ def _verify_completed_rollback(
                     f"rollback completion has created owned directory: {path}"
                 )
         return
-    assert prior_manifest is not None
+    if prior_manifest is None:
+        if home_fs.exists(manifest_path):
+            raise IncompleteRollbackError(
+                "rollback completion does not match absent prior shared manifest"
+            )
+        _verify_manifest_files_and_directories(
+            home_fs,
+            prior_data,
+            error_type=IncompleteRollbackError,
+            context="rollback completion Prime legacy prior",
+        )
+        return
     try:
         manifest_matches = home_fs.matches_exact_file(
             manifest_path,
@@ -1757,7 +2100,10 @@ def _install_provider_plan_groups(
             prior_manifest_content = home_fs.read_optional(manifest_path)
             prior_data = None
             prior_manifest_mode = None
+            prime_adoption_record = None
             if prior_manifest_content is not None:
+                if group.prime_gstack_legacy_adoption is not None:
+                    raise ValueError("Prime gstack legacy adoption conflicts with shared ownership")
                 prior_manifest_stat = home_fs.stat(manifest_path)
                 _validate_ownership_manifest_stat(prior_manifest_stat)
                 prior_manifest_mode = stat.S_IMODE(prior_manifest_stat.st_mode)
@@ -1772,6 +2118,10 @@ def _install_provider_plan_groups(
                     error_type=ValueError,
                     context="prior",
                 )
+            elif group.prime_gstack_legacy_adoption is not None:
+                adoption_prestate = _prime_gstack_adoption_prestate(home_fs, group)
+                assert adoption_prestate is not None
+                prior_data, prime_adoption_record = adoption_prestate
             managed = (
                 {
                     Path(item["path"]): (item["fingerprint"], item["mode"])
@@ -1821,7 +2171,11 @@ def _install_provider_plan_groups(
                         raise ValueError(f"unmanaged destination conflicts with plan: {item.path}")
                     if _fingerprint(installed) != prior[0] or installed_mode != prior[1]:
                         raise ValueError(f"managed destination changed: {item.path}")
-                    if installed == item.content and installed_mode == item.mode:
+                    if (
+                        installed == item.content
+                        and installed_mode == item.mode
+                        and prime_adoption_record is None
+                    ):
                         operations.append(_operation(item, transaction_id, index, kind="adopted"))
                         continue
                 operation = _operation(item, transaction_id, index, kind="installed")
@@ -2003,7 +2357,11 @@ def _install_provider_plan_groups(
             else:
                 legacy_operation_index = None
             record = {
-                "schema_version": _TRANSACTION_SCHEMA_VERSION,
+                "schema_version": (
+                    _TRANSACTION_SCHEMA_VERSION
+                    if prime_adoption_record is not None
+                    else _FINITE_RUNTIME_CACHE_MATRIX_SCHEMA_VERSION
+                ),
                 "state": "prepared",
                 "operation_cursor": 0,
                 "operation_phase": "ready",
@@ -2041,7 +2399,45 @@ def _install_provider_plan_groups(
                 "directories": directory_records,
                 "operations": operations,
             }
-            home_fs.write_file(record_path, _record_bytes(record), 0o600)
+            if prime_adoption_record is not None:
+                record["prime_gstack_legacy_adoption"] = prime_adoption_record
+                record["prime_gstack_concurrent_mutation"] = None
+                record["prime_gstack_move_authority"] = None
+            prime_adoption_paths = (
+                {
+                    Path(item["path"])
+                    for item in prime_adoption_record["files"]
+                }
+                | {Path(prime_adoption_record["manifest_path"])}
+                if prime_adoption_record is not None
+                else set()
+            )
+            prime_adoption_pins: dict[Path, _PinnedPrimeGstackLegacyFile] = {}
+            try:
+                for operation in operations:
+                    destination = Path(operation["destination"])
+                    if operation["backup"] is None or destination not in prime_adoption_paths:
+                        continue
+                    prime_adoption_pins[destination] = _PinnedPrimeGstackLegacyFile(
+                        home_fs,
+                        destination,
+                        operation,
+                    )
+            except BaseException:
+                for pinned in prime_adoption_pins.values():
+                    pinned.close()
+                for directory in directory_records:
+                    evidence = directory["prestate_evidence"]
+                    if evidence is not None and home_fs.exists(Path(evidence)):
+                        home_fs.unlink(Path(evidence))
+                _prune_transaction_directories(home_fs, transaction, record)
+                raise
+            try:
+                home_fs.write_file(record_path, _record_bytes(record), 0o600)
+            except BaseException:
+                for pinned in prime_adoption_pins.values():
+                    pinned.close()
+                raise
             try:
                 for directory in manifest.directories:
                     if not home_fs.exists(directory.path):
@@ -2077,6 +2473,7 @@ def _install_provider_plan_groups(
                         if operation["kind"] == _RUNTIME_CACHE_REMOVAL
                         else None
                     )
+                    pinned_prime_legacy = prime_adoption_pins.get(destination)
                     try:
                         _before_operation_mutation(home_fs, record_path, operation)
                         if backup is not None:
@@ -2087,6 +2484,16 @@ def _install_provider_plan_groups(
                                     backup,
                                     operation,
                                     pinned_cache,
+                                )
+                            elif pinned_prime_legacy is not None:
+                                _retain_prime_gstack_legacy_file(
+                                    home_fs,
+                                    destination,
+                                    backup,
+                                    pinned_prime_legacy,
+                                    record,
+                                    record_path,
+                                    operation,
                                 )
                             else:
                                 home_fs.replace(destination, backup)
@@ -2225,6 +2632,9 @@ def _install_provider_plan_groups(
                         f"evidence retained at {target.home / record_path}"
                     ) from rollback_error
                 raise
+            finally:
+                for pinned in prime_adoption_pins.values():
+                    pinned.close()
         manifests.append(manifest)
 
 
@@ -2238,6 +2648,8 @@ def _validate_group_current_state(
     prior_content = home_fs.read_optional(manifest_path)
     prior_data = None
     if prior_content is not None:
+        if group.prime_gstack_legacy_adoption is not None:
+            raise ValueError("Prime gstack legacy adoption conflicts with shared ownership")
         _validate_ownership_manifest_stat(home_fs.stat(manifest_path))
         prior_data = _validated_prior_manifest_data(
             prior_content,
@@ -2250,6 +2662,10 @@ def _validate_group_current_state(
             error_type=ValueError,
             context="prior",
         )
+    elif group.prime_gstack_legacy_adoption is not None:
+        adoption_prestate = _prime_gstack_adoption_prestate(home_fs, group)
+        assert adoption_prestate is not None
+        prior_data, _adoption_record = adoption_prestate
     managed = (
         {Path(item["path"]): (item["fingerprint"], item["mode"]) for item in prior_data["files"]}
         if prior_data is not None
@@ -2422,6 +2838,8 @@ def _decode_record(
             _LEGACY_OPERATION_CURSOR_SCHEMA_VERSION,
             6,
             _RUNTIME_CACHE_PROVENANCE_SCHEMA_VERSION,
+            _FINITE_RUNTIME_CACHE_MATRIX_SCHEMA_VERSION,
+            _PRIME_GSTACK_ADOPTION_SCHEMA_VERSION,
             _TRANSACTION_SCHEMA_VERSION,
         }
         or record.get("state") not in {"prepared", "committed", "indeterminate", "rolled-back"}
@@ -2443,6 +2861,12 @@ def _decode_record(
     }
     if record["schema_version"] >= 4:
         record_keys.add("legacy_link_transition")
+    if record["schema_version"] >= _PRIME_GSTACK_ADOPTION_SCHEMA_VERSION:
+        record_keys.add("prime_gstack_legacy_adoption")
+    if record["schema_version"] >= _TRANSACTION_SCHEMA_VERSION:
+        record_keys.update(
+            {"prime_gstack_concurrent_mutation", "prime_gstack_move_authority"}
+        )
     if record["schema_version"] >= _OPERATION_CURSOR_SCHEMA_VERSION:
         record_keys.update({"operation_cursor", "operation_phase"})
     _require_exact_keys(record, record_keys, label="transaction record")
@@ -2459,6 +2883,10 @@ def _decode_record(
         raise ValueError("invalid transaction record channel transition")
     if manifest.transaction_id != transaction_id:
         raise ValueError("invalid transaction record identifier")
+    prime_adoption_prior = _decode_prime_gstack_adoption_record(
+        record.get("prime_gstack_legacy_adoption"),
+        manifest=manifest,
+    )
     legacy = record.get("legacy_link_transition")
     if legacy is not None:
         if not isinstance(legacy, dict):
@@ -2526,6 +2954,8 @@ def _decode_record(
     prior_encoded = record.get("prior_manifest_content")
     prior_data: dict[str, Any] | None = None
     if prior_encoded is not None:
+        if prime_adoption_prior is not None:
+            raise ValueError("transaction cannot combine shared and Prime legacy ownership")
         if not isinstance(prior_encoded, str):
             raise ValueError("invalid transaction record prior manifest")
         try:
@@ -2541,6 +2971,8 @@ def _decode_record(
             raise ValueError("invalid transaction record prior manifest mode")
     elif record.get("prior_manifest_mode") is not None:
         raise ValueError("invalid transaction record prior manifest mode")
+    elif prime_adoption_prior is not None:
+        prior_data = prime_adoption_prior
     operations = record.get("operations")
     directories = record.get("directories")
     if not isinstance(operations, list) or not isinstance(directories, list):
@@ -2678,6 +3110,133 @@ def _decode_record(
                     raise ValueError("invalid runtime cache removal source")
             elif _runtime_python_source_for_cache(destination) != runtime_source:
                 raise ValueError("invalid runtime cache removal source")
+    concurrent = record.get("prime_gstack_concurrent_mutation")
+    if concurrent is not None:
+        if not isinstance(concurrent, dict) or prime_adoption_prior is None:
+            raise ValueError("invalid Prime gstack concurrent mutation")
+        _require_exact_keys(
+            concurrent,
+            {
+                "operation_index",
+                "destination",
+                "kind",
+                "fingerprint",
+                "mode",
+                "identity",
+            },
+            label="Prime gstack concurrent mutation",
+        )
+        concurrent_index = concurrent["operation_index"]
+        concurrent_destination = _canonical_relative_text(
+            concurrent["destination"],
+            label="Prime gstack concurrent destination",
+        )
+        if (
+            type(concurrent_index) is not int
+            or concurrent_index < 0
+            or concurrent_index >= len(operations)
+            or operations[concurrent_index]["index"] != concurrent_index
+            or Path(operations[concurrent_index]["destination"]) != concurrent_destination
+            or operations[concurrent_index]["backup"] is None
+            or not operations[concurrent_index]["prior_exists"]
+            or type(concurrent["kind"]) is not str
+            or concurrent["kind"] not in {"regular", "missing"}
+            or record["state"] in {"committed", "indeterminate"}
+        ):
+            raise ValueError("invalid Prime gstack concurrent mutation binding")
+        if concurrent["kind"] == "regular":
+            if (
+                type(concurrent["fingerprint"]) is not str
+                or len(concurrent["fingerprint"]) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in concurrent["fingerprint"]
+                )
+                or not _valid_file_mode(concurrent["mode"])
+                or not isinstance(concurrent["identity"], dict)
+            ):
+                raise ValueError("invalid Prime gstack concurrent regular file")
+            _require_exact_keys(
+                concurrent["identity"],
+                {"device", "inode"},
+                label="Prime gstack concurrent identity",
+            )
+            if (
+                type(concurrent["identity"]["device"]) is not int
+                or concurrent["identity"]["device"] < 0
+                or type(concurrent["identity"]["inode"]) is not int
+                or concurrent["identity"]["inode"] <= 0
+            ):
+                raise ValueError("invalid Prime gstack concurrent identity")
+        elif (
+            concurrent["fingerprint"] is not None
+            or concurrent["mode"] is not None
+            or concurrent["identity"] is not None
+        ):
+            raise ValueError("invalid Prime gstack concurrent deletion")
+        prime_prior_paths = {Path(item["path"]) for item in prime_adoption_prior["files"]}
+        if concurrent_destination not in prime_prior_paths:
+            raise ValueError("Prime gstack concurrent mutation is outside legacy ownership")
+    move_authority = record.get("prime_gstack_move_authority")
+    if move_authority is not None:
+        if not isinstance(move_authority, dict) or prime_adoption_prior is None:
+            raise ValueError("invalid Prime gstack move authority")
+        _require_exact_keys(
+            move_authority,
+            {
+                "operation_index",
+                "destination",
+                "fingerprint",
+                "mode",
+                "identity",
+            },
+            label="Prime gstack move authority",
+        )
+        authority_index = move_authority["operation_index"]
+        authority_destination = _canonical_relative_text(
+            move_authority["destination"],
+            label="Prime gstack move authority destination",
+        )
+        identity = move_authority["identity"]
+        if (
+            type(authority_index) is not int
+            or authority_index < 0
+            or authority_index >= len(operations)
+            or operations[authority_index]["index"] != authority_index
+            or Path(operations[authority_index]["destination"]) != authority_destination
+            or operations[authority_index]["backup"] is None
+            or not operations[authority_index]["prior_exists"]
+            or type(move_authority["fingerprint"]) is not str
+            or len(move_authority["fingerprint"]) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in move_authority["fingerprint"]
+            )
+            or not _valid_file_mode(move_authority["mode"])
+            or not isinstance(identity, dict)
+            or record["state"] in {"committed", "indeterminate", "rolled-back"}
+        ):
+            raise ValueError("invalid Prime gstack move authority binding")
+        _require_exact_keys(
+            identity,
+            {"device", "inode"},
+            label="Prime gstack move authority identity",
+        )
+        if (
+            type(identity["device"]) is not int
+            or identity["device"] < 0
+            or type(identity["inode"]) is not int
+            or identity["inode"] <= 0
+        ):
+            raise ValueError("invalid Prime gstack move authority identity")
+        prime_prior_paths = {Path(item["path"]) for item in prime_adoption_prior["files"]}
+        if authority_destination not in prime_prior_paths:
+            raise ValueError("Prime gstack move authority is outside legacy ownership")
+        if concurrent is not None and (
+            concurrent["operation_index"] != authority_index
+            or concurrent["destination"] != authority_destination.as_posix()
+        ):
+            raise ValueError("Prime gstack move authority conflicts with concurrent mutation")
     manifest_files = {
         Path(item["path"]): (item["fingerprint"], item["mode"])
         for item in record["manifest"]["files"]
@@ -2870,6 +3429,13 @@ def _operation_proven_unstarted(
     record: dict[str, Any],
     operation: dict[str, Any],
 ) -> bool:
+    concurrent = _prime_gstack_concurrent_mutation(record)
+    if (
+        concurrent is not None
+        and _prime_gstack_concurrent_operation(record, operation)
+        and _prime_gstack_concurrent_is_restored(home_fs, record)
+    ):
+        return True
     if (
         record["schema_version"] >= _OPERATION_CURSOR_SCHEMA_VERSION
         and operation["backup"] is not None
@@ -3395,6 +3961,18 @@ def _rollback_record(
             prior_raw["channel"],
         )
         prior_data = _validated_manifest_data(prior_manifest, target=recovery_target)
+    else:
+        _target, candidate_manifest = _manifest_from_data(
+            record["manifest"],
+            home=home_fs.home,
+        )
+        prior_data = _decode_prime_gstack_adoption_record(
+            record.get("prime_gstack_legacy_adoption"),
+            manifest=candidate_manifest,
+        )
+    _resolve_prime_gstack_move_authority(home_fs, record, record_path)
+    _restore_prime_gstack_concurrent_before_evidence(home_fs, record)
+    prior_data = _prior_data_without_prime_concurrent(prior_data, record)
     expected_manifest = base64.b64decode(record["manifest_content"], validate=True)
     legacy = record.get("legacy_link_transition")
     legacy_destination = Path(legacy["destination"]) if legacy is not None else None
@@ -3431,6 +4009,9 @@ def _rollback_record(
         destination = Path(operation["destination"])
         backup = Path(operation["backup"]) if operation["backup"] else None
         kind = operation["kind"]
+        if _prime_gstack_concurrent_operation(record, operation):
+            _verify_prime_gstack_concurrent_restored(home_fs, record)
+            continue
         if kind == "installed" and home_fs.exists(destination):
             if (
                 legacy_destination is not None
@@ -3535,6 +4116,9 @@ def _rollback_record(
         for operation in reversed(record["operations"]):
             destination = Path(operation["destination"])
             backup = Path(operation["backup"]) if operation["backup"] else None
+            if _prime_gstack_concurrent_operation(record, operation):
+                _verify_prime_gstack_concurrent_restored(home_fs, record)
+                continue
             if operation["kind"] == _RUNTIME_CACHE_REMOVAL and backup is not None:
                 if not home_fs.exists(destination):
                     home_fs.publish_new(backup, destination)
@@ -3805,14 +4389,19 @@ def recover_transaction(path: Path) -> DeploymentManifest:
                 record,
                 relative,
             )
+        _resolve_prime_gstack_move_authority(home_fs, record, relative)
+        _restore_prime_gstack_concurrent_before_evidence(home_fs, record)
         _restore_unauthorized_runtime_cache_before_evidence(home_fs, record)
         _validate_transaction_evidence(home_fs, record, relative)
         if (
             record["state"] in {"prepared", "indeterminate"}
             and current_manifest == prior_manifest
-            and any(
-                operation["kind"] == _RUNTIME_CACHE_REMOVAL
-                for operation in record["operations"]
+            and (
+                record.get("prime_gstack_legacy_adoption") is not None
+                or any(
+                    operation["kind"] == _RUNTIME_CACHE_REMOVAL
+                    for operation in record["operations"]
+                )
             )
         ):
             _rollback_record(home_fs, record, relative, retain_completed=True)
@@ -4265,6 +4854,426 @@ def _recorded_runtime_cache_is_valid(
             ),
         ),
     )
+
+
+class _PinnedPrimeGstackLegacyFile:
+    """No-follow legacy-file authority retained across its backup move."""
+
+    def __init__(self, home_fs: _HomeFS, path: Path, operation: dict[str, Any]) -> None:
+        self._home_fs = home_fs
+        self.path = path
+        self.fingerprint = operation["prior_fingerprint"]
+        self.mode = operation["prior_mode"]
+        with home_fs.parent(path) as (parent, leaf):
+            self.descriptor = os.open(
+                leaf,
+                os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW,
+                dir_fd=parent,
+            )
+        try:
+            os.set_inheritable(self.descriptor, False)
+            observed = self._verified_descriptor()
+            self.identity = observed.st_dev, observed.st_ino
+            current = home_fs.stat(path)
+            if (current.st_dev, current.st_ino) != self.identity:
+                raise ValueError(f"Prime gstack legacy file changed before mutation: {path}")
+        except BaseException:
+            os.close(self.descriptor)
+            raise
+
+    def _verified_descriptor(self) -> os.stat_result:
+        observed = os.fstat(self.descriptor)
+        content = _read_status_descriptor(self.descriptor)
+        if (
+            os.get_inheritable(self.descriptor)
+            or not stat.S_ISREG(observed.st_mode)
+            or observed.st_nlink != 1
+            or stat.S_IMODE(observed.st_mode) != self.mode
+            or _fingerprint(content) != self.fingerprint
+        ):
+            raise ValueError(f"Prime gstack legacy file changed before mutation: {self.path}")
+        return observed
+
+    def matches_backup(self, backup: Path) -> bool:
+        try:
+            self._verified_descriptor()
+            moved = self._home_fs.stat(backup)
+            return (
+                stat.S_ISREG(moved.st_mode)
+                and moved.st_nlink == 1
+                and stat.S_IMODE(moved.st_mode) == self.mode
+                and (moved.st_dev, moved.st_ino) == self.identity
+                and self._home_fs.matches_fingerprint_file(
+                    backup,
+                    self.fingerprint,
+                    self.mode,
+                )
+            )
+        except (OSError, ValueError):
+            return False
+
+    def close(self) -> None:
+        with suppress(OSError):
+            os.close(self.descriptor)
+
+
+class _PinnedPrimeGstackCurrentFile:
+    """Exact live authority captured before a Prime legacy backup move."""
+
+    def __init__(self, home_fs: _HomeFS, path: Path) -> None:
+        self._home_fs = home_fs
+        self.path = path
+        with home_fs.parent(path) as (parent, leaf):
+            self.descriptor = os.open(
+                leaf,
+                os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW,
+                dir_fd=parent,
+            )
+        try:
+            os.set_inheritable(self.descriptor, False)
+            observed, content = self._verified_descriptor()
+            self.identity = observed.st_dev, observed.st_ino
+            self.fingerprint = _fingerprint(content)
+            self.mode = stat.S_IMODE(observed.st_mode)
+            current = home_fs.stat(path)
+            if (current.st_dev, current.st_ino) != self.identity:
+                raise ValueError(f"Prime gstack live file changed before mutation: {path}")
+        except BaseException:
+            os.close(self.descriptor)
+            raise
+
+    def _verified_descriptor(self) -> tuple[os.stat_result, bytes]:
+        observed = os.fstat(self.descriptor)
+        content = _read_status_descriptor(self.descriptor)
+        if (
+            os.get_inheritable(self.descriptor)
+            or not stat.S_ISREG(observed.st_mode)
+            or observed.st_nlink != 1
+            or not _valid_file_mode(stat.S_IMODE(observed.st_mode))
+        ):
+            raise ValueError(f"Prime gstack live file is unsafe: {self.path}")
+        return observed, content
+
+    def matches_legacy(self, pinned: _PinnedPrimeGstackLegacyFile) -> bool:
+        try:
+            self._verified_descriptor()
+            return (
+                self.identity == pinned.identity
+                and self.fingerprint == pinned.fingerprint
+                and self.mode == pinned.mode
+            )
+        except (OSError, ValueError):
+            return False
+
+    def matches_path(self, path: Path) -> bool:
+        try:
+            self._verified_descriptor()
+            observed = self._home_fs.stat(path)
+            return (
+                (observed.st_dev, observed.st_ino) == self.identity
+                and stat.S_ISREG(observed.st_mode)
+                and observed.st_nlink == 1
+                and self._home_fs.matches_fingerprint_file(
+                    path,
+                    self.fingerprint,
+                    self.mode,
+                )
+            )
+        except (OSError, ValueError):
+            return False
+
+    def matches_authority(self, authority: dict[str, Any]) -> bool:
+        try:
+            self._verified_descriptor()
+            identity = authority["identity"]
+            return (
+                self.fingerprint == authority["fingerprint"]
+                and self.mode == authority["mode"]
+                and self.identity == (identity["device"], identity["inode"])
+            )
+        except (KeyError, OSError, ValueError):
+            return False
+
+    def close(self) -> None:
+        with suppress(OSError):
+            os.close(self.descriptor)
+
+
+def _prime_gstack_file_authority(
+    operation: dict[str, Any],
+    destination: Path,
+    pinned: _PinnedPrimeGstackCurrentFile,
+) -> dict[str, Any]:
+    return {
+        "operation_index": operation["index"],
+        "destination": destination.as_posix(),
+        "fingerprint": pinned.fingerprint,
+        "mode": pinned.mode,
+        "identity": {
+            "device": pinned.identity[0],
+            "inode": pinned.identity[1],
+        },
+    }
+
+
+def _prime_gstack_concurrent_regular(
+    operation: dict[str, Any],
+    destination: Path,
+    pinned: _PinnedPrimeGstackCurrentFile,
+) -> dict[str, Any]:
+    return {
+        **_prime_gstack_file_authority(operation, destination, pinned),
+        "kind": "regular",
+    }
+
+
+def _prime_gstack_move_authority(record: dict[str, Any]) -> dict[str, Any] | None:
+    value = record.get("prime_gstack_move_authority")
+    return value if isinstance(value, dict) else None
+
+
+def _resolve_prime_gstack_move_authority(
+    home_fs: _HomeFS,
+    record: dict[str, Any],
+    record_path: Path,
+) -> None:
+    """Resolve one journaled Prime move without replacing another live entry."""
+    authority = _prime_gstack_move_authority(record)
+    if authority is None:
+        return
+    operation = record["operations"][authority["operation_index"]]
+    destination = Path(authority["destination"])
+    backup = Path(operation["backup"])
+    destination_exists = home_fs.exists(destination)
+    backup_exists = home_fs.exists(backup)
+    if destination_exists and backup_exists:
+        raise IncompleteRollbackError(
+            f"Prime gstack move recovery found both live and backup entries: {destination}"
+        )
+    if destination_exists:
+        try:
+            pinned = _PinnedPrimeGstackCurrentFile(home_fs, destination)
+        except (OSError, ValueError) as exc:
+            raise IncompleteRollbackError(
+                f"Prime gstack move recovery found an unsafe live entry: {destination}"
+            ) from exc
+        try:
+            concurrent = _prime_gstack_concurrent_mutation(record)
+            if not pinned.matches_authority(authority):
+                record["prime_gstack_concurrent_mutation"] = (
+                    _prime_gstack_concurrent_regular(operation, destination, pinned)
+                )
+            elif concurrent is not None and (
+                concurrent["kind"] != "regular"
+                or not pinned.matches_authority(concurrent)
+            ):
+                raise IncompleteRollbackError(
+                    f"Prime gstack move recovery conflicts with live authority: {destination}"
+                )
+            record["prime_gstack_move_authority"] = None
+            home_fs.write_atomic(record_path, _record_bytes(record), 0o600)
+            return
+        finally:
+            pinned.close()
+    if not backup_exists:
+        record["prime_gstack_concurrent_mutation"] = {
+            "operation_index": operation["index"],
+            "destination": destination.as_posix(),
+            "kind": "missing",
+            "fingerprint": None,
+            "mode": None,
+            "identity": None,
+        }
+        record["prime_gstack_move_authority"] = None
+        home_fs.write_atomic(record_path, _record_bytes(record), 0o600)
+        return
+    try:
+        pinned = _PinnedPrimeGstackCurrentFile(home_fs, backup)
+    except (OSError, ValueError) as exc:
+        raise IncompleteRollbackError(
+            f"Prime gstack move recovery found an unsafe backup entry: {backup}"
+        ) from exc
+    try:
+        concurrent = _prime_gstack_concurrent_mutation(record)
+        if not pinned.matches_authority(authority):
+            record["prime_gstack_concurrent_mutation"] = _prime_gstack_concurrent_regular(
+                operation,
+                destination,
+                pinned,
+            )
+            home_fs.write_atomic(record_path, _record_bytes(record), 0o600)
+            concurrent = _prime_gstack_concurrent_mutation(record)
+        elif concurrent is None:
+            record["prime_gstack_move_authority"] = None
+            home_fs.write_atomic(record_path, _record_bytes(record), 0o600)
+            return
+        elif concurrent["kind"] != "regular" or not pinned.matches_authority(concurrent):
+            raise IncompleteRollbackError(
+                f"Prime gstack move recovery conflicts with backup authority: {backup}"
+            )
+        if not pinned.matches_path(backup):
+            raise IncompleteRollbackError(
+                f"Prime gstack move backup changed before restoration: {backup}"
+            )
+        try:
+            home_fs.move_new(backup, destination)
+        except FileExistsError as exc:
+            raise IncompleteRollbackError(
+                f"Prime gstack move recovery preserved a newer live entry: {destination}"
+            ) from exc
+        if not pinned.matches_path(destination):
+            raise IncompleteRollbackError(
+                f"Prime gstack move recovery changed during restoration: {destination}"
+            )
+        record["prime_gstack_move_authority"] = None
+        home_fs.write_atomic(record_path, _record_bytes(record), 0o600)
+    finally:
+        pinned.close()
+
+
+def _retain_prime_gstack_legacy_file(
+    home_fs: _HomeFS,
+    destination: Path,
+    backup: Path,
+    pinned: _PinnedPrimeGstackLegacyFile,
+    record: dict[str, Any],
+    record_path: Path,
+    operation: dict[str, Any],
+) -> None:
+    """Move only retained legacy authority; journal and restore a raced entry."""
+    try:
+        current = _PinnedPrimeGstackCurrentFile(home_fs, destination)
+    except FileNotFoundError:
+        if home_fs.exists(destination) or home_fs.exists(backup):
+            raise
+        record["prime_gstack_concurrent_mutation"] = {
+            "operation_index": operation["index"],
+            "destination": destination.as_posix(),
+            "kind": "missing",
+            "fingerprint": None,
+            "mode": None,
+            "identity": None,
+        }
+        home_fs.write_atomic(record_path, _record_bytes(record), 0o600)
+        _after_prime_gstack_concurrent_journal(home_fs, record_path, record)
+        raise _PrimeGstackConcurrentMutation(destination) from None
+    try:
+        record["prime_gstack_move_authority"] = _prime_gstack_file_authority(
+            operation,
+            destination,
+            current,
+        )
+        home_fs.write_atomic(record_path, _record_bytes(record), 0o600)
+        matches_legacy = current.matches_legacy(pinned)
+        if not matches_legacy:
+            record["prime_gstack_concurrent_mutation"] = (
+                _prime_gstack_concurrent_regular(operation, destination, current)
+            )
+            home_fs.write_atomic(record_path, _record_bytes(record), 0o600)
+            _after_prime_gstack_concurrent_journal(home_fs, record_path, record)
+        home_fs.replace(destination, backup)
+        if matches_legacy and current.matches_path(backup):
+            record["prime_gstack_move_authority"] = None
+            return
+        _resolve_prime_gstack_move_authority(home_fs, record, record_path)
+        raise _PrimeGstackConcurrentMutation(destination)
+    finally:
+        current.close()
+
+
+def _prime_gstack_concurrent_mutation(record: dict[str, Any]) -> dict[str, Any] | None:
+    value = record.get("prime_gstack_concurrent_mutation")
+    return value if isinstance(value, dict) else None
+
+
+def _prime_gstack_concurrent_operation(
+    record: dict[str, Any],
+    operation: dict[str, Any],
+) -> bool:
+    concurrent = _prime_gstack_concurrent_mutation(record)
+    return concurrent is not None and concurrent["operation_index"] == operation["index"]
+
+
+def _prime_gstack_concurrent_file_matches(
+    home_fs: _HomeFS,
+    path: Path,
+    concurrent: dict[str, Any],
+) -> bool:
+    if concurrent["kind"] != "regular":
+        return False
+    try:
+        observed = home_fs.stat(path)
+        identity = concurrent["identity"]
+        return (
+            stat.S_ISREG(observed.st_mode)
+            and observed.st_nlink == 1
+            and (observed.st_dev, observed.st_ino)
+            == (identity["device"], identity["inode"])
+            and _file_matches(
+                home_fs,
+                path,
+                concurrent["fingerprint"],
+                concurrent["mode"],
+            )
+        )
+    except OSError:
+        return False
+
+
+def _prime_gstack_concurrent_is_restored(
+    home_fs: _HomeFS,
+    record: dict[str, Any],
+) -> bool:
+    concurrent = _prime_gstack_concurrent_mutation(record)
+    if concurrent is None:
+        return True
+    operation = record["operations"][concurrent["operation_index"]]
+    destination = Path(concurrent["destination"])
+    backup = Path(operation["backup"])
+    if concurrent["kind"] == "missing":
+        return not home_fs.exists(destination) and not home_fs.exists(backup)
+    return _prime_gstack_concurrent_file_matches(
+        home_fs,
+        destination,
+        concurrent,
+    ) and not home_fs.exists(backup)
+
+
+def _restore_prime_gstack_concurrent_before_evidence(
+    home_fs: _HomeFS,
+    record: dict[str, Any],
+) -> None:
+    """Restore journaled concurrent content before rollback classification."""
+    concurrent = _prime_gstack_concurrent_mutation(record)
+    if concurrent is None:
+        return
+    operation = record["operations"][concurrent["operation_index"]]
+    destination = Path(concurrent["destination"])
+    backup = Path(operation["backup"])
+    if concurrent["kind"] == "missing":
+        if home_fs.exists(destination) or home_fs.exists(backup):
+            raise IncompleteRollbackError(
+                f"Prime gstack concurrent deletion recovery is ambiguous: {destination}"
+            )
+        return
+    destination_matches = _prime_gstack_concurrent_file_matches(
+        home_fs,
+        destination,
+        concurrent,
+    )
+    backup_matches = _prime_gstack_concurrent_file_matches(home_fs, backup, concurrent)
+    if backup_matches and not home_fs.exists(destination):
+        home_fs.move_new(backup, destination)
+        destination_matches = _prime_gstack_concurrent_file_matches(
+            home_fs,
+            destination,
+            concurrent,
+        )
+        backup_matches = False
+    if not destination_matches or backup_matches or home_fs.exists(backup):
+        raise IncompleteRollbackError(
+            f"Prime gstack concurrent entry recovery is ambiguous: {destination}"
+        )
 
 
 class _PinnedRuntimeCache:
