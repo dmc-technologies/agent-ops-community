@@ -1432,6 +1432,69 @@ def test_prime_gstack_legacy_adoption_rolls_back_exact_prestate_after_late_failu
     assert not list((home / ".agentops/deployment/manifests").glob("*.json"))
 
 
+@pytest.mark.parametrize("raced_entry", ("runtime", "legacy-manifest"))
+@pytest.mark.parametrize("race_kind", ("replacement", "content", "mode"))
+def test_prime_gstack_legacy_adoption_preserves_concurrent_entry_before_backup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    raced_entry: str,
+    race_kind: str,
+) -> None:
+    home = tmp_path / "home"
+    plan, runtime, skill, legacy_manifest, legacy_manifest_bytes = _prime_gstack_legacy_plan(home)
+    raced_path = runtime if raced_entry == "runtime" else legacy_manifest
+    raced_relative = raced_path.relative_to(home)
+    concurrent_content = f"concurrent {raced_entry}\n".encode()
+    runtime_before = runtime.read_bytes()
+    skill_before = skill.read_bytes()
+    original_content = raced_path.read_bytes()
+    original_mode = stat.S_IMODE(raced_path.stat().st_mode)
+    concurrent_mode = (
+        0o700 if raced_entry == "runtime" else 0o600
+    ) if race_kind == "mode" else original_mode
+    expected_content = original_content if race_kind == "mode" else concurrent_content
+    changed = False
+
+    def replace_before_backup(
+        _home_fs: object,
+        _record_path: Path,
+        operation: dict[str, object],
+    ) -> None:
+        nonlocal changed
+        if changed or operation["destination"] != raced_relative.as_posix():
+            return
+        if race_kind == "replacement":
+            concurrent = raced_path.with_name(f"{raced_path.name}.concurrent")
+            concurrent.write_bytes(concurrent_content)
+            concurrent.chmod(original_mode)
+            os.replace(concurrent, raced_path)
+        elif race_kind == "content":
+            raced_path.write_bytes(concurrent_content)
+        else:
+            raced_path.chmod(concurrent_mode)
+        changed = True
+
+    monkeypatch.setattr(
+        transaction_module,
+        "_before_operation_mutation",
+        replace_before_backup,
+    )
+
+    with pytest.raises((OSError, ValueError)):
+        install_provider_plans((plan,))
+
+    assert changed
+    assert raced_path.read_bytes() == expected_content
+    assert stat.S_IMODE(raced_path.stat().st_mode) == concurrent_mode
+    if raced_entry == "runtime":
+        assert skill.read_bytes() == skill_before
+        assert legacy_manifest.read_bytes() == legacy_manifest_bytes
+    else:
+        assert runtime.read_bytes() == runtime_before
+        assert skill.read_bytes() == skill_before
+    assert not list((home / ".agentops/deployment/manifests").glob("*.json"))
+
+
 def test_prime_gstack_legacy_adoption_recovery_restores_exact_prestate(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
