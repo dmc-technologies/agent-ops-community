@@ -1549,6 +1549,55 @@ def test_prime_gstack_legacy_adoption_rolls_back_when_future_entry_changes(
     assert not list((home / ".agentops/deployment/transactions").glob("*/record.json"))
 
 
+def test_prime_gstack_legacy_adoption_rolls_back_when_future_unchanged_entry_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    plan, runtime, skill, legacy_manifest, legacy_manifest_bytes = _prime_gstack_legacy_plan(home)
+    plan = ProviderPlan(
+        plan.provider_id,
+        plan.source_revision,
+        plan.target,
+        (plan.files[0], PlannedFile(plan.files[1].path, skill.read_bytes(), 0o644)),
+        audit_roots=plan.audit_roots,
+        prime_gstack_legacy_adoption=plan.prime_gstack_legacy_adoption,
+    )
+    runtime_before = runtime.read_bytes()
+    concurrent_content = b"concurrent unchanged skill\n"
+    changed = False
+
+    def replace_after_earlier_operation(
+        _home_fs: object,
+        _record_path: Path,
+        operation: dict[str, object],
+    ) -> None:
+        nonlocal changed
+        if changed or operation["destination"] != runtime.relative_to(home).as_posix():
+            return
+        concurrent = skill.with_name(f"{skill.name}.concurrent")
+        concurrent.write_bytes(concurrent_content)
+        concurrent.chmod(0o644)
+        os.replace(concurrent, skill)
+        changed = True
+
+    monkeypatch.setattr(
+        transaction_module,
+        "_after_operation_mutation",
+        replace_after_earlier_operation,
+    )
+
+    with pytest.raises((OSError, ValueError)):
+        install_provider_plans((plan,))
+
+    assert changed
+    assert runtime.read_bytes() == runtime_before
+    assert skill.read_bytes() == concurrent_content
+    assert legacy_manifest.read_bytes() == legacy_manifest_bytes
+    assert not list((home / ".agentops/deployment/manifests").glob("*.json"))
+    assert not list((home / ".agentops/deployment/transactions").glob("*/record.json"))
+
+
 @pytest.mark.parametrize("exit_point", ("journaled-backup", "restored-destination"))
 @pytest.mark.parametrize("race_kind", ("replacement", "missing"))
 def test_prime_gstack_concurrent_entry_recovery_restores_live_path_after_process_exit(
