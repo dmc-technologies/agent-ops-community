@@ -35,9 +35,9 @@ ERROR_LOCK_VIOLATION = 33
 INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 _INVALID_WINDOWS_CHARS = frozenset('<>:"|?*')
 _RESERVED_WINDOWS_NAMES = frozenset(
-    {"CON", "PRN", "AUX", "NUL"}
-    | {f"COM{index}" for index in range(1, 10)}
-    | {f"LPT{index}" for index in range(1, 10)}
+    {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"}
+    | {f"COM{index}" for index in (*range(1, 10), "¹", "²", "³")}
+    | {f"LPT{index}" for index in (*range(1, 10), "¹", "²", "³")}
 )
 
 

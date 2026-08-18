@@ -41,6 +41,11 @@ from agent_ops.registries.models import Framework
     (
         "skills/example/SKILL.md:payload",
         "skills/example/CON.txt",
+        "skills/example/CONIN$",
+        "skills/example/CONOUT$",
+        "skills/example/COM¹.txt",
+        "skills/example/LPT².log",
+        "skills/example/COM³",
         "skills/example/name.",
         "skills/example/name ",
     ),
