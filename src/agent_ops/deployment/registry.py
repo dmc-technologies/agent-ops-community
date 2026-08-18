@@ -51,6 +51,13 @@ _STATUS_KEYS = frozenset({"target_id", "state", "channel", "commit"})
 _RECEIPT_WRAPPER_KEYS = frozenset({"schema_version", "registry_fingerprint", "receipt"})
 _RECEIPT_COUNTER = "receipt-count"
 _MAX_RECEIPTS = 1_000_000
+_WINDOWS_SUPPORTED = os.name == "nt"
+
+
+def _windows_registry_backend() -> Any:
+    from agent_ops.deployment import windows_registry
+
+    return windows_registry
 
 
 class _StrictLoader(yaml.SafeLoader):
@@ -223,6 +230,8 @@ class DeploymentRegistry:
         return self.load_snapshot().config
 
     def load_snapshot(self) -> RegistrySnapshot:
+        if _WINDOWS_SUPPORTED:
+            return _windows_registry_backend().load_snapshot(self)
         _require_secure_platform(require_locking=True)
         parent, identities, lock = _open_locked_parent(
             self.path.parent, self.lock_path.name, exclusive=False, create_lock=False
@@ -236,10 +245,12 @@ class DeploymentRegistry:
             os.close(parent)
 
     @contextmanager
-    def retain_snapshot(
-        self, snapshot: RegistrySnapshot
-    ) -> Iterator[_RegistrySnapshotAuthority]:
+    def retain_snapshot(self, snapshot: RegistrySnapshot) -> Iterator[_RegistrySnapshotAuthority]:
         """Retain shared authority for an exact registry snapshot."""
+        if _WINDOWS_SUPPORTED:
+            with _windows_registry_backend().retain_snapshot(self, snapshot) as authority:
+                yield authority
+            return
         _require_secure_platform(require_locking=True)
         if type(snapshot) is not RegistrySnapshot:
             raise TypeError("snapshot must be an exact RegistrySnapshot")
@@ -269,6 +280,12 @@ class DeploymentRegistry:
         *,
         expected_snapshot: RegistrySnapshot | None = None,
     ) -> RegistrySnapshot:
+        if _WINDOWS_SUPPORTED:
+            return _windows_registry_backend().save(
+                self,
+                config,
+                expected_snapshot=expected_snapshot,
+            )
         _require_secure_platform(require_locking=True)
         _validate_config(config, require_nonempty=True)
         if expected_snapshot is not None and type(expected_snapshot) is not RegistrySnapshot:
@@ -390,6 +407,12 @@ class DeploymentRegistry:
         *,
         snapshot: RegistrySnapshot,
     ) -> Path:
+        if _WINDOWS_SUPPORTED:
+            return _windows_registry_backend().append_receipt(
+                self,
+                receipt,
+                snapshot=snapshot,
+            )
         _require_secure_platform(require_locking=True)
         receipt_data = _receipt_to_data(receipt)
         if type(snapshot) is not RegistrySnapshot:
@@ -499,6 +522,8 @@ class DeploymentRegistry:
         return tuple(record.receipt for record in self.receipt_records())
 
     def receipt_records(self) -> tuple[ReceiptRecord, ...]:
+        if _WINDOWS_SUPPORTED:
+            return _windows_registry_backend().receipt_records(self)
         _require_secure_platform(require_locking=True)
         parent, identities, lock = _open_locked_parent(
             self.path.parent, self.lock_path.name, exclusive=False, create_lock=False
@@ -593,11 +618,7 @@ class DeploymentRegistry:
             sources = {source.id: source for source in config.sources}
             channel = channels[target.channel]
             source = sources[channel.source]
-            state = (
-                TargetState.STABLE
-                if channel.ref == source.stable_ref
-                else TargetState.BRANCH
-            )
+            state = TargetState.STABLE if channel.ref == source.stable_ref else TargetState.BRANCH
         return TargetStatus(target_id=target_id, state=state, channel=target.channel, commit=commit)
 
 
@@ -633,8 +654,7 @@ def _validate_ref(value: Any) -> str:
     )
     if not invalid:
         invalid = any(
-            not part or part.startswith(".") or part.endswith(".lock")
-            for part in value.split("/")
+            not part or part.startswith(".") or part.endswith(".lock") for part in value.split("/")
         )
     if invalid:
         raise ValueError("Git ref must be a fully qualified refs/... string")
@@ -661,6 +681,15 @@ def _validate_home(path: Path, label: str) -> tuple[tuple[int, int] | None, str]
     if os.sep == "/" and normalized.startswith("//"):
         normalized = f"/{normalized.lstrip('/')}"
     normalized = os.path.normcase(normalized)
+    if _WINDOWS_SUPPORTED:
+        from agent_ops.deployment.windows_fs import WindowsPathPins
+
+        try:
+            with WindowsPathPins(path, create=False) as pins:
+                identity = pins.identities[-1]
+                return (identity.volume, identity.index), normalized
+        except FileNotFoundError:
+            return None, normalized
     current = Path(path.anchor)
     for part in path.parts[1:]:
         current /= part
@@ -835,12 +864,10 @@ def _dump_registry(config: RegistryConfig) -> bytes:
     document = {
         "schema_version": 1,
         "sources": {
-            source.id: {"url": source.url, "stable_ref": source.stable_ref}
-            for source in sources
+            source.id: {"url": source.url, "stable_ref": source.stable_ref} for source in sources
         },
         "channels": {
-            channel.id: {"source": channel.source, "ref": channel.ref}
-            for channel in channels
+            channel.id: {"source": channel.source, "ref": channel.ref} for channel in channels
         },
         "targets": {
             target.id: {
@@ -894,9 +921,7 @@ def _receipt_to_data(receipt: DeploymentReceipt) -> dict[str, Any]:
     return {"operation": operation, "commits": commits, "targets": targets}
 
 
-def _dump_receipt_wrapper(
-    receipt: dict[str, Any], registry_fingerprint: str
-) -> bytes:
+def _dump_receipt_wrapper(receipt: dict[str, Any], registry_fingerprint: str) -> bytes:
     _validate_fingerprint(registry_fingerprint)
     return (
         json.dumps(
@@ -955,9 +980,7 @@ def _parse_receipt_wrapper(content: bytes) -> tuple[str, DeploymentReceipt]:
     )
 
 
-def _read_receipt_wrapper(
-    receipts: int, name: str
-) -> tuple[str, DeploymentReceipt]:
+def _read_receipt_wrapper(receipts: int, name: str) -> tuple[str, DeploymentReceipt]:
     return _parse_receipt_wrapper(
         _read_regular_file(
             receipts,
@@ -984,9 +1007,7 @@ def _require_secure_platform(*, require_locking: bool = False) -> None:
     required_flags = ("O_NOFOLLOW", "O_DIRECTORY", "O_CREAT", "O_EXCL")
     required_dir_fd = (os.open, os.stat, os.mkdir, os.unlink, os.link, os.rename)
     missing = [
-        function.__name__
-        for function in required_dir_fd
-        if function not in os.supports_dir_fd
+        function.__name__ for function in required_dir_fd if function not in os.supports_dir_fd
     ]
     unsupported = (
         os.name != "posix"
@@ -1100,9 +1121,7 @@ def _snapshot_from_parent(parent: int, name: str) -> RegistrySnapshot:
     )
 
 
-def _require_current_snapshot(
-    parent: int, name: str, expected: RegistrySnapshot
-) -> None:
+def _require_current_snapshot(parent: int, name: str, expected: RegistrySnapshot) -> None:
     current = _snapshot_from_parent(parent, name)
     if current != expected:
         raise ValueError("registry no longer matches the required snapshot")
@@ -1264,9 +1283,7 @@ def _open_private_directory(
     return descriptor
 
 
-def _open_private_lock(
-    parent: int, name: str, *, create: bool, writable: bool
-) -> int:
+def _open_private_lock(parent: int, name: str, *, create: bool, writable: bool) -> int:
     access = os.O_RDWR if writable else os.O_RDONLY
     try:
         descriptor = os.open(name, access | os.O_NOFOLLOW, dir_fd=parent)
@@ -1324,10 +1341,9 @@ def _receipt_names_for_append(
     for name in os.listdir(directory):
         if _RECEIPT_FILE.fullmatch(name) is not None:
             receipt_names.append(name)
-        elif (
-            (match := _RECEIPT_TEMP.fullmatch(name)) is not None
-            and match.group("receipt") == destination
-        ):
+        elif (match := _RECEIPT_TEMP.fullmatch(name)) is not None and match.group(
+            "receipt"
+        ) == destination:
             temporary_names.append(name)
         else:
             raise RuntimeError(f"unexpected entry in receipt directory: {name}")
@@ -1342,9 +1358,7 @@ def _receipt_names_for_append(
     if staged_fingerprint != registry_fingerprint or staged_receipt != receipt:
         raise RuntimeError("interrupted receipt stage does not match append retry")
     if destination in receipt_names:
-        destination_identity = _optional_regular_identity(
-            directory, destination, "orphan receipt"
-        )
+        destination_identity = _optional_regular_identity(directory, destination, "orphan receipt")
         temporary_identity = _optional_regular_identity(
             directory, temporary, "receipt temporary file"
         )
@@ -1410,10 +1424,9 @@ def _recover_history_before_save(
         for name in os.listdir(receipts):
             if _RECEIPT_FILE.fullmatch(name) is not None:
                 receipt_names.append(name)
-            elif (
-                (match := _RECEIPT_TEMP.fullmatch(name)) is not None
-                and match.group("receipt") == destination
-            ):
+            elif (match := _RECEIPT_TEMP.fullmatch(name)) is not None and match.group(
+                "receipt"
+            ) == destination:
                 temporary_names.append(name)
             else:
                 raise RuntimeError(f"unexpected entry in receipt directory: {name}")
@@ -1436,9 +1449,7 @@ def _recover_history_before_save(
                     raise RuntimeError("orphan receipt fingerprint does not match old registry")
                 if _optional_regular_identity(
                     receipts, destination, "orphan receipt"
-                ) != _optional_regular_identity(
-                    receipts, temporary, "receipt temporary file"
-                ):
+                ) != _optional_regular_identity(receipts, temporary, "receipt temporary file"):
                     raise RuntimeError("interrupted receipt stage is not linked to orphan")
             else:
                 before_mutation()
@@ -1542,8 +1553,10 @@ def _write_private_atomic(parent: int, name: str, content: bytes, *, label: str)
 
 
 def _is_preview_channel(channel: str) -> bool:
-    return channel == "preview" or channel.startswith("preview-") or channel.startswith(
-        "unreviewed-local"
+    return (
+        channel == "preview"
+        or channel.startswith("preview-")
+        or channel.startswith("unreviewed-local")
     )
 
 
