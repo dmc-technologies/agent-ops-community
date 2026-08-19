@@ -11,19 +11,21 @@ Repository: `agent-ops-community`
 5. Search or recall relevant shared-memory entries when prior context could
    affect the work.
 6. Run `git status --short --branch`.
-7. Run the fastest relevant verification command before broad edits when feasible.
-8. Continue from `.agentops/harness/PROGRESS.md` "Next Actions".
+7. Determine the target branch and whether repository instructions declare an integration branch, a routine feature pull request, integration-controller work, or stable-branch landing.
+8. Run the fastest relevant verification command before broad edits when feasible.
+9. Continue from `.agentops/harness/PROGRESS.md` "Next Actions" when that file is owned by the current branch role; otherwise continue from exact pull request and tracker evidence.
 
 ## Clock Out
 
-1. Update `.agentops/harness/PROGRESS.md` with current state, verification,
-   blockers, and next actions.
-2. Add durable architecture or workflow decisions to `.agentops/harness/DECISIONS.md`.
-3. Write shared-memory entries only for distilled cross-agent memory: important
+1. If no integration branch is declared, update `.agentops/harness/PROGRESS.md` with current state, verification, blockers, and next actions.
+2. If repository instructions declare an integration branch, hand off a routine feature pull request through exact pull request and tracker evidence; do not replace `.agentops/harness/PROGRESS.md`.
+3. The integration controller or stable-branch landing updates `.agentops/harness/PROGRESS.md` when repository instructions assign that role.
+4. Add durable architecture or workflow decisions to `.agentops/harness/DECISIONS.md`.
+5. Write shared-memory entries only for distilled cross-agent memory: important
    decisions, durable discoveries, non-obvious debugging findings, or workflow
    changes. Do not write automatic session summaries.
-4. Remove stale debug artifacts and leave the startup path usable.
-5. Run the local CI contract or record why it could not be run.
+6. Remove stale debug artifacts and leave the startup path usable.
+7. Run the local CI contract or record why it could not be run.
 
 ## ACID State Rules
 
