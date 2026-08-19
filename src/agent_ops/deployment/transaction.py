@@ -5899,17 +5899,42 @@ def retain_provider_plan_evidence(
             evidence.close()
 
 
+def _is_preview_status_channel(channel: str) -> bool:
+    return (
+        channel == "preview"
+        or channel.startswith("preview-")
+        or channel.startswith("unreviewed-local")
+    )
+
+
 def _read_preview_status_evidence(
     target: TargetSpec,
 ) -> tuple[DeploymentManifest | None, DeploymentAudit | None]:
     """Read and audit one preview manifest under retained cooperative authority."""
     _require_supported_platform()
-    if not (
-        target.channel == "preview"
-        or target.channel.startswith("preview-")
-        or target.channel.startswith("unreviewed-local")
-    ):
+    if not _is_preview_status_channel(target.channel):
         raise ValueError("preview status evidence requires a preview target")
+    return _read_pinned_status_evidence(target, preview=True)
+
+
+def _read_managed_status_evidence(
+    target: TargetSpec,
+) -> tuple[DeploymentManifest | None, DeploymentAudit | None]:
+    """Read and audit one managed manifest under retained cooperative authority."""
+    _require_supported_platform()
+    if _is_preview_status_channel(target.channel):
+        raise ValueError("managed status evidence rejects a preview target")
+    if _WINDOWS_SUPPORTED and not _POSIX_SUPPORTED:
+        return _windows_transaction_backend().read_managed_status_evidence(target)
+    return _read_pinned_status_evidence(target, preview=False)
+
+
+def _read_pinned_status_evidence(
+    target: TargetSpec,
+    *,
+    preview: bool,
+) -> tuple[DeploymentManifest | None, DeploymentAudit | None]:
+    """Pin and compare one installed manifest against its own recorded paths."""
     try:
         with _target_read_lock(target.home) as home_fs:
             pinned: list[_PinnedStatusFile | _PinnedStatusDirectory] = []
@@ -5918,12 +5943,9 @@ def _read_preview_status_evidence(
                 pinned.append(manifest_pin)
                 data = _validated_manifest_data(manifest_pin.content, target=target)
                 revision = data["source_revision"]
-                if (
-                    data.get("review_state") != "unreviewed-local"
-                    or len(revision) != 64
-                    or any(character not in "0123456789abcdef" for character in revision)
-                ):
-                    raise ValueError("invalid preview manifest review state or fingerprint")
+                _validate_status_manifest_revision(
+                    data.get("review_state"), revision, preview=preview
+                )
                 manifest = DeploymentManifest(
                     schema_version=data["schema_version"],
                     target_id=target.id,
@@ -5940,7 +5962,7 @@ def _read_preview_status_evidence(
                         for item in data["directories"]
                     ),
                     transaction_id=data["transaction_id"],
-                    review_state="unreviewed-local",
+                    review_state="unreviewed-local" if preview else None,
                 )
                 missing: list[str] = []
                 changed: list[str] = []
@@ -5986,3 +6008,18 @@ def _read_preview_status_evidence(
                     evidence.close()
     except FileNotFoundError:
         return None, None
+
+
+def _validate_status_manifest_revision(
+    review_state: object, revision: str, *, preview: bool
+) -> None:
+    expected_length = 64 if preview else 40
+    expected_review_state = "unreviewed-local" if preview else None
+    if (
+        review_state != expected_review_state
+        or len(revision) != expected_length
+        or any(character not in "0123456789abcdef" for character in revision)
+    ):
+        if preview:
+            raise ValueError("invalid preview manifest review state or fingerprint")
+        raise ValueError("invalid managed manifest review state or source revision")

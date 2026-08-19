@@ -4,6 +4,13 @@ Repository: `agent-ops-community`
 
 Record durable architecture, workflow, and harness decisions here.
 
+### 2026-08-19: Managed deployment status classifies from the installed ownership manifest
+
+- Decision: `DeploymentEngine.status` reads each managed target's installed ownership manifest through the shared cooperative status-evidence reader that preview already used, and passes that manifest plus a manifest-versus-installed audit to `DeploymentRegistry.status`. The receipt bound to the current registry snapshot supplies only the last resolved commit and the recorded failure or missing-ref outcome. Managed evidence requires no preview review state and a full 40-hex source revision; preview evidence keeps its `unreviewed-local` state and 64-hex fingerprint. Native Windows uses the same contract through a shared-lock manifest read in the Windows backend.
+- Rationale: passing `manifest=None` for managed targets forced `TargetState.STALE` for every managed target regardless of its installed state, so `status` could never agree with `refresh` or `audit` and the stable, branch, and modified classifications were unreachable. The installed manifest is the same artifact `audit` validates, so reading it removes the contradiction without a fetch or a receipt write.
+- Applies to: `agent_ops.deployment.engine.status`, the shared status-evidence reader in `agent_ops.deployment.transaction`, the native Windows transaction backend, deployment documentation, and deployment engine, registry, and Windows tests.
+- Revisit when: managed status needs the current channel-ref commit rather than the last resolved commit, which would require a fetch and a different command contract.
+
 ### 2026-08-18: Integration branch roles determine repository progress ownership
 
 - Decision: when repository instructions declare an integration branch, routine feature pull requests hand off through exact pull-request and tracker evidence without replacing repository progress. The integration controller and stable-branch landing own bounded progress updates. Repositories without an integration branch retain the existing single-branch closeout.

@@ -463,6 +463,64 @@ def test_native_windows_engine_refreshes_one_complete_managed_path_twice(
     assert (home / "skills/example/SKILL.md").is_file()
 
 
+def test_managed_status_evidence_dispatches_to_native_windows_backend(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = _windows_plan(tmp_path / "codex").target
+    expected = (SimpleNamespace(source_revision="1" * 40), SimpleNamespace(matches=True))
+    calls: list[TargetSpec] = []
+    backend = SimpleNamespace(
+        read_managed_status_evidence=lambda item: calls.append(item) or expected
+    )
+    monkeypatch.setattr(transaction_module, "_POSIX_SUPPORTED", False)
+    monkeypatch.setattr(transaction_module, "_WINDOWS_SUPPORTED", True, raising=False)
+    monkeypatch.setattr(
+        transaction_module,
+        "_windows_transaction_backend",
+        lambda: backend,
+        raising=False,
+    )
+
+    evidence = transaction_module._read_managed_status_evidence(target)
+
+    assert evidence is expected
+    assert calls == [target]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows")
+def test_native_windows_managed_status_evidence_reads_the_installed_manifest(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "codex"
+    plan = _windows_plan(home)
+    install_provider_plans((plan,))
+
+    manifest, audit = transaction_module._read_managed_status_evidence(plan.target)
+
+    assert manifest is not None
+    assert manifest.source_revision == "1" * 40
+    assert manifest.review_state is None
+    assert audit is not None
+    assert audit.matches
+
+    (home / "AGENTS.md").write_text("tampered\n", encoding="utf-8")
+    _manifest, tampered = transaction_module._read_managed_status_evidence(plan.target)
+
+    assert tampered is not None
+    assert not tampered.matches
+    assert tampered.changed == ("AGENTS.md",)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows")
+def test_native_windows_managed_status_evidence_is_empty_without_an_install(
+    tmp_path: Path,
+) -> None:
+    target = _windows_plan(tmp_path / "codex").target
+
+    assert transaction_module._read_managed_status_evidence(target) == (None, None)
+
+
 @pytest.mark.skipif(os.name != "nt", reason="requires native Windows")
 def test_native_windows_first_install_and_identical_refresh_are_complete_and_auditable(
     tmp_path: Path,

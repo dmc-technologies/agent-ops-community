@@ -4,33 +4,32 @@ Repository: `agent-ops-community`
 
 ## Current State
 
-- Branch: `feat/integration-branch-harness`
-- Base: Community `origin/main` at `6e95965dfa041a24f0a36a86040671fdaeae50ef`
-- Upstream proof: the first private adopter's accepted integration commit `90ed25237592cfe000b8978da99a352a1171c0f8` landed through merge commit `7eb8054c64a303489b73fcbaca78508b29c16384`; the stable and integration refs both resolve to that merge
-- Publication: authorized by the accepted landing and branch fast-forward proof
+- Branch: `fix/deployment-status-reads-installed-manifest`
+- Base: Community `origin/main` at `35defac62486a3c465825836cb489d27609016a1`
 - Plane: no Community Plane work item applies
+- Merge authority: Dan retains it; this branch is published for review only
 
 ## Current Work
 
-The generic harness now supports repository-declared integration delivery without hard-coding branch names, trackers, CI tiers, review tools, or organization policy. Routine feature pull requests hand off through exact pull-request and tracker evidence; integration controllers and stable-branch landings own repository progress. Repositories without integration delivery retain the original closeout behavior.
+`agentops deployment status` could never report a healthy managed target. The managed branch of `DeploymentEngine.status` passed `manifest=None` into `DeploymentRegistry.status`, which classifies a missing manifest as `stale`, so `stable`, `branch`, and `modified` were unreachable for every managed target and status contradicted `refresh` and `audit` on the same machine. Status now reads each managed target's installed ownership manifest through the same cooperative status-evidence reader preview already used, and the receipt bound to the current registry snapshot supplies only the last resolved commit. Preview behavior is unchanged.
 
 ## Session Log
 
-- Created an isolated worktree from current Community main while the first private adopter continued through hosted acceptance.
-- Added two failing generated-harness tests before changing source and one failing repository-self-application test before updating local entry points.
-- Implemented the minimum conditional closeout language in the generated and repository harness surfaces.
-- Removed the private adopter name after the complete public-safety suite rejected it, then verified the generic replacement.
+- Reproduced the defect against the machine's live Claude Code registry: `status` printed `stale` while `refresh` and `audit` reported `stable` at the same commit.
+- Added five failing engine status tests before changing source, covering stable, branch, stale, absent manifest, and modified classification plus target-home immutability.
+- Generalized `_read_preview_status_evidence` into one pinned status-evidence reader with preview and managed validation, and added a native Windows shared-lock manifest read so managed status keeps working on Windows.
+- Replaced the managed branch of `DeploymentEngine.status` with the manifest read, keeping the receipt lookup only for the last resolved commit and the recorded failure and missing-ref outcomes.
+- Documented managed status classification in `README.md` and `ARCHITECTURE.md`.
 
 ## Verification Log
 
-- Baseline `uv run pytest tests/test_harness.py -q` passed 10 tests; focused Ruff passed.
-- Two generated-harness tests failed before conditional branch-role guidance existed, then passed.
-- Repository self-application failed before its entry points matched the generated contract, then the complete harness file passed 13 tests.
-- The public-safety node passed after the private identifier was removed. The complete suite passed 1,028 tests with 11 supported skips.
-- `uv run ruff check .`, `uv run agentops harness check .`, and `git diff --check` pass.
+- Focused feedback before the fix: `python -m pytest tests/test_deployment_engine.py -k engine_status` reported 5 failed, 1 passed, 83 deselected.
+- Focused feedback after the fix: the same node selection reported 6 passed, 83 deselected.
+- `python -m pytest tests/test_deployment_preview.py tests/test_deployment_transaction.py tests/test_deployment_models.py tests/test_deployment_engine.py tests/test_deployment_registry.py tests/test_deployment_cli.py` reported 629 passed before the change and 634 passed after it.
+- `ruff check .` passed. `python -m pytest -q` reported 1,034 passed with 13 supported skips. `agentops harness check .` reported ok. `git diff --check` reported no whitespace defects.
+- Live read-only proof on this machine: `agentops deployment status --registry ~/.claude/.agentops/deployments.yaml --all` and the same command for `~/.agentops/.agentops/deployments.yaml` now print `stable` at commit `3940bcdaa5971c5c4e8ccbd3d684fd090bc4eba5`, matching `refresh` and `audit`, and neither target home was modified.
 
 ## Next Actions
 
-1. Freeze and publish one Community pull-request head.
-2. Obtain exact-head hosted Linux and Windows CI, then one Review Gate acceptance.
-3. Merge only with unchanged-head acceptance and explicit authority so the private overlay can pin the resulting Community merge commit.
+1. Obtain exact-head hosted Linux and Windows CI, then one Review Gate acceptance.
+2. Merge only with Dan's explicit merge authority on the unchanged accepted head.

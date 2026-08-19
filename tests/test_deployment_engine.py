@@ -973,9 +973,23 @@ def test_launch_authorization_rejects_inheritable_target_authority_descriptor(
             os.set_inheritable(descriptor, False)
 
 
-def test_engine_status_is_conservative_and_does_not_fetch(tmp_path: Path) -> None:
+def _installed_manifest(home: Path) -> Path:
+    return next((home / ".agentops/deployment/manifests").glob("*.json"))
+
+
+def _rewrite_manifest_revision(home: Path, revision: str) -> None:
+    manifest = _installed_manifest(home)
+    data = json.loads(manifest.read_bytes())
+    data["source_revision"] = revision
+    manifest.write_bytes((json.dumps(data, indent=2, sort_keys=True) + "\n").encode())
+    manifest.chmod(0o600)
+
+
+def test_engine_status_reports_stable_from_the_installed_manifest_without_fetching(
+    tmp_path: Path,
+) -> None:
     engine, registry, home = _engine_fixture(tmp_path)
-    engine.refresh(("codex",))
+    receipt = engine.refresh(("codex",))
     store_state_before = sorted(
         (path.relative_to(tmp_path / "source-store"), path.stat().st_mtime_ns)
         for path in (tmp_path / "source-store").rglob("*")
@@ -983,13 +997,95 @@ def test_engine_status_is_conservative_and_does_not_fetch(tmp_path: Path) -> Non
 
     statuses = engine.status(("codex",))
 
-    assert statuses[0].state is TargetState.STALE
+    assert statuses[0] == TargetStatus(
+        target_id="codex",
+        state=TargetState.STABLE,
+        channel="stable",
+        commit=receipt.commits[0],
+    )
     assert home.exists()
     assert len(registry.receipts()) == 1
     assert store_state_before == sorted(
         (path.relative_to(tmp_path / "source-store"), path.stat().st_mtime_ns)
         for path in (tmp_path / "source-store").rglob("*")
     )
+
+
+def test_engine_status_reports_branch_for_an_installed_branch_channel(
+    tmp_path: Path,
+) -> None:
+    engine, _registry, home = _engine_fixture(tmp_path)
+    home.mkdir()
+    commit = _create_branch(tmp_path / "source", "feature", b"feature\n")
+    engine.deploy("demo", "refs/heads/feature", ("codex",))
+
+    statuses = engine.status(("codex",))
+
+    assert statuses[0] == TargetStatus(
+        target_id="codex",
+        state=TargetState.BRANCH,
+        channel="demo",
+        commit=commit,
+    )
+
+
+def test_engine_status_reports_stale_when_the_installed_commit_is_out_of_date(
+    tmp_path: Path,
+) -> None:
+    engine, _registry, home = _engine_fixture(tmp_path)
+    engine.refresh(("codex",))
+    _rewrite_manifest_revision(home, "c" * 40)
+
+    statuses = engine.status(("codex",))
+
+    assert statuses[0].state is TargetState.STALE
+    assert statuses[0].commit == "c" * 40
+
+
+def test_engine_status_reports_stale_when_no_manifest_is_installed(
+    tmp_path: Path,
+) -> None:
+    engine, _registry, home = _engine_fixture(tmp_path)
+    engine.refresh(("codex",))
+    _installed_manifest(home).unlink()
+
+    statuses = engine.status(("codex",))
+
+    assert statuses[0].state is TargetState.STALE
+
+
+def test_engine_status_reports_modified_when_a_managed_file_changed(
+    tmp_path: Path,
+) -> None:
+    engine, _registry, home = _engine_fixture(tmp_path)
+    engine.refresh(("codex",))
+    installed = home / "skills/example/payload.txt"
+    installed.write_bytes(b"tampered\n")
+
+    statuses = engine.status(("codex",))
+
+    assert statuses[0].state is TargetState.MODIFIED
+
+
+def test_engine_status_does_not_write_to_the_target_home(tmp_path: Path) -> None:
+    engine, _registry, home = _engine_fixture(tmp_path)
+    engine.refresh(("codex",))
+    before = {
+        path.relative_to(home): (
+            path.lstat().st_mode,
+            path.read_bytes() if path.is_file() else None,
+        )
+        for path in home.rglob("*")
+    }
+
+    assert engine.status(("codex",))[0].state is TargetState.STABLE
+    assert {
+        path.relative_to(home): (
+            path.lstat().st_mode,
+            path.read_bytes() if path.is_file() else None,
+        )
+        for path in home.rglob("*")
+    } == before
 
 
 def test_engine_rejects_provider_snapshot_tamper_before_target_mutation(
