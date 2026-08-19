@@ -4650,6 +4650,52 @@ def _is_valid_runtime_python_cache(
     )
 
 
+def _supported_runtime_python_source_for_cache(candidate: Path) -> Path | None:
+    """Resolve the source of a cache written by any supported CPython version."""
+    if candidate.parent.name != "__pycache__":
+        return None
+    for tag in _SUPPORTED_CPYTHON_CACHE_MAGICS:
+        for optimization in _SUPPORTED_CPYTHON_CACHE_OPTIMIZATIONS:
+            optimization_suffix = "" if optimization is None else f".opt-{optimization}"
+            suffix = f".{tag}{optimization_suffix}.pyc"
+            if not candidate.name.endswith(suffix):
+                continue
+            source_name = candidate.name.removesuffix(suffix)
+            if not source_name:
+                return None
+            return candidate.parent.parent / f"{source_name}.py"
+    return None
+
+
+def _is_supported_runtime_python_cache(
+    home_fs: _HomeFS, candidate: Path, sources: tuple[Path, ...]
+) -> bool:
+    """Accept an opted-in bytecode cache from any supported CPython version."""
+    source = _supported_runtime_python_source_for_cache(candidate)
+    if source is None or source not in sources:
+        return False
+    try:
+        cache_stat = home_fs.stat(candidate)
+        source_stat = home_fs.stat(source)
+        if not _runtime_cache_stat_shape_is_safe(cache_stat):
+            return False
+        cache = home_fs.read_file_bounded(candidate, _MAX_RUNTIME_CACHE_BYTES)
+        source_bytes = home_fs.read_file(source)
+    except OSError:
+        return False
+    return (
+        _runtime_cache_provenance(
+            candidate,
+            source,
+            cache,
+            cache_stat,
+            source_bytes,
+            source_stat,
+        )
+        is not None
+    )
+
+
 def _runtime_python_cache_content_is_valid(
     cache: bytes,
     cache_stat: os.stat_result,
@@ -5641,7 +5687,11 @@ def audit_provider_plans(plans: tuple[ProviderPlan, ...]) -> DeploymentAudit:
                 candidate = root / item
                 if candidate in planned_paths:
                     continue
-                if _is_valid_runtime_python_cache(home_fs, candidate, group.runtime_python_sources):
+                if _is_supported_runtime_python_cache(
+                    home_fs,
+                    candidate,
+                    group.runtime_python_sources,
+                ):
                     continue
                 unexpected.add(candidate.as_posix())
         duplicates = [

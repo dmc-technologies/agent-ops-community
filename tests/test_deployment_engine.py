@@ -6,6 +6,7 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 import threading
 from pathlib import Path
 
@@ -59,6 +60,46 @@ class _FixtureProvider:
                     0o640,
                 ),
             ),
+        )
+
+
+_CPYTHON_CACHE_MAGICS = {
+    "cpython-311": bytes.fromhex("a70d0d0a"),
+    "cpython-312": bytes.fromhex("cb0d0d0a"),
+    "cpython-313": bytes.fromhex("f30d0d0a"),
+    "cpython-314": bytes.fromhex("2b0e0d0a"),
+}
+
+
+class _RuntimePythonProvider:
+    provider_id = "fixture"
+    source = Path("skills/example/src/package/__init__.py")
+
+    def supports(self, snapshot: SourceSnapshot, target: TargetSpec) -> bool:
+        return target.framework is Framework.CODEX
+
+    def source_closure(
+        self,
+        snapshot: SourceSnapshot,
+        target: TargetSpec,
+        selection: tuple[str, ...] | None,
+    ) -> tuple[Path, ...]:
+        return (Path("payload.txt"),)
+
+    def plan(self, snapshot: SourceSnapshot, target: TargetSpec) -> ProviderPlan:
+        return ProviderPlan(
+            self.provider_id,
+            snapshot.commit,
+            target,
+            (
+                PlannedFile(
+                    self.source,
+                    (snapshot.root / "payload.txt").read_bytes(),
+                    0o644,
+                ),
+            ),
+            audit_roots=(Path("skills/example"),),
+            runtime_python_sources=(self.source,),
         )
 
 
@@ -2405,3 +2446,45 @@ def test_checkout_rejects_untracked_output_before_rendering(tmp_path: Path) -> N
         )
 
     assert not (tmp_path / "home").exists()
+
+
+def test_refresh_succeeds_with_other_interpreter_runtime_cache(tmp_path: Path) -> None:
+    _fixture_engine, registry, home = _engine_fixture(tmp_path)
+    engine = DeploymentEngine(
+        registry,
+        SourceStore(tmp_path / "source-store"),
+        providers=(_RuntimePythonProvider(),),
+    )
+    engine.refresh(("codex",))
+    installed = home / _RuntimePythonProvider.source
+    os.utime(installed, (1_700_000_000, 1_700_000_000))
+    foreign_tag = next(tag for tag in _CPYTHON_CACHE_MAGICS if tag != sys.implementation.cache_tag)
+    cache = installed.parent / "__pycache__" / f"{installed.stem}.{foreign_tag}.pyc"
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_bytes(
+        b"".join(
+            (
+                _CPYTHON_CACHE_MAGICS[foreign_tag],
+                b"\0\0\0\0",
+                int(installed.stat().st_mtime).to_bytes(4, "little"),
+                len(installed.read_bytes()).to_bytes(4, "little"),
+                b"bytecode",
+            )
+        )
+    )
+    cache.chmod(0o644)
+    source = tmp_path / "source"
+    (source / "unrelated.txt").write_bytes(b"unrelated\n")
+    subprocess.run(["git", "add", "unrelated.txt"], cwd=source, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "unrelated"],
+        cwd=source,
+        check=True,
+        capture_output=True,
+    )
+
+    receipt = engine.refresh(("codex",))
+
+    assert receipt.targets[0].state is TargetState.STABLE
+    assert cache.is_file()
+    assert installed.read_bytes() == b"deployed\n"
