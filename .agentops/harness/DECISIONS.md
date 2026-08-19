@@ -4,6 +4,13 @@ Repository: `agent-ops-community`
 
 Record durable architecture, workflow, and harness decisions here.
 
+### 2026-08-18: Integration branch roles determine repository progress ownership
+
+- Decision: when repository instructions declare an integration branch, routine feature pull requests hand off through exact pull-request and tracker evidence without replacing repository progress. The integration controller and stable-branch landing own bounded progress updates. Repositories without an integration branch retain the existing single-branch closeout.
+- Rationale: concurrent feature pull requests otherwise overwrite one shared handoff file, while forcing full stable-branch acceptance on each feature slows early delivery. Branch-role ownership preserves one durable controller state without imposing repository-specific branch names or CI tiers.
+- Applies to: generated `AGENTS.md` and `.agentops/harness/BOOTSTRAP.md`, Community harness tests, and repository-specific integration-delivery adapters.
+- Revisit when: Agent Ops gains a typed repository delivery profile that can validate branch roles directly.
+
 ### 2026-08-17: Prime gstack legacy ownership moves only through the shared transaction
 
 - Decision: permit one Prime-only typed transition from `.agentops/gstack-prime-manifest.json` into the shared public-skill ownership manifest. Declare it only for the public Prime gstack plan when no shared manifest exists. Under the existing target lock, require the canonical public gstack repository, exact legacy schema, owner, pinned ref, canonical complete planned path set, current file fingerprints, single-link regular files, and planned modes. Before any replacement, retain no-follow descriptor authority over every accepted file and the retired manifest through backup-backed operations, including accepted files already equal to the plan. Persist exact operation, path, fingerprint, mode, and filesystem identity before each move. If the moved backup differs because the path changed after classification, journal that safe backup as concurrent evidence before no-replace restoration. Roll back earlier operations, never overwrite another live entry, and abort before shared ownership publication. Treat the legacy manifest and its files as rollback-backed prior state; never prepublish a synthetic shared manifest.
