@@ -737,6 +737,53 @@ def audit_provider_plans(plans: tuple[ProviderPlan, ...]) -> DeploymentAudit:
     return _audit_group(active[_absolute(group.target.home)], group)
 
 
+def read_managed_status_evidence(
+    target: TargetSpec,
+) -> tuple[DeploymentManifest | None, DeploymentAudit | None]:
+    """Read and compare one managed manifest under a shared Windows target lock."""
+    tx = _tx()
+    try:
+        with WindowsTargetLock(target.home, shared=True, create=False) as lock:
+            content = lock.read_optional(_manifest_path(target))
+            if content is None:
+                return None, None
+            data = tx._validated_manifest_data(content, target=target)
+            tx._validate_status_manifest_revision(
+                data.get("review_state"),
+                data["source_revision"],
+                preview=False,
+            )
+            manifest = _record_manifest({"manifest": data})
+            missing: list[str] = []
+            changed: list[str] = []
+            for item in manifest.files:
+                installed = lock.read_optional(item.path)
+                if installed is None:
+                    missing.append(item.path.as_posix())
+                elif _fingerprint(installed) != item.fingerprint:
+                    changed.append(item.path.as_posix())
+            for item in manifest.directories:
+                try:
+                    identity = lock.identity(item.path, directory=True)
+                except FileNotFoundError:
+                    missing.append(item.path.as_posix())
+                    continue
+                except (OSError, ValueError):
+                    changed.append(item.path.as_posix())
+                    continue
+                if not identity.is_directory:
+                    changed.append(item.path.as_posix())
+            lock.verify()
+            return manifest, DeploymentAudit(
+                target_id=target.id,
+                matches=not (missing or changed),
+                missing=tuple(sorted(missing)),
+                changed=tuple(sorted(changed)),
+            )
+    except FileNotFoundError:
+        return None, None
+
+
 def _audit_group(lock: WindowsTargetLock, group: Any) -> DeploymentAudit:
     missing: list[str] = []
     changed: list[str] = []

@@ -46,6 +46,7 @@ from agent_ops.deployment.source_store import (
 from agent_ops.deployment.transaction import (
     _locked_provider_plan_targets,
     _preflight_provider_plans_read_only,
+    _read_managed_status_evidence,
     _read_preview_status_evidence,
     audit_provider_plans,
     install_provider_plans,
@@ -158,22 +159,51 @@ class DeploymentEngine:
                     )
                 )
                 continue
-            audit = None
-            failure = None
-            resolved = recorded.commit
             if recorded.state is TargetState.FAILED:
-                failure = "latest deployment receipt records failure"
-            elif recorded.state is TargetState.MODIFIED:
+                statuses.append(
+                    self._registry.status(
+                        target.id,
+                        manifest=None,
+                        resolved_commit=recorded.commit,
+                        audit=None,
+                        failure="latest deployment receipt records failure",
+                        snapshot=snapshot,
+                    )
+                )
+                continue
+            if recorded.state is TargetState.MISSING_REF:
+                statuses.append(
+                    self._registry.status(
+                        target.id,
+                        manifest=None,
+                        resolved_commit=None,
+                        audit=None,
+                        snapshot=snapshot,
+                    )
+                )
+                continue
+            try:
+                manifest, audit = _read_managed_status_evidence(target)
+            except Exception as error:
+                statuses.append(
+                    self._registry.status(
+                        target.id,
+                        manifest=None,
+                        resolved_commit=None,
+                        audit=None,
+                        failure=f"installed deployment manifest is unreadable: {error}",
+                        snapshot=snapshot,
+                    )
+                )
+                continue
+            if recorded.state is TargetState.MODIFIED:
                 audit = DeploymentAudit(target.id, matches=False, changed=("recorded",))
-            elif recorded.state is TargetState.MISSING_REF:
-                resolved = None
             statuses.append(
                 self._registry.status(
                     target.id,
-                    manifest=None,
-                    resolved_commit=resolved,
+                    manifest=manifest,
+                    resolved_commit=recorded.commit,
                     audit=audit,
-                    failure=failure,
                     snapshot=snapshot,
                 )
             )
