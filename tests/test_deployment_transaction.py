@@ -1124,6 +1124,100 @@ def test_legacy_link_transition_rollback_preserves_destination_race(
     assert os.readlink(backup) == "configs/global/AGENTS.md"
 
 
+def _foreign_cache_fixture(
+    tmp_path: Path,
+) -> tuple[Path, Path, ProviderPlan, Path]:
+    """Install a provider target plus a public-skills target in one home."""
+    home = tmp_path / "home"
+    source = Path("skills/private/src/package/__init__.py")
+    provider = ProviderPlan(
+        "private",
+        "1" * 40,
+        TargetSpec("prime-agent", Framework.PRIME_AGENT, home, "stable"),
+        (
+            PlannedFile(Path("AGENTS.md"), b"policy\n", 0o644),
+            PlannedFile(source, b"VALUE = 'managed'\n", 0o644),
+        ),
+        audit_roots=(Path("skills/private"),),
+        runtime_python_sources=(source,),
+    )
+    install_provider_plans((provider,))
+    public_skills = ProviderPlan(
+        "public-skill:example",
+        'public-skills:[{"id":"example","ref":"' + "a" * 40 + '"}]',
+        TargetSpec("public-skills:prime-agent", Framework.PRIME_AGENT, home, "public"),
+        (PlannedFile(Path("skills/example-public/SKILL.md"), b"public\n", 0o644),),
+        audit_roots=(Path("skills/example-public"),),
+    )
+    install_provider_plans((public_skills,))
+    assert len(list((home / ".agentops/deployment/manifests").glob("*.json"))) == 2
+    installed_source = home / source
+    os.utime(installed_source, (1_700_000_000, 1_700_000_000))
+    foreign_tag = next(tag for tag in _CPYTHON_CACHE_MAGICS if tag != sys.implementation.cache_tag)
+    cache = _cache_path(source, foreign_tag)
+    absolute_cache = home / cache
+    absolute_cache.parent.mkdir(parents=True, exist_ok=True)
+    absolute_cache.write_bytes(_foreign_timestamp_cache(installed_source, foreign_tag))
+    absolute_cache.chmod(0o644)
+    return home, source, provider, cache
+
+
+def test_audit_tolerates_other_interpreter_cache_beside_public_skills_manifest(
+    tmp_path: Path,
+) -> None:
+    home, _source, provider, cache = _foreign_cache_fixture(tmp_path)
+
+    audit = audit_provider_plans((provider,))
+
+    assert (home / cache).is_file()
+    assert audit.unexpected == ()
+    assert audit.validation_errors == ()
+    assert audit.matches
+
+
+def test_audit_reports_changed_provider_file_beside_other_interpreter_cache(
+    tmp_path: Path,
+) -> None:
+    home, source, provider, _cache = _foreign_cache_fixture(tmp_path)
+    (home / source).write_bytes(b"VALUE = 'drifted'\n")
+
+    audit = audit_provider_plans((provider,))
+
+    assert not audit.matches
+    assert source.as_posix() in audit.changed
+
+
+def test_audit_rejects_other_interpreter_cache_that_does_not_bind_its_source(
+    tmp_path: Path,
+) -> None:
+    home, _source, provider, cache = _foreign_cache_fixture(tmp_path)
+    content = (home / cache).read_bytes()
+    (home / cache).write_bytes(content[:8] + (1_700_000_001).to_bytes(4, "little") + content[12:])
+
+    audit = audit_provider_plans((provider,))
+
+    assert not audit.matches
+    assert cache.as_posix() in audit.unexpected
+
+
+def test_audit_rejects_other_interpreter_cache_for_unowned_source(tmp_path: Path) -> None:
+    home, source, provider, cache = _foreign_cache_fixture(tmp_path)
+    unowned = ProviderPlan(
+        provider.provider_id,
+        provider.source_revision,
+        provider.target,
+        provider.files,
+        audit_roots=provider.audit_roots,
+    )
+    assert unowned.runtime_python_sources == ()
+
+    audit = audit_provider_plans((unowned,))
+
+    assert not audit.matches
+    assert cache.as_posix() in audit.unexpected
+    assert (home / source).is_file()
+
+
 def test_audit_allows_co_resident_provider_owned_roots_only(tmp_path: Path) -> None:
     home = tmp_path / "home"
     private = ProviderPlan(

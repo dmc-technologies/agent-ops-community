@@ -169,6 +169,13 @@ Record durable architecture, workflow, and harness decisions here.
 - Correction: Git receives transient HTTPS Basic authorization through its per-process `GIT_CONFIG_*` environment rather than a `-c` command argument. Missing audited directories are represented by the expected missing file set while every present directory remains descriptor-pinned.
 - Rationale: process arguments can be read by another local account; an absent directory cannot be opened as evidence, but repeated complete audit equality still prevents a changed result from receiving a receipt.
 
+### 2026-08-19: Audit tolerates an opted-in bytecode cache from any supported CPython
+
+- Decision: the audit unexpected-file scan resolves a `__pycache__` candidate's source from the PEP 3147 name for any supported CPython 3.11–3.14 tag with default, `opt-1`, or `opt-2` naming, requires that source to be declared in the plan's runtime Python sources, and accepts the file only through the shared runtime-cache provenance check. The running interpreter's tag keeps exact compiled code-object equality; another supported tag requires known magic, a timestamp and source-length header bound to the live source, exact derived name and parent, regular single-link `0644` identity, and bounded size. Nothing else changes: unrelated files, invalid caches, caches for sources the plan does not declare, and any managed file whose bytes or mode differ still fail audit.
+- Rationale: resolving only the running interpreter's cache tag classified a cache left by a previously installed CPython minor as an unexpected unmanaged file. That permanently blocked the affected target: audit reported `modified` and every refresh installed correctly, failed its post-install audit, and rolled back, so the target could never reach the current channel commit. Retirement already trusts the same finite matrix and the same foreign-tag evidence, so audit now uses one shared acceptance rule instead of a narrower one.
+- Applies to: `audit_provider_plans` in `src/agent_ops/deployment/transaction.py`, grouped refresh acceptance, `README.md`, `ARCHITECTURE.md`, and the deployment transaction and engine tests.
+- Revisit when: the repository adds or removes a supported CPython minor, CPython changes the cache-name or timestamp-header contract, Agent Ops adopts a cross-version bytecode verifier, or refresh gains authority to delete a stale cache whose source it still owns.
+
 ### YYYY-MM-DD: Decision title
 
 - Decision: what changed or what standard was chosen.
