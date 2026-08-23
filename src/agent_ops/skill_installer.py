@@ -16,7 +16,11 @@ from pathlib import Path
 import json5
 
 from agent_ops.deployment.models import ProviderPlan
-from agent_ops.deployment.public_skills import PROVIDER_INDEX_PATH
+from agent_ops.deployment.public_skills import (
+    PROVIDER_INDEX_PATH,
+    named_skills_source_root,
+    resolve_named_skills,
+)
 from agent_ops.deployment.public_skills import build_public_skill_plans as _build_public_skill_plans
 from agent_ops.deployment.transaction import (
     UnsupportedPlatformError,
@@ -1489,6 +1493,16 @@ def _install_dependency(
             collision_limits=collision_limits,
             collision_allowed_symlink_targets=collision_allowed_symlink_targets,
         )
+        return
+    if install.strategy == "copy-named-skills":
+        resolved = resolve_named_skills(named_skills_source_root(source, install), install.skills)
+        destination.mkdir(parents=True, exist_ok=True)
+        names = sorted(resolved)
+        for stale in sorted(set(_read_manifest(destination, dependency_id)) - set(names)):
+            _remove_path(destination / stale)
+        for name in names:
+            _replace_tree(resolved[name], destination / name)
+        _write_manifest(destination, dependency_id, names)
         return
     if install.strategy == "copy-skills":
         if install.source is None:

@@ -78,3 +78,87 @@
       strategy: humanlayer-show-me
       source: plugins/show-me/skills
       destination: skills
+
+- id: trailofbits
+  name: Trail of Bits Skills
+  repo: https://github.com/trailofbits/skills.git
+  ref: 293fb74c3151cceda32a85a545fe8acd67f8f5c6
+  version: "2026.08.21"
+  license: CC-BY-SA-4.0
+  install:
+    codex:
+      strategy: copy-named-skills
+      source: plugins
+      destination: skills
+      skills: &trailofbits_skills
+        - git-cleanup
+        - mutation-testing
+        - property-based-testing
+        - sarif-parsing
+        - second-opinion
+        - sharp-edges
+        - supply-chain-risk-auditor
+    opencode:
+      strategy: copy-named-skills
+      source: plugins
+      destination: skills
+      skills: *trailofbits_skills
+
+- id: mattpocock
+  name: Matt Pocock Engineering Skills
+  repo: https://github.com/mattpocock/skills.git
+  ref: 5b15a47f2d7150f545fbcacbfe381787fc0230dc
+  version: "2026.08.23"
+  license: MIT
+  install:
+    claude-code:
+      strategy: copy-named-skills
+      source: skills
+      destination: skills
+      skills: &mattpocock_skills
+        - codebase-design
+        - domain-modeling
+        - grill-me
+        - grill-with-docs
+        - grilling
+        - implement
+        - improve-codebase-architecture
+        - prototype
+        - research
+        - resolving-merge-conflicts
+        - wayfinder
+        - writing-for-agents
+    codex:
+      strategy: copy-named-skills
+      source: skills
+      destination: skills
+      skills: *mattpocock_skills
+    opencode:
+      strategy: copy-named-skills
+      source: skills
+      destination: skills
+      skills: *mattpocock_skills
+
+- id: moyu
+  name: Moyu Anti Over-Engineering
+  repo: https://github.com/uucz/moyu.git
+  ref: f276e3cc8a7fba8a71a6aa2180ffb991c138bbc3
+  version: "2026.08.23"
+  license: MIT
+  install:
+    claude-code:
+      strategy: copy-named-skills
+      source: skills
+      destination: skills
+      skills: &moyu_skills
+        - moyu-en
+    codex:
+      strategy: copy-named-skills
+      source: skills
+      destination: skills
+      skills: *moyu_skills
+    opencode:
+      strategy: copy-named-skills
+      source: skills
+      destination: skills
+      skills: *moyu_skills

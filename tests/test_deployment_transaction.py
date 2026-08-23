@@ -5763,3 +5763,62 @@ def test_audit_reports_opened_home_descriptor_race_as_identity_error(
 
     assert not audit.matches
     assert audit.validation_errors == ("deployment canonical home identity changed",)
+
+
+def _prime_gstack_revision(install: dict[str, object], source_ref: str) -> str:
+    return "public-skills:" + json.dumps(
+        [
+            {
+                "id": "gstack",
+                "repo": "https://github.com/garrytan/gstack.git",
+                "ref": source_ref,
+                "install": install,
+            }
+        ],
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def test_prime_gstack_legacy_source_binding_accepts_an_empty_skills_allowlist() -> None:
+    source_ref = "74895062fb8a3acbf9f66cd088a83359aaaa56cd"
+    revision = _prime_gstack_revision(
+        {
+            "strategy": "prime-gstack",
+            "source": None,
+            "destination": ".",
+            "skills": [],
+        },
+        source_ref,
+    )
+
+    assert transaction_module._source_revision_binds_prime_gstack_ref(revision, source_ref)
+
+
+def test_prime_gstack_legacy_source_binding_rejects_a_populated_skills_allowlist() -> None:
+    source_ref = "74895062fb8a3acbf9f66cd088a83359aaaa56cd"
+    revision = _prime_gstack_revision(
+        {
+            "strategy": "prime-gstack",
+            "source": None,
+            "destination": ".",
+            "skills": ["smuggled-skill"],
+        },
+        source_ref,
+    )
+
+    assert not transaction_module._source_revision_binds_prime_gstack_ref(revision, source_ref)
+
+
+def test_prime_gstack_legacy_source_binding_accepts_a_pre_skills_descriptor() -> None:
+    source_ref = "74895062fb8a3acbf9f66cd088a83359aaaa56cd"
+    revision = _prime_gstack_revision(
+        {
+            "strategy": "prime-gstack",
+            "source": None,
+            "destination": ".",
+        },
+        source_ref,
+    )
+
+    assert transaction_module._source_revision_binds_prime_gstack_ref(revision, source_ref)
