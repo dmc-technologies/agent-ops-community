@@ -76,6 +76,7 @@ _PRIME_GSTACK_LEGACY_MANIFEST = Path(".agentops/gstack-prime-manifest.json")
 _PRIME_GSTACK_LEGACY_OWNER = "agent-ops-community:gstack-prime"
 _PRIME_GSTACK_LEGACY_MANIFEST_MODE = 0o644
 _PRIME_GSTACK_REPOSITORY = "https://github.com/garrytan/gstack.git"
+_PRIME_GSTACK_INSTALL_KEYS = {"strategy", "source", "destination", "skills"}
 _PUBLIC_PROVIDER_INDEX = Path("skills/.agentops-public-provider-index.json")
 
 
@@ -1495,10 +1496,11 @@ def _source_revision_binds_prime_gstack_ref(source_revision: str, source_ref: st
         descriptor.get("ref") == source_ref
         and descriptor.get("repo") == _PRIME_GSTACK_REPOSITORY
         and isinstance(install, dict)
-        and set(install) == {"strategy", "source", "destination"}
+        and set(install) in ({"strategy", "source", "destination"}, _PRIME_GSTACK_INSTALL_KEYS)
         and install.get("strategy") == "prime-gstack"
         and install.get("source") is None
         and install.get("destination") == "."
+        and install.get("skills", []) == []
     )
 
 

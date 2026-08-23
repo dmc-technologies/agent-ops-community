@@ -262,7 +262,55 @@ def _provider_index_bytes(
     return (json.dumps(data, indent=2, sort_keys=True) + "\n").encode()
 
 
+def named_skills_source_root(source: Path, install: SkillDependencyInstall) -> Path:
+    """Return the directory a copy-named-skills install searches."""
+
+    if install.source is None:
+        raise ValueError("copy-named-skills dependency install requires a source path")
+    if not install.skills:
+        raise ValueError("copy-named-skills dependency install requires a skills allowlist")
+    root = source / install.source
+    if not root.is_dir():
+        raise FileNotFoundError(root)
+    return root
+
+
+def resolve_named_skills(root: Path, names: list[str]) -> dict[str, Path]:
+    """Map each allowlisted skill name to the one directory that defines it.
+
+    A skill directory is one holding a ``SKILL.md``. Publishers nest these
+    differently -- ``skills/<name>``, ``skills/<category>/<name>`` and
+    ``plugins/<plugin>/skills/<name>`` all occur -- so the search is recursive
+    and the allowlist, not the layout, decides what gets installed.
+    """
+
+    matches: dict[str, list[Path]] = {}
+    wanted = set(names)
+    for skill_file in sorted(root.rglob("SKILL.md")):
+        directory = skill_file.parent
+        if directory.name not in wanted:
+            continue
+        if any(part in _SOURCE_METADATA_DIRECTORIES for part in directory.parts):
+            continue
+        matches.setdefault(directory.name, []).append(directory)
+
+    missing = sorted(wanted - set(matches))
+    if missing:
+        raise FileNotFoundError(
+            f"allowlisted skills are absent from {root}: {', '.join(missing)}"
+        )
+    ambiguous = sorted(name for name, found in matches.items() if len(found) > 1)
+    if ambiguous:
+        raise ValueError(
+            f"allowlisted skills resolve to more than one directory under {root}: "
+            f"{', '.join(ambiguous)}"
+        )
+    return {name: found[0] for name, found in sorted(matches.items())}
+
+
 def _source_closure(source: Path, install: SkillDependencyInstall) -> tuple[Path, ...]:
+    if install.strategy == "copy-named-skills":
+        return (named_skills_source_root(source, install),)
     if install.strategy in {"copy-skills", "prime-superpowers"}:
         if install.source is None:
             raise ValueError(f"{install.strategy} dependency install requires a source path")
@@ -628,6 +676,8 @@ def _managed_files(
     exact_paths: list[Path] | None = None
     if install.strategy in {"gstack", "copy-repo"}:
         roots = [shadow_home / install.destination]
+    elif install.strategy == "copy-named-skills":
+        roots = [shadow_home / install.destination / name for name in sorted(install.skills)]
     elif install.strategy == "copy-skills":
         assert install.source is not None
         children = sorted(child.name for child in (source / install.source).iterdir())
@@ -976,6 +1026,18 @@ def _default_install_dependency(
             destination,
             ignore=shutil.ignore_patterns(*sorted(_SOURCE_METADATA_DIRECTORIES)),
         )
+        return
+    if install.strategy == "copy-named-skills":
+        root = named_skills_source_root(source, install)
+        destination.mkdir(parents=True, exist_ok=True)
+        for name, skill_source in resolve_named_skills(root, install.skills).items():
+            target = destination / name
+            _remove_shadow_path(target)
+            shutil.copytree(
+                skill_source,
+                target,
+                ignore=shutil.ignore_patterns(*sorted(_SOURCE_METADATA_DIRECTORIES)),
+            )
         return
     if install.strategy == "copy-skills":
         if install.source is None:

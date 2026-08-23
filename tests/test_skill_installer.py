@@ -3654,3 +3654,198 @@ def test_openclaw_configured_agent_workspace_collision_is_checked(
             framework=Framework.OPENCLAW,
             dependencies=[_show_me_dependency(Framework.OPENCLAW)],
         )
+
+
+def _named_skill(root: Path, relative: str, name: str) -> None:
+    directory = root / relative
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "SKILL.md").write_text(f"---\nname: {name}\n---\n", encoding="utf-8")
+
+
+def _named_skills_dependency(
+    *,
+    repo_url: str,
+    ref: str,
+    source: str,
+    skills: list[str],
+) -> SkillDependency:
+    return SkillDependency(
+        id="trailofbits",
+        name="Trail of Bits",
+        repo=repo_url,
+        ref=ref,
+        license="CC-BY-SA-4.0",
+        install={
+            "codex": SkillDependencyInstall(
+                strategy="copy-named-skills",
+                source=source,
+                destination="skills",
+                skills=skills,
+            )
+        },
+    )
+
+
+def test_copy_named_skills_installs_only_allowlisted_skills_from_nested_layout(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "trailofbits-src"
+    repo_url = _git_repo(repo)
+    _named_skill(repo, "plugins/static-analysis/skills/semgrep", "semgrep")
+    _named_skill(repo, "plugins/static-analysis/skills/codeql", "codeql")
+    _named_skill(repo, "plugins/building-secure-contracts/skills/cairo-scanner", "cairo-scanner")
+    ref = _commit(repo)
+
+    install_skill_dependencies(
+        framework=Framework.CODEX,
+        dependencies=[
+            _named_skills_dependency(
+                repo_url=repo_url,
+                ref=ref,
+                source="plugins",
+                skills=["semgrep", "codeql"],
+            )
+        ],
+        home=tmp_path / "home",
+        cache_dir=tmp_path / "cache",
+    )
+
+    skills_home = tmp_path / "home" / "skills"
+    assert (skills_home / "semgrep" / "SKILL.md").exists()
+    assert (skills_home / "codeql" / "SKILL.md").exists()
+    assert not (skills_home / "cairo-scanner").exists()
+
+
+def test_copy_named_skills_resolves_skills_at_mixed_nesting_depths(tmp_path: Path) -> None:
+    repo = tmp_path / "mattpocock-src"
+    repo_url = _git_repo(repo)
+    _named_skill(repo, "skills/engineering/codebase-design", "codebase-design")
+    _named_skill(repo, "skills/productivity/grill-me", "grill-me")
+    _named_skill(repo, "skills/moyu-en", "moyu-en")
+    ref = _commit(repo)
+
+    install_skill_dependencies(
+        framework=Framework.CODEX,
+        dependencies=[
+            _named_skills_dependency(
+                repo_url=repo_url,
+                ref=ref,
+                source="skills",
+                skills=["codebase-design", "grill-me", "moyu-en"],
+            )
+        ],
+        home=tmp_path / "home",
+        cache_dir=tmp_path / "cache",
+    )
+
+    skills_home = tmp_path / "home" / "skills"
+    for name in ("codebase-design", "grill-me", "moyu-en"):
+        assert (skills_home / name / "SKILL.md").exists()
+
+
+def test_copy_named_skills_rejects_an_allowlisted_skill_that_is_absent(tmp_path: Path) -> None:
+    repo = tmp_path / "partial-src"
+    repo_url = _git_repo(repo)
+    _named_skill(repo, "plugins/static-analysis/skills/semgrep", "semgrep")
+    ref = _commit(repo)
+
+    with pytest.raises(FileNotFoundError, match="renamed-upstream"):
+        install_skill_dependencies(
+            framework=Framework.CODEX,
+            dependencies=[
+                _named_skills_dependency(
+                    repo_url=repo_url,
+                    ref=ref,
+                    source="plugins",
+                    skills=["semgrep", "renamed-upstream"],
+                )
+            ],
+            home=tmp_path / "home",
+            cache_dir=tmp_path / "cache",
+        )
+
+    assert not (tmp_path / "home" / "skills" / "semgrep").exists()
+
+
+def test_copy_named_skills_rejects_an_ambiguous_skill_name(tmp_path: Path) -> None:
+    repo = tmp_path / "ambiguous-src"
+    repo_url = _git_repo(repo)
+    _named_skill(repo, "plugins/one/skills/review", "review")
+    _named_skill(repo, "plugins/two/skills/review", "review")
+    ref = _commit(repo)
+
+    with pytest.raises(ValueError, match="more than one directory"):
+        install_skill_dependencies(
+            framework=Framework.CODEX,
+            dependencies=[
+                _named_skills_dependency(
+                    repo_url=repo_url,
+                    ref=ref,
+                    source="plugins",
+                    skills=["review"],
+                )
+            ],
+            home=tmp_path / "home",
+            cache_dir=tmp_path / "cache",
+        )
+
+
+def test_copy_named_skills_removes_a_skill_dropped_from_the_allowlist(tmp_path: Path) -> None:
+    repo = tmp_path / "shrinking-src"
+    repo_url = _git_repo(repo)
+    _named_skill(repo, "plugins/static-analysis/skills/semgrep", "semgrep")
+    _named_skill(repo, "plugins/static-analysis/skills/codeql", "codeql")
+    ref = _commit(repo)
+    home = tmp_path / "home"
+
+    install_skill_dependencies(
+        framework=Framework.CODEX,
+        dependencies=[
+            _named_skills_dependency(
+                repo_url=repo_url, ref=ref, source="plugins", skills=["semgrep", "codeql"]
+            )
+        ],
+        home=home,
+        cache_dir=tmp_path / "cache",
+    )
+    assert (home / "skills" / "codeql" / "SKILL.md").exists()
+
+    install_skill_dependencies(
+        framework=Framework.CODEX,
+        dependencies=[
+            _named_skills_dependency(
+                repo_url=repo_url, ref=ref, source="plugins", skills=["semgrep"]
+            )
+        ],
+        home=home,
+        cache_dir=tmp_path / "cache",
+    )
+
+    assert (home / "skills" / "semgrep" / "SKILL.md").exists()
+    # Dropping a skill from the allowlist must make it undiscoverable and unowned.
+    assert not (home / "skills" / "codeql" / "SKILL.md").exists()
+    index = json.loads((home / "skills" / ".agentops-public-provider-index.json").read_text())
+    owned = {path for provider in index["providers"] for path in provider["paths"]}
+    assert owned == {"skills/semgrep/SKILL.md"}
+    # The shared transaction removes owned files but not the directory they leave
+    # behind; the pre-existing copy-skills strategy behaves the same way. An empty
+    # directory holds no SKILL.md, so nothing discovers it.
+    codeql = home / "skills" / "codeql"
+    assert not codeql.exists() or list(codeql.iterdir()) == []
+
+
+def test_registry_ships_pinned_named_skill_dependencies() -> None:
+    dependencies = {dependency.id: dependency for dependency in load_skill_dependencies()}
+
+    for dependency_id in ("trailofbits", "mattpocock", "moyu"):
+        dependency = dependencies[dependency_id]
+        assert len(dependency.ref) == 40, f"{dependency_id} ref must be a full commit"
+        assert dependency.license, f"{dependency_id} must record a license"
+        for framework, install in dependency.install.items():
+            assert install.strategy == "copy-named-skills", (dependency_id, framework)
+            assert install.skills, (dependency_id, framework)
+
+    # Claude Code consumes Trail of Bits through its plugin marketplace, which
+    # carries the workflow commands and subagents a skills-only copy would drop.
+    assert "claude-code" not in dependencies["trailofbits"].install
+    assert "claude-code" in dependencies["mattpocock"].install
