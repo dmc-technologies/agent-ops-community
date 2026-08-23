@@ -91,7 +91,6 @@
       source: plugins
       destination: skills
       skills: &trailofbits_skills
-        - gh-cli
         - git-cleanup
         - mutation-testing
         - property-based-testing

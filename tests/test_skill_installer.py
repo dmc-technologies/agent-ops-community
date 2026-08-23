@@ -3855,13 +3855,14 @@ def test_named_skill_dependencies_declare_only_standalone_trail_of_bits_skills()
     dependencies = {dependency.id: dependency for dependency in load_skill_dependencies()}
     declared = set(dependencies["trailofbits"].install["codex"].skills)
 
-    # These delegate to subagents or sibling workflows that live beside the skill
-    # directory, so a skills-only copy installs something that cannot run.
+    # These delegate to subagents, sibling workflows, or hooks that live beside the
+    # skill directory, so a skills-only copy installs something that cannot run.
     plugin_only = {
         "audit-context-building",
         "codeql",
         "dimensional-analysis",
         "fp-check",
+        "gh-cli",
         "semgrep",
         "spec-to-code-compliance",
     }
