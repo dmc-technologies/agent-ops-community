@@ -290,7 +290,8 @@ def resolve_named_skills(root: Path, names: list[str]) -> dict[str, Path]:
         directory = skill_file.parent
         if directory.name not in wanted:
             continue
-        if any(part in _SOURCE_METADATA_DIRECTORIES for part in directory.parts):
+        relative = directory.relative_to(root)
+        if any(part in _SOURCE_METADATA_DIRECTORIES for part in relative.parts):
             continue
         matches.setdefault(directory.name, []).append(directory)
 

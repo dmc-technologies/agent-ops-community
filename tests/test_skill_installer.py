@@ -3849,3 +3849,85 @@ def test_registry_ships_pinned_named_skill_dependencies() -> None:
     # carries the workflow commands and subagents a skills-only copy would drop.
     assert "claude-code" not in dependencies["trailofbits"].install
     assert "claude-code" in dependencies["mattpocock"].install
+
+
+def test_named_skill_dependencies_declare_only_standalone_trail_of_bits_skills() -> None:
+    dependencies = {dependency.id: dependency for dependency in load_skill_dependencies()}
+    declared = set(dependencies["trailofbits"].install["codex"].skills)
+
+    # These delegate to subagents or sibling workflows that live beside the skill
+    # directory, so a skills-only copy installs something that cannot run.
+    plugin_only = {
+        "audit-context-building",
+        "codeql",
+        "dimensional-analysis",
+        "fp-check",
+        "semgrep",
+        "spec-to-code-compliance",
+    }
+    assert declared.isdisjoint(plugin_only)
+
+
+def test_named_skill_dependencies_declare_their_delegation_targets() -> None:
+    dependencies = {dependency.id: dependency for dependency in load_skill_dependencies()}
+    declared = set(dependencies["mattpocock"].install["codex"].skills)
+
+    # grill-me, grill-with-docs, improve-codebase-architecture and wayfinder each
+    # hand off to these; omitting them installs a skill that dead-ends on use.
+    assert {"grilling", "implement", "prototype", "research"} <= declared
+
+
+def test_named_skill_dependencies_avoid_frameworks_that_regress_on_native_windows() -> None:
+    dependencies = {dependency.id: dependency for dependency in load_skill_dependencies()}
+
+    # Native Windows has no shared transaction, and the native path refuses more
+    # than one bundle. Cursor and OpenClaw select exactly one bundle today, so
+    # adding these would turn a working install into an aborted one.
+    for dependency_id in ("trailofbits", "mattpocock", "moyu"):
+        install = dependencies[dependency_id].install
+        assert "cursor" not in install, dependency_id
+        assert "openclaw" not in install, dependency_id
+
+
+def test_copy_named_skills_installs_when_the_checkout_sits_under_a_metadata_directory(
+    tmp_path: Path,
+) -> None:
+    # The default dependency cache is ~/.cache/agentops/skill-dependencies, so every
+    # real checkout has a .cache component in its absolute path.
+    repo = tmp_path / "trailofbits-src"
+    repo_url = _git_repo(repo)
+    _named_skill(repo, "plugins/static-analysis/skills/semgrep", "semgrep")
+    ref = _commit(repo)
+
+    install_skill_dependencies(
+        framework=Framework.CODEX,
+        dependencies=[
+            _named_skills_dependency(
+                repo_url=repo_url, ref=ref, source="plugins", skills=["semgrep"]
+            )
+        ],
+        home=tmp_path / "home",
+        cache_dir=tmp_path / ".cache" / "agentops" / "skill-dependencies",
+    )
+
+    assert (tmp_path / "home" / "skills" / "semgrep" / "SKILL.md").exists()
+
+
+def test_copy_named_skills_still_skips_metadata_below_the_searched_root(tmp_path: Path) -> None:
+    repo = tmp_path / "vendored-src"
+    repo_url = _git_repo(repo)
+    _named_skill(repo, "plugins/real/skills/semgrep", "semgrep")
+    _named_skill(repo, "plugins/real/node_modules/vendored/skills/codeql", "codeql")
+    ref = _commit(repo)
+
+    with pytest.raises(FileNotFoundError, match="codeql"):
+        install_skill_dependencies(
+            framework=Framework.CODEX,
+            dependencies=[
+                _named_skills_dependency(
+                    repo_url=repo_url, ref=ref, source="plugins", skills=["semgrep", "codeql"]
+                )
+            ],
+            home=tmp_path / "home",
+            cache_dir=tmp_path / "cache",
+        )

@@ -91,30 +91,14 @@
       source: plugins
       destination: skills
       skills: &trailofbits_skills
-        - audit-context-building
-        - codeql
-        - dimensional-analysis
-        - fp-check
         - gh-cli
         - git-cleanup
         - mutation-testing
         - property-based-testing
         - sarif-parsing
         - second-opinion
-        - semgrep
         - sharp-edges
-        - spec-to-code-compliance
         - supply-chain-risk-auditor
-    cursor:
-      strategy: copy-named-skills
-      source: plugins
-      destination: skills
-      skills: *trailofbits_skills
-    openclaw:
-      strategy: copy-named-skills
-      source: plugins
-      destination: skills
-      skills: *trailofbits_skills
     opencode:
       strategy: copy-named-skills
       source: plugins
@@ -137,21 +121,15 @@
         - domain-modeling
         - grill-me
         - grill-with-docs
+        - grilling
+        - implement
         - improve-codebase-architecture
+        - prototype
+        - research
         - resolving-merge-conflicts
         - wayfinder
         - writing-for-agents
     codex:
-      strategy: copy-named-skills
-      source: skills
-      destination: skills
-      skills: *mattpocock_skills
-    cursor:
-      strategy: copy-named-skills
-      source: skills
-      destination: skills
-      skills: *mattpocock_skills
-    openclaw:
       strategy: copy-named-skills
       source: skills
       destination: skills
@@ -176,16 +154,6 @@
       skills: &moyu_skills
         - moyu-en
     codex:
-      strategy: copy-named-skills
-      source: skills
-      destination: skills
-      skills: *moyu_skills
-    cursor:
-      strategy: copy-named-skills
-      source: skills
-      destination: skills
-      skills: *moyu_skills
-    openclaw:
       strategy: copy-named-skills
       source: skills
       destination: skills
