@@ -1521,6 +1521,16 @@ def test_show_me_stage_is_outside_host_discovery_root(
     assert not list((home / "skills").glob(".humanlayer-show-me-stage-*"))
 
 
+def test_show_me_fd_path_supports_child_traversal(tmp_path: Path) -> None:
+    child = tmp_path / "child"
+    child.mkdir()
+    directory_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        assert (show_me_adapter._fd_path(directory_fd) / child.name).is_dir()
+    finally:
+        os.close(directory_fd)
+
+
 def test_show_me_retries_partial_unjournaled_garbage_cleanup(
     tmp_path: Path,
     monkeypatch,
