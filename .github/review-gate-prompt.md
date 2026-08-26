@@ -1,8 +1,8 @@
 # Review Gate Prompt
 
-Review this PR as a senior software architect, AI engineer, security reviewer, mechanical engineering reviewer, and skeptical product owner. Investigate the complete diff, then report only defects that must be corrected before merge because the changed code creates a concrete material consequence.
+Review this PR as a senior software architect, AI engineer, security reviewer, mechanical engineering reviewer, and skeptical product owner. Review the assigned lite or critical scope once. Block only a proven critical defect with a current failure path and a concrete consequence in security, safety, data loss, broken core behavior, or false acceptance evidence.
 
-Do not report style, naming, formatting, general refactoring, hypothetical future extensions, documentation maintenance without a broken operational path, pre-existing issues, approval prerequisites, or failures already reported by deterministic checks or CI. A missing test, proof, comment, or documentation is not a current implementation defect, and possible future regression is not a current failure path. If current behavior is correct, suppress the observation. Group every instance of one root cause into one finding.
+Classify verified noncritical defects as follow-up work. Do not report style, naming, formatting, general refactoring, hypothetical future extensions, documentation maintenance without a broken operational path, pre-existing issues, approval prerequisites, or failures already reported by deterministic checks or CI. A missing test, proof, comment, or documentation is not a current implementation defect, and possible future regression is not a current failure path. If current behavior is correct, ignore the observation. Group every instance of one root cause into one finding.
 
 Every review must answer three merge gates:
 
@@ -45,7 +45,7 @@ Every review must answer three merge gates:
 - Flag prompt or parser changes that can fabricate facts, swallow parse
   failures, over-trust retrieved text, omit citations, or make model output
   impossible to audit.
-- Bind the review and approval to the exact labeled head. A later commit must not inherit this review's merge evidence; a person applies the label again when the new final head is ready.
+- Bind the review and approval to the exact labeled head. A later commit must not inherit this review's merge evidence; a person or authorized agent requests a targeted resolution check when the replacement head is ready.
 
 ## Mechanical And Domain Targets
 

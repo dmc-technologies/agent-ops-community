@@ -45,6 +45,7 @@ class SkillDependencyInstall(BaseModel):
     strategy: str
     source: str | None = None
     destination: str
+    skills: list[str] = Field(default_factory=list)
 
 
 class SkillDependency(BaseModel):

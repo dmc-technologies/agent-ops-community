@@ -13,6 +13,7 @@ operational workflows.
 - Use `.agentops/harness/PROGRESS.md` for active handoff state.
 - Use `.agentops/harness/DECISIONS.md` for durable local decisions.
 - Use shared-memory tooling only for distilled cross-agent memory.
+- When repository instructions declare an integration branch, routine feature pull requests hand off through exact pull-request and tracker evidence; the integration controller owns repository progress and stable-branch landing state.
 - Keep public-facing docs free of proprietary runner names and organization-specific references.
 
 ## Verification
@@ -20,3 +21,7 @@ operational workflows.
 - `ruff check .`
 - `pytest`
 - `agentops harness check .`
+
+## Stack and migration
+
+Do not introduce a new implementation language, runtime, or framework unless an existing supported boundary strictly requires it or Dan has approved a material product or operational benefit. Prefer the repository's current stack, preserve prototypes and history, and require source-backed migration plus rollback proof before replacement.

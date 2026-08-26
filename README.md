@@ -65,6 +65,48 @@ agentops frameworks command examples/local-smoke.yaml --framework prime-agent --
 
 Prime Agent handoff uses its non-interactive `--print` mode and passes the job context with an explicit `--cwd`. Prime Agent skill bundles install namespaced skills under `${PRIME_AGENT_CODING_AGENT_DIR:-$HOME/.prime/agent}/skills` and keep ownership records outside the shared skill namespace. See [Prime Agent support](docs/prime-agent.md) for the complete setup, collision contract, and command contract.
 
+## Pull-Based Deployment Channels
+
+Agent Ops can keep multiple isolated framework homes on stable `main` or an explicitly selected branch. Each machine owns its registry, fetched snapshots, locks, receipts, and target homes; machines that follow the same branch do not share mutable deployment state. Stable remains the reviewed path, while a branch target can refresh immediately and continue to receive ordinary pull-request review in parallel.
+
+Supported daily commands are:
+
+```bash
+agentops deployment status --all
+agentops deployment plan --all
+agentops deployment refresh --all
+agentops deployment audit --all
+agentops deployment status --all
+agentops channel deploy skill-routing-v2 --ref refs/heads/feat/skill-routing-v2 --targets codex-skill-routing-v2,claude-skill-routing-v2
+agentops channel refresh skill-routing-v2
+agentops channel switch stable --targets codex-skill-routing-v2,claude-skill-routing-v2
+agentops channel launch skill-routing-v2 --framework codex
+```
+
+Branch snapshots are data sources only. The stable installed package discovers providers, validates each provider's declared source closure, and plans against a restricted copy containing only that closure. Agent Ops does not import or execute Python from the branch, invoke branch build files or hooks, or copy unrelated catalog or configuration content. A grouped refresh plans every selected target before mutation, locks homes in deterministic order, audits the result, and restores every changed target if installation or audit fails. Incomplete recovery stops with retained transaction evidence under the affected target's `.agentops/deployment/transactions` directory.
+
+When a plan retires an exact Python source owned by the prior manifest, the locked transaction also checks the finite CPython 3.11–3.14 PEP 3147 cache-name matrix for default, `opt-1`, and `opt-2` bytecode beside that source. The running interpreter's cache still requires exact compiled code equality. A cache from another listed tag is removable only as a derived retirement artifact: exact source stem and parent, known tag magic, timestamp header bound to the source modification time and byte length, regular single-link `0644` file, and bounded size. Other files remain in place and audit reports them. This cache-retirement matrix does not add Python runtime support or install another interpreter.
+
+Audit applies that same finite cache matrix to a plan-owned runtime Python source that is still installed. A bytecode cache beside such a source is tolerated as a derived artifact under identical evidence: exact source stem and parent, a known CPython 3.11–3.14 tag with default, `opt-1`, or `opt-2` naming, a timestamp header bound to the current source modification time and byte length, a regular single-link `0644` file, and bounded size. The running interpreter's cache still requires exact compiled code equality. A cache left by a previously installed CPython minor therefore no longer reports the target as `modified`, and refresh no longer fails its post-install audit and rolls back. Every other unmanaged file inside an owned audit root is still reported, and any managed file whose bytes or mode changed still fails audit and refresh.
+
+`agentops deployment status` classifies each managed target from that target's installed ownership manifest. It takes the established cooperative shared target lock, reads the manifest and every owned file and directory through retained no-follow descriptors, and compares the recorded revision against the last resolved commit on a receipt for the current registry snapshot. Matching evidence reports `stable` or `branch`, owned-state differences report `modified`, an absent or different installed revision reports `stale`, and unreadable or contradictory evidence reports `failed`. Status performs no fetch, writes no receipt, and changes nothing in the target home.
+
+Every target needs its own home. Authenticate the native framework inside that target's environment before launch, such as `CODEX_HOME=/path/to/home codex login`; the launch command reports the framework-specific prerequisite when readiness cannot be verified. Credentials remain in the isolated home and are not copied from a repository or another target.
+
+For an explicitly unreviewed local skill edit, configure an existing preview-reserved target and run:
+
+```bash
+agentops deployment preview --source-checkout /path/to/agent-ops-checkout --skill my-skill --target codex-preview
+```
+
+Preview accepts only selected Git-tracked data from that checkout, requires every requested name to resolve exactly once to an installed provider's canonical skill identity and exclusively owned paths, and skips an installed provider that owns none of the requested identities. It includes selected working-tree changes in a SHA-256 fingerprint and reports `review_state=unreviewed-local`. Preview Git access is restricted to the exact read-only `rev-parse` and `ls-files` queries it needs, with executable fsmonitor, hooks, pagers, editors, askpass, helpers, diffs, global configuration, and system configuration disabled; linked worktrees remain supported. It retains descriptors for the checkout, selected paths and parents, Git index, and Git HEAD through planning, then revalidates their identities, bytes, modes, tracked state, and selected commit immediately before installation and again after installation and audit before success. After locking the target it replans, retains the exact original registry snapshot through install and audit, and rejects or rolls back any target channel, home, framework, registry identity, or content change. A terminal mismatch uses the same reverse recovery path and cannot produce successful preview evidence. It rejects stable and branch targets, links, untracked referenced resources, writable or Git-inconsistent modes, overlapping source and target paths, and managed refresh, switch, deploy, or launch treatment. It never fetches or publishes a ref or creates a managed source-store snapshot.
+
+`agentops deployment status --target codex-preview` takes a cooperative shared target lock and reads the preview manifest and every owned file and directory through retained no-follow descriptors without a managed fetch or receipt. The manifest binds the exact target channel alias as well as target ID, framework, `unreviewed-local` state, and 64-hex fingerprint. Status revalidates every canonical inode, mode, and exact file content before returning; replacement or contradictory evidence reports `failed`, while stable owned-state differences report `modified`.
+
+Every grouped install records both the expected prior channel and the candidate channel. Ordinary refresh and preview require an existing ownership manifest to match the target's current channel; only `channel switch` and `channel deploy` authorize a different exact prior-to-candidate pair. Recovery validates that same pair before restoring the exact prior manifest.
+
+Installed extension packages expose deployment providers through the `agent_ops.deployment_providers` entry-point group. A provider supplies a stable `provider_id`, a boolean `supports(snapshot, target)` decision, an exact repository-relative `source_closure(snapshot, target, selection)`, and an immutable `plan(snapshot, target)`. Managed branch planning retains the tuple-of-paths closure contract. Preview requires `source_closure` to return `ProviderSourceClosure`, which binds the provider to canonical `SkillSourceClosure` identities, aliases, and exclusively owned paths. The shared engine confines and validates the closure before calling `plan`.
+
 ## Extension Model
 
 Third-party and organization-specific runners integrate through Python entry
@@ -88,6 +130,8 @@ frameworks:
 
 See [docs/roadmap.md](docs/roadmap.md) for the remaining generic scope planned
 for the community package.
+
+Pull-request review follows the [bounded Review Gate policy](docs/review-gate-policy.md): one discovery review, proven critical blockers only, one grouped follow-up issue for verified noncritical defects, and targeted checks for critical fixes.
 
 ## Development
 

@@ -23,10 +23,17 @@ on:
         description: "PR base branch/ref"
         required: true
         type: string
+      scope:
+        description: "Review scope: auto, lite, or critical"
+        required: false
+        default: "auto"
+        type: string
     secrets:
       OPENAI_API_KEY:
         required: true
       REVIEW_GATE_APPROVAL_TOKEN:
+        required: false
+      REVIEW_GATE_STATE_KEY:
         required: false
 
 jobs:
@@ -114,6 +121,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.REVIEW_GATE_APPROVAL_TOKEN || github.token }}
           REVIEW_GATE_BASE_REF: ${{ inputs.base_ref }}
+          REVIEW_GATE_STATE_KEY: ${{ secrets.REVIEW_GATE_STATE_KEY }}
         run: |
           RUN_URL="${{ github.server_url }}/${{ inputs.repo }}/actions/runs/${{ github.run_id }}"
           python review-gate-main/.github/scripts/review_gate.py \
@@ -124,4 +132,5 @@ jobs:
             --post-status \
             --post-comment \
             --submit-approval \
+            --scope "${{ inputs.scope }}" \
             --run-url "$RUN_URL"

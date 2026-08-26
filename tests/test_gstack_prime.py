@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -8,6 +9,23 @@ from pathlib import Path
 import pytest
 
 import agent_ops.gstack_prime as gstack_prime
+
+
+def _tree_snapshot(root: Path) -> dict[str, tuple[str, int, bytes | str | None]]:
+    snapshot: dict[str, tuple[str, int, bytes | str | None]] = {}
+    for current, directories, files in os.walk(root, followlinks=False):
+        current_path = Path(current)
+        for name in sorted([*directories, *files]):
+            path = current_path / name
+            relative = path.relative_to(root).as_posix()
+            mode = path.lstat().st_mode & 0o777
+            if path.is_symlink():
+                snapshot[relative] = ("link", mode, os.readlink(path))
+            elif path.is_dir():
+                snapshot[relative] = ("directory", mode, None)
+            else:
+                snapshot[relative] = ("file", mode, path.read_bytes())
+    return snapshot
 
 
 def _upstream_repo(path: Path) -> tuple[Path, Path, str]:
@@ -161,6 +179,142 @@ def test_install_generates_namespaced_prime_skills_and_built_runtime(
     manifest = json.loads((target / gstack_prime.MANIFEST_NAME).read_text())
     assert manifest["owner"] == gstack_prime.MANIFEST_OWNER
     assert manifest["files"]["skills/agentops-gstack-review/SKILL.md"]
+
+
+def test_install_uses_explicit_renderer_environment_for_bun(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    upstream, bun, ref = _upstream_repo(tmp_path / "upstream")
+    monkeypatch.setattr(gstack_prime, "PINNED_GSTACK_REF", ref)
+    environment_log = tmp_path / "renderer-environment.json"
+    wrapper = tmp_path / "environment-bun"
+    required = (
+        "HOME",
+        "BUN_INSTALL",
+        "BUN_INSTALL_CACHE_DIR",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+    )
+    wrapper.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        f"required = {required!r}\n"
+        "values = {name: os.environ[name] for name in required}\n"
+        "for value in values.values():\n"
+        "    path = Path(value)\n"
+        "    path.mkdir(parents=True, exist_ok=True)\n"
+        "    (path / 'renderer-write').write_text('confined')\n"
+        f"Path({str(environment_log)!r}).write_text(json.dumps(values))\n"
+        f"os.execv({str(bun)!r}, [{str(bun)!r}, *sys.argv[1:]])\n",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    workspace = tmp_path / "cache/render"
+    renderer_env = {"PATH": os.environ["PATH"]}
+    renderer_env.update(
+        {
+            "HOME": str(workspace / "home"),
+            "BUN_INSTALL": str(workspace / "bun/install"),
+            "BUN_INSTALL_CACHE_DIR": str(workspace / "bun/cache"),
+            "XDG_CACHE_HOME": str(workspace / "xdg/cache"),
+            "XDG_CONFIG_HOME": str(workspace / "xdg/config"),
+            "XDG_DATA_HOME": str(workspace / "xdg/data"),
+            "TMPDIR": str(workspace / "tmp"),
+            "TMP": str(workspace / "tmp"),
+            "TEMP": str(workspace / "tmp"),
+        }
+    )
+
+    gstack_prime.install_prime_gstack(
+        upstream,
+        tmp_path / "prime-agent",
+        bun=wrapper,
+        renderer_env=renderer_env,
+    )
+
+    recorded = json.loads(environment_log.read_text())
+    assert recorded == {name: renderer_env[name] for name in required}
+    assert all(Path(value).is_relative_to(tmp_path / "cache") for value in recorded.values())
+    assert all((Path(value) / "renderer-write").is_file() for value in recorded.values())
+
+
+def test_install_extracts_archive_without_ambient_temporary_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    upstream, bun, ref = _upstream_repo(tmp_path / "upstream")
+    monkeypatch.setattr(gstack_prime, "PINNED_GSTACK_REF", ref)
+
+    def refuse_ambient_archive(*_args, **_kwargs):
+        raise AssertionError("ambient archive temporary file was created")
+
+    monkeypatch.setattr(gstack_prime.tempfile, "NamedTemporaryFile", refuse_ambient_archive)
+
+    result = gstack_prime.install_prime_gstack(
+        upstream,
+        tmp_path / "prime-agent",
+        bun=bun,
+    )
+
+    assert result.upstream_ref == ref
+
+
+def test_install_passes_confined_renderer_environment_to_git(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    upstream, bun, ref = _upstream_repo(tmp_path / "upstream")
+    monkeypatch.setattr(gstack_prime, "PINNED_GSTACK_REF", ref)
+    external = tmp_path / "external"
+    external.mkdir()
+    sentinel = external / "sentinel"
+    sentinel.write_bytes(b"unchanged\n")
+    sentinel.chmod(0o640)
+    ambient_config = external / "ambient-git-config"
+    ambient_config.write_bytes(b"[core]\n\tfilemode = true\n")
+    trace_variables = {
+        "GIT_TRACE": external / "git-trace",
+        "GIT_TRACE2": external / "git-trace2",
+        "GIT_TRACE2_EVENT": external / "git-trace2-event",
+        "GIT_TRACE_SETUP": external / "git-trace-setup",
+        "GIT_TRACE_PERFORMANCE": external / "git-trace-performance",
+    }
+    for name, path in trace_variables.items():
+        monkeypatch.setenv(name, str(path))
+    monkeypatch.setenv("GIT_CURL_VERBOSE", "1")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(ambient_config))
+    renderer_root = tmp_path / "cache/renderer"
+    renderer_env = {
+        "PATH": os.environ["PATH"],
+        "HOME": str(renderer_root / "home"),
+        "XDG_CONFIG_HOME": str(renderer_root / "xdg-config"),
+        "TMPDIR": str(renderer_root / "tmp"),
+        "TMP": str(renderer_root / "tmp"),
+        "TEMP": str(renderer_root / "tmp"),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": str(renderer_root / "git-config"),
+    }
+    for path in (
+        renderer_root / "home",
+        renderer_root / "xdg-config",
+        renderer_root / "tmp",
+    ):
+        path.mkdir(parents=True, exist_ok=True)
+    (renderer_root / "git-config").write_bytes(b"")
+    before = _tree_snapshot(external)
+
+    result = gstack_prime.install_prime_gstack(
+        upstream,
+        tmp_path / "prime-agent",
+        bun=bun,
+        renderer_env=renderer_env,
+    )
+
+    assert result.upstream_ref == ref
+    assert _tree_snapshot(external) == before
 
 
 def test_install_refuses_colliding_user_file_without_partial_writes(
@@ -476,7 +630,6 @@ Continue the review.
     assert "### Landscape Check" in executive
     assert "Discuss the product directly" in executive
     assert "/office-hours" not in executive
-
 
 
 def test_shared_and_root_routing_uses_concrete_supported_actions() -> None:
