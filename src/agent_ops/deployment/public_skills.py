@@ -708,7 +708,10 @@ def _managed_files(
         content = item.read_bytes()
         if install.strategy in {"prime-gstack", "prime-superpowers"} and b"\0" not in content:
             content = content.replace(shadow_marker, target_marker)
-        planned.append(PlannedFile(relative, content, stat.S_IMODE(item.stat().st_mode)))
+        mode = stat.S_IMODE(item.stat().st_mode)
+        if install.strategy == "prime-gstack":
+            mode = 0o755 if mode & 0o111 else 0o644
+        planned.append(PlannedFile(relative, content, mode))
     return tuple(planned)
 
 

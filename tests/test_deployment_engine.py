@@ -1666,8 +1666,10 @@ def test_gstack_audit_retains_owned_roots_but_ignores_transaction_metadata(
     )
 
 
+@pytest.mark.parametrize("legacy_skill_mode", (0o644, 0o666))
 def test_prime_gstack_adopts_exact_legacy_owner_manifest_in_shared_transaction(
     tmp_path: Path,
+    legacy_skill_mode: int,
 ) -> None:
     source = tmp_path / "source"
     source.mkdir()
@@ -1679,7 +1681,7 @@ def test_prime_gstack_adopts_exact_legacy_owner_manifest_in_shared_transaction(
     runtime.write_bytes(b"legacy executable\n")
     runtime.chmod(0o755)
     skill.write_bytes(b"legacy skill\n")
-    skill.chmod(0o644)
+    skill.chmod(legacy_skill_mode)
     neighbor = home / "notes/user-authored.txt"
     neighbor.parent.mkdir(parents=True)
     neighbor.write_bytes(b"user content\n")
@@ -1732,7 +1734,7 @@ def test_prime_gstack_adopts_exact_legacy_owner_manifest_in_shared_transaction(
         rendered_runtime.write_bytes(b"current executable\n")
         rendered_runtime.chmod(0o755)
         rendered_skill.write_bytes(b"current skill\n")
-        rendered_skill.chmod(0o644)
+        rendered_skill.chmod(0o666)
         rendered_manifest = target_home / ".agentops/gstack-prime-manifest.json"
         rendered_manifest.parent.mkdir(parents=True, exist_ok=True)
         rendered_manifest.write_text(
@@ -1769,6 +1771,7 @@ def test_prime_gstack_adopts_exact_legacy_owner_manifest_in_shared_transaction(
     assert runtime.read_bytes() == b"current executable\n"
     assert stat.S_IMODE(runtime.stat().st_mode) == 0o755
     assert skill.read_bytes() == b"current skill\n"
+    assert stat.S_IMODE(skill.stat().st_mode) == 0o644
     assert neighbor.read_bytes() == b"user content\n"
     assert not legacy_manifest.exists()
     assert audit_provider_plans(plans).matches

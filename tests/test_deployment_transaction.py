@@ -1479,7 +1479,7 @@ def test_prime_gstack_legacy_adoption_refuses_inexact_evidence_without_replaceme
     elif case == "missing-file":
         runtime.unlink()
     elif case == "wrong-file-mode":
-        runtime.chmod(0o744)
+        runtime.chmod(0o644)
     elif case == "wrong-manifest-mode":
         legacy_manifest.chmod(0o600)
     if case in {"wrong-schema", "wrong-owner", "wrong-ref", "extra-path", "missing-path"}:
@@ -1524,6 +1524,45 @@ def test_prime_gstack_legacy_adoption_rolls_back_exact_prestate_after_late_failu
     assert legacy_manifest.read_bytes() == legacy_manifest_bytes
     assert stat.S_IMODE(legacy_manifest.stat().st_mode) == 0o644
     assert not list((home / ".agentops/deployment/manifests").glob("*.json"))
+
+
+def test_prime_gstack_legacy_adoption_bounds_open_file_pins(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    plan, runtime, skill, legacy_manifest, _legacy_manifest_bytes = (
+        _prime_gstack_legacy_plan(home)
+    )
+    pinned = transaction_module._PinnedPrimeGstackLegacyFile
+    original_init = pinned.__init__
+    original_close = pinned.close
+    active = 0
+    maximum = 0
+
+    def limited_init(self, *args: object, **kwargs: object) -> None:
+        nonlocal active, maximum
+        if active >= 1:
+            raise OSError(24, "Too many open files")
+        original_init(self, *args, **kwargs)
+        active += 1
+        maximum = max(maximum, active)
+
+    def tracked_close(self) -> None:
+        nonlocal active
+        original_close(self)
+        active -= 1
+
+    monkeypatch.setattr(pinned, "__init__", limited_init)
+    monkeypatch.setattr(pinned, "close", tracked_close)
+
+    install_provider_plans((plan,))
+
+    assert maximum == 1
+    assert active == 0
+    assert runtime.read_bytes() == b"current executable\n"
+    assert skill.read_bytes() == b"current skill\n"
+    assert not legacy_manifest.exists()
 
 
 @pytest.mark.parametrize("raced_entry", ("runtime", "legacy-manifest"))

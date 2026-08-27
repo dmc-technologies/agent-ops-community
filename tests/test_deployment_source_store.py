@@ -987,6 +987,48 @@ def test_descriptor_closure_pins_entry_and_rejects_replacement(
     assert closure.closed
 
 
+def test_descriptor_closure_bounds_open_files_for_large_source_set(
+    git_remote: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    work = _remote_work(git_remote)
+    _git("checkout", "main", cwd=work)
+    bulk = work / "bulk"
+    bulk.mkdir()
+    declared = tuple(Path(f"bulk/item-{index}.txt") for index in range(32))
+    for path in declared:
+        (work / path).write_text(f"{path.name}\n")
+    _git("add", "bulk", cwd=work)
+    _git("commit", "-m", "add large source set", cwd=work)
+    _git("push", "origin", "HEAD:refs/heads/main", cwd=work)
+
+    snapshot = SourceStore(tmp_path / "state").fetch(
+        _source(git_remote), "refs/heads/main"
+    )
+    original_open = source_store_module.os.open
+    original_close = source_store_module.os.close
+    active: set[int] = set()
+
+    def bounded_open(*args: object, **kwargs: object) -> int:
+        if len(active) >= 12:
+            raise OSError(24, "Too many open files")
+        descriptor = original_open(*args, **kwargs)
+        active.add(descriptor)
+        return descriptor
+
+    def tracked_close(descriptor: int) -> None:
+        active.discard(descriptor)
+        original_close(descriptor)
+
+    monkeypatch.setattr(source_store_module.os, "open", bounded_open)
+    monkeypatch.setattr(source_store_module.os, "close", tracked_close)
+
+    with _open_provider_data_closure(snapshot, declared) as closure:
+        assert tuple(entry.read_bytes() for entry in closure.entries) == tuple(
+            f"{path.name}\n".encode() for path in declared
+        )
+    assert not active
+
+
 def test_descriptor_closure_rejects_in_place_equal_length_byte_change(
     git_remote: Path, tmp_path: Path
 ) -> None:

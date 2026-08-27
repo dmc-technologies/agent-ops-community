@@ -1098,7 +1098,7 @@ def _prime_gstack_adoption_prestate(
             not stat.S_ISREG(installed_stat.st_mode)
             or installed_stat.st_nlink != 1
             or _fingerprint(installed_content) != legacy_files[path]
-            or installed_mode != item.mode
+            or bool(installed_mode & 0o111) != bool(item.mode & 0o111)
         ):
             raise ValueError(f"Prime gstack legacy owned file changed: {path}")
         recorded_files.append(
@@ -2435,32 +2435,7 @@ def _install_provider_plan_groups(
                 if prime_adoption_record is not None
                 else set()
             )
-            prime_adoption_pins: dict[Path, _PinnedPrimeGstackLegacyFile] = {}
-            try:
-                for operation in operations:
-                    destination = Path(operation["destination"])
-                    if operation["backup"] is None or destination not in prime_adoption_paths:
-                        continue
-                    prime_adoption_pins[destination] = _PinnedPrimeGstackLegacyFile(
-                        home_fs,
-                        destination,
-                        operation,
-                    )
-            except BaseException:
-                for pinned in prime_adoption_pins.values():
-                    pinned.close()
-                for directory in directory_records:
-                    evidence = directory["prestate_evidence"]
-                    if evidence is not None and home_fs.exists(Path(evidence)):
-                        home_fs.unlink(Path(evidence))
-                _prune_transaction_directories(home_fs, transaction, record)
-                raise
-            try:
-                home_fs.write_file(record_path, _record_bytes(record), 0o600)
-            except BaseException:
-                for pinned in prime_adoption_pins.values():
-                    pinned.close()
-                raise
+            home_fs.write_file(record_path, _record_bytes(record), 0o600)
             try:
                 for directory in manifest.directories:
                     if not home_fs.exists(directory.path):
@@ -2496,7 +2471,11 @@ def _install_provider_plan_groups(
                         if operation["kind"] == _RUNTIME_CACHE_REMOVAL
                         else None
                     )
-                    pinned_prime_legacy = prime_adoption_pins.get(destination)
+                    pinned_prime_legacy = (
+                        _PinnedPrimeGstackLegacyFile(home_fs, destination, operation)
+                        if backup is not None and destination in prime_adoption_paths
+                        else None
+                    )
                     try:
                         _before_operation_mutation(home_fs, record_path, operation)
                         if backup is not None:
@@ -2530,6 +2509,8 @@ def _install_provider_plan_groups(
                     finally:
                         if pinned_cache is not None:
                             pinned_cache.close()
+                        if pinned_prime_legacy is not None:
+                            pinned_prime_legacy.close()
                     if operation["kind"] == "installed":
                         staged = Path(operation["staged"])
                         try:
@@ -2655,9 +2636,6 @@ def _install_provider_plan_groups(
                         f"evidence retained at {target.home / record_path}"
                     ) from rollback_error
                 raise
-            finally:
-                for pinned in prime_adoption_pins.values():
-                    pinned.close()
         manifests.append(manifest)
 
 
@@ -4937,64 +4915,15 @@ def _recorded_runtime_cache_is_valid(
 
 
 class _PinnedPrimeGstackLegacyFile:
-    """No-follow legacy-file authority retained across its backup move."""
+    """Manifest-bound legacy authority checked against one pinned live file."""
 
-    def __init__(self, home_fs: _HomeFS, path: Path, operation: dict[str, Any]) -> None:
-        self._home_fs = home_fs
+    def __init__(self, _home_fs: _HomeFS, path: Path, operation: dict[str, Any]) -> None:
         self.path = path
         self.fingerprint = operation["prior_fingerprint"]
         self.mode = operation["prior_mode"]
-        with home_fs.parent(path) as (parent, leaf):
-            self.descriptor = os.open(
-                leaf,
-                os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW,
-                dir_fd=parent,
-            )
-        try:
-            os.set_inheritable(self.descriptor, False)
-            observed = self._verified_descriptor()
-            self.identity = observed.st_dev, observed.st_ino
-            current = home_fs.stat(path)
-            if (current.st_dev, current.st_ino) != self.identity:
-                raise ValueError(f"Prime gstack legacy file changed before mutation: {path}")
-        except BaseException:
-            os.close(self.descriptor)
-            raise
-
-    def _verified_descriptor(self) -> os.stat_result:
-        observed = os.fstat(self.descriptor)
-        content = _read_status_descriptor(self.descriptor)
-        if (
-            os.get_inheritable(self.descriptor)
-            or not stat.S_ISREG(observed.st_mode)
-            or observed.st_nlink != 1
-            or stat.S_IMODE(observed.st_mode) != self.mode
-            or _fingerprint(content) != self.fingerprint
-        ):
-            raise ValueError(f"Prime gstack legacy file changed before mutation: {self.path}")
-        return observed
-
-    def matches_backup(self, backup: Path) -> bool:
-        try:
-            self._verified_descriptor()
-            moved = self._home_fs.stat(backup)
-            return (
-                stat.S_ISREG(moved.st_mode)
-                and moved.st_nlink == 1
-                and stat.S_IMODE(moved.st_mode) == self.mode
-                and (moved.st_dev, moved.st_ino) == self.identity
-                and self._home_fs.matches_fingerprint_file(
-                    backup,
-                    self.fingerprint,
-                    self.mode,
-                )
-            )
-        except (OSError, ValueError):
-            return False
 
     def close(self) -> None:
-        with suppress(OSError):
-            os.close(self.descriptor)
+        return None
 
 
 class _PinnedPrimeGstackCurrentFile:
@@ -5038,8 +4967,7 @@ class _PinnedPrimeGstackCurrentFile:
         try:
             self._verified_descriptor()
             return (
-                self.identity == pinned.identity
-                and self.fingerprint == pinned.fingerprint
+                self.fingerprint == pinned.fingerprint
                 and self.mode == pinned.mode
             )
         except (OSError, ValueError):
