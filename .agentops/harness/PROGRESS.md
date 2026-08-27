@@ -32,5 +32,5 @@ A managed target could be blocked from ever reaching its channel commit by one l
 
 ## Next Actions
 
-1. Obtain exact-head hosted Linux and Windows CI, then one Review Gate acceptance.
+1. Obtain exact-head hosted Linux and Windows CI, then complete the repository's ordinary human review.
 2. Merge only with Dan's explicit merge authority on the unchanged accepted head.
