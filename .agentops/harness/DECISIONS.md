@@ -4,6 +4,13 @@ Repository: `agent-ops-community`
 
 Record durable architecture, workflow, and harness decisions here.
 
+### 2026-08-26: Retire the shared Codex pull-request reviewer
+
+- Decision: Installed product repositories use CodeRabbit's built-in automatic and incremental review flow. Agent Ops Community no longer publishes a label dispatcher, reusable AI review workflow, prompt, or review script.
+- Rationale: CodeRabbit is the approved one and only AI review standard; retaining a second reviewer would preserve the architecture being replaced.
+- Applies to: `.github/`, review documentation, tests, README, and repository handoff.
+- Revisit when: Dan approves a new review architecture through a separate design.
+
 ### 2026-08-19: Managed deployment status classifies from the installed ownership manifest
 
 - Decision: `DeploymentEngine.status` reads each managed target's installed ownership manifest through the shared cooperative status-evidence reader that preview already used, and passes that manifest plus a manifest-versus-installed audit to `DeploymentRegistry.status`. The receipt bound to the current registry snapshot supplies only the last resolved commit and the recorded failure or missing-ref outcome. Managed evidence requires no preview review state and a full 40-hex source revision; preview evidence keeps its `unreviewed-local` state and 64-hex fingerprint. Native Windows uses the same contract through a shared-lock manifest read in the Windows backend.
