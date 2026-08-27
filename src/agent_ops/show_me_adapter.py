@@ -2229,7 +2229,26 @@ def _unlink_if_present(directory_fd: int, name: str) -> None:
 
 
 def _fd_path(directory_fd: int, child: str | None = None) -> Path:
-    root = Path(f"/dev/fd/{directory_fd}")
+    if fcntl is not None and hasattr(fcntl, "F_GETPATH"):
+        try:
+            buffer = fcntl.fcntl(directory_fd, fcntl.F_GETPATH, b"\0" * 1024)
+            encoded = buffer.split(b"\0", 1)[0]
+            if not encoded:
+                raise OSError("empty descriptor path")
+            root = Path(os.fsdecode(encoded))
+            pinned = os.fstat(directory_fd)
+            resolved = root.stat(follow_symlinks=False)
+        except OSError as exc:
+            raise ShowMeCollisionError(
+                "could not resolve pinned show-me directory"
+            ) from exc
+        if not stat.S_ISDIR(resolved.st_mode) or (
+            pinned.st_dev,
+            pinned.st_ino,
+        ) != (resolved.st_dev, resolved.st_ino):
+            raise ShowMeCollisionError("pinned show-me directory identity changed")
+    else:
+        root = Path(f"/dev/fd/{directory_fd}")
     return root if child is None else root / child
 
 
