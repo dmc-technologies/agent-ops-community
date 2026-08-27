@@ -1017,50 +1017,45 @@ class _PinnedEntry:
         self,
         closure: _PinnedClosure,
         relative_path: Path,
-        descriptor: int,
-        chain: tuple[tuple[int, str, tuple[int, int, int, int, int]], ...],
+        identity: tuple[int, int, int, int, int],
+        chain: tuple[tuple[str, tuple[int, int, int, int, int]], ...],
         expected_blob: str | None,
         object_format: str,
+        kind: str,
+        mode: int,
+        size: int,
     ) -> None:
         self._closure = closure
-        self._descriptor = descriptor
         self._chain = chain
-        observed = os.fstat(descriptor)
-        self._identity = _identity(observed)
+        self._identity = identity
         self._expected_blob = expected_blob
         self._object_format = object_format
         self.relative_path = relative_path
-        self.kind = "directory" if stat.S_ISDIR(observed.st_mode) else "file"
-        self.mode = stat.S_IMODE(observed.st_mode)
-        self.size = observed.st_size
+        self.kind = kind
+        self.mode = mode
+        self.size = size
 
     @property
     def info(self) -> _ClosureEntryInfo:
         return _ClosureEntryInfo(self.relative_path, self.kind, self.mode, self.size)
 
-    def _revalidate(self) -> None:
-        self._closure._revalidate_root()
-        for parent_fd, name, expected in self._chain:
-            try:
-                observed = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-            except FileNotFoundError:
-                raise RuntimeError("provider data changed during consumption") from None
-            if _identity(observed) != expected:
-                raise RuntimeError("provider data changed during consumption")
-        if _identity(os.fstat(self._descriptor)) != self._identity:
-            raise RuntimeError("provider data changed during consumption")
-
     def read_bytes(self) -> bytes:
         if self.kind != "file":
             raise RuntimeError("provider data directories cannot be read as bytes")
-        self._revalidate()
-        data = _read_fd_bytes(self._descriptor)
-        self._revalidate()
-        if self._expected_blob is None or (
-            _blob_oid(data, self._object_format) != self._expected_blob
-        ):
-            raise RuntimeError("provider data bytes differ from the tracked Git blob")
-        return data
+        descriptor = self._closure._open_verified_entry(
+            self.relative_path, self._chain, self._identity
+        )
+        try:
+            data = _read_fd_bytes(descriptor)
+            if _identity(os.fstat(descriptor)) != self._identity:
+                raise RuntimeError("provider data changed during consumption")
+            if self._expected_blob is None or (
+                _blob_oid(data, self._object_format) != self._expected_blob
+            ):
+                raise RuntimeError("provider data bytes differ from the tracked Git blob")
+            return data
+        finally:
+            os.close(descriptor)
 
 
 class _PinnedClosure:
@@ -1068,7 +1063,6 @@ class _PinnedClosure:
         self._root = Path(snapshot.root)
         self._root_fd = -1
         self._root_identity: tuple[int, int, int, int, int] | None = None
-        self._owned_fds: list[int] = []
         self.entries: tuple[_PinnedEntry, ...] = ()
         self.closed = False
         self._open(snapshot, declared)
@@ -1125,35 +1119,77 @@ class _PinnedClosure:
         }
         if any(head.mode == "120000" for head in closure_entries.values()):
             raise RuntimeError(f"provider data closure contains a symlink: {raw}")
-        parent_fd = os.dup(self._root_fd)
-        self._owned_fds.append(parent_fd)
-        chain: list[tuple[int, str, tuple[int, int, int, int, int]]] = []
-        current_fd = parent_fd
-        for index, part in enumerate(path.parts):
-            flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
-            if index < len(path.parts) - 1 or raw not in expected:
-                flags |= os.O_DIRECTORY
-            try:
-                next_fd = os.open(part, flags, dir_fd=current_fd)
-            except FileNotFoundError:
-                raise RuntimeError(f"provider data path is missing: {raw}") from None
-            except OSError as error:
-                if error.errno in {errno.ELOOP, errno.ENOTDIR}:
-                    raise RuntimeError(f"provider data path contains a symlink: {raw}") from error
-                raise
-            self._owned_fds.append(next_fd)
-            observed = os.fstat(next_fd)
-            chain.append((current_fd, part, _identity(observed)))
-            current_fd = next_fd
-        expected_blob = expected[raw].object_id if raw in expected else None
-        return _PinnedEntry(
-            self,
-            path,
-            current_fd,
-            tuple(chain),
-            expected_blob,
-            object_format,
+        descriptor, chain = self._open_entry_descriptor(
+            path, final_directory=raw not in expected
         )
+        observed = os.fstat(descriptor)
+        expected_blob = expected[raw].object_id if raw in expected else None
+        try:
+            entry = _PinnedEntry(
+                self,
+                path,
+                _identity(observed),
+                chain,
+                expected_blob,
+                object_format,
+                "directory" if stat.S_ISDIR(observed.st_mode) else "file",
+                stat.S_IMODE(observed.st_mode),
+                observed.st_size,
+            )
+            if expected_blob is not None:
+                data = _read_fd_bytes(descriptor)
+                if _blob_oid(data, object_format) != expected_blob:
+                    raise RuntimeError("provider data bytes differ from the tracked Git blob")
+            return entry
+        finally:
+            os.close(descriptor)
+
+    def _open_entry_descriptor(
+        self, path: Path, *, final_directory: bool
+    ) -> tuple[int, tuple[tuple[str, tuple[int, int, int, int, int]], ...]]:
+        self._revalidate_root()
+        current_fd = os.dup(self._root_fd)
+        chain: list[tuple[str, tuple[int, int, int, int, int]]] = []
+        try:
+            for index, part in enumerate(path.parts):
+                flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
+                if index < len(path.parts) - 1 or final_directory:
+                    flags |= os.O_DIRECTORY
+                try:
+                    next_fd = os.open(part, flags, dir_fd=current_fd)
+                except FileNotFoundError:
+                    raise RuntimeError(
+                        f"provider data path is missing: {path.as_posix()}"
+                    ) from None
+                except OSError as error:
+                    if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+                        raise RuntimeError(
+                            "provider data changed during consumption"
+                        ) from error
+                    raise
+                os.close(current_fd)
+                current_fd = next_fd
+                chain.append((part, _identity(os.fstat(current_fd))))
+            self._revalidate_root()
+            return current_fd, tuple(chain)
+        except BaseException:
+            with suppress(OSError):
+                os.close(current_fd)
+            raise
+
+    def _open_verified_entry(
+        self,
+        path: Path,
+        expected_chain: tuple[tuple[str, tuple[int, int, int, int, int]], ...],
+        expected_identity: tuple[int, int, int, int, int],
+    ) -> int:
+        descriptor, observed_chain = self._open_entry_descriptor(
+            path, final_directory=False
+        )
+        if observed_chain != expected_chain or _identity(os.fstat(descriptor)) != expected_identity:
+            os.close(descriptor)
+            raise RuntimeError("provider data changed during consumption")
+        return descriptor
 
     def _revalidate_root(self) -> None:
         if self.closed or self._root_identity is None:
@@ -1171,9 +1207,6 @@ class _PinnedClosure:
     def close(self) -> None:
         if self.closed:
             return
-        for descriptor in reversed(self._owned_fds):
-            with suppress(OSError):
-                os.close(descriptor)
         if self._root_fd >= 0:
             with suppress(OSError):
                 os.close(self._root_fd)
