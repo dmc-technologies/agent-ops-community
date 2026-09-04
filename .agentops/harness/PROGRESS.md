@@ -6,7 +6,7 @@ Repository: `agent-ops-community`
 
 - Branch: `feat/first-class-third-party-skills`
 - Base: Community `origin/main` at `77b9a2d`
-- Pull request: https://github.com/dmc-technologies/agent-ops-community/pull/48
+- Pull request: 48 in this repository
 - Plane: no Community Plane work item applies
 - Merge authority: Dan granted it for this pull request on 2026-09-04, conditional on repository checks passing. The standing bar still holds: a current-head CodeRabbit review with an `APPROVED` decision and zero unresolved conversations.
 
