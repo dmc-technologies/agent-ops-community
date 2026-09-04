@@ -21,7 +21,9 @@ Each declared skill lands in exactly one of three states.
     hand copy looks exactly like this. It reports as a failure because Agent Ops
     cannot refresh, verify, or retire a directory it does not own.
 ``missing``
-    Nothing of that name is installed at all.
+    No directory of that name is installed, whether or not an ownership record
+    still claims it. A record outlives the files it describes, so the filesystem
+    decides this first.
 
 Both failing states exit non-zero, because both mean the declaration is not in
 force on that machine. That is the defect this module exists to catch: a skill
@@ -145,12 +147,17 @@ def audit_home(
         provider_owned = owned.get(f"public-skill:{dependency.id}", set())
         provider_owned |= _load_legacy_ownership(home, dependency.id)
         for skill in expected_skills(install):
-            if skill in provider_owned:
-                state = MANAGED
-            elif (skills_root / skill).is_dir():
-                state = UNMANAGED
-            else:
+            # An ownership record is a claim about the past. The directory is the
+            # present. A skill deleted from a home still has its record, so
+            # checking the record alone reports a skill that is not there as
+            # installed -- the audit must agree with the filesystem first.
+            installed = (skills_root / skill).is_dir()
+            if not installed:
                 state = MISSING
+            elif skill in provider_owned:
+                state = MANAGED
+            else:
+                state = UNMANAGED
             states.append(SkillState(framework, dependency.id, skill, state))
     return states
 
@@ -222,7 +229,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         names = ", ".join(
             f"{state.framework.value}:{state.dependency_id}/{state.skill}" for state in failed
         )
-        print(f"\n{len(failed)} declared skills are not managed by Agent Ops: {names}")
+        plural = "skill is" if len(failed) == 1 else "skills are"
+        print(f"\n{len(failed)} declared {plural} not managed by Agent Ops: {names}")
         return 1
     print(f"\nall {len(states)} declared skills are managed by Agent Ops")
     return 0

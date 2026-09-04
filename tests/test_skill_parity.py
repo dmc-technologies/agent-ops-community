@@ -209,3 +209,25 @@ def test_show_me_adapter_manifest_records_a_single_skill(tmp_path: Path) -> None
     states = audit_home(Framework.CODEX, [show_me], tmp_path)
 
     assert [(state.skill, state.state) for state in states] == [("show-me", MANAGED)]
+
+
+def test_deleted_skill_reports_missing_even_though_its_record_survives(tmp_path: Path) -> None:
+    """An ownership record is a claim about the past; the directory is the present.
+
+    Removing a skill directory leaves its ownership record behind. Checking the
+    record alone reports a skill that is not on disk as installed, which makes
+    the audit unable to fail on the one thing it exists to detect.
+    """
+
+    _write_index(tmp_path, "public-skill:example", ["alpha"])
+    _write_legacy_manifest(
+        tmp_path,
+        "example",
+        {"dependency_id": "example", "skills": {"alpha": {"SKILL.md": "0" * 64}}},
+    )
+    # Both records claim alpha. Nothing is on disk.
+
+    states = audit_home(Framework.CODEX, [_dependency(["alpha"])], tmp_path)
+
+    assert [(state.skill, state.state) for state in states] == [("alpha", MISSING)]
+    assert not any(state.ok for state in states)
