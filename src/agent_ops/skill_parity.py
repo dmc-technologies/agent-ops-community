@@ -8,8 +8,14 @@ nothing, and reaches no network.
 Each declared skill lands in exactly one of three states.
 
 ``managed``
-    Agent Ops installed it and the ownership index records the provider that
-    owns it. This is the only passing state.
+    Agent Ops installed it and an ownership record claims it. This is the only
+    passing state. Two ownership records exist and either one counts: the shared
+    provider index at ``skills/.agentops-public-provider-index.json``, written by
+    the transactional engine, and the older per-dependency manifests under
+    ``.agentops/skill-dependencies/``, written by the standalone installers that
+    predate it. A home provisioned before the engine landed carries only the
+    second, and reading just the first would report every one of its skills as a
+    hand copy.
 ``unmanaged``
     A directory of that name exists in the home, but no provider claims it. A
     hand copy looks exactly like this. It reports as a failure because Agent Ops
@@ -35,6 +41,9 @@ from agent_ops.deployment.public_skills import PROVIDER_INDEX_PATH
 from agent_ops.registries import load_skill_dependencies
 from agent_ops.registries.models import Framework, SkillDependency, SkillDependencyInstall
 from agent_ops.skill_installer import default_framework_home
+
+#: Per-dependency ownership manifests written by the standalone installers.
+LEGACY_OWNERSHIP_DIR = Path(".agentops/skill-dependencies")
 
 MANAGED = "managed"
 UNMANAGED = "unmanaged"
@@ -97,6 +106,28 @@ def _load_provider_index(home: Path) -> dict[str, set[str]]:
     return owned
 
 
+def _load_legacy_ownership(home: Path, dependency_id: str) -> set[str]:
+    """Return the skill names the per-dependency ownership manifest records.
+
+    These manifests predate the shared provider index. `copy-named-skills`
+    records a `skills` mapping of name to file fingerprints; the show-me adapter
+    records the single `skill` it owns.
+    """
+
+    manifest = home / LEGACY_OWNERSHIP_DIR / f"{dependency_id}.json"
+    if not manifest.is_file():
+        return set()
+    try:
+        document = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return set()
+    if isinstance(document.get("skills"), dict):
+        return set(document["skills"])
+    if isinstance(document.get("skill"), str):
+        return {document["skill"]}
+    return set()
+
+
 def audit_home(
     framework: Framework,
     dependencies: Sequence[SkillDependency],
@@ -112,6 +143,7 @@ def audit_home(
         if install is None:
             continue
         provider_owned = owned.get(f"public-skill:{dependency.id}", set())
+        provider_owned |= _load_legacy_ownership(home, dependency.id)
         for skill in expected_skills(install):
             if skill in provider_owned:
                 state = MANAGED

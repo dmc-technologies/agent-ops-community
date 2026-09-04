@@ -141,3 +141,71 @@ def test_format_report_counts_only_the_states_it_was_given() -> None:
     states = audit_home(Framework.CODEX, [], Path("/nonexistent"))
     assert states == []
     assert format_report(states) == ""
+
+
+def _write_legacy_manifest(home: Path, dependency_id: str, document: dict) -> None:
+    manifest = home / ".agentops" / "skill-dependencies" / f"{dependency_id}.json"
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    manifest.write_text(json.dumps(document), encoding="utf-8")
+
+
+def test_skill_owned_only_by_a_legacy_manifest_is_managed(tmp_path: Path) -> None:
+    """Homes provisioned before the shared provider index carry the older record.
+
+    `~/.claude` is one of them: its `.agentops/skill-dependencies/mattpocock.json`
+    records eight skills that no provider index mentions. Reading only the index
+    would call all eight hand copies and fail a home that Agent Ops installed
+    correctly.
+    """
+
+    (tmp_path / "skills" / "alpha").mkdir(parents=True)
+    _write_legacy_manifest(
+        tmp_path,
+        "example",
+        {"dependency_id": "example", "skills": {"alpha": {"SKILL.md": "0" * 64}}},
+    )
+
+    states = audit_home(Framework.CODEX, [_dependency(["alpha"])], tmp_path)
+
+    assert [(state.skill, state.state) for state in states] == [("alpha", MANAGED)]
+
+
+def test_legacy_manifest_does_not_launder_a_skill_it_never_recorded(tmp_path: Path) -> None:
+    """A manifest present for the dependency must not vouch for other names."""
+
+    (tmp_path / "skills" / "beta").mkdir(parents=True)
+    _write_legacy_manifest(
+        tmp_path,
+        "example",
+        {"dependency_id": "example", "skills": {"alpha": {"SKILL.md": "0" * 64}}},
+    )
+
+    states = audit_home(Framework.CODEX, [_dependency(["beta"])], tmp_path)
+
+    assert [(state.skill, state.state) for state in states] == [("beta", UNMANAGED)]
+
+
+def test_show_me_adapter_manifest_records_a_single_skill(tmp_path: Path) -> None:
+    """The show-me adapter writes `skill`, not a `skills` mapping."""
+
+    show_me = SkillDependency.model_validate(
+        {
+            "id": "humanlayer-show-me",
+            "name": "HumanLayer Show Me",
+            "repo": "https://example.invalid/skills.git",
+            "ref": "0" * 40,
+            "install": {
+                "codex": {
+                    "strategy": "humanlayer-show-me",
+                    "source": "plugins/show-me/skills",
+                    "destination": "skills",
+                }
+            },
+        }
+    )
+    (tmp_path / "skills" / "show-me").mkdir(parents=True)
+    _write_legacy_manifest(tmp_path, "humanlayer-show-me", {"skill": "show-me"})
+
+    states = audit_home(Framework.CODEX, [show_me], tmp_path)
+
+    assert [(state.skill, state.state) for state in states] == [("show-me", MANAGED)]
