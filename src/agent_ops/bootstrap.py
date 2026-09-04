@@ -23,9 +23,16 @@ SKILL_INSTALL_BOOTSTRAPS = set(SUPPORTED_BOOTSTRAPS) - {Framework.LOCAL}
 
 
 def skill_install_command(framework: Framework) -> str:
+    """Name the command that installs every third-party skill this framework declares.
+
+    `skills install` takes a hand-picked subset and so silently skips any
+    dependency added to the registry since the last run. `skills sync` installs
+    whatever the registry currently declares and audits the home afterwards.
+    """
+
     if framework not in SKILL_INSTALL_BOOTSTRAPS:
         return ""
-    return f"   agentops skills install {framework.value}\n"
+    return f"   agentops skills sync {framework.value}\n"
 
 
 def bootstrap_text(framework: Framework) -> str:

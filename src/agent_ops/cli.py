@@ -33,6 +33,7 @@ from agent_ops.registries import (
     load_tools,
 )
 from agent_ops.skill_installer import install_skill_dependencies
+from agent_ops.skill_parity import main as skill_parity_main
 from agent_ops.verify import run_verification
 
 
@@ -253,6 +254,80 @@ def list_skills(json_output: Annotated[bool, typer.Option("--json")] = False) ->
 def show_skill(skill_id: str) -> None:
     skill = get_by_id(load_skills(), skill_id)
     typer.echo(skill.model_dump_json(indent=2))
+
+
+@skills_app.command("audit")
+def audit_skills(
+    framework: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--framework",
+            help="Framework home to audit. Repeat to audit several. "
+            "Defaults to claude-code and codex.",
+        ),
+    ] = None,
+    all_frameworks: Annotated[
+        bool,
+        typer.Option("--all", help="Audit every framework any dependency declares."),
+    ] = False,
+) -> None:
+    """Report whether each declared third-party skill is installed and Agent Ops owned.
+
+    Read-only. Exits non-zero when a declared skill is absent, or present but
+    owned by nobody, which is what a hand-placed copy looks like.
+    """
+    argv: list[str] = []
+    if all_frameworks:
+        argv.append("--all")
+    for value in framework or []:
+        argv.extend(["--framework", value])
+    raise typer.Exit(skill_parity_main(argv))
+
+
+@skills_app.command("sync")
+def sync_skills(
+    framework: Annotated[Framework, typer.Argument(help="Framework home to sync.")],
+    home: Annotated[
+        Path | None,
+        typer.Option("--home", help="Override the selected framework home."),
+    ] = None,
+    cache_dir: Annotated[
+        Path | None,
+        typer.Option("--cache-dir", help="Override dependency checkout cache directory."),
+    ] = None,
+    dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
+) -> None:
+    """Install every dependency this framework declares, then audit the result.
+
+    `skills install` takes a hand-picked subset, so a dependency added to the
+    registry after the last install never reaches the home. This installs
+    whatever the registry currently declares, which is what makes a new
+    dependency reach a machine without somebody remembering it.
+    """
+    try:
+        rows = install_skill_dependencies(
+            framework=framework,
+            dependencies=load_skill_dependencies(),
+            home=home,
+            dependency_ids=None,
+            cache_dir=cache_dir,
+            dry_run=dry_run,
+        )
+    except (
+        FileNotFoundError,
+        UnsupportedPlatformError,
+        ValueError,
+        subprocess.CalledProcessError,
+    ) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from exc
+
+    verb = "would install" if dry_run else "installed"
+    for row in rows:
+        typer.echo(f"{verb}: {row.id} -> {row.destination}")
+    if dry_run:
+        return
+    raise typer.Exit(skill_parity_main(["--framework", framework.value]))
 
 
 @skills_app.command("install")

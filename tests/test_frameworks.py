@@ -69,9 +69,13 @@ def test_public_bootstrap_writes_generic_framework_files(tmp_path: Path) -> None
 
 
 def test_public_bootstrap_advertises_supported_skill_installs() -> None:
+    # Bootstrap names `skills sync`, not `skills install`. `install` takes a
+    # hand-picked subset, so a dependency added to the registry after the last
+    # run never reaches the home; `sync` installs whatever the registry declares
+    # and audits the home afterwards.
     for framework in GENERIC_PRIVATE_FRAMEWORKS - {Framework.LOCAL}:
-        assert f"agentops skills install {framework.value}" in bootstrap_text(framework)
-    assert "agentops skills install local" not in bootstrap_text(Framework.LOCAL)
+        assert f"agentops skills sync {framework.value}" in bootstrap_text(framework)
+    assert "agentops skills sync local" not in bootstrap_text(Framework.LOCAL)
     claude_bootstrap = bootstrap_text(Framework.CLAUDE_CODE)
     assert "CLAUDE_CONFIG_DIR" in claude_bootstrap
     assert "CLAUDE_HOME" not in claude_bootstrap
