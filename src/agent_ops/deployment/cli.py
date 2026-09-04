@@ -349,16 +349,44 @@ def _refresh_common(
     state_home: Path | None,
     accept_rewrite_old: str | None,
     accept_rewrite_new: str | None,
+    with_skills: bool = False,
 ) -> None:
     registry, engine = _command_runtime(registry_path, state_home)
+    configuration = _call(registry.load)
     selected = _selected_targets(
-        _call(registry.load), targets=targets, target=target, all_targets=all_targets
+        configuration, targets=targets, target=target, all_targets=all_targets
     )
     rewrite = _rewrite(accept_rewrite_old, accept_rewrite_new)
     _emit_receipt(
         _call(lambda: engine.refresh(selected or (), rewrite=rewrite)),
         json_output,
     )
+    if with_skills:
+        _sync_target_skills(configuration, selected)
+
+
+def _sync_target_skills(configuration: Any, selected: tuple[str, ...]) -> None:
+    """Install declared third-party skills into each refreshed target's home.
+
+    A deployment refresh moves a target to its channel commit. Third-party skill
+    bundles come from pinned upstream repositories instead, so the engine's
+    transaction never touches them and a home can sit at the right commit while
+    missing every skill the registry declares. This reconciles both in one
+    operator command. It reaches the network, so it stays opt-in.
+    """
+
+    from agent_ops.cli import sync_skills
+
+    chosen = set(selected)
+    for target in configuration.targets:
+        if chosen and target.id not in chosen:
+            continue
+        typer.echo(f"syncing skills for {target.id} ({target.framework.value})")
+        try:
+            sync_skills(framework=target.framework, home=target.home)
+        except typer.Exit as exit_signal:
+            if exit_signal.exit_code:
+                raise
 
 
 @deployment_app.command("refresh")
@@ -372,6 +400,14 @@ def refresh_command(
     json_output: Annotated[bool, typer.Option("--json")] = False,
     registry_path: Annotated[Path | None, typer.Option("--registry")] = None,
     state_home: Annotated[Path | None, typer.Option("--state-home")] = None,
+    with_skills: Annotated[
+        bool,
+        typer.Option(
+            "--with-skills",
+            help="Also install every third-party skill each refreshed target declares, "
+            "then audit the home. Reaches the network.",
+        ),
+    ] = False,
 ) -> None:
     _refresh_common(
         targets=targets,
@@ -382,6 +418,7 @@ def refresh_command(
         state_home=state_home,
         accept_rewrite_old=accept_rewrite_old,
         accept_rewrite_new=accept_rewrite_new,
+        with_skills=with_skills,
     )
 
 

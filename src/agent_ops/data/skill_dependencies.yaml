@@ -79,6 +79,33 @@
       source: plugins/show-me/skills
       destination: skills
 
+- id: humanlayer
+  name: HumanLayer Skills
+  repo: https://github.com/humanlayer/skills.git
+  ref: 4d8d644ca747517973f58d7953f58d7cd07520cd
+  version: "1.0.0"
+  license: MIT
+  # Upstream promotes five plugins in .claude-plugin/marketplace.json. show-me
+  # is installed by the humanlayer-show-me entry, whose adapter adapts the skill
+  # body and pins this same commit in code (show_me_adapter.PINNED_REF); the
+  # other four install as ordinary named skills. Both entries track one commit,
+  # so a refresh fetches one checkout of this repository.
+  install:
+    claude-code:
+      strategy: copy-named-skills
+      source: plugins
+      destination: skills
+      skills: &humanlayer_skills
+        - build-iterated-agentic-loop
+        - design-control-loop
+        - improve-claude-md
+        - narrow-react-prop-types
+    codex:
+      strategy: copy-named-skills
+      source: plugins
+      destination: skills
+      skills: *humanlayer_skills
+
 - id: trailofbits
   name: Trail of Bits Skills
   repo: https://github.com/trailofbits/skills.git
@@ -107,26 +134,42 @@
 - id: mattpocock
   name: Matt Pocock Engineering Skills
   repo: https://github.com/mattpocock/skills.git
-  ref: 5b15a47f2d7150f545fbcacbfe381787fc0230dc
-  version: "2026.08.23"
+  ref: 3cca18b368ae95cdbdebbff572ccafa662551015
+  version: "2026.09.04"
   license: MIT
+  # Upstream promotes 25 skills in .claude-plugin/plugin.json. All are declared
+  # except code-review, whose name collides with the Claude Code built-in skill
+  # of the same name; an installed copy would shadow it. It is excluded for
+  # every framework so the frameworks stay identical.
   install:
     claude-code:
       strategy: copy-named-skills
       source: skills
       destination: skills
       skills: &mattpocock_skills
+        - ask-matt
         - codebase-design
+        - diagnosing-bugs
         - domain-modeling
         - grill-me
         - grill-with-docs
         - grilling
+        - handoff
         - implement
         - improve-codebase-architecture
         - prototype
         - research
         - resolving-merge-conflicts
+        - setup-matt-pocock-skills
+        - tdd
+        - teach
+        - to-questionnaire
+        - to-spec
+        - to-tickets
+        - triage
+        - wait-what
         - wayfinder
+        - wizard
         - writing-for-agents
     codex:
       strategy: copy-named-skills
@@ -138,7 +181,6 @@
       source: skills
       destination: skills
       skills: *mattpocock_skills
-
 - id: moyu
   name: Moyu Anti Over-Engineering
   repo: https://github.com/uucz/moyu.git

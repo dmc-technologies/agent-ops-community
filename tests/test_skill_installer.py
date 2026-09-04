@@ -3942,3 +3942,99 @@ def test_copy_named_skills_still_skips_metadata_below_the_searched_root(tmp_path
             home=tmp_path / "home",
             cache_dir=tmp_path / "cache",
         )
+
+
+def test_codex_and_claude_code_receive_identical_skill_installs() -> None:
+    """Codex and Claude Code are the two primary harnesses and must not drift.
+
+    Every dependency that declares both frameworks declares the same strategy,
+    source, destination, and allowlist for each. A dependency that deliberately
+    serves only one framework is out of scope here and is asserted separately.
+    """
+
+    dependencies = load_skill_dependencies()
+    compared = []
+    for dependency in dependencies:
+        codex = dependency.install.get("codex")
+        claude_code = dependency.install.get("claude-code")
+        if codex is None or claude_code is None:
+            continue
+        compared.append(dependency.id)
+        assert codex.model_dump() == claude_code.model_dump(), dependency.id
+
+    # A loop over an empty registry would report success having compared nothing.
+    # Adding a dependency that declares both harnesses must update this list, so
+    # that a new bundle cannot reach one harness and skip the other unnoticed.
+    assert sorted(compared) == [
+        "gstack",
+        "humanlayer",
+        "humanlayer-show-me",
+        "mattpocock",
+        "moyu",
+        "superpowers",
+    ]
+
+
+def test_both_tracked_registry_copies_are_identical() -> None:
+    """The checkout and the installed package read different files.
+
+    `_data_path` returns `<repo>/data/skill_dependencies.yaml` when that exists
+    and falls back to `src/agent_ops/data/skill_dependencies.yaml` otherwise. A
+    checkout therefore reads the first and an installed Agent Ops reads the
+    second, so editing one alone ships a declaration that behaves differently in
+    the two places and is caught by nothing else.
+    """
+
+    root = Path(__file__).resolve().parents[1]
+    tracked = (root / "data" / "skill_dependencies.yaml").read_bytes()
+    packaged = (root / "src" / "agent_ops" / "data" / "skill_dependencies.yaml").read_bytes()
+    assert tracked == packaged
+
+
+def test_mattpocock_declares_the_promoted_set_without_code_review() -> None:
+    """Upstream's plugin manifest is the promoted set; one name is held back.
+
+    `code-review` collides with the Claude Code built-in skill of the same name,
+    so an installed copy would shadow it. It is excluded for every framework so
+    the frameworks stay identical.
+    """
+
+    dependencies = {dependency.id: dependency for dependency in load_skill_dependencies()}
+    declared = set(dependencies["mattpocock"].install["claude-code"].skills)
+
+    assert "code-review" not in declared
+    assert len(declared) == 24
+    # wayfinder, grill-me, grill-with-docs and improve-codebase-architecture all
+    # redirect into these; an allowlist missing one installs a broken redirect.
+    redirect_targets = {
+        "grilling",
+        "implement",
+        "prototype",
+        "research",
+        "setup-matt-pocock-skills",
+    }
+    assert redirect_targets <= declared
+
+
+def test_humanlayer_promoted_plugins_are_all_declared() -> None:
+    """Both HumanLayer entries together cover the five promoted plugins.
+
+    `show-me` installs through its own adapter, which adapts the skill body and
+    pins this commit in code as `show_me_adapter.PINNED_REF`; the other four
+    install as ordinary named skills. Both entries must track that same commit,
+    or a refresh fetches two revisions of one repository and the adapter refuses
+    the install outright.
+    """
+
+    dependencies = {dependency.id: dependency for dependency in load_skill_dependencies()}
+    show_me = dependencies["humanlayer-show-me"]
+    rest = dependencies["humanlayer"]
+
+    assert show_me.repo == rest.repo
+    assert show_me.ref == rest.ref == show_me_adapter.PINNED_REF
+    assert set(rest.install["claude-code"].skills) == {
+        "build-iterated-agentic-loop",
+        "design-control-loop",
+        "improve-claude-md",
+        "narrow-react-prop-types",
+    }
