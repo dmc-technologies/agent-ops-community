@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from agent_ops.registries.models import Framework, SkillDependency
 from agent_ops.skill_parity import (
     MANAGED,
@@ -231,3 +233,106 @@ def test_deleted_skill_reports_missing_even_though_its_record_survives(tmp_path:
 
     assert [(state.skill, state.state) for state in states] == [("alpha", MISSING)]
     assert not any(state.ok for state in states)
+
+
+@pytest.mark.parametrize(
+    ("label", "blob"),
+    [
+        ("truncated", b'{"providers": ['),
+        ("empty", b""),
+        ("top level is a list", b"[]"),
+        ("providers is not a list", b'{"providers": {}}'),
+        ("provider has no id", b'{"providers": [{"paths": ["skills/alpha/SKILL.md"]}]}'),
+        ("paths is not a list", b'{"providers": [{"provider_id": "p", "paths": 7}]}'),
+    ],
+)
+def test_unusable_ownership_index_is_reported_not_raised(
+    tmp_path: Path, label: str, blob: bytes
+) -> None:
+    """An interrupted install leaves a half-written record; the audit must describe it.
+
+    Crashing on a malformed ownership record exits non-zero with a traceback
+    that names no skill, which reads as a failure while telling the reader
+    nothing. An unusable record claims nothing instead, so the skills it should
+    have covered report as unmanaged and are named.
+    """
+
+    (tmp_path / "skills").mkdir()
+    (tmp_path / "skills" / ".agentops-public-provider-index.json").write_bytes(blob)
+    (tmp_path / "skills" / "alpha").mkdir()
+
+    states = audit_home(Framework.CODEX, [_dependency(["alpha"])], tmp_path)
+
+    assert [(state.skill, state.state) for state in states] == [("alpha", UNMANAGED)], label
+
+
+def test_unusable_legacy_manifest_is_reported_not_raised(tmp_path: Path) -> None:
+    (tmp_path / "skills" / "alpha").mkdir(parents=True)
+    manifest = tmp_path / ".agentops" / "skill-dependencies" / "example.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_bytes(b'["not", "an", "object"]')
+
+    states = audit_home(Framework.CODEX, [_dependency(["alpha"])], tmp_path)
+
+    assert [(state.skill, state.state) for state in states] == [("alpha", UNMANAGED)]
+
+
+def test_repeating_a_framework_audits_its_home_once(tmp_path, capsys, monkeypatch) -> None:
+    """Auditing one home twice would double every count in the report."""
+
+    _write_index(tmp_path, "public-skill:example", ["alpha"])
+    (tmp_path / "skills" / "alpha").mkdir(parents=True)
+    dependency = _dependency(["alpha"])
+    monkeypatch.setattr("agent_ops.skill_parity.load_skill_dependencies", lambda: [dependency])
+    monkeypatch.setattr("agent_ops.skill_parity.default_framework_home", lambda _f: tmp_path)
+
+    status = main(["--framework", "codex", "--framework", "codex"])
+    output = capsys.readouterr().out
+
+    assert status == 0
+    assert "all 1 checked skills are managed by Agent Ops" in output
+    assert "codex: 1/1 managed" in output
+
+
+def test_all_and_framework_together_are_refused(capsys) -> None:
+    """Silently ignoring an explicit --framework would hide what was audited."""
+
+    with pytest.raises(SystemExit) as raised:
+        main(["--all", "--framework", "codex"])
+
+    assert raised.value.code == 2
+    assert "do not also pass --framework" in capsys.readouterr().err
+
+
+def test_report_names_the_bundles_it_could_not_check(tmp_path, capsys, monkeypatch) -> None:
+    """A passing report must say what it examined, not only that nothing failed.
+
+    gstack renders a whole repository and declares no skill names, so the audit
+    cannot check it name by name. Reporting only "all N managed" would let a
+    reader believe gstack had been examined and found correct.
+    """
+
+    gstack = SkillDependency.model_validate(
+        {
+            "id": "gstack",
+            "name": "GStack",
+            "repo": "https://example.invalid/gstack.git",
+            "ref": "0" * 40,
+            "install": {"codex": {"strategy": "gstack", "destination": "skills/gstack"}},
+        }
+    )
+    _write_index(tmp_path, "public-skill:example", ["alpha"])
+    (tmp_path / "skills" / "alpha").mkdir(parents=True)
+    monkeypatch.setattr(
+        "agent_ops.skill_parity.load_skill_dependencies", lambda: [_dependency(["alpha"]), gstack]
+    )
+    monkeypatch.setattr("agent_ops.skill_parity.default_framework_home", lambda _f: tmp_path)
+
+    status = main(["--framework", "codex"])
+    output = capsys.readouterr().out
+
+    assert status == 0
+    assert "codex:gstack (gstack)" in output
+    assert "not checked by skill name" in output
+    # The count describes what was checked, not what was declared.
+    assert "all 1 checked skills are managed" in output

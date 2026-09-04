@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -54,6 +55,15 @@ MISSING = "missing"
 #: Frameworks this audit covers. Codex and Claude Code are the primary agent
 #: harnesses and are required to hold the same skills.
 DEFAULT_FRAMEWORKS = (Framework.CLAUDE_CODE, Framework.CODEX)
+
+
+@dataclass(frozen=True)
+class UnauditedBundle:
+    """A declared bundle whose installed skill names cannot be checked by name."""
+
+    framework: Framework
+    dependency_id: str
+    strategy: str
 
 
 @dataclass(frozen=True)
@@ -86,6 +96,29 @@ def expected_skills(install: SkillDependencyInstall) -> tuple[str, ...]:
     return ()
 
 
+def _read_ownership_document(path: Path) -> dict | None:
+    """Return a JSON object from `path`, or None if it is absent or unusable.
+
+    An ownership record is written by an install that can be interrupted, so a
+    truncated or empty file is a state this audit must describe rather than die
+    on. An unreadable record claims nothing, which makes the skills it should
+    have covered report as unmanaged -- a loud, named failure instead of a
+    traceback that names nothing.
+    """
+
+    if not path.is_file():
+        return None
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        print(f"warning: cannot read ownership record {path}: {error}", file=sys.stderr)
+        return None
+    if not isinstance(document, dict):
+        print(f"warning: ownership record {path} is not a JSON object", file=sys.stderr)
+        return None
+    return document
+
+
 def _load_provider_index(home: Path) -> dict[str, set[str]]:
     """Map each provider id to the skill directory names it owns in this home.
 
@@ -93,18 +126,28 @@ def _load_provider_index(home: Path) -> dict[str, set[str]]:
     a home that Agent Ops has never provisioned looks like.
     """
 
-    index_path = home / PROVIDER_INDEX_PATH
-    if not index_path.is_file():
+    document = _read_ownership_document(home / PROVIDER_INDEX_PATH)
+    if document is None:
         return {}
-    document = json.loads(index_path.read_text(encoding="utf-8"))
+    providers = document.get("providers")
+    if not isinstance(providers, list):
+        return {}
     owned: dict[str, set[str]] = {}
-    for provider in document.get("providers", []):
+    for provider in providers:
+        if not isinstance(provider, dict):
+            continue
+        provider_id = provider.get("provider_id")
+        if not isinstance(provider_id, str):
+            continue
+        paths = provider.get("paths")
         names: set[str] = set()
-        for path in provider.get("paths", []):
+        for path in paths if isinstance(paths, list) else ():
+            if not isinstance(path, str):
+                continue
             parts = Path(path).parts
             if len(parts) >= 2 and parts[0] == "skills":
                 names.add(parts[1])
-        owned[provider["provider_id"]] = names
+        owned[provider_id] = names
     return owned
 
 
@@ -116,12 +159,8 @@ def _load_legacy_ownership(home: Path, dependency_id: str) -> set[str]:
     records the single `skill` it owns.
     """
 
-    manifest = home / LEGACY_OWNERSHIP_DIR / f"{dependency_id}.json"
-    if not manifest.is_file():
-        return set()
-    try:
-        document = json.loads(manifest.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    document = _read_ownership_document(home / LEGACY_OWNERSHIP_DIR / f"{dependency_id}.json")
+    if document is None:
         return set()
     if isinstance(document.get("skills"), dict):
         return set(document["skills"])
@@ -160,6 +199,28 @@ def audit_home(
                 state = UNMANAGED
             states.append(SkillState(framework, dependency.id, skill, state))
     return states
+
+
+def unaudited_bundles(
+    frameworks: Iterable[Framework],
+    dependencies: Sequence[SkillDependency],
+) -> list[UnauditedBundle]:
+    """List the declared bundles this audit cannot check name by name.
+
+    `gstack` renders a whole repository into one directory and `copy-skills`
+    installs whatever the upstream ships, so neither declares the names it
+    creates. A report that stayed silent about them would let a reader believe
+    every declared bundle had been examined.
+    """
+
+    skipped: list[UnauditedBundle] = []
+    for framework in frameworks:
+        for dependency in dependencies:
+            install = dependency.install.get(framework.value)
+            if install is None or expected_skills(install):
+                continue
+            skipped.append(UnauditedBundle(framework, dependency.id, install.strategy))
+    return skipped
 
 
 def audit(
@@ -209,6 +270,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     arguments = parser.parse_args(argv)
 
+    if arguments.all and arguments.framework:
+        parser.error("--all audits every declared framework; do not also pass --framework")
+
     dependencies = load_skill_dependencies()
     if arguments.all:
         declared = {
@@ -218,12 +282,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             framework for framework in Framework if framework.value in declared
         )
     elif arguments.framework:
-        frameworks = tuple(Framework(value) for value in arguments.framework)
+        # Repeating a framework would audit its home twice and double every
+        # count in the report, so the same home is never audited more than once.
+        frameworks = tuple(dict.fromkeys(Framework(value) for value in arguments.framework))
     else:
         frameworks = DEFAULT_FRAMEWORKS
 
     states = audit(frameworks, dependencies)
     print(format_report(states))
+    skipped = unaudited_bundles(frameworks, dependencies)
+    if skipped:
+        names = ", ".join(
+            f"{bundle.framework.value}:{bundle.dependency_id} ({bundle.strategy})"
+            for bundle in skipped
+        )
+        print(f"\nnot checked by skill name, no declared name list: {names}")
     failed = [state for state in states if not state.ok]
     if failed:
         names = ", ".join(
@@ -232,7 +305,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         plural = "skill is" if len(failed) == 1 else "skills are"
         print(f"\n{len(failed)} declared {plural} not managed by Agent Ops: {names}")
         return 1
-    print(f"\nall {len(states)} declared skills are managed by Agent Ops")
+    print(f"\nall {len(states)} checked skills are managed by Agent Ops")
     return 0
 
 

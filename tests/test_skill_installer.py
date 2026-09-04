@@ -3963,6 +3963,8 @@ def test_codex_and_claude_code_receive_identical_skill_installs() -> None:
         assert codex.model_dump() == claude_code.model_dump(), dependency.id
 
     # A loop over an empty registry would report success having compared nothing.
+    # Adding a dependency that declares both harnesses must update this list, so
+    # that a new bundle cannot reach one harness and skip the other unnoticed.
     assert sorted(compared) == [
         "gstack",
         "humanlayer",
