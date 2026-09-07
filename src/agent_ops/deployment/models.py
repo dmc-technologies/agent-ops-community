@@ -6,6 +6,7 @@ from enum import StrEnum
 from pathlib import Path, PureWindowsPath
 from typing import Protocol, runtime_checkable
 
+from agent_ops.deployment.shared_selection import SharedSelection
 from agent_ops.registries.models import Framework
 
 
@@ -362,17 +363,38 @@ class TargetSource:
 
 
 @dataclass(frozen=True)
+class SharedTargetSource:
+    """Bind a target to a validated selection without treating its fingerprint as Git."""
+
+    target_id: str
+    channel: str
+    selection: SharedSelection
+
+    def __post_init__(self) -> None:
+        _exact_nonempty(self.target_id, "shared target id")
+        _exact_nonempty(self.channel, "shared target channel")
+        if type(self.selection) is not SharedSelection:
+            raise ValueError("shared target selection must be an exact SharedSelection value")
+
+    @property
+    def selection_fingerprint(self) -> str:
+        return self.selection.fingerprint
+
+
+@dataclass(frozen=True)
 class DeploymentPlan:
     snapshots: tuple[SourceSnapshot, ...]
     provider_plans: tuple[ProviderPlan, ...]
-    target_sources: tuple[TargetSource, ...]
+    target_sources: tuple[TargetSource | SharedTargetSource, ...]
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "snapshots", tuple(self.snapshots))
         object.__setattr__(self, "provider_plans", tuple(self.provider_plans))
         object.__setattr__(self, "target_sources", tuple(self.target_sources))
-        if any(type(item) is not TargetSource for item in self.target_sources):
-            raise ValueError("plan target sources must be exact TargetSource values")
+        if any(
+            type(item) not in (TargetSource, SharedTargetSource) for item in self.target_sources
+        ):
+            raise ValueError("plan target sources must be exact source association values")
         planned_ids = {plan.target.id for plan in self.provider_plans}
         association_ids = [association.target_id for association in self.target_sources]
         if set(association_ids) != planned_ids or len(association_ids) != len(planned_ids):
@@ -385,6 +407,24 @@ class DeploymentPlan:
             )
             if any(plan.target.channel != association.channel for plan in target_plans):
                 raise ValueError("plan source association target channel does not match")
+            if type(association) is SharedTargetSource:
+                if any(
+                    plan.source_revision != association.selection_fingerprint
+                    for plan in target_plans
+                ):
+                    raise ValueError("shared provider revision must match selection fingerprint")
+                for binding in association.selection.sources:
+                    matches = tuple(
+                        snapshot for snapshot in self.snapshots
+                        if snapshot.source_id == binding.source_id
+                    )
+                    if (
+                        len(matches) != 1
+                        or matches[0].commit != binding.commit
+                        or matches[0].ref != binding.commit
+                    ):
+                        raise ValueError("shared source requires one unique exact pinned snapshot")
+                continue
             if any(plan.source_revision != association.commit for plan in target_plans):
                 raise ValueError("plan source association does not match provider revision")
             matches = tuple(
