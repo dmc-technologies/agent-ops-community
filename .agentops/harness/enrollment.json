@@ -1,0 +1,21 @@
+{
+  "entries": [
+    {
+      "baseline": null,
+      "baseline_fingerprint": null,
+      "block": "shared-agentops",
+      "source": "shared-bootstrap.md",
+      "source_fingerprint": "2363e1c61a7d429bd412a5167dfb9222a30a7f146df89fba5cfe81870b5228c5",
+      "target": ".agentops/harness/BOOTSTRAP.md"
+    },
+    {
+      "baseline": null,
+      "baseline_fingerprint": null,
+      "block": "shared-agentops",
+      "source": "community-instructions.md",
+      "source_fingerprint": "56f6c1d58a28d7cc56b11a1962acf969d9ba14b80bb81f200760c3b415caea98",
+      "target": "AGENTS.md"
+    }
+  ],
+  "schema_version": 2
+}
