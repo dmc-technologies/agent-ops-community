@@ -4,6 +4,7 @@ import base64
 import errno
 import hashlib
 import importlib.util
+import io
 import json
 import marshal
 import os
@@ -27,12 +28,15 @@ except ImportError:  # pragma: no cover - exercised by import on non-POSIX syste
 from agent_ops.deployment.models import (
     DeploymentAudit,
     DeploymentManifest,
+    DeploymentTargetKind,
     LegacyLinkTransition,
     ManifestDirectory,
     ManifestFile,
     PlannedFile,
     PrimeGstackLegacyAdoption,
     ProviderPlan,
+    SharedSelectionActivation,
+    SharedTargetSpec,
     TargetChannelTransition,
     TargetSpec,
 )
@@ -932,6 +936,12 @@ def _target_read_lock(home: Path) -> Iterator[_HomeFS]:
         os.close(parent)
 
 
+def _target_from_values(target_id: str, framework: str, home: Path, channel: str):
+    if framework == DeploymentTargetKind.SHARED.value:
+        return SharedTargetSpec(target_id, home, channel)
+    return TargetSpec(target_id, Framework(framework), home, channel)
+
+
 def _manifest_path(target: TargetSpec) -> Path:
     key = hashlib.sha256(target.id.encode()).hexdigest()
     return _METADATA / "manifests" / f"{key}.json"
@@ -968,6 +978,8 @@ def _manifest_to_dict(manifest: DeploymentManifest) -> dict[str, Any]:
             for item in manifest.files
         ],
     }
+    if manifest.selection_activation is not None:
+        result["selection_activation"] = manifest.selection_activation.snapshot.as_posix()
     if manifest.review_state is not None:
         result["review_state"] = manifest.review_state
     return result
@@ -1234,7 +1246,7 @@ def _validated_manifest_data(content: bytes, *, target: TargetSpec) -> dict[str,
     if (
         not isinstance(data, dict)
         or type(data.get("schema_version")) is not int
-        or data["schema_version"] != _SCHEMA_VERSION
+        or data["schema_version"] not in {_SCHEMA_VERSION, 2}
     ):
         raise ValueError("invalid deployment manifest schema")
     manifest_keys = {
@@ -1249,6 +1261,8 @@ def _validated_manifest_data(content: bytes, *, target: TargetSpec) -> dict[str,
         "directories",
     }
     data_keys = set(data)
+    if data["schema_version"] == 2:
+        manifest_keys.add("selection_activation")
     allowed_manifest_keys = manifest_keys | {"review_state"}
     unknown_manifest_keys = sorted(data_keys - allowed_manifest_keys)
     missing_manifest_keys = sorted(manifest_keys - data_keys)
@@ -1256,6 +1270,17 @@ def _validated_manifest_data(content: bytes, *, target: TargetSpec) -> dict[str,
         raise ValueError(f"unknown deployment manifest member: {unknown_manifest_keys[0]}")
     if missing_manifest_keys:
         raise ValueError(f"missing deployment manifest member: {missing_manifest_keys[0]}")
+    activation = data.get("selection_activation")
+    if activation is not None:
+        if type(activation) is not str or type(target) is not SharedTargetSpec:
+            raise ValueError("invalid shared selection activation")
+        selected = SharedSelectionActivation(Path(activation))
+        if selected.snapshot.name != data.get("source_revision"):
+            raise ValueError("shared manifest revision does not match its active snapshot")
+        if selected.snapshot.as_posix() != activation:
+            raise ValueError("noncanonical shared selection activation")
+    elif type(target) is SharedTargetSpec:
+        raise ValueError("shared manifest requires selection activation")
     review_state = data.get("review_state")
     if review_state not in {None, "unreviewed-local"}:
         raise ValueError("invalid deployment manifest review state")
@@ -1302,6 +1327,15 @@ def _validated_manifest_data(content: bytes, *, target: TargetSpec) -> dict[str,
         if file_path in file_paths:
             raise ValueError("invalid deployment manifest duplicate file path")
         file_paths.add(file_path)
+    if activation is not None:
+        if not file_paths or any(
+            len(path.parts) < 3 or path.parts[0] != "snapshots" for path in file_paths
+        ):
+            raise ValueError("shared manifest files must be confined to snapshots")
+        for path in file_paths:
+            SharedSelectionActivation(Path(*path.parts[:2]))
+        if not any(Path(activation) in path.parents for path in file_paths):
+            raise ValueError("shared snapshot has no candidate files")
     directory_paths: set[Path] = set()
     for item in data["directories"]:
         if (
@@ -1339,9 +1373,9 @@ def _validated_manifest_data(content: bytes, *, target: TargetSpec) -> dict[str,
 def _validated_prior_manifest_data(
     content: bytes, *, target: TargetSpec, expected_channel: str
 ) -> dict[str, Any]:
-    prior_target = TargetSpec(
+    prior_target = _target_from_values(
         target.id,
-        target.framework,
+        target.framework.value,
         target.home,
         expected_channel,
     )
@@ -1465,6 +1499,7 @@ class _PlanGroup:
     runtime_cache_removals: tuple[tuple[Path, Path], ...]
     legacy_link_transition: LegacyLinkTransition | None
     prime_gstack_legacy_adoption: PrimeGstackLegacyAdoption | None
+    selection_activation: SharedSelectionActivation | None = None
 
 
 def _source_revision_binds_prime_gstack_ref(source_revision: str, source_ref: str) -> bool:
@@ -1520,13 +1555,10 @@ def _validate_and_group(
     removals: dict[tuple[str, Framework, Path, str, str], set[Path]] = {}
     audit_roots: dict[tuple[str, Framework, Path, str, str], set[Path]] = {}
     runtime_python_sources: dict[tuple[str, Framework, Path, str, str], set[Path]] = {}
-    runtime_cache_removals: dict[
-        tuple[str, Framework, Path, str, str], dict[Path, Path]
-    ] = {}
+    runtime_cache_removals: dict[tuple[str, Framework, Path, str, str], dict[Path, Path]] = {}
     legacy_links: dict[tuple[str, Framework, Path, str, str], LegacyLinkTransition] = {}
-    prime_adoptions: dict[
-        tuple[str, Framework, Path, str, str], PrimeGstackLegacyAdoption
-    ] = {}
+    prime_adoptions: dict[tuple[str, Framework, Path, str, str], PrimeGstackLegacyAdoption] = {}
+    activations = {}
     target_keys: dict[str, tuple[str, Framework, Path, str, str]] = {}
     home_targets: dict[Path, str] = {}
     preflight_cwd = Path.cwd()
@@ -1539,6 +1571,26 @@ def _validate_and_group(
             plan.target.channel,
             plan.source_revision,
         )
+        if plan.selection_activation is not None:
+            if not _POSIX_SUPPORTED:
+                raise UnsupportedPlatformError("shared selection activation requires POSIX")
+            prior_activation = activations.setdefault(key, plan.selection_activation)
+            if prior_activation != plan.selection_activation:
+                raise ValueError("incompatible shared selection activations")
+            if plan.removals or plan.legacy_link_transition or plan.prime_gstack_legacy_adoption:
+                raise ValueError(
+                    "shared selection activation cannot remove snapshots or adopt links"
+                )
+            if not plan.files or any(
+                len(item.path.parts) < 3 or item.path.parts[0] != "snapshots" for item in plan.files
+            ):
+                raise ValueError("shared selection files must be confined to snapshots")
+            for item in plan.files:
+                SharedSelectionActivation(Path(*item.path.parts[:2]))
+            if not any(
+                plan.selection_activation.snapshot in item.path.parents for item in plan.files
+            ):
+                raise ValueError("shared selection requires nonempty candidate content")
         prior_key = target_keys.setdefault(plan.target.id, key)
         if prior_key != key:
             raise ValueError(f"incompatible plans for target {plan.target.id!r}")
@@ -1635,7 +1687,7 @@ def _validate_and_group(
     results = []
     for key in sorted(groups, key=lambda item: (str(item[2]), item[0])):
         target_id, framework, home, channel, source_revision = key
-        target = TargetSpec(target_id, framework, home, channel)
+        target = _target_from_values(target_id, framework.value, home, channel)
         results.append(
             _PlanGroup(
                 target=target,
@@ -1648,9 +1700,178 @@ def _validate_and_group(
                 runtime_cache_removals=tuple(sorted(runtime_cache_removals[key].items())),
                 legacy_link_transition=legacy_links.get(key),
                 prime_gstack_legacy_adoption=prime_adoptions.get(key),
+                selection_activation=activations.get(key),
             )
         )
     return tuple(results)
+
+
+def _shared_prior_selection(record: dict[str, Any]) -> str | None:
+    prior = _prior_manifest_content(record)
+    if prior is None:
+        return None
+    data = _strict_json_loads(prior, label="prior shared manifest")
+    return data.get("selection_activation")
+
+
+def _shared_staged_selector(record: dict[str, Any], *, rollback: bool = False) -> Path:
+    suffix = "rollback" if rollback else "candidate"
+    return Path(f".agentops-selection-{record['manifest']['transaction_id']}-{suffix}")
+
+
+def _shared_selector_matches(home_fs: _HomeFS, selected: str | None) -> bool:
+    return (
+        not home_fs.exists(Path("current"))
+        if selected is None
+        else home_fs.matches_symlink(Path("current"), selected)
+    )
+
+
+def _validate_shared_prestate(home_fs: _HomeFS, group: _PlanGroup, prior: dict | None) -> None:
+    previous = prior.get("selection_activation") if prior is not None else None
+    if prior is not None and previous is None:
+        raise ValueError("shared selector has no prior ownership authority")
+    if not _shared_selector_matches(home_fs, previous):
+        raise ValueError("unowned or changed shared selector")
+    if prior is None:
+        return
+    planned = {item.path.as_posix(): (item.fingerprint, item.mode) for item in group.files}
+    for item in prior["files"]:
+        if planned.get(item["path"]) != (item["fingerprint"], item["mode"]):
+            raise ValueError("shared snapshots must retain immutable prior files")
+
+
+def _before_shared_selector_replace(home_fs: _HomeFS, record: dict[str, Any]) -> None:
+    """Failure injection boundary before checking the owned selector leaf."""
+
+
+def _after_shared_selector_replace(home_fs: _HomeFS, record: dict[str, Any]) -> None:
+    """Failure injection boundary after atomic selector publication."""
+
+
+def _exchange_shared_selector(home_fs: _HomeFS, staged: Path) -> None:
+    """Exchange leaf entries without following either entry or their parents."""
+    import ctypes
+
+    home_fs.verify_lock_identity()
+    backend, _ = _atomic_noreplace_backend()
+    # Both supported systems use bit 1 for exchange/swap.
+    with home_fs.parent(staged) as (parent, leaf):
+        if backend(parent, os.fsencode(leaf), parent, b"current", 2) != 0:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error))
+        os.fsync(parent)
+
+
+def _publish_shared_exchange(home_fs: _HomeFS, staged: Path, desired: str, expected: str) -> None:
+    _exchange_shared_selector(home_fs, staged)
+    if not home_fs.matches_symlink(staged, expected):
+        # The displaced entry remains available. Put it back only while current
+        # still names our candidate; otherwise retain both pieces of evidence.
+        if home_fs.matches_symlink(Path("current"), desired):
+            _exchange_shared_selector(home_fs, staged)
+        raise IncompleteRollbackError("shared selector changed during exchange; entry preserved")
+    if not home_fs.matches_symlink(Path("current"), desired):
+        raise IncompleteRollbackError("shared selector changed after exchange; evidence retained")
+    _remove_shared_selector(home_fs, staged, expected)
+
+
+def _stage_shared_selector(home_fs: _HomeFS, path: Path, selected: str) -> None:
+    home_fs.verify_lock_identity()
+    SharedSelectionActivation(Path(selected))
+    with home_fs.parent(path) as (parent, leaf):
+        os.symlink(selected, leaf, dir_fd=parent)
+        os.fsync(parent)
+    if not home_fs.matches_symlink(path, selected):
+        raise ValueError("staged shared selector changed")
+
+
+def _remove_shared_selector(home_fs: _HomeFS, path: Path, selected: str) -> None:
+    home_fs.verify_lock_identity()
+    with home_fs.parent(path) as (parent, leaf):
+        item = os.stat(leaf, dir_fd=parent, follow_symlinks=False)
+        if not stat.S_ISLNK(item.st_mode) or os.readlink(leaf, dir_fd=parent) != selected:
+            raise IncompleteRollbackError("shared selector changed; unexpected entry preserved")
+        os.unlink(leaf, dir_fd=parent)
+        os.fsync(parent)
+
+
+def _activate_shared_selection(home_fs: _HomeFS, record: dict[str, Any]) -> None:
+    selected = record["manifest"]["selection_activation"]
+    previous = _shared_prior_selection(record)
+    # The candidate is completely verified before the only discovery mutation.
+    content_manifest = dict(record["manifest"])
+    content_manifest.pop("selection_activation")
+    _verify_manifest_files_and_directories(
+        home_fs, content_manifest, error_type=ValueError, context="shared candidate"
+    )
+    if not _shared_selector_matches(home_fs, previous):
+        raise ValueError("shared selector changed before activation")
+    staged = _shared_staged_selector(record)
+    _stage_shared_selector(home_fs, staged, selected)
+    _before_shared_selector_replace(home_fs, record)
+    _verify_manifest_files_and_directories(
+        home_fs, content_manifest, error_type=ValueError, context="shared candidate"
+    )
+    home_fs.verify_lock_identity()
+    if not _shared_selector_matches(home_fs, previous):
+        raise ValueError("shared selector changed before activation")
+    if not home_fs.matches_symlink(staged, selected):
+        raise ValueError("staged shared selector changed before activation")
+    if previous is None:
+        home_fs.move_new(staged, Path("current"))
+    else:
+        _publish_shared_exchange(home_fs, staged, selected, previous)
+    _after_shared_selector_replace(home_fs, record)
+    if not home_fs.matches_symlink(Path("current"), selected):
+        raise ValueError("shared selector changed after activation")
+
+
+def _restore_shared_selection(home_fs: _HomeFS, record: dict[str, Any]) -> None:
+    selected = record["manifest"]["selection_activation"]
+    previous = _shared_prior_selection(record)
+    if not _shared_selector_matches(home_fs, previous):
+        if not home_fs.matches_symlink(Path("current"), selected):
+            raise IncompleteRollbackError("shared selector changed; unexpected entry preserved")
+        if previous is None:
+            _remove_shared_selector(home_fs, Path("current"), selected)
+        else:
+            staged = _shared_staged_selector(record, rollback=True)
+            if not home_fs.exists(staged):
+                _stage_shared_selector(home_fs, staged, previous)
+            if not home_fs.matches_symlink(staged, previous):
+                raise IncompleteRollbackError("shared rollback selector changed")
+            if not home_fs.matches_symlink(Path("current"), selected):
+                raise IncompleteRollbackError("shared selector changed before rollback")
+            _publish_shared_exchange(home_fs, staged, previous, selected)
+    for rollback, expected in ((False, selected), (True, previous)):
+        staged = _shared_staged_selector(record, rollback=rollback)
+        if home_fs.exists(staged):
+            if expected is None:
+                raise IncompleteRollbackError("unexpected shared rollback selector")
+            # An interrupted exchange can retain the displaced owned selector.
+            alternatives = (selected, previous)
+            observed = next(
+                (
+                    value
+                    for value in alternatives
+                    if value is not None and home_fs.matches_symlink(staged, value)
+                ),
+                None,
+            )
+            if observed is None:
+                raise IncompleteRollbackError("unexpected staged shared selector preserved")
+            _remove_shared_selector(home_fs, staged, observed)
+    _verify_shared_rollback(home_fs, record)
+
+
+def _verify_shared_rollback(home_fs: _HomeFS, record: dict[str, Any]) -> None:
+    if not _shared_selector_matches(home_fs, _shared_prior_selection(record)):
+        raise IncompleteRollbackError("shared selector rollback does not match prior selection")
+    if any(
+        home_fs.exists(_shared_staged_selector(record, rollback=value)) for value in (False, True)
+    ):
+        raise IncompleteRollbackError("shared selector rollback retains staged selector")
 
 
 def _ensure_directory(home_fs: _HomeFS, path: Path, mode: int) -> bool:
@@ -1763,6 +1984,9 @@ def _verify_manifest_files_and_directories(
     error_type: type[Exception],
     context: str,
 ) -> None:
+    selected = manifest_data.get("selection_activation")
+    if selected is not None and not home_fs.matches_symlink(Path("current"), selected):
+        raise error_type(f"{context} shared selector changed")
     for item in manifest_data["files"]:
         path = Path(item["path"])
         if not _file_matches(home_fs, path, item["fingerprint"], item["mode"]):
@@ -1872,6 +2096,8 @@ def _verify_completed_rollback(
     prior_data: dict[str, Any] | None,
     prior_manifest: bytes | None,
 ) -> None:
+    if record["manifest"].get("selection_activation") is not None:
+        _verify_shared_rollback(home_fs, record)
     prior_data = _prior_data_without_prime_concurrent(prior_data, record)
     _verify_prime_gstack_concurrent_restored(home_fs, record)
     manifest_path = Path(record["manifest_path"])
@@ -1994,6 +2220,8 @@ def install_provider_plans(
     channel_transitions: tuple[TargetChannelTransition, ...] | None = None,
 ) -> tuple[DeploymentManifest, ...]:
     _require_supported_platform()
+    if any(plan.selection_activation is not None for plan in plans) and not _POSIX_SUPPORTED:
+        raise UnsupportedPlatformError("shared selection activation requires POSIX")
     if _WINDOWS_SUPPORTED and not _POSIX_SUPPORTED:
         return _windows_transaction_backend().install_provider_plans(
             plans,
@@ -2089,7 +2317,7 @@ def _install_provider_plan_groups(
         files = group.files
         transaction_id = uuid.uuid4().hex
         manifest = DeploymentManifest(
-            schema_version=_SCHEMA_VERSION,
+            schema_version=2 if group.selection_activation is not None else _SCHEMA_VERSION,
             target_id=target.id,
             framework=target.framework,
             channel=target.channel,
@@ -2098,6 +2326,7 @@ def _install_provider_plan_groups(
             files=tuple(ManifestFile(item.path, item.fingerprint, item.mode) for item in files),
             directories=_directories(files),
             transaction_id=transaction_id,
+            selection_activation=group.selection_activation,
             review_state=(
                 "unreviewed-local"
                 if target.channel == "preview"
@@ -2154,9 +2383,7 @@ def _install_provider_plan_groups(
                 else {}
             )
             runtime_cache_removals = dict(group.runtime_cache_removals)
-            runtime_cache_removals.update(
-                _discover_runtime_cache_removals(home_fs, group, managed)
-            )
+            runtime_cache_removals.update(_discover_runtime_cache_removals(home_fs, group, managed))
             removals = tuple(sorted(set(group.removals) | set(runtime_cache_removals), key=str))
             for directory in manifest.directories:
                 if not home_fs.exists(directory.path):
@@ -2355,6 +2582,7 @@ def _install_provider_plan_groups(
                 directories=tuple(actual_directories),
                 transaction_id=manifest.transaction_id,
                 review_state=manifest.review_state,
+                selection_activation=manifest.selection_activation,
             )
             legacy_evidence_path = (
                 _legacy_link_evidence_path(transaction) if legacy_active is not None else None
@@ -2427,10 +2655,7 @@ def _install_provider_plan_groups(
                 record["prime_gstack_concurrent_mutation"] = None
                 record["prime_gstack_move_authority"] = None
             prime_adoption_paths = (
-                {
-                    Path(item["path"])
-                    for item in prime_adoption_record["files"]
-                }
+                {Path(item["path"]) for item in prime_adoption_record["files"]}
                 | {Path(prime_adoption_record["manifest_path"])}
                 if prime_adoption_record is not None
                 else set()
@@ -2548,6 +2773,8 @@ def _install_provider_plan_groups(
                         )
                         record["legacy_link_transition"]["operation_phase"] = "ready"
                     home_fs.write_atomic(record_path, _record_bytes(record), 0o600)
+                if manifest.selection_activation is not None:
+                    _activate_shared_selection(home_fs, record)
                 manifest_content = _manifest_bytes(manifest)
                 home_fs.write_file(
                     manifest_temp,
@@ -2667,6 +2894,8 @@ def _validate_group_current_state(
         adoption_prestate = _prime_gstack_adoption_prestate(home_fs, group)
         assert adoption_prestate is not None
         prior_data, _adoption_record = adoption_prestate
+    if group.selection_activation is not None:
+        _validate_shared_prestate(home_fs, group, prior_data)
     managed = (
         {Path(item["path"]): (item["fingerprint"], item["mode"]) for item in prior_data["files"]}
         if prior_data is not None
@@ -2774,14 +3003,18 @@ def _manifest_from_data(
     home: Path,
 ) -> tuple[TargetSpec, DeploymentManifest]:
     try:
-        framework = Framework(data["framework"])
+        framework = (
+            DeploymentTargetKind.SHARED
+            if data["framework"] == "shared"
+            else Framework(data["framework"])
+        )
         target_id = data["target_id"]
         if not isinstance(target_id, str) or not target_id:
             raise ValueError("invalid target id")
         channel = data["channel"]
         if not isinstance(channel, str) or not channel:
             raise ValueError("invalid target channel")
-        target = TargetSpec(target_id, framework, home, channel)
+        target = _target_from_values(target_id, framework.value, home, channel)
         validated = _validated_manifest_data(
             (json.dumps(data, sort_keys=True) + "\n").encode(),
             target=target,
@@ -2803,6 +3036,11 @@ def _manifest_from_data(
             ),
             transaction_id=validated["transaction_id"],
             review_state=validated.get("review_state"),
+            selection_activation=(
+                SharedSelectionActivation(Path(validated["selection_activation"]))
+                if "selection_activation" in validated
+                else None
+            ),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError(f"invalid transaction record manifest: {exc}") from exc
@@ -3961,9 +4199,9 @@ def _rollback_record(
             or not prior_raw["channel"]
         ):
             raise IncompleteRollbackError("rollback incomplete: invalid prior manifest channel")
-        recovery_target = TargetSpec(
+        recovery_target = _target_from_values(
             record["manifest"]["target_id"],
-            Framework(record["manifest"]["framework"]),
+            record["manifest"]["framework"],
             home_fs.home,
             prior_raw["channel"],
         )
@@ -3985,9 +4223,7 @@ def _rollback_record(
     legacy_destination = Path(legacy["destination"]) if legacy is not None else None
     legacy_entry = Path(legacy["retained_entry"]) if legacy is not None else None
     legacy_candidate = (
-        _legacy_link_rollback_candidate_path(record_path.parent)
-        if legacy is not None
-        else None
+        _legacy_link_rollback_candidate_path(record_path.parent) if legacy is not None else None
     )
     if record["state"] == "rolled-back":
         _verify_completed_rollback(home_fs, record, prior_data, prior_manifest)
@@ -4012,6 +4248,8 @@ def _rollback_record(
     current_manifest = home_fs.read_optional(manifest_path)
     if current_manifest not in {expected_manifest, prior_manifest, None}:
         raise IncompleteRollbackError("rollback incomplete: deployment manifest changed")
+    if record["manifest"].get("selection_activation") is not None:
+        _restore_shared_selection(home_fs, record)
     for operation in record["operations"]:
         destination = Path(operation["destination"])
         backup = Path(operation["backup"]) if operation["backup"] else None
@@ -4161,8 +4399,7 @@ def _rollback_record(
                             legacy["expected_link_text"],
                         ):
                             raise IncompleteRollbackError(
-                                f"rollback incomplete: retained legacy link changed: "
-                                f"{legacy_entry}"
+                                f"rollback incomplete: retained legacy link changed: {legacy_entry}"
                             )
                         home_fs.move_new(legacy_entry, destination)
                         continue
@@ -4391,11 +4628,13 @@ def recover_transaction(path: Path) -> DeploymentManifest:
             raise PublicationIndeterminateError(
                 "manifest publication remains indeterminate; unexpected manifest preserved"
             )
+        if manifest.selection_activation is not None:
+            _rollback_record(home_fs, record, relative, retain_completed=True)
+            _TRANSACTION_PATHS[manifest.transaction_id] = path
+            home_fs.verify_lock_identity()
+            return manifest
         legacy = record.get("legacy_link_transition")
-        if (
-            legacy is not None
-            and record["state"] in {"prepared", "indeterminate"}
-        ):
+        if legacy is not None and record["state"] in {"prepared", "indeterminate"}:
             _restore_legacy_destination_before_evidence(
                 home_fs,
                 record,
@@ -4697,7 +4936,10 @@ def _runtime_python_cache_content_is_valid(
     if timestamp != int(source_stat.st_mtime) or size != len(source_bytes):
         return False
     try:
-        observed = marshal.loads(cache[16:])
+        stream = io.BytesIO(cache[16:])
+        observed = marshal.load(stream)
+        if stream.read(1):
+            return False
         if not isinstance(observed, type(compile("", "", "exec"))):
             return False
         expected = compile(
@@ -4707,9 +4949,9 @@ def _runtime_python_cache_content_is_valid(
             dont_inherit=True,
             optimize=-1 if optimization is None else int(optimization),
         )
-    except (SyntaxError, ValueError, TypeError):
+    except (EOFError, SyntaxError, ValueError, TypeError):
         return False
-    return observed == expected and marshal.dumps(observed) == cache[16:]
+    return observed == expected
 
 
 def _runtime_cache_provenance(
@@ -5549,6 +5791,12 @@ def audit_provider_plans(plans: tuple[ProviderPlan, ...]) -> DeploymentAudit:
             assert manifest_content is not None
             try:
                 manifest_data = _validated_manifest_data(manifest_content, target=target)
+                if group.selection_activation is not None:
+                    selected = group.selection_activation.snapshot.as_posix()
+                    if manifest_data.get(
+                        "selection_activation"
+                    ) != selected or not home_fs.matches_symlink(Path("current"), selected):
+                        validation_errors.append("shared selector does not match plan")
                 if manifest_data["source_revision"] != group.source_revision:
                     validation_errors.append(
                         "deployment manifest source revision does not match plan"
@@ -5603,7 +5851,10 @@ def audit_provider_plans(plans: tuple[ProviderPlan, ...]) -> DeploymentAudit:
                 or content != item.content
             ):
                 changed.append(display)
-            if item.path.name == "SKILL.md":
+            if item.path.name == "SKILL.md" and (
+                group.selection_activation is None
+                or group.selection_activation.snapshot in item.path.parents
+            ):
                 name = _frontmatter_name(content)
                 if name is not None:
                     names.setdefault(name, []).append(display)
@@ -5988,6 +6239,89 @@ def _read_pinned_status_evidence(
                     evidence.close()
     except FileNotFoundError:
         return None, None
+
+
+@contextmanager
+def _shared_read_authority(target: SharedTargetSpec) -> Iterator[_HomeFS]:
+    active = _GROUP_HOME_LOCKS.get()
+    home = _absolute_home(target.home)
+    if active is not None and home in active:
+        yield active[home]
+    else:
+        with _target_read_lock(home) as home_fs:
+            yield home_fs
+
+
+def read_shared_target_evidence(
+    target: SharedTargetSpec,
+) -> tuple[DeploymentManifest | None, DeploymentAudit | None, tuple[PlannedFile, ...]]:
+    """Read owned snapshot bytes under the same target authority used for writes."""
+    if type(target) is not SharedTargetSpec or not _POSIX_SUPPORTED:
+        raise UnsupportedPlatformError("shared target evidence requires a POSIX shared target")
+    try:
+        with _shared_read_authority(target) as home_fs, ExitStack() as pins:
+            try:
+                manifest_pin = _PinnedStatusFile(home_fs, _manifest_path(target), manifest=True)
+            except FileNotFoundError:
+                return None, None, ()
+            pins.callback(manifest_pin.close)
+            data = _validated_manifest_data(manifest_pin.content, target=target)
+            _, manifest = _manifest_from_data(data, home=target.home)
+            evidence_pins = [manifest_pin]
+            missing, changed, files = [], [], []
+            for owned in manifest.files:
+                try:
+                    pin = _PinnedStatusFile(home_fs, owned.path)
+                except FileNotFoundError:
+                    missing.append(owned.path.as_posix())
+                    continue
+                except (OSError, ValueError):
+                    changed.append(owned.path.as_posix())
+                    continue
+                pins.callback(pin.close)
+                evidence_pins.append(pin)
+                if (
+                    hashlib.sha256(pin.content).hexdigest() != owned.fingerprint
+                    or stat.S_IMODE(os.fstat(pin.descriptor).st_mode) != owned.mode
+                ):
+                    changed.append(owned.path.as_posix())
+                files.append(PlannedFile(owned.path, pin.content, owned.mode))
+            for owned in manifest.directories:
+                try:
+                    pin = _PinnedStatusDirectory(home_fs, owned.path)
+                except FileNotFoundError:
+                    missing.append(owned.path.as_posix())
+                    continue
+                except (OSError, ValueError):
+                    changed.append(owned.path.as_posix())
+                    continue
+                pins.callback(pin.close)
+                evidence_pins.append(pin)
+                if stat.S_IMODE(os.fstat(pin.descriptor).st_mode) != owned.mode:
+                    changed.append(owned.path.as_posix())
+            if not home_fs.matches_symlink(Path("current"), data["selection_activation"]):
+                changed.append("current")
+            expected = {item.path for item in manifest.files}
+            try:
+                observed = {
+                    Path("snapshots") / path for path in home_fs.scan_tree(Path("snapshots"))
+                }
+            except FileNotFoundError:
+                observed = set()
+            unexpected = tuple(sorted(path.as_posix() for path in observed - expected))
+            home_fs.verify_lock_identity()
+            for pin in evidence_pins:
+                pin.verify()
+            audit = DeploymentAudit(
+                target.id,
+                not (missing or changed or unexpected),
+                missing=tuple(sorted(missing)),
+                changed=tuple(sorted(changed)),
+                unexpected=unexpected,
+            )
+            return manifest, audit, tuple(files)
+    except FileNotFoundError:
+        return None, None, ()
 
 
 def _validate_status_manifest_revision(

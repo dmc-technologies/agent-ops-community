@@ -47,6 +47,47 @@ class TargetSpec:
         _exact_nonempty(self.channel, "target channel")
 
 
+class DeploymentTargetKind(StrEnum):
+    SHARED = "shared"
+
+
+@dataclass(frozen=True)
+class SharedTargetSpec:
+    id: str
+    home: Path
+    channel: str = "shared"
+
+    def __post_init__(self) -> None:
+        _exact_nonempty(self.id, "shared target id")
+        _exact_nonempty(self.channel, "shared target channel")
+
+    @property
+    def framework(self) -> DeploymentTargetKind:
+        return DeploymentTargetKind.SHARED
+
+
+@dataclass(frozen=True)
+class SharedSelectionActivation:
+    """Activate one confined immutable snapshot through the fixed selector."""
+
+    snapshot: Path
+
+    def __post_init__(self) -> None:
+        path = _repository_relative_path(self.snapshot)
+        if (
+            len(path.parts) != 2
+            or path.parts[0] != "snapshots"
+            or len(path.name) != 64
+            or any(character not in "0123456789abcdef" for character in path.name)
+        ):
+            raise ValueError("shared selection snapshot must be snapshots/<64 lowercase hex>")
+        object.__setattr__(self, "snapshot", path)
+
+    @property
+    def selector(self) -> Path:
+        return Path("current")
+
+
 @dataclass(frozen=True)
 class TargetChannelTransition:
     target_id: str
@@ -157,15 +198,23 @@ class ManifestDirectory:
 class ProviderPlan:
     provider_id: str
     source_revision: str
-    target: TargetSpec
+    target: TargetSpec | SharedTargetSpec
     files: tuple[PlannedFile, ...]
     removals: tuple[Path, ...] = ()
     audit_roots: tuple[Path, ...] = ()
     runtime_python_sources: tuple[Path, ...] = ()
     legacy_link_transition: LegacyLinkTransition | None = None
     prime_gstack_legacy_adoption: PrimeGstackLegacyAdoption | None = None
+    selection_activation: SharedSelectionActivation | None = None
 
     def __post_init__(self) -> None:
+        if self.selection_activation is not None:
+            if type(self.selection_activation) is not SharedSelectionActivation:
+                raise ValueError("shared activation must be an exact immutable value")
+            if type(self.target) is not SharedTargetSpec:
+                raise ValueError("shared activation requires a shared target")
+        elif type(self.target) is SharedTargetSpec:
+            raise ValueError("shared target requires selection activation")
         _nonempty(self.provider_id, "provider id")
         _nonempty(self.source_revision, "source revision")
         object.__setattr__(self, "files", tuple(self.files))
@@ -333,6 +382,7 @@ class DeploymentManifest:
     directories: tuple[ManifestDirectory, ...]
     transaction_id: str
     review_state: str | None = None
+    selection_activation: SharedSelectionActivation | None = None
 
     def __post_init__(self) -> None:
         _nonempty(self.target_id, "target id")
@@ -468,6 +518,28 @@ class TargetStatus:
 
 
 @dataclass(frozen=True)
+class SharedTargetStatus:
+    """Observed shared selection identity, distinct from a constituent Git commit."""
+
+    target_id: str
+    state: TargetState
+    channel: str
+    selection_fingerprint: str | None
+
+    def __post_init__(self) -> None:
+        _exact_nonempty(self.target_id, "shared status target id")
+        _exact_nonempty(self.channel, "shared status channel")
+        if type(self.state) is not TargetState:
+            raise ValueError("shared status state must be a TargetState")
+        value = self.selection_fingerprint
+        if value is not None and (
+            type(value) is not str or len(value) != 64
+            or any(char not in "0123456789abcdef" for char in value)
+        ):
+            raise ValueError("selection fingerprint must be 64 lowercase hexadecimal characters")
+
+
+@dataclass(frozen=True)
 class TargetReadiness:
     ready: bool
     prerequisite: str | None
@@ -477,7 +549,7 @@ class TargetReadiness:
 class DeploymentReceipt:
     operation: str
     commits: tuple[str, ...]
-    targets: tuple[TargetStatus, ...]
+    targets: tuple[TargetStatus | SharedTargetStatus, ...]
 
     def __post_init__(self) -> None:
         _nonempty(self.operation, "operation")

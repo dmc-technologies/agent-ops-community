@@ -51,6 +51,7 @@ def build_shared_content(
     files: list[PlannedFile] = []
     mappings: list[dict[str, str]] = []
     names: set[str] = set()
+    policy_mapping = None
     for binding in selection.sources:
         matches = [snapshot for snapshot in snapshots if snapshot.source_id == binding.source_id]
         if (
@@ -73,8 +74,26 @@ def build_shared_content(
             for path in sorted(tracked)
             if any(root in Path(path).parents for root in roots)
         )
-        with _open_provider_data_closure(snapshot, roots + selected_files) as closure:
+        policy_path = (
+            Path(selection.policy.path)
+            if selection.policy is not None and selection.policy.source_id == binding.source_id
+            else None
+        )
+        declared = roots + selected_files + ((policy_path,) if policy_path is not None else ())
+        with _open_provider_data_closure(snapshot, declared) as closure:
             entries = {entry.relative_path: entry for entry in closure.entries}
+            if policy_path is not None:
+                policy_entry = entries[policy_path]
+                if policy_entry.kind != "file":
+                    raise ValueError("policy must be a regular file")
+                files.append(
+                    PlannedFile(prefix / "policy/AGENTS.md", policy_entry.read_bytes(), 0o644)
+                )
+                policy_mapping = {
+                    "source_id": binding.source_id,
+                    "commit": binding.commit,
+                    "path": policy_path.as_posix(),
+                }
             for root in roots:
                 if entries[root].kind != "directory":
                     raise ValueError("selected skill path must be a directory")
@@ -110,6 +129,8 @@ def build_shared_content(
         "selection_fingerprint": selection.fingerprint,
         "skills": sorted(mappings, key=lambda item: item["name"]),
     }
+    if policy_mapping is not None:
+        mapping["policy"] = policy_mapping
     files.append(
         PlannedFile(
             prefix / "source-map.json",

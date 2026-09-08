@@ -6,7 +6,7 @@ import os
 import stat
 import tempfile
 from collections.abc import Iterable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -19,6 +19,10 @@ from agent_ops.deployment.models import (
     PlannedFile,
     ProviderPlan,
     RewriteAcceptance,
+    SharedSelectionActivation,
+    SharedTargetSource,
+    SharedTargetSpec,
+    SharedTargetStatus,
     SourceSnapshot,
     TargetChannelTransition,
     TargetSource,
@@ -38,6 +42,8 @@ from agent_ops.deployment.registry import (
     _is_preview_channel,
     _RegistrySnapshotAuthority,
 )
+from agent_ops.deployment.shared_content import build_shared_content
+from agent_ops.deployment.shared_selection import SharedSelection, SharedSourceBinding
 from agent_ops.deployment.source_store import (
     SourceStore,
     _open_provider_data_closure,
@@ -48,11 +54,100 @@ from agent_ops.deployment.transaction import (
     _preflight_provider_plans_read_only,
     _read_managed_status_evidence,
     _read_preview_status_evidence,
+    _strict_json_loads,
     audit_provider_plans,
     install_provider_plans,
+    read_shared_target_evidence,
     retain_provider_plan_evidence,
     rollback_manifests,
 )
+
+
+def _shared_provider_plan(
+    target: SharedTargetSpec,
+    selection: SharedSelection,
+    content: tuple[PlannedFile, ...],
+    retained: tuple[PlannedFile, ...],
+) -> ProviderPlan:
+    files = {item.path: item for item in retained}
+    for item in content:
+        if item.path in files and files[item.path] != item:
+            raise ValueError("shared immutable snapshot content changed")
+        files[item.path] = item
+    return ProviderPlan(
+        "shared-skills",
+        selection.fingerprint,
+        target,
+        tuple(files[path] for path in sorted(files, key=str)),
+        audit_roots=(Path("snapshots"),),
+        selection_activation=SharedSelectionActivation(Path("snapshots") / selection.fingerprint),
+    )
+
+
+def _selection_from_shared_files(
+    files: tuple[PlannedFile, ...], fingerprint: str
+) -> SharedSelection:
+    path = Path("snapshots") / fingerprint / "source-map.json"
+    matches = [item for item in files if item.path == path]
+    if len(matches) != 1:
+        raise ValueError("shared snapshot source map is missing")
+    data = _strict_json_loads(matches[0].content, label="shared source map")
+    if (
+        type(data) is not dict
+        or set(data)
+        not in (
+            {"schema_version", "selection_fingerprint", "skills"},
+            {"schema_version", "selection_fingerprint", "skills", "policy"},
+        )
+        or type(data["schema_version"]) is not int
+        or data["schema_version"] != 1
+        or data["selection_fingerprint"] != fingerprint
+        or type(data["skills"]) is not list
+        or not data["skills"]
+    ):
+        raise ValueError("invalid shared source map")
+    grouped, names = {}, set()
+    for item in data["skills"]:
+        if (
+            type(item) is not dict
+            or set(item) != {"name", "source_id", "commit", "path"}
+            or any(type(value) is not str or not value for value in item.values())
+        ):
+            raise ValueError("invalid shared skill source mapping")
+        if item["name"] in names:
+            raise ValueError("duplicate shared skill identity")
+        names.add(item["name"])
+        binding = grouped.setdefault(item["source_id"], (item["commit"], []))
+        if binding[0] != item["commit"] or item["path"] in binding[1]:
+            raise ValueError("conflicting shared skill source mapping")
+        binding[1].append(item["path"])
+    policy = None
+    if "policy" in data:
+        from agent_ops.deployment.shared_selection import SharedPolicyBinding
+
+        item = data["policy"]
+        if (
+            type(item) is not dict
+            or set(item) != {"source_id", "commit", "path"}
+            or any(type(value) is not str or not value for value in item.values())
+            or item["source_id"] not in grouped
+            or grouped[item["source_id"]][0] != item["commit"]
+        ):
+            raise ValueError("invalid shared policy source mapping")
+        policy = SharedPolicyBinding(source_id=item["source_id"], path=item["path"])
+        policy_path = Path("snapshots") / fingerprint / "policy" / "AGENTS.md"
+        if sum(file.path == policy_path for file in files) != 1:
+            raise ValueError("shared source map requires one owned policy file")
+    selection = SharedSelection(
+        policy=policy,
+        sources=tuple(
+            SharedSourceBinding(source_id=key, commit=value[0], skill_paths=tuple(value[1]))
+            for key, value in grouped.items()
+        ),
+    )
+    if selection.fingerprint != fingerprint:
+        raise ValueError("shared source map fingerprint does not match its constituents")
+    return selection
 
 
 class DeploymentEngineError(RuntimeError):
@@ -103,6 +198,131 @@ class DeploymentEngine:
         self._source_store = source_store
         discovered = load_deployment_providers() if providers is None else providers
         self._providers = normalize_deployment_providers(discovered)
+
+    def shared_status(self) -> SharedTargetStatus:
+        """Inspect the installed shared selection without fetching any source."""
+        snapshot = self._registry.load_snapshot()
+        shared = snapshot.config.shared_selection
+        if shared is None:
+            raise ValueError("registry has no shared selection")
+        try:
+            manifest, audit, files = read_shared_target_evidence(shared.target)
+        except Exception as error:
+            return self._registry.shared_status(
+                manifest=None,
+                audit=None,
+                source_mapping_fingerprint=None,
+                failure=str(error),
+                snapshot=snapshot,
+            )
+        mapping_fingerprint = None
+        if manifest is not None:
+            with suppress(ValueError, KeyError, TypeError):
+                mapping_fingerprint = _selection_from_shared_files(
+                    files, manifest.source_revision
+                ).fingerprint
+        return self._registry.shared_status(
+            manifest=manifest,
+            audit=audit,
+            source_mapping_fingerprint=mapping_fingerprint,
+            snapshot=snapshot,
+        )
+
+    def shared_sync(self, selection: SharedSelection | None = None) -> DeploymentReceipt:
+        """Publish a complete pinned source selection through the shared target."""
+        return self._shared_operation(selection, rollback=False)
+
+    def shared_rollback(self) -> DeploymentReceipt:
+        """Republish the verified retained previous selection without network access."""
+        return self._shared_operation(None, rollback=True)
+
+    def _shared_operation(
+        self, selection: SharedSelection | None, *, rollback: bool
+    ) -> DeploymentReceipt:
+        original = self._registry.load_snapshot()
+        shared = original.config.shared_selection
+        if shared is None:
+            raise ValueError("registry has no shared selection")
+        desired = (
+            shared.previous
+            if rollback
+            else (selection if selection is not None else shared.selected)
+        )
+        if type(desired) is not SharedSelection:
+            raise ValueError(
+                "shared rollback requires a retained previous selection"
+                if rollback
+                else "invalid shared selection"
+            )
+        # Validate source registration before fetching or touching the shared home.
+        replace(original.config, shared_selection=replace(shared, selected=desired))
+        manifest, audit, retained = read_shared_target_evidence(shared.target)
+        if manifest is not None and (audit is None or not audit.matches):
+            raise ValueError("shared target changed; refusing to replace modified snapshots")
+        if rollback:
+            if manifest is None:
+                raise ValueError("shared rollback requires an installed selection")
+            observed = _selection_from_shared_files(retained, desired.fingerprint)
+            if observed != desired:
+                raise ValueError("retained previous snapshot source mapping does not match")
+            prefix = Path("snapshots") / desired.fingerprint
+            content = tuple(item for item in retained if prefix in item.path.parents)
+            snapshots = ()
+        else:
+            sources = {source.id: source for source in original.config.sources}
+            snapshots = tuple(
+                self._source_store.fetch_pinned(sources[binding.source_id], binding.commit)
+                for binding in desired.sources
+            )
+            content = build_shared_content(desired, snapshots)
+        initial = _shared_provider_plan(shared.target, desired, content, retained)
+        if not rollback:
+            DeploymentPlan(
+                snapshots, (initial,), (SharedTargetSource(shared.id, shared.channel, desired),)
+            )
+        _preflight_provider_plans_read_only((initial,))
+        with _locked_provider_plan_targets((initial,)):
+            manifest, audit, retained = read_shared_target_evidence(shared.target)
+            if manifest is not None and (audit is None or not audit.matches):
+                raise ValueError("shared target changed while acquiring its lock")
+            installed = (
+                _selection_from_shared_files(retained, manifest.source_revision)
+                if manifest is not None
+                else None
+            )
+            if rollback and _selection_from_shared_files(retained, desired.fingerprint) != desired:
+                raise ValueError("retained previous snapshot changed")
+            previous = shared.previous if installed == desired else installed
+            if (
+                previous is not None
+                and _selection_from_shared_files(retained, previous.fingerprint) != previous
+            ):
+                raise ValueError("previous source map does not match the retained selection")
+            candidate = replace(
+                original.config,
+                shared_selection=replace(shared, selected=desired, previous=previous),
+            )
+            provider_plan = _shared_provider_plan(shared.target, desired, content, retained)
+            _preflight_provider_plans_read_only((provider_plan,))
+            # Repeated synchronization verifies existing bytes without publishing a
+            # replacement ownership manifest or discarding the previous selection.
+            manifests = () if installed == desired else install_provider_plans((provider_plan,))
+            operation = "shared-rollback" if rollback else "shared-sync"
+
+            def receipt_factory(snapshot, audits):
+                return DeploymentReceipt(
+                    operation,
+                    tuple(sorted({binding.commit for binding in desired.sources})),
+                    (
+                        SharedTargetStatus(
+                            shared.id, TargetState.STABLE, shared.channel, desired.fingerprint
+                        ),
+                    ),
+                )
+
+            return self._commit_candidate(
+                original, candidate, (provider_plan,), manifests, receipt_factory
+            )
 
     def status(
         self, target_ids: tuple[str, ...] | None = None
@@ -427,9 +647,7 @@ class DeploymentEngine:
         *,
         rewrite: RewriteAcceptance | None = None,
     ) -> DeploymentReceipt:
-        original_targets = {
-            target.id: target for target in original_snapshot.config.targets
-        }
+        original_targets = {target.id: target for target in original_snapshot.config.targets}
         channel_transitions = tuple(
             TargetChannelTransition(
                 target.id,
@@ -461,58 +679,73 @@ class DeploymentEngine:
                 plan,
                 channel_transitions=channel_transitions,
             )
-            candidate_snapshot: RegistrySnapshot | None = None
-            try:
-                audits = self._audit_plans(plan.provider_plans, require_matches=True)
-                with retain_provider_plan_evidence(plan.provider_plans) as authority:
-                    candidate_snapshot = self._registry.save(
-                        candidate,
-                        expected_snapshot=original_snapshot,
-                    )
-                    receipt = self._receipt(
-                        operation,
-                        candidate_snapshot,
-                        candidate_targets,
-                        snapshots,
-                        manifests=manifests,
-                        audits=audits,
-                    )
-                    authority.verify()
-                    self._registry.append_receipt(receipt, snapshot=candidate_snapshot)
-            except BaseException as error:
-                recovery_errors: list[BaseException] = []
-                if candidate_snapshot is not None:
-                    try:
-                        self._registry.save(
-                            original_snapshot.config,
-                            expected_snapshot=candidate_snapshot,
-                        )
-                    except BaseException as recovery_error:
-                        if not isinstance(recovery_error, Exception):
-                            recovery_error.add_note(
-                                "deployment recovery incomplete while restoring the "
-                                f"registry; original failure: {error}; target rollback "
-                                "was not attempted"
-                            )
-                            raise
-                        recovery_errors.append(recovery_error)
+            return self._commit_candidate(
+                original_snapshot,
+                candidate,
+                plan.provider_plans,
+                manifests,
+                lambda candidate_snapshot, audits: self._receipt(
+                    operation,
+                    candidate_snapshot,
+                    candidate_targets,
+                    snapshots,
+                    manifests=manifests,
+                    audits=audits,
+                ),
+            )
+
+    def _commit_candidate(
+        self,
+        original_snapshot,
+        candidate,
+        provider_plans,
+        manifests,
+        receipt_factory,
+    ) -> DeploymentReceipt:
+        """Commit audited targets and registry selection through one recovery path."""
+        candidate_snapshot: RegistrySnapshot | None = None
+        try:
+            audits = self._audit_plans(provider_plans, require_matches=True)
+            with retain_provider_plan_evidence(provider_plans) as authority:
+                candidate_snapshot = (
+                    original_snapshot
+                    if candidate == original_snapshot.config
+                    else self._registry.save(candidate, expected_snapshot=original_snapshot)
+                )
+                receipt = receipt_factory(candidate_snapshot, audits)
+                authority.verify()
+                self._registry.append_receipt(receipt, snapshot=candidate_snapshot)
+        except BaseException as error:
+            recovery_errors: list[BaseException] = []
+            if candidate_snapshot is not None and candidate_snapshot != original_snapshot:
                 try:
-                    rollback_manifests(manifests)
+                    self._registry.save(
+                        original_snapshot.config, expected_snapshot=candidate_snapshot
+                    )
                 except BaseException as recovery_error:
                     if not isinstance(recovery_error, Exception):
-                        prior_recovery = "; ".join(
-                            str(item) for item in recovery_errors
-                        )
                         recovery_error.add_note(
-                            "deployment recovery incomplete while restoring targets; "
-                            f"original failure: {error}; prior recovery failures: "
-                            f"{prior_recovery or 'none'}; transaction evidence retained"
+                            "deployment recovery incomplete while restoring the "
+                            f"registry; original failure: {error}; target rollback "
+                            "was not attempted"
                         )
                         raise
                     recovery_errors.append(recovery_error)
-                if recovery_errors:
-                    self._raise_incomplete_recovery(error, recovery_errors)
-                raise
+            try:
+                rollback_manifests(manifests)
+            except BaseException as recovery_error:
+                if not isinstance(recovery_error, Exception):
+                    prior_recovery = "; ".join(str(item) for item in recovery_errors)
+                    recovery_error.add_note(
+                        "deployment recovery incomplete while restoring targets; "
+                        f"original failure: {error}; prior recovery failures: "
+                        f"{prior_recovery or 'none'}; transaction evidence retained"
+                    )
+                    raise
+                recovery_errors.append(recovery_error)
+            if recovery_errors:
+                self._raise_incomplete_recovery(error, recovery_errors)
+            raise
         return receipt
 
     @staticmethod

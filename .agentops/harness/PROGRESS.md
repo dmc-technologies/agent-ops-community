@@ -1,3 +1,21 @@
+# Shared machine skills and policy implementation
+
+An engineer can activate one exact selection of skill sources and optional global policy through the existing deployment transaction. Status verifies installed content and source mapping; rollback uses retained verified snapshots without a network fetch. Harness discovery registration and live machine migration are not implemented by this public core checkpoint.
+
+- Approved plan: private Agent Ops `docs/superpowers/plans/2026-09-07-shared-skill-distribution.md`; later policy and repository enrollment additions are recorded in its integration addendum.
+- Branch: `feat/shared-skill-distribution`, based on accepted `c8e0ac95ff20f0bf92c8d9027e6f9be85841e980`. No Plane work item applies. No merge authority was granted.
+- Source choices are exact original Git commits; the collection fingerprint is never represented as an upstream commit. Named-reference source fetching retains its prior contract.
+- The fixed selector uses the existing journal and ownership manifest. Atomic replacement does not promise consistent multiple file opens across an update; a reader needing that property must pin the resolved snapshot directory once.
+- Shared activation currently supports macOS and Linux. Windows refuses before writing; existing Windows deployment remains supported separately.
+- `agentops machine install|sync|status|rollback|source|updates` operate on an initialized machine registry. Installation here activates shared content; it does not enroll a harness or migrate an existing home.
+- Scope evidence: source-store affected suite passed 111 tests after correcting test process startup timing and using actual process observation on macOS. Policy/selection/composition affected tests passed 52; shared engine passed 10; machine CLI passed 9. New tests exercised refusal by deliberate broken implementations before restoration. These are component evidence, not final full acceptance.
+- CI integration readback: organization ruleset 21335575 requires `CI`; accepted workflows emitted other check names. Final job accounting now reports that required name. Deliberate failed input returned `CI refused: test finished as failure`; complete public results returned `CI passed: examined 2 required job results`.
+- CodeRabbit remains the only AI PR reviewer. The additive repository overlay inherits central DMC configuration; actual configuration-source readback and current-head review await publication.
+- Parent owns full repository verification. Run `PATH="$PWD/.venv/bin:$PATH" TMPDIR=/private/tmp .venv/bin/python -m pytest -o addopts= -q`, `.venv/bin/python -m ruff check .`, `.venv/bin/agentops harness check .`, and `.venv/bin/agentops verify examples/local-smoke.yaml --json` against the frozen candidate. Record exact-head results in the PR without rewriting this record solely for bookkeeping.
+- Remaining: full local/hosted CI and CodeRabbit review, private entry-point integration, enrollment, recoverable machine migration, and Dan's merge review. Repository enrollment will propose diffs and preserve project state; it is not completed by this checkpoint.
+
+## Prior source history
+
 # Progress
 
 Repository: `agent-ops-community`
