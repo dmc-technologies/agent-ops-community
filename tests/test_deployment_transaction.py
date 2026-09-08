@@ -4409,9 +4409,13 @@ def test_nonregular_backup_evidence_is_rejected_before_recovery(
             evidence.parent,
             os.O_RDONLY | os.O_DIRECTORY,
         )
+        prior_directory = os.open(".", os.O_RDONLY | os.O_DIRECTORY)
         try:
-            open_socket.bind(f"/proc/self/fd/{evidence_directory}/{evidence.name}")
+            os.fchdir(evidence_directory)
+            open_socket.bind(evidence.name)
         finally:
+            os.fchdir(prior_directory)
+            os.close(prior_directory)
             os.close(evidence_directory)
     try:
         with pytest.raises(ValueError, match="evidence"):

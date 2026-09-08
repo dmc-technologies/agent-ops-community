@@ -10,9 +10,15 @@ An engineer can activate one exact selection of skill sources and optional globa
 - `agentops machine install|sync|status|rollback|source|updates` operate on an initialized machine registry. Installation here activates shared content; it does not enroll a harness or migrate an existing home.
 - Scope evidence: source-store affected suite passed 111 tests after correcting test process startup timing and using actual process observation on macOS. Policy/selection/composition affected tests passed 52; shared engine passed 10; machine CLI passed 9. New tests exercised refusal by deliberate broken implementations before restoration. These are component evidence, not final full acceptance.
 - CI integration readback: organization ruleset 21335575 requires `CI`; accepted workflows emitted other check names. Final job accounting now reports that required name. Deliberate failed input returned `CI refused: test finished as failure`; complete public results returned `CI passed: examined 2 required job results`.
-- CodeRabbit remains the only AI PR reviewer. The additive repository overlay inherits central DMC configuration; actual configuration-source readback and current-head review await publication.
+- CodeRabbit remains the only AI PR reviewer. The additive repository overlay inherits central organization configuration; actual configuration-source readback and current-head review await publication.
 - Parent owns full repository verification. Run `PATH="$PWD/.venv/bin:$PATH" TMPDIR=/private/tmp .venv/bin/python -m pytest -o addopts= -q`, `.venv/bin/python -m ruff check .`, `.venv/bin/agentops harness check .`, and `.venv/bin/agentops verify examples/local-smoke.yaml --json` against the frozen candidate. Record exact-head results in the PR without rewriting this record solely for bookkeeping.
 - Remaining: full local/hosted CI and CodeRabbit review, private entry-point integration, enrollment, recoverable machine migration, and Dan's merge review. Repository enrollment will propose diffs and preserve project state; it is not completed by this checkpoint.
+
+## Integration verification before the corrected candidate
+
+- First full public run: 1185 passed, 13 skipped, 6 failed. The failures exposed host-sensitive fixtures and one public-record wording violation: two tests saw the operator's installed show-me skill; a requested set-group bit was stripped by macOS; a case-insensitive directory fixture failed before its identity assertion; a Unix socket fixture assumed Linux `/proc`; and this progress record contained a prohibited organization term.
+- Corrections preserve the exercised safety behavior: isolate the two test home environments, use a retained set-user permission bit, assert alias rejection on case-insensitive filesystems, create the socket relative to its opened evidence directory, and keep public records generic. The 10 targeted cases passed. Full acceptance is rerun on the resulting frozen commit.
+- A real CLI walkthrough installed and updated skill resources plus global policy, inspected original source provenance, removed source availability, rolled back both resources, and reported intentionally modified installed bytes with exit 1. This is content-engine evidence; it does not establish harness enrollment or live-home migration.
 
 ## Prior source history
 

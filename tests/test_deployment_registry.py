@@ -535,9 +535,16 @@ def test_existing_home_identity_rejects_alias_but_preserves_posix_case(
     upper = tmp_path / "A"
     lower = tmp_path / "a"
     upper.mkdir()
-    lower.mkdir()
+    lower.mkdir(exist_ok=True)
     if upper.stat().st_ino == lower.stat().st_ino:
-        pytest.skip("host filesystem is case-insensitive")
+        with pytest.raises(ValueError, match="same home"):
+            _registry(tmp_path).save(
+                RegistryConfig(1, source, channels, (
+                    TargetSpec("upper", Framework.CODEX, upper, "stable"),
+                    TargetSpec("lower", Framework.CODEX, lower, "stable"),
+                ))
+            )
+        return
     registry = _registry(tmp_path)
     registry.save(
         RegistryConfig(
