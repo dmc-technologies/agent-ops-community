@@ -1667,21 +1667,24 @@ def _validate_and_group(
                 or legacy.destination in removals[key]
             ):
                 raise ValueError("legacy link transition must bind one installed planned file")
-        for index, path in enumerate(file_paths):
-            if any(
-                path in other.parents or other in path.parents for other in file_paths[index + 1 :]
-            ):
-                raise ValueError(f"invalid plan topology at file destination: {path}")
-        for index, path in enumerate(removal_paths):
-            if any(
-                path == other or path in other.parents or other in path.parents
-                for other in removal_paths[index + 1 :]
-            ):
-                raise ValueError(f"invalid plan topology at removal destination: {path}")
+        # Inspect each path's ancestors once rather than comparing every pair.
+        # The dictionaries/sets already deduplicate equal destinations above.
+        removal_set = removals[key]
+        removal_ancestors: set[Path] = set()
+        for path in file_paths:
+            for parent in path.parents:
+                if parent in files:
+                    raise ValueError(f"invalid plan topology at file destination: {parent}")
+        for path in removal_paths:
+            for parent in path.parents:
+                if parent in removal_set:
+                    raise ValueError(f"invalid plan topology at removal destination: {parent}")
+                removal_ancestors.add(parent)
         for file_path in file_paths:
-            if any(
-                file_path == removal or file_path in removal.parents or removal in file_path.parents
-                for removal in removal_paths
+            if (
+                file_path in removal_set
+                or file_path in removal_ancestors
+                or any(parent in removal_set for parent in file_path.parents)
             ):
                 raise ValueError(f"invalid plan topology across file and removal: {file_path}")
     results = []

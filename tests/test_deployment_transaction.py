@@ -4806,6 +4806,8 @@ def test_rollback_verifies_untouched_prior_files_before_restoring_manifest(
     [
         "file-descendant",
         "file-removal-ancestor",
+        "file-removal-descendant",
+        "file-removal-equal",
         "removal-ancestor",
         "duplicate-destination",
         "reserved-metadata",
@@ -4830,14 +4832,19 @@ def test_plan_topology_is_rejected_before_target_mutation(
                 ),
             ),
         )
-    elif case == "file-removal-ancestor":
+    elif case in {"file-removal-ancestor", "file-removal-descendant", "file-removal-equal"}:
+        file_path, removal = {
+            "file-removal-ancestor": ("skills/foo/bar", "skills/foo"),
+            "file-removal-descendant": ("skills/foo", "skills/foo/bar"),
+            "file-removal-equal": ("skills/foo", "skills/foo"),
+        }[case]
         plans = (
             ProviderPlan(
                 "fixture",
                 "1" * 40,
                 target,
-                (PlannedFile(Path("skills/foo/bar"), b"child\n", 0o644),),
-                (Path("skills/foo"),),
+                (PlannedFile(Path(file_path), b"child\n", 0o644),),
+                (Path(removal),),
             ),
         )
     elif case == "removal-ancestor":
@@ -5865,3 +5872,38 @@ def test_prime_gstack_legacy_source_binding_accepts_a_pre_skills_descriptor() ->
     )
 
     assert transaction_module._source_revision_binds_prime_gstack_ref(revision, source_ref)
+
+
+@pytest.mark.parametrize("kind", ["files", "removals", "mixed"])
+def test_plan_topology_bounds_parent_traversals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    count = 160
+    files = tuple(
+        PlannedFile(Path(f"skills/current/{index}/SKILL.md"), b"skill", 0o644)
+        for index in range(count)
+    ) if kind != "removals" else ()
+    removals = tuple(Path(f"skills/old/{index}/SKILL.md") for index in range(count)) \
+        if kind != "files" else ()
+    plan = ProviderPlan(
+        "fixture", "1" * 40,
+        TargetSpec("codex-dev", Framework.CODEX, tmp_path / "home", "feature"),
+        files, removals,
+    )
+    original = Path.parents
+    visits = 0
+    bound = 12 * (len(files) + len(removals))
+
+    def parents(path: Path):
+        nonlocal visits
+        visits += 1
+        assert visits <= bound, "topology validation repeatedly scans every pair of paths"
+        return original.__get__(path, type(path))
+
+    monkeypatch.setattr(Path, "parents", property(parents))
+    groups = transaction_module._validate_and_group((plan,))
+    assert len(groups) == 1
+    assert len(groups[0].files) == len(files)
+    assert len(groups[0].removals) == len(removals)
+    assert visits > 0
+    assert not plan.target.home.exists()
