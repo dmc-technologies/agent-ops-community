@@ -13,6 +13,7 @@ from agent_ops.deployment.transaction import _runtime_python_cache_content_is_va
 def test_valid_cache_does_not_require_identical_reserialization(tmp_path: Path, version: int):
     source = tmp_path / "skill.py"
     source.write_bytes(b'value = "shared skill"\n')
+    source.chmod(0o644)
     source_stat = source.stat()
     body = marshal.dumps(compile(source.read_bytes(), str(source), "exec"), version)
     cache = tmp_path / "skill.pyc"
@@ -23,6 +24,7 @@ def test_valid_cache_does_not_require_identical_reserialization(tmp_path: Path, 
         + len(source.read_bytes()).to_bytes(4, "little")
     )
     cache.write_bytes(header + body)
+    cache.chmod(0o644)
     assert _runtime_python_cache_content_is_valid(
         cache.read_bytes(), cache.stat(), source.read_bytes(), source_stat
     )
