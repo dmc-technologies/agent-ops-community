@@ -3,12 +3,12 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from test_deployment_source_store import _git
+from test_deployment_source_store import git_remote as _git_remote
 
 import agent_ops.deployment.source_store as module
 from agent_ops.deployment.models import SourceSpec
 from agent_ops.deployment.source_store import SourceStore, _open_provider_data_closure
-from tests.test_deployment_source_store import _git
-from tests.test_deployment_source_store import git_remote as _git_remote
 
 
 @pytest.fixture

@@ -5,11 +5,11 @@ import json
 from pathlib import Path
 
 import pytest
+from test_shared_content import fixture, git
 
 from agent_ops.deployment.models import SourceSnapshot
 from agent_ops.deployment.shared_content import build_shared_content
 from agent_ops.deployment.shared_selection import SharedSelection
-from tests.test_shared_content import fixture, git
 
 
 def policy_fixture(tmp_path, symlink=False):
