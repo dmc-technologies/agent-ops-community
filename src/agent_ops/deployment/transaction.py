@@ -5927,7 +5927,14 @@ def _read_status_descriptor(descriptor: int, *, max_bytes: int | None = None) ->
     return b"".join(chunks)
 
 
+def _evidence_identity(item: os.stat_result) -> tuple[int, ...]:
+    # ctime catches replacement/recreation even when bytes and mtime are restored.
+    return (*_status_identity(item), item.st_ctime_ns)
+
+
 class _PinnedStatusFile:
+    """Retain identity and bytes while bounding open descriptors to each read."""
+
     def __init__(
         self,
         home_fs: _HomeFS,
@@ -5937,84 +5944,84 @@ class _PinnedStatusFile:
     ) -> None:
         self._home_fs = home_fs
         self.path = path
-        with home_fs.parent(path) as (parent, leaf):
-            self.descriptor = os.open(
-                leaf,
-                os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW,
-                dir_fd=parent,
-            )
-        try:
-            os.set_inheritable(self.descriptor, False)
-            observed = os.fstat(self.descriptor)
+        with self._open() as descriptor:
+            observed = os.fstat(descriptor)
             if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
                 raise ValueError(f"preview evidence file is not regular: {path}")
             if manifest and stat.S_IMODE(observed.st_mode) != _OWNERSHIP_MANIFEST_MODE:
                 raise ValueError("ownership manifest mode must be 0o600")
-            self.identity = _status_identity(observed)
+            self.identity = _evidence_identity(observed)
+            self.mode = stat.S_IMODE(observed.st_mode)
             if manifest:
-                _after_preview_status_manifest_open(home_fs, path, self.descriptor)
+                _after_preview_status_manifest_open(home_fs, path, descriptor)
             else:
-                _after_preview_status_owned_open(path, "file", self.descriptor)
-            self.content = _read_status_descriptor(self.descriptor)
-        except BaseException:
-            os.close(self.descriptor)
-            raise
+                _after_preview_status_owned_open(path, "file", descriptor)
+            self.content = _read_status_descriptor(descriptor)
+
+    @contextmanager
+    def _open(self) -> Iterator[int]:
+        with self._home_fs.parent(self.path) as (parent, leaf):
+            descriptor = os.open(
+                leaf, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=parent
+            )
+        try:
+            os.set_inheritable(descriptor, False)
+            yield descriptor
+        finally:
+            os.close(descriptor)
 
     def verify(self) -> None:
-        if os.get_inheritable(self.descriptor):
-            raise RuntimeError("preview evidence descriptor must be close-on-exec")
         try:
-            canonical = self._home_fs.stat(self.path)
+            with self._open() as descriptor:
+                if (
+                    _evidence_identity(os.fstat(descriptor)) != self.identity
+                    or _read_status_descriptor(descriptor) != self.content
+                    or _evidence_identity(os.fstat(descriptor)) != self.identity
+                    or _evidence_identity(self._home_fs.stat(self.path)) != self.identity
+                ):
+                    raise ValueError(f"preview evidence path changed: {self.path}")
         except OSError as error:
             raise ValueError(f"preview evidence path changed: {self.path}") from error
-        if (
-            _status_identity(canonical) != self.identity
-            or _status_identity(os.fstat(self.descriptor)) != self.identity
-            or _read_status_descriptor(self.descriptor) != self.content
-        ):
-            raise ValueError(f"preview evidence path changed: {self.path}")
 
     def close(self) -> None:
-        with suppress(OSError):
-            os.close(self.descriptor)
+        """Reads close their descriptors immediately; no resource remains retained."""
 
 
 class _PinnedStatusDirectory:
     def __init__(self, home_fs: _HomeFS, path: Path) -> None:
         self._home_fs = home_fs
         self.path = path
-        self.descriptor = home_fs.open_dir(path)
+        descriptor = home_fs.open_dir(path)
         try:
-            os.set_inheritable(self.descriptor, False)
-            observed = os.fstat(self.descriptor)
+            observed = os.fstat(descriptor)
             if not stat.S_ISDIR(observed.st_mode):
                 raise ValueError(f"preview evidence directory is invalid: {path}")
-            self.identity = _status_identity(observed)
-            _after_preview_status_owned_open(path, "directory", self.descriptor)
-        except BaseException:
-            os.close(self.descriptor)
-            raise
+            self.identity = _evidence_identity(observed)
+            self.mode = stat.S_IMODE(observed.st_mode)
+            _after_preview_status_owned_open(path, "directory", descriptor)
+        finally:
+            os.close(descriptor)
 
     def verify(self) -> None:
-        if os.get_inheritable(self.descriptor):
-            raise RuntimeError("preview evidence descriptor must be close-on-exec")
         try:
-            canonical = self._home_fs.stat(self.path)
+            descriptor = self._home_fs.open_dir(self.path)
+            try:
+                if (
+                    _evidence_identity(os.fstat(descriptor)) != self.identity
+                    or _evidence_identity(self._home_fs.stat(self.path)) != self.identity
+                ):
+                    raise ValueError(f"preview evidence path changed: {self.path}")
+            finally:
+                os.close(descriptor)
         except OSError as error:
             raise ValueError(f"preview evidence path changed: {self.path}") from error
-        if (
-            _status_identity(canonical) != self.identity
-            or _status_identity(os.fstat(self.descriptor)) != self.identity
-        ):
-            raise ValueError(f"preview evidence path changed: {self.path}")
 
     def close(self) -> None:
-        with suppress(OSError):
-            os.close(self.descriptor)
+        """Reads close their descriptors immediately; no resource remains retained."""
 
 
 class _RetainedProviderPlanEvidence:
-    """Descriptor-backed audit evidence retained until terminal handoff."""
+    """Identity and byte evidence revalidated until terminal handoff."""
 
     def __init__(
         self,
@@ -6208,7 +6215,7 @@ def _read_pinned_status_evidence(
                         continue
                     pinned.append(evidence)
                     if (
-                        stat.S_IMODE(os.fstat(evidence.descriptor).st_mode) != item.mode
+                        evidence.mode != item.mode
                         or hashlib.sha256(evidence.content).hexdigest() != item.fingerprint
                     ):
                         changed.append(item.path.as_posix())
@@ -6222,7 +6229,7 @@ def _read_pinned_status_evidence(
                         changed.append(item.path.as_posix())
                         continue
                     pinned.append(evidence)
-                    if stat.S_IMODE(os.fstat(evidence.descriptor).st_mode) != item.mode:
+                    if evidence.mode != item.mode:
                         changed.append(item.path.as_posix())
                 home_fs.verify_lock_identity()
                 for evidence in pinned:
@@ -6282,7 +6289,7 @@ def read_shared_target_evidence(
                 evidence_pins.append(pin)
                 if (
                     hashlib.sha256(pin.content).hexdigest() != owned.fingerprint
-                    or stat.S_IMODE(os.fstat(pin.descriptor).st_mode) != owned.mode
+                    or pin.mode != owned.mode
                 ):
                     changed.append(owned.path.as_posix())
                 files.append(PlannedFile(owned.path, pin.content, owned.mode))
@@ -6297,7 +6304,7 @@ def read_shared_target_evidence(
                     continue
                 pins.callback(pin.close)
                 evidence_pins.append(pin)
-                if stat.S_IMODE(os.fstat(pin.descriptor).st_mode) != owned.mode:
+                if pin.mode != owned.mode:
                     changed.append(owned.path.as_posix())
             if not home_fs.matches_symlink(Path("current"), data["selection_activation"]):
                 changed.append("current")

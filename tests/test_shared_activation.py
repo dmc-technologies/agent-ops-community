@@ -236,3 +236,70 @@ def test_shared_manifest_revision_must_match_active_snapshot(tmp_path):
     data["source_revision"] = "b" * 64
     with pytest.raises(ValueError, match="snapshot"):
         tx._validated_manifest_data(json.dumps(data).encode(), target=candidate.target)
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='POSIX descriptor limits')
+@pytest.mark.parametrize('operation', ['read', 'retain'])
+def test_shared_evidence_bounds_descriptors_for_large_snapshots(tmp_path, operation):
+    import dataclasses
+    import subprocess
+    import sys
+
+    initial = plan(tmp_path / 'home', 'a')
+    prefix = Path('snapshots') / ('a' * 64)
+    candidate = dataclasses.replace(initial, files=initial.files + tuple(
+        models.PlannedFile(prefix / f'resource-{i}.txt', b'resource', 0o644)
+        for i in range(160)
+    ))
+    tx.install_provider_plans((candidate,))
+    script = '''
+import resource, sys
+from pathlib import Path
+from agent_ops.deployment import models, transaction as tx
+home = Path(sys.argv[1])
+prefix = Path('snapshots') / ('a' * 64)
+target = models.SharedTargetSpec('shared-skills', home)
+files = (models.PlannedFile(prefix / 'skills/example/SKILL.md', b'a', 0o644),) + tuple(
+    models.PlannedFile(prefix / f'resource-{i}.txt', b'resource', 0o644) for i in range(160)
+)
+plan = models.ProviderPlan('shared-skills', 'a' * 64, target, files,
+    audit_roots=(prefix,), selection_activation=models.SharedSelectionActivation(prefix))
+soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+resource.setrlimit(resource.RLIMIT_NOFILE, (64, hard))
+if sys.argv[2] == 'read':
+    manifest, audit, observed = tx.read_shared_target_evidence(target)
+    assert manifest is not None and audit.matches and len(observed) == 161
+else:
+    with tx._locked_provider_plan_targets((plan,)):
+        with tx.retain_provider_plan_evidence((plan,)) as evidence:
+            evidence.verify()
+print('verified 161 files with a 64-descriptor limit')
+'''
+    observed = subprocess.run([sys.executable, '-c', script, str(candidate.target.home), operation],
+        capture_output=True, text=True, timeout=30)
+    assert observed.returncode == 0, observed.stderr
+    assert 'verified 161 files' in observed.stdout
+
+
+@pytest.mark.parametrize('change', ['replacement', 'restore-bytes-and-mtime'])
+def test_bounded_evidence_rejects_changed_identity_even_when_bytes_match(tmp_path, change):
+    candidate = plan(tmp_path / 'home', 'a')
+    tx.install_provider_plans((candidate,))
+    path = candidate.target.home / candidate.files[0].path
+    with (
+        tx._locked_provider_plan_targets((candidate,)),
+        tx.retain_provider_plan_evidence((candidate,)) as evidence,
+    ):
+        before = path.stat()
+        if change == 'replacement':
+            replacement = path.with_name('replacement')
+            replacement.write_bytes(path.read_bytes())
+            replacement.chmod(0o644)
+            os.replace(replacement, path)
+        else:
+            path.write_bytes(b'changed')
+            path.write_bytes(b'a')
+            os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+        assert path.read_bytes() == b'a'
+        with pytest.raises(ValueError, match='retained audit evidence changed'):
+            evidence.verify()
