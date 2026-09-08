@@ -20,6 +20,7 @@ from agent_ops.deployment.cli import (
     emit_json_usage_error,
     json_output_scope,
 )
+from agent_ops.deployment.machine_cli import machine_app
 from agent_ops.deployment.transaction import UnsupportedPlatformError
 from agent_ops.frameworks import ADAPTERS, get_adapter
 from agent_ops.harness import check_harness, default_verification, init_harness
@@ -38,7 +39,7 @@ from agent_ops.verify import run_verification
 
 
 def _deployment_json_requested(arguments: list[str]) -> bool:
-    if not arguments or arguments[0] not in {"deployment", "channel"}:
+    if not arguments or arguments[0] not in {"deployment", "channel", "machine"}:
         return False
     try:
         delimiter = arguments.index("--")
@@ -70,6 +71,7 @@ frameworks_app = typer.Typer(help="Framework adapter commands.")
 harness_app = typer.Typer(help="Repository harness checks.")
 app.add_typer(deployment_app, name="deployment")
 app.add_typer(channel_app, name="channel")
+app.add_typer(machine_app, name="machine")
 app.add_typer(capabilities_app, name="capabilities")
 app.add_typer(skills_app, name="skills")
 app.add_typer(tools_app, name="tools")

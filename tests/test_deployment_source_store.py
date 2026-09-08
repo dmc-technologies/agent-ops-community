@@ -1123,6 +1123,16 @@ def test_metadata_replacement_race_rejects_pinned_old_bytes(
         store.snapshot("example", snapshot.commit)
 
 
+def _process_state(pid: int) -> str:
+    result = subprocess.run(
+        ("ps", "-o", "stat=", "-p", str(pid)), capture_output=True, text=True, check=False
+    )
+    if result.returncode == 1 and not result.stdout.strip():
+        return "gone"
+    assert result.returncode == 0 and result.stdout.strip(), result.stderr
+    return result.stdout.strip()[0]
+
+
 def test_git_timeout_kills_complete_process_group(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1140,15 +1150,11 @@ def test_git_timeout_kills_complete_process_group(
     )
     fake_git.chmod(0o755)
     monkeypatch.setenv("PATH", f"{binary}{os.pathsep}{os.environ['PATH']}")
+    # Allow the executable loader and child interpreter to start before testing cleanup.
     with pytest.raises(_GitTimeout, match="timed out"):
-        _run_git(("version",), timeout=0.2)
+        _run_git(("version",), timeout=1.0)
     child_pid = int(marker.read_text())
-    child_state = Path(f"/proc/{child_pid}/stat")
-    try:
-        state = child_state.read_text().split()[2]
-    except (FileNotFoundError, ProcessLookupError):
-        state = "gone"
-    assert state in {"gone", "Z"}
+    assert _process_state(child_pid) in {"gone", "Z"}
 
 
 def test_git_timeout_kills_descendant_after_leader_exits(
@@ -1177,16 +1183,12 @@ def test_git_timeout_kills_descendant_after_leader_exits(
     fake_git.chmod(0o755)
     monkeypatch.setenv("PATH", f"{binary}{os.pathsep}{os.environ['PATH']}")
     started = time.monotonic()
+    # Allow the executable loader and child interpreter to start before testing cleanup.
     with pytest.raises(_GitTimeout, match="timed out"):
-        _run_git(("version",), timeout=0.2)
+        _run_git(("version",), timeout=1.0)
     assert time.monotonic() - started < 2.0
     descendant_pid = int(marker.read_text())
-    process_state = Path(f"/proc/{descendant_pid}/stat")
-    try:
-        state = process_state.read_text().split()[2]
-    except (FileNotFoundError, ProcessLookupError):
-        state = "gone"
-    assert state in {"gone", "Z"}
+    assert _process_state(descendant_pid) in {"gone", "Z"}
 
 
 def test_git_runner_preserves_process_control_when_cleanup_fails(
@@ -1304,3 +1306,13 @@ def test_relative_state_root_is_stable_after_chdir(
     loaded = store.snapshot("example", snapshot.commit)
     assert loaded.root == snapshot.root
     assert observed_paths and all(path.is_absolute() for path in observed_paths)
+
+
+def test_timeout_probe_distinguishes_live_process_from_absence():
+    process = subprocess.Popen(["sleep", "60"])
+    try:
+        assert _process_state(process.pid) not in {"gone", "Z"}
+    finally:
+        process.terminate()
+        process.wait()
+    assert _process_state(process.pid) == "gone"

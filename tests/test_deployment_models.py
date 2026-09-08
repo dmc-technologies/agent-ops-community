@@ -321,3 +321,65 @@ def test_deployment_plan_rejects_invalid_target_source_associations(
 
     with pytest.raises(ValueError, match=message):
         DeploymentPlan(snapshots, providers, associations)
+
+
+def _shared_deployment_plan_parts():
+    from agent_ops.deployment.models import SharedTargetSource
+    from agent_ops.deployment.shared_selection import SharedSelection
+
+    selection = SharedSelection(sources=(
+        {"source_id": "catalog", "commit": "a" * 40, "skill_paths": ("skills/a",)},
+        {"source_id": "extras", "commit": "b" * 40, "skill_paths": ("skills/b",)},
+    ))
+    target = TargetSpec("client", Framework.CODEX, Path("client-home"), "stable")
+    snapshots = tuple(SourceSnapshot(s.source_id, s.commit, s.commit, Path(s.source_id))
+                      for s in selection.sources)
+    provider = ProviderPlan("skills", selection.fingerprint, target, ())
+    association = SharedTargetSource(target.id, target.channel, selection)
+    return snapshots, provider, association
+
+
+def test_shared_plan_preserves_constituent_commits_and_selection_identity():
+    snapshots, provider, association = _shared_deployment_plan_parts()
+    plan = DeploymentPlan(snapshots, (provider,), (association,))
+    assert plan.target_sources == (association,)
+    assert association.selection_fingerprint == association.selection.fingerprint
+    assert tuple(s.commit for s in plan.snapshots) == ("a" * 40, "b" * 40)
+    assert not hasattr(association, "commit")
+    with pytest.raises(FrozenInstanceError):
+        association.channel = "other"
+
+
+@pytest.mark.parametrize("change", ["missing", "duplicate", "conflict", "ref", "revision",
+                                    "channel", "association-duplicate", "association-extra"])
+def test_shared_plan_refuses_inconsistent_constituents(change):
+    from dataclasses import replace
+
+    snapshots, provider, association = _shared_deployment_plan_parts()
+    associations = (association,)
+    if change == "missing":
+        snapshots = snapshots[:1]
+    elif change == "duplicate":
+        snapshots += snapshots[:1]
+    elif change == "conflict":
+        snapshots += (replace(snapshots[0], commit="c" * 40, ref="c" * 40),)
+    elif change == "ref":
+        snapshots = (replace(snapshots[0], ref="refs/heads/main"), snapshots[1])
+    elif change == "revision":
+        provider = replace(provider, source_revision="a" * 40)
+    elif change == "channel":
+        association = replace(association, channel="other")
+        associations = (association,)
+    elif change == "association-duplicate":
+        associations += (association,)
+    elif change == "association-extra":
+        associations += (replace(association, target_id="other"),)
+    with pytest.raises(ValueError):
+        DeploymentPlan(snapshots, (provider,), associations)
+
+
+def test_shared_association_refuses_unvalidated_selection():
+    from agent_ops.deployment.models import SharedTargetSource
+
+    with pytest.raises(ValueError, match="selection"):
+        SharedTargetSource("client", "stable", {"sources": []})

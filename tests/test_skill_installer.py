@@ -622,6 +622,7 @@ def test_non_posix_dry_run_rejects_plan_dependency_mismatch(
 def test_non_posix_single_bundle_revalidates_planned_checkout_before_native_apply(
     tmp_path: Path, monkeypatch
 ) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "user-home"))
     import agent_ops.skill_installer as skill_installer
 
     source = _show_me_source(tmp_path / "source")

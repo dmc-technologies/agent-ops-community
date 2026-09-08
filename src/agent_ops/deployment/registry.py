@@ -21,11 +21,14 @@ from agent_ops.deployment.models import (
     DeploymentAudit,
     DeploymentManifest,
     DeploymentReceipt,
+    SharedTargetSpec,
+    SharedTargetStatus,
     SourceSpec,
     TargetSpec,
     TargetState,
     TargetStatus,
 )
+from agent_ops.deployment.shared_selection import SharedSelection
 from agent_ops.registries.models import Framework
 
 try:
@@ -108,11 +111,37 @@ class ChannelSpec:
 
 
 @dataclass(frozen=True)
+class SharedSelectionConfig:
+    """One machine installation and its selected and previous source choices."""
+
+    id: str
+    home: Path
+    selected: SharedSelection
+    previous: SharedSelection | None = None
+    channel: str = "shared"
+
+    def __post_init__(self) -> None:
+        _validate_id(self.id, "shared target id")
+        _validate_id(self.channel, "shared target channel")
+        if not isinstance(self.home, Path):
+            raise ValueError("shared target home must be a Path")
+        if type(self.selected) is not SharedSelection:
+            raise ValueError("selected must be an exact SharedSelection")
+        if self.previous is not None and type(self.previous) is not SharedSelection:
+            raise ValueError("previous must be an exact SharedSelection or None")
+
+    @property
+    def target(self) -> SharedTargetSpec:
+        return SharedTargetSpec(id=self.id, home=self.home, channel=self.channel)
+
+
+@dataclass(frozen=True)
 class RegistryConfig:
     schema_version: int
     sources: tuple[SourceSpec, ...]
     channels: tuple[ChannelSpec, ...]
     targets: tuple[TargetSpec, ...]
+    shared_selection: SharedSelectionConfig | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "sources", tuple(self.sources))
@@ -559,6 +588,52 @@ class DeploymentRegistry:
             _close_registry_lock(lock)
             os.close(parent)
 
+    def shared_status(
+        self,
+        *,
+        manifest: DeploymentManifest | None,
+        audit: DeploymentAudit | None,
+        source_mapping_fingerprint: str | None,
+        failure: str | None = None,
+        snapshot: RegistrySnapshot | None = None,
+    ) -> SharedTargetStatus:
+        """Classify observed shared content without fetching or changing its sources."""
+        if snapshot is not None and type(snapshot) is not RegistrySnapshot:
+            raise ValueError("status snapshot must be an exact RegistrySnapshot")
+        config = snapshot.config if snapshot is not None else self.load()
+        shared = config.shared_selection
+        if shared is None:
+            raise ValueError("registry has no shared selection")
+        observed = None
+        if manifest is not None:
+            if (manifest.target_id != shared.id or manifest.channel != shared.channel
+                    or manifest.framework is not shared.target.framework):
+                raise ValueError("shared manifest does not match target")
+            observed = _validate_fingerprint(manifest.source_revision)
+            if manifest.review_state is not None:
+                raise ValueError("shared manifest cannot have preview review state")
+        if audit is not None and audit.target_id != shared.id:
+            raise ValueError("audit belongs to a different shared target")
+        if source_mapping_fingerprint is not None:
+            _validate_fingerprint(source_mapping_fingerprint)
+        if failure is not None:
+            _require_string(failure, "failure")
+            state = TargetState.FAILED
+        elif manifest is None:
+            state = TargetState.STALE
+        elif (
+            audit is None or _audit_is_invalid(audit)
+            or source_mapping_fingerprint != observed
+            or manifest.selection_activation is None
+            or manifest.selection_activation.snapshot != Path("snapshots") / observed
+        ):
+            state = TargetState.MODIFIED
+        elif observed != shared.selected.fingerprint:
+            state = TargetState.STALE
+        else:
+            state = TargetState.STABLE
+        return SharedTargetStatus(shared.id, state, shared.channel, observed)
+
     def status(
         self,
         target_id: str,
@@ -714,8 +789,13 @@ def _validate_home(path: Path, label: str) -> tuple[tuple[int, int] | None, str]
 
 
 def _validate_config_fields(config: RegistryConfig, *, require_nonempty: bool) -> None:
-    if type(config.schema_version) is not int or config.schema_version != 1:
-        raise ValueError("registry schema version must be integer 1")
+    if type(config.schema_version) is not int or config.schema_version not in (1, 2):
+        raise ValueError("registry schema version must be integer 1 or 2")
+    shared = config.shared_selection
+    if shared is not None and (
+        config.schema_version != 2 or type(shared) is not SharedSelectionConfig
+    ):
+        raise ValueError("shared selection requires schema 2 and exact SharedSelectionConfig")
     collections = (
         (config.sources, SourceSpec, "source"),
         (config.channels, ChannelSpec, "channel"),
@@ -724,11 +804,19 @@ def _validate_config_fields(config: RegistryConfig, *, require_nonempty: bool) -
     for values, expected, label in collections:
         if type(values) is not tuple or any(type(value) is not expected for value in values):
             raise ValueError(f"registry {label}s must contain exact {label} values")
-        if require_nonempty and not values:
+        if require_nonempty and not values and (label == "source" or shared is None):
             raise ValueError("registry sources, channels, and targets must be nonempty mappings")
         _validate_unique(values, label)
     source_ids = {source.id for source in config.sources}
     channel_ids = {channel.id for channel in config.channels}
+    if shared is not None:
+        if shared.id in {target.id for target in config.targets}:
+            raise ValueError("shared target id conflicts with a legacy target")
+        for selection in (shared.selected, shared.previous):
+            if selection is not None and any(
+                binding.source_id not in source_ids for binding in selection.sources
+            ):
+                raise ValueError("shared selection refers to an unknown source")
     for source in config.sources:
         _validate_id(source.id, "source id")
         _require_string(source.url, "source URL")
@@ -756,7 +844,9 @@ def _validate_config(config: RegistryConfig, *, require_nonempty: bool) -> None:
     _validate_config_fields(config, require_nonempty=require_nonempty)
     homes: set[str] = set()
     identities: set[tuple[int, int]] = set()
-    for target in config.targets:
+    shared_targets = (config.shared_selection.target,) if config.shared_selection else ()
+    targets = config.targets + shared_targets
+    for target in targets:
         identity, key = _validate_home(target.home, f"target {target.id!r} home")
         if key in homes or (identity is not None and identity in identities):
             raise ValueError("two targets may not use the same home")
@@ -801,14 +891,19 @@ def _load_yaml(content: bytes) -> dict[str, Any]:
 
 def _parse_registry(content: bytes) -> RegistryConfig:
     root = _load_yaml(content)
-    _exact_keys(root, _ROOT_KEYS, "registry")
+    version = root.get("schema_version")
+    keys = _ROOT_KEYS
+    if type(version) is int and version == 2:
+        keys = keys | {"shared_selection"}
+    _exact_keys(root, keys, "registry schema version 2" if version == 2 else "registry")
     if type(root["schema_version"]) is not int:
         raise ValueError("registry schema version must be an integer")
-    if root["schema_version"] != 1:
-        raise ValueError("registry schema version must be 1")
+    if root["schema_version"] not in (1, 2):
+        raise ValueError("registry schema version must be 1 or 2")
     source_data = _mapping(root["sources"], "sources", nonempty=True)
-    channel_data = _mapping(root["channels"], "channels", nonempty=True)
-    target_data = _mapping(root["targets"], "targets", nonempty=True)
+    has_shared = version == 2 and root["shared_selection"] is not None
+    channel_data = _mapping(root["channels"], "channels", nonempty=not has_shared)
+    target_data = _mapping(root["targets"], "targets", nonempty=not has_shared)
     sources: list[SourceSpec] = []
     channels: list[ChannelSpec] = []
     targets: list[TargetSpec] = []
@@ -852,7 +947,20 @@ def _parse_registry(content: bytes) -> RegistryConfig:
                 channel=_validate_id(item["channel"], "target channel"),
             )
         )
-    config = RegistryConfig(1, tuple(sources), tuple(channels), tuple(targets))
+    shared = None
+    if has_shared:
+        item = _mapping(root["shared_selection"], "shared selection")
+        _exact_keys(item, frozenset({"id", "home", "channel", "selected", "previous"}),
+                    "shared selection")
+        shared = SharedSelectionConfig(
+            id=_validate_id(item["id"], "shared target id"),
+            home=Path(_require_string(item["home"], "shared target home")),
+            channel=_validate_id(item["channel"], "shared target channel"),
+            selected=SharedSelection.model_validate(item["selected"]),
+            previous=(SharedSelection.model_validate(item["previous"])
+                      if item["previous"] is not None else None),
+        )
+    config = RegistryConfig(version, tuple(sources), tuple(channels), tuple(targets), shared)
     _validate_config(config, require_nonempty=True)
     return config
 
@@ -862,7 +970,7 @@ def _dump_registry(config: RegistryConfig) -> bytes:
     channels = sorted(config.channels, key=lambda channel: channel.id)
     targets = sorted(config.targets, key=lambda target: target.id)
     document = {
-        "schema_version": 1,
+        "schema_version": config.schema_version,
         "sources": {
             source.id: {"url": source.url, "stable_ref": source.stable_ref} for source in sources
         },
@@ -878,6 +986,15 @@ def _dump_registry(config: RegistryConfig) -> bytes:
             for target in targets
         },
     }
+    if config.schema_version == 2:
+        shared = config.shared_selection
+        document["shared_selection"] = None if shared is None else {
+            "id": shared.id,
+            "home": os.fspath(shared.home),
+            "channel": shared.channel,
+            "selected": shared.selected.model_dump(mode="json"),
+            "previous": shared.previous.model_dump(mode="json") if shared.previous else None,
+        }
     return yaml.safe_dump(
         document,
         allow_unicode=False,
@@ -902,8 +1019,19 @@ def _receipt_to_data(receipt: DeploymentReceipt) -> dict[str, Any]:
     commits = [_validate_commit(commit) for commit in receipt.commits]
     targets: list[dict[str, Any]] = []
     for target in receipt.targets:
+        if type(target) is SharedTargetStatus:
+            _validate_id(target.target_id, "receipt target id")
+            _validate_id(target.channel, "receipt target channel")
+            if type(target.state) is not TargetState:
+                raise ValueError("receipt target state is invalid")
+            if target.selection_fingerprint is not None:
+                _validate_fingerprint(target.selection_fingerprint)
+            targets.append({"kind": "shared", "target_id": target.target_id,
+                            "state": target.state.value, "channel": target.channel,
+                            "selection_fingerprint": target.selection_fingerprint})
+            continue
         if not isinstance(target, TargetStatus):
-            raise ValueError("receipt targets must be TargetStatus values")
+            raise ValueError("receipt targets must be target status values")
         _validate_id(target.target_id, "receipt target id")
         _validate_id(target.channel, "receipt target channel")
         if not isinstance(target.state, TargetState):
@@ -926,7 +1054,7 @@ def _dump_receipt_wrapper(receipt: dict[str, Any], registry_fingerprint: str) ->
     return (
         json.dumps(
             {
-                "schema_version": 1,
+                "schema_version": 2 if any("kind" in item for item in receipt["targets"]) else 1,
                 "registry_fingerprint": registry_fingerprint,
                 "receipt": receipt,
             },
@@ -945,8 +1073,9 @@ def _parse_receipt_wrapper(content: bytes) -> tuple[str, DeploymentReceipt]:
         raise ValueError("receipt must be strict UTF-8 JSON") from error
     wrapper = _mapping(data, "receipt wrapper")
     _exact_keys(wrapper, _RECEIPT_WRAPPER_KEYS, "receipt wrapper")
-    if type(wrapper["schema_version"]) is not int or wrapper["schema_version"] != 1:
-        raise ValueError("receipt wrapper schema version must be integer 1")
+    version = wrapper["schema_version"]
+    if type(version) is not int or version not in (1, 2):
+        raise ValueError("receipt wrapper schema version must be integer 1 or 2")
     fingerprint = _validate_fingerprint(wrapper["registry_fingerprint"])
     root = _mapping(wrapper["receipt"], "receipt")
     _exact_keys(root, _RECEIPT_KEYS, "receipt")
@@ -956,14 +1085,26 @@ def _parse_receipt_wrapper(content: bytes) -> tuple[str, DeploymentReceipt]:
     if type(root["targets"]) is not list:
         raise ValueError("receipt targets must be a list")
     commits = tuple(_validate_commit(commit) for commit in root["commits"])
-    targets: list[TargetStatus] = []
+    targets: list[TargetStatus | SharedTargetStatus] = []
     for index, value in enumerate(root["targets"]):
         item = _mapping(value, f"receipt target {index}")
-        _exact_keys(item, _STATUS_KEYS, f"receipt target {index}")
+        shared = version == 2 and item.get("kind") == "shared"
+        keys = (frozenset({"kind", "target_id", "state", "channel", "selection_fingerprint"})
+                if shared else _STATUS_KEYS)
+        _exact_keys(item, keys, f"receipt target {index}")
         try:
             state = TargetState(_require_string(item["state"], "receipt target state"))
         except ValueError as error:
             raise ValueError("receipt target state is invalid") from error
+        if shared:
+            selection_fingerprint = item["selection_fingerprint"]
+            if selection_fingerprint is not None:
+                _validate_fingerprint(selection_fingerprint)
+            targets.append(SharedTargetStatus(
+                _validate_id(item["target_id"], "receipt target id"), state,
+                _validate_id(item["channel"], "receipt target channel"), selection_fingerprint,
+            ))
+            continue
         commit = item["commit"]
         if commit is not None:
             _validate_commit(commit, "receipt target commit")
@@ -1583,4 +1724,5 @@ __all__ = [
     "ReceiptRecord",
     "RegistryConfig",
     "RegistrySnapshot",
+    "SharedSelectionConfig",
 ]

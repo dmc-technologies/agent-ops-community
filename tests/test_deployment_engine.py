@@ -2295,6 +2295,7 @@ def test_shared_manifest_rejects_duplicate_json_members(tmp_path: Path, monkeypa
 def test_exact_legacy_show_me_state_is_adopted_and_no_longer_controls_updates(
     tmp_path: Path, monkeypatch
 ) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "user-home"))
     source = _show_me_source(tmp_path / "source")
     home = tmp_path / "home"
     install_show_me(source, home / "skills/show-me")

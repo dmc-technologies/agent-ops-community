@@ -150,6 +150,10 @@ agentops harness check .
 - Prime gstack generation requires Bun. Agent Ops uses the pinned upstream lockfile and stops without changing the Prime profile if generation or the required runtime build fails.
 - The Prime gstack runtime contains compiled browser, design, and PDF executables and currently uses about 600 MB on Linux.
 
+## Shared machine skills and policy
+
+The [shared machine guide](docs/shared-machine-skills.md) covers exact source selection, content activation, source inspection, and offline rollback. Harness discovery registration and existing-home migration are separate onboarding responsibilities.
+
 ## Agent Harness
 
 This repository carries the standard Agent Ops harness:

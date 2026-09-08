@@ -482,7 +482,7 @@ def test_preview_rejects_source_closure_symlink(tmp_path: Path) -> None:
     _assert_no_preview_install(home)
 
 
-@pytest.mark.parametrize("mode", (0o2644, 0o666, 0o620))
+@pytest.mark.parametrize("mode", (0o4644, 0o666, 0o620))
 def test_preview_rejects_unsafe_worktree_file_modes(tmp_path: Path, mode: int) -> None:
     engine, checkout, home = _preview(tmp_path)
     (checkout / "skills/demo/SKILL.md").chmod(mode)

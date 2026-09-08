@@ -6,6 +6,7 @@ from enum import StrEnum
 from pathlib import Path, PureWindowsPath
 from typing import Protocol, runtime_checkable
 
+from agent_ops.deployment.shared_selection import SharedSelection
 from agent_ops.registries.models import Framework
 
 
@@ -44,6 +45,47 @@ class TargetSpec:
     def __post_init__(self) -> None:
         _nonempty(self.id, "target id")
         _exact_nonempty(self.channel, "target channel")
+
+
+class DeploymentTargetKind(StrEnum):
+    SHARED = "shared"
+
+
+@dataclass(frozen=True)
+class SharedTargetSpec:
+    id: str
+    home: Path
+    channel: str = "shared"
+
+    def __post_init__(self) -> None:
+        _exact_nonempty(self.id, "shared target id")
+        _exact_nonempty(self.channel, "shared target channel")
+
+    @property
+    def framework(self) -> DeploymentTargetKind:
+        return DeploymentTargetKind.SHARED
+
+
+@dataclass(frozen=True)
+class SharedSelectionActivation:
+    """Activate one confined immutable snapshot through the fixed selector."""
+
+    snapshot: Path
+
+    def __post_init__(self) -> None:
+        path = _repository_relative_path(self.snapshot)
+        if (
+            len(path.parts) != 2
+            or path.parts[0] != "snapshots"
+            or len(path.name) != 64
+            or any(character not in "0123456789abcdef" for character in path.name)
+        ):
+            raise ValueError("shared selection snapshot must be snapshots/<64 lowercase hex>")
+        object.__setattr__(self, "snapshot", path)
+
+    @property
+    def selector(self) -> Path:
+        return Path("current")
 
 
 @dataclass(frozen=True)
@@ -156,15 +198,23 @@ class ManifestDirectory:
 class ProviderPlan:
     provider_id: str
     source_revision: str
-    target: TargetSpec
+    target: TargetSpec | SharedTargetSpec
     files: tuple[PlannedFile, ...]
     removals: tuple[Path, ...] = ()
     audit_roots: tuple[Path, ...] = ()
     runtime_python_sources: tuple[Path, ...] = ()
     legacy_link_transition: LegacyLinkTransition | None = None
     prime_gstack_legacy_adoption: PrimeGstackLegacyAdoption | None = None
+    selection_activation: SharedSelectionActivation | None = None
 
     def __post_init__(self) -> None:
+        if self.selection_activation is not None:
+            if type(self.selection_activation) is not SharedSelectionActivation:
+                raise ValueError("shared activation must be an exact immutable value")
+            if type(self.target) is not SharedTargetSpec:
+                raise ValueError("shared activation requires a shared target")
+        elif type(self.target) is SharedTargetSpec:
+            raise ValueError("shared target requires selection activation")
         _nonempty(self.provider_id, "provider id")
         _nonempty(self.source_revision, "source revision")
         object.__setattr__(self, "files", tuple(self.files))
@@ -332,6 +382,7 @@ class DeploymentManifest:
     directories: tuple[ManifestDirectory, ...]
     transaction_id: str
     review_state: str | None = None
+    selection_activation: SharedSelectionActivation | None = None
 
     def __post_init__(self) -> None:
         _nonempty(self.target_id, "target id")
@@ -362,17 +413,38 @@ class TargetSource:
 
 
 @dataclass(frozen=True)
+class SharedTargetSource:
+    """Bind a target to a validated selection without treating its fingerprint as Git."""
+
+    target_id: str
+    channel: str
+    selection: SharedSelection
+
+    def __post_init__(self) -> None:
+        _exact_nonempty(self.target_id, "shared target id")
+        _exact_nonempty(self.channel, "shared target channel")
+        if type(self.selection) is not SharedSelection:
+            raise ValueError("shared target selection must be an exact SharedSelection value")
+
+    @property
+    def selection_fingerprint(self) -> str:
+        return self.selection.fingerprint
+
+
+@dataclass(frozen=True)
 class DeploymentPlan:
     snapshots: tuple[SourceSnapshot, ...]
     provider_plans: tuple[ProviderPlan, ...]
-    target_sources: tuple[TargetSource, ...]
+    target_sources: tuple[TargetSource | SharedTargetSource, ...]
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "snapshots", tuple(self.snapshots))
         object.__setattr__(self, "provider_plans", tuple(self.provider_plans))
         object.__setattr__(self, "target_sources", tuple(self.target_sources))
-        if any(type(item) is not TargetSource for item in self.target_sources):
-            raise ValueError("plan target sources must be exact TargetSource values")
+        if any(
+            type(item) not in (TargetSource, SharedTargetSource) for item in self.target_sources
+        ):
+            raise ValueError("plan target sources must be exact source association values")
         planned_ids = {plan.target.id for plan in self.provider_plans}
         association_ids = [association.target_id for association in self.target_sources]
         if set(association_ids) != planned_ids or len(association_ids) != len(planned_ids):
@@ -385,6 +457,24 @@ class DeploymentPlan:
             )
             if any(plan.target.channel != association.channel for plan in target_plans):
                 raise ValueError("plan source association target channel does not match")
+            if type(association) is SharedTargetSource:
+                if any(
+                    plan.source_revision != association.selection_fingerprint
+                    for plan in target_plans
+                ):
+                    raise ValueError("shared provider revision must match selection fingerprint")
+                for binding in association.selection.sources:
+                    matches = tuple(
+                        snapshot for snapshot in self.snapshots
+                        if snapshot.source_id == binding.source_id
+                    )
+                    if (
+                        len(matches) != 1
+                        or matches[0].commit != binding.commit
+                        or matches[0].ref != binding.commit
+                    ):
+                        raise ValueError("shared source requires one unique exact pinned snapshot")
+                continue
             if any(plan.source_revision != association.commit for plan in target_plans):
                 raise ValueError("plan source association does not match provider revision")
             matches = tuple(
@@ -428,6 +518,28 @@ class TargetStatus:
 
 
 @dataclass(frozen=True)
+class SharedTargetStatus:
+    """Observed shared selection identity, distinct from a constituent Git commit."""
+
+    target_id: str
+    state: TargetState
+    channel: str
+    selection_fingerprint: str | None
+
+    def __post_init__(self) -> None:
+        _exact_nonempty(self.target_id, "shared status target id")
+        _exact_nonempty(self.channel, "shared status channel")
+        if type(self.state) is not TargetState:
+            raise ValueError("shared status state must be a TargetState")
+        value = self.selection_fingerprint
+        if value is not None and (
+            type(value) is not str or len(value) != 64
+            or any(char not in "0123456789abcdef" for char in value)
+        ):
+            raise ValueError("selection fingerprint must be 64 lowercase hexadecimal characters")
+
+
+@dataclass(frozen=True)
 class TargetReadiness:
     ready: bool
     prerequisite: str | None
@@ -437,7 +549,7 @@ class TargetReadiness:
 class DeploymentReceipt:
     operation: str
     commits: tuple[str, ...]
-    targets: tuple[TargetStatus, ...]
+    targets: tuple[TargetStatus | SharedTargetStatus, ...]
 
     def __post_init__(self) -> None:
         _nonempty(self.operation, "operation")
