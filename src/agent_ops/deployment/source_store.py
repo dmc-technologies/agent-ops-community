@@ -193,6 +193,15 @@ def _validate_ref(ref: str) -> None:
         raise ValueError("source ref must be a fully qualified Git ref")
 
 
+def _validate_snapshot_ref(ref: str, commit: str) -> None:
+    """A snapshot may name a branch or exactly its own canonical commit."""
+    if isinstance(ref, str) and _COMMIT.fullmatch(ref):
+        if ref != commit or ref != ref.lower():
+            raise ValueError("pinned source ref must equal snapshot commit")
+        return
+    _validate_ref(ref)
+
+
 def _normalize_commit(commit: str) -> str:
     if not isinstance(commit, str) or _COMMIT.fullmatch(commit) is None:
         raise ValueError("source commit must be a full 40-hex object id")
@@ -674,6 +683,35 @@ class SourceStore:
                 with suppress(_GitFailure):
                     self._git(("--git-dir", str(mirror), "update-ref", "-d", candidate))
 
+    def fetch_pinned(self, source: SourceSpec, commit: str) -> SourceSnapshot:
+        """Fetch only an exact selected commit without resolving a branch fallback."""
+        if _WINDOWS_SUPPORTED:
+            raise RuntimeError("pinned source fetch is unsupported on this platform")
+        _validate_source_id(source.id)
+        _validate_ref(source.stable_ref)
+        normalized = _normalize_commit(commit)
+        if normalized != commit:
+            raise ValueError("pinned source commit must be an exact lowercase object id")
+        url = _normalize_source_url(source.url)
+        if fcntl is None:
+            raise RuntimeError("source store locking is unsupported on this platform")
+        sources = _ensure_store_root(self._state_root)
+        with self._source_lock(sources, source.id):
+            source_root = sources / source.id
+            _require_owner_only_directory(source_root, "source directory", create=True)
+            self._cleanup_partial_state(source_root)
+            mirror = self._prepare_mirror(source_root, url)
+            candidate = f"refs/agentops/candidate/{uuid.uuid4().hex}"
+            try:
+                observed = self._fetch_candidate(mirror, commit, candidate, url)
+                if observed != commit:
+                    raise RuntimeError("fetched source does not match requested commit")
+                snapshot = self._ensure_snapshot(source_root, source.id, commit, commit)
+                return SourceSnapshot(source.id, commit, commit, snapshot.root)
+            finally:
+                with suppress(_GitFailure):
+                    self._git(("--git-dir", str(mirror), "update-ref", "-d", candidate))
+
     def snapshot(self, source_id: str, commit: str) -> SourceSnapshot:
         if _WINDOWS_SUPPORTED:
             return _windows_source_store_backend().snapshot(self, source_id, commit)
@@ -992,7 +1030,7 @@ class SourceStore:
             os.close(git_fd)
         if metadata["source_id"] != source_id or metadata["commit"] != commit:
             raise RuntimeError("invalid snapshot metadata: identity mismatch")
-        _validate_ref(metadata["ref"])
+        _validate_snapshot_ref(metadata["ref"], commit)
         _verify_exact_checkout(root, commit, timeout=self._git_timeout)
         return SourceSnapshot(source_id, metadata["ref"], commit, root)
 
@@ -1069,8 +1107,8 @@ class _PinnedClosure:
 
     def _open(self, snapshot: SourceSnapshot, declared: tuple[Path, ...]) -> None:
         _validate_source_id(snapshot.source_id)
-        _validate_ref(snapshot.ref)
         commit = _normalize_commit(snapshot.commit)
+        _validate_snapshot_ref(snapshot.ref, commit)
         self._root_fd = os.open(self._root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         self._root_identity = _identity(os.fstat(self._root_fd))
         try:
