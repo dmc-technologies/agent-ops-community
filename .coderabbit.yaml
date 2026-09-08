@@ -1,0 +1,20 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+inheritance: true
+reviews:
+  path_instructions:
+    - path: "src/agent_ops/deployment/**"
+      instructions: >-
+        Review exact source selection, shared installation ownership, confined
+        filesystem writes, and recovery after process exit. Report evidence of
+        lost user changes, source substitutions, incomplete rollback, or a
+        successful status that does not verify installed content. A selection
+        fingerprint identifies a collection and is not an upstream Git commit.
+    - path: ".github/**"
+      instructions: >-
+        Review required job accounting, credential boundaries, and untrusted
+        pull-request inputs. A successful CI result must examine every required
+        job and refuse failed, cancelled, missing, or incorrectly skipped work.
+    - path: "tests/**"
+      instructions: >-
+        Report checks that can accept broken deployment behavior, ignore missing
+        evidence, or claim process cleanup without observing the process state.

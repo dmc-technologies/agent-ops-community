@@ -22,11 +22,28 @@ def test_retired_review_runtime_is_absent() -> None:
 def test_current_handoff_has_no_retired_review_instruction() -> None:
     current = {
         "README.md": (ROOT / "README.md").read_text(encoding="utf-8"),
-        "PROGRESS.md": (ROOT / ".agentops/harness/PROGRESS.md").read_text(
-            encoding="utf-8"
-        ),
+        "PROGRESS.md": (ROOT / ".agentops/harness/PROGRESS.md").read_text(encoding="utf-8"),
     }
     for name, text in current.items():
         assert text.strip(), name
         for phrase in ("ai review", "Review Gate", "review-gate"):
             assert phrase not in text, f"{name}: {phrase}"
+
+
+def test_review_overlay_preserves_central_review_authority() -> None:
+    import yaml
+
+    config = yaml.safe_load((ROOT / ".coderabbit.yaml").read_text())
+    assert set(config) == {"inheritance", "reviews"}
+    assert config["inheritance"] is True
+    assert set(config["reviews"]) == {"path_instructions"}
+    instructions = config["reviews"]["path_instructions"]
+    assert len(instructions) == 3
+    assert {entry["path"] for entry in instructions} == {
+        "src/agent_ops/deployment/**",
+        ".github/**",
+        "tests/**",
+    }
+    for entry in instructions:
+        assert set(entry) == {"path", "instructions"}
+        assert entry["instructions"].strip()
