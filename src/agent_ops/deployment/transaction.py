@@ -2688,12 +2688,19 @@ def _install_provider_plan_groups(
                 for operation in operations:
                     destination = Path(operation["destination"])
                     backup = Path(operation["backup"]) if operation["backup"] else None
+                    # Recovery reads the cursor only for a step that moves an existing file
+                    # to a backup or replaces the legacy link. Other steps leave either the
+                    # exact planned file or nothing, so their cursor needs no durable write.
+                    durable = backup is not None or (
+                        legacy_active is not None and destination == legacy_active.destination
+                    )
                     record["operation_cursor"] = operation["index"]
                     record["operation_phase"] = "applying"
                     if legacy_active is not None:
                         record["legacy_link_transition"]["operation_cursor"] = operation["index"]
                         record["legacy_link_transition"]["operation_phase"] = "applying"
-                    home_fs.write_atomic(record_path, _record_bytes(record), 0o600)
+                    if durable:
+                        home_fs.write_atomic(record_path, _record_bytes(record), 0o600)
                     pinned_cache = (
                         _PinnedRuntimeCache(home_fs, destination, operation)
                         if operation["kind"] == _RUNTIME_CACHE_REMOVAL
@@ -2775,6 +2782,9 @@ def _install_provider_plan_groups(
                             operation["index"] + 1
                         )
                         record["legacy_link_transition"]["operation_phase"] = "ready"
+                    if durable:
+                        home_fs.write_atomic(record_path, _record_bytes(record), 0o600)
+                if operations and not durable:
                     home_fs.write_atomic(record_path, _record_bytes(record), 0o600)
                 if manifest.selection_activation is not None:
                     _activate_shared_selection(home_fs, record)

@@ -5907,3 +5907,124 @@ def test_plan_topology_bounds_parent_traversals(
     assert len(groups[0].removals) == len(removals)
     assert visits > 0
     assert not plan.target.home.exists()
+
+
+def test_resync_writes_the_journal_only_for_files_that_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    unchanged = tuple(
+        PlannedFile(Path(f"skills/s{index}/SKILL.md"), f"body {index}\n".encode(), 0o644)
+        for index in range(40)
+    )
+    install_provider_plans((_plan(home, *unchanged),))
+    added = PlannedFile(Path("skills/new/SKILL.md"), b"new\n", 0o644)
+    journal_writes: list[Path] = []
+    original_write_atomic = transaction_module._HomeFS.write_atomic
+
+    def count_journal_writes(home_fs: object, relative: Path, content: bytes, mode: int) -> None:
+        if relative.name == "record.json":
+            journal_writes.append(relative)
+        original_write_atomic(home_fs, relative, content, mode)
+
+    monkeypatch.setattr(transaction_module._HomeFS, "write_atomic", count_journal_writes)
+
+    install_provider_plans((_plan(home, *unchanged, added, revision="2" * 40),))
+
+    assert (home / "skills/new/SKILL.md").read_bytes() == b"new\n"
+    assert all((home / item.path).read_bytes() == item.content for item in unchanged)
+    assert 0 < len(journal_writes) <= 10, f"{len(journal_writes)} journal writes for one new file"
+
+
+@pytest.mark.parametrize("hook", ["_after_operation_mutation", "_before_manifest_replace"])
+def test_recovery_after_power_loss_amid_adopted_files_completes_the_install(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, hook: str
+) -> None:
+    home = tmp_path / "home"
+    unchanged = tuple(
+        PlannedFile(Path(f"skills/s{index}/SKILL.md"), f"body {index}\n".encode(), 0o644)
+        for index in range(6)
+    )
+    first = _plan(home, *unchanged)
+    install_provider_plans((first,))
+    added = PlannedFile(Path("skills/new/SKILL.md"), b"new\n", 0o644)
+    second = _plan(home, *unchanged[:3], added, *unchanged[3:], revision="2" * 40)
+    original_hook = getattr(transaction_module, hook)
+
+    def terminate(*_args: object) -> None:
+        os._exit(93)
+
+    monkeypatch.setattr(transaction_module, hook, terminate)
+    process = multiprocessing.get_context("fork").Process(
+        target=lambda: install_provider_plans((second,))
+    )
+    process.start()
+    process.join(timeout=5)
+    assert process.exitcode == 93
+    monkeypatch.setattr(transaction_module, hook, original_hook)
+    record_path = next(
+        path
+        for path in (home / ".agentops/deployment/transactions").glob("*/record.json")
+        if json.loads(path.read_text())["state"] == "prepared"
+    )
+
+    recover_transaction(record_path)
+
+    assert json.loads(record_path.read_text())["state"] == "committed"
+    assert (home / "skills/new/SKILL.md").read_bytes() == b"new\n"
+    assert audit_provider_plans((second,)).matches
+
+
+def test_first_install_writes_the_journal_a_bounded_number_of_times(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    files = tuple(
+        PlannedFile(Path(f"skills/s{index}/SKILL.md"), f"body {index}\n".encode(), 0o644)
+        for index in range(40)
+    )
+    journal_writes: list[Path] = []
+    original_write_atomic = transaction_module._HomeFS.write_atomic
+
+    def count_journal_writes(home_fs: object, relative: Path, content: bytes, mode: int) -> None:
+        if relative.name == "record.json":
+            journal_writes.append(relative)
+        original_write_atomic(home_fs, relative, content, mode)
+
+    monkeypatch.setattr(transaction_module._HomeFS, "write_atomic", count_journal_writes)
+
+    install_provider_plans((_plan(home, *files),))
+
+    assert audit_provider_plans((_plan(home, *files),)).matches
+    assert 0 < len(journal_writes) <= 10, f"{len(journal_writes)} journal writes for 40 new files"
+
+
+def test_recovery_after_power_loss_amid_new_files_refuses_and_keeps_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    files = tuple(
+        PlannedFile(Path(f"skills/s{index}/SKILL.md"), f"body {index}\n".encode(), 0o644)
+        for index in range(6)
+    )
+    original_hook = transaction_module._after_operation_mutation
+
+    def terminate_after_third(_home_fs: object, _record_path: Path, operation: dict) -> None:
+        if operation["index"] == 2:
+            os._exit(94)
+
+    monkeypatch.setattr(transaction_module, "_after_operation_mutation", terminate_after_third)
+    process = multiprocessing.get_context("fork").Process(
+        target=lambda: install_provider_plans((_plan(home, *files),))
+    )
+    process.start()
+    process.join(timeout=5)
+    assert process.exitcode == 94
+    monkeypatch.setattr(transaction_module, "_after_operation_mutation", original_hook)
+    record_path = next((home / ".agentops/deployment/transactions").glob("*/record.json"))
+
+    with pytest.raises(PublicationIndeterminateError, match="skills/s3/SKILL.md"):
+        recover_transaction(record_path)
+
+    assert json.loads(record_path.read_text())["state"] == "prepared"
+    assert [(home / item.path).exists() for item in files] == [True] * 3 + [False] * 3
