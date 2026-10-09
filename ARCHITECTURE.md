@@ -2,8 +2,8 @@
 
 ## Public Core Boundary
 
-Agent Ops Community owns the general-purpose Agent Ops experience: harnesses,
-job contracts, context handoff, framework bootstrap, common framework command
+Agent Ops Community owns the general-purpose Agent Ops experience: job
+contracts, context handoff, framework bootstrap, common framework command
 handoff, verification helpers, and plugin interfaces. It does not own
 proprietary runner/verifier implementations or organization-specific operational
 workflows.
@@ -18,7 +18,6 @@ workflows.
 ## Package Boundaries
 
 - `agent_ops.contracts`: stable job and result models.
-- `agent_ops.harness`: file-based repository harness templates and checks.
 - `agent_ops.plugins`: public extension interfaces and plugin discovery.
 - `agent_ops.verify`: deterministic local verification execution.
 - `agent_ops.deployment.models`: public immutable source, target, provider, plan, manifest, audit, status, and receipt contracts.

@@ -66,27 +66,13 @@ verification:
     assert data["status"] == "fail"
 
 
-def test_harness_init_and_check_cli(tmp_path: Path) -> None:
-    init_result = runner.invoke(
-        app,
-        [
-            "harness",
-            "init",
-            str(tmp_path),
-            "--repo-name",
-            "example",
-            "--repo-type",
-            "python",
-            "--json",
-        ],
-    )
+def test_harness_commands_are_removed(tmp_path: Path) -> None:
+    for command in (["harness", "check", str(tmp_path)], ["harness", "init", str(tmp_path)]):
+        result = runner.invoke(app, command)
 
-    assert init_result.exit_code == 0
-
-    check_result = runner.invoke(app, ["harness", "check", str(tmp_path), "--json"])
-
-    assert check_result.exit_code == 0
-    assert json.loads(check_result.output)["ok"] is True
+        assert result.exit_code == 2, result.output
+        assert "No such command 'harness'" in result.output
+    assert not (tmp_path / ".agentops").exists()
 
 
 def test_bootstrap_writes_public_agentops_file(tmp_path: Path) -> None:

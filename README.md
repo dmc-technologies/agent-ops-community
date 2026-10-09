@@ -1,8 +1,7 @@
 # Agent Ops Community
 
 Agent Ops Community is a public, tool-neutral operations layer for agentic
-development workflows. It provides repository harness templates, job contracts,
-context handoff, framework bootstrap guidance, plugin discovery, and verification
+development workflows. It provides job contracts, context handoff, framework bootstrap guidance, plugin discovery, and verification
 helpers that can be used by local agents and framework-specific runners.
 
 This repository is intended to contain the full Agent Ops experience for common
@@ -31,14 +30,6 @@ agentops skills install prime-agent
 By default, supported frameworks install all configured skill dependency bundles. Codex, Claude Code, and OpenCode retain the existing upstream layouts for gstack and Superpowers, while all six supported agent hosts receive HumanLayer's pinned `show-me` skill through a collision-safe adapter with a portable HTML artifact opener. Prime Agent receives generated Prime-native variants of the two larger bundles: gstack skills use `agentops-gstack-*` names with their built runtime under `.agentops/runtime/gstack`, and Superpowers skills use `agentops-superpowers-*` names. Fingerprint manifests prevent every adapted bundle from overwriting an unowned or locally modified skill.
 
 ## Quick Start
-
-Initialize a repo-local harness:
-
-```bash
-mkdir -p /tmp/agentops-example
-agentops harness init /tmp/agentops-example --repo-name agentops-example --repo-type python
-agentops harness check /tmp/agentops-example
-```
 
 Validate and run verification from a job contract:
 
@@ -111,15 +102,13 @@ Installed extension packages expose deployment providers through the `agent_ops.
 
 Third-party and organization-specific runners integrate through Python entry
 points under the `agent_ops.plugins` group. The public core discovers installed
-plugins only when running plugin-backed execution paths. Harness checks,
-contract validation, and public safety checks do not import arbitrary plugins.
+plugins only when running plugin-backed execution paths. Contract validation, and public safety checks do not import arbitrary plugins.
 
 ## Community Scope
 
 Agent Ops Community should support the same generic workflow shape across agent
 frameworks:
 
-- repository harnesses and clock-in/clock-out conventions
 - job contracts and result manifests
 - context packs and framework handoff commands
 - bootstrap instructions for common agent frameworks

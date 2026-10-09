@@ -23,7 +23,6 @@ from agent_ops.deployment.cli import (
 from agent_ops.deployment.machine_cli import machine_app
 from agent_ops.deployment.transaction import UnsupportedPlatformError
 from agent_ops.frameworks import ADAPTERS, get_adapter
-from agent_ops.harness import check_harness, default_verification, init_harness
 from agent_ops.plugins import run_with_plugins
 from agent_ops.registries import (
     Framework,
@@ -68,7 +67,6 @@ skills_app = typer.Typer(help="Portable skill registry.")
 tools_app = typer.Typer(help="Portable tool registry.")
 context_app = typer.Typer(help="Build portable context packs.")
 frameworks_app = typer.Typer(help="Framework adapter commands.")
-harness_app = typer.Typer(help="Repository harness checks.")
 app.add_typer(deployment_app, name="deployment")
 app.add_typer(channel_app, name="channel")
 app.add_typer(machine_app, name="machine")
@@ -77,7 +75,6 @@ app.add_typer(skills_app, name="skills")
 app.add_typer(tools_app, name="tools")
 app.add_typer(context_app, name="context")
 app.add_typer(frameworks_app, name="frameworks")
-app.add_typer(harness_app, name="harness")
 
 
 def _emit_result(result: RunResult, json_output: bool, output: Path | None) -> None:
@@ -167,62 +164,6 @@ def verify(
     result = run_verification(load_job(job_file), job_file.parent)
     _emit_result(result, json_output, output)
     if result.status.value == "fail":
-        raise typer.Exit(1)
-
-
-@harness_app.command("init")
-def init_harness_command(
-    repo_root: Annotated[Path, typer.Argument(file_okay=False)] = Path("."),
-    repo_name: Annotated[str | None, typer.Option("--repo-name")] = None,
-    repo_type: Annotated[
-        str,
-        typer.Option("--repo-type", help="generic, python, or agent-ops."),
-    ] = "generic",
-    verification: Annotated[
-        list[str] | None,
-        typer.Option("--verification", "-v", help="Verification command. Repeat as needed."),
-    ] = None,
-    force: Annotated[
-        bool,
-        typer.Option("--force", help="Overwrite existing harness files."),
-    ] = False,
-    json_output: Annotated[bool, typer.Option("--json")] = False,
-) -> None:
-    """Create the standard repo-local harness scaffold."""
-    root = repo_root.resolve()
-    commands = tuple(verification) if verification else default_verification(repo_type)
-    writes = init_harness(
-        root,
-        repo_name=repo_name or root.name,
-        repo_type=repo_type,
-        verification_commands=commands,
-        force=force,
-    )
-    rows = [
-        {"path": str(write.path), "status": "written" if write.written else "exists"}
-        for write in writes
-    ]
-    if json_output:
-        typer.echo(json.dumps(rows, indent=2))
-        return
-    for row in rows:
-        typer.echo(f"{row['status']}: {row['path']}")
-
-
-@harness_app.command("check")
-def check_harness_command(
-    repo_root: Annotated[Path, typer.Argument(file_okay=False)] = Path("."),
-    json_output: Annotated[bool, typer.Option("--json")] = False,
-) -> None:
-    """Validate that a repository has the standard harness scaffold."""
-    report = check_harness(repo_root)
-    if json_output:
-        typer.echo(report.model_dump_json(indent=2))
-    else:
-        typer.echo(f"{'ok' if report.ok else 'fail'}: {report.root}")
-        for finding in report.findings:
-            typer.echo(f"{finding.severity} {finding.path}: {finding.message}")
-    if not report.ok:
         raise typer.Exit(1)
 
 
