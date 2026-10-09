@@ -29,8 +29,8 @@ workflows.
 - `agent_ops.deployment.engine`: complete-plan orchestration across sources, providers, sorted target locks, registry publication, and grouped recovery.
 - `agent_ops.deployment.preview`: selected Git-tracked working-tree data capture for an isolated preview target without a managed fetch or source-store write.
 - `agent_ops.cli`: thin Typer command surface.
-- `AGENTS.md`, `CLAUDE.md`, and `.agentops/harness/`: repo-local agent
-  operating contract and handoff state.
+- `AGENTS.md`, `CLAUDE.md`, and `docs/DECISIONS.md`: repo-local agent
+  operating contract and durable decisions.
 
 ## Deployment Authority And Isolation
 
@@ -65,7 +65,6 @@ The public repository must pass:
 ```bash
 ruff check .
 pytest
-agentops harness check .
 ```
 
 The test suite includes a public-safety scan that rejects private terms and

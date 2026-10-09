@@ -138,7 +138,6 @@ Installed product repositories may use CodeRabbit's built-in automatic and incre
 ```bash
 ruff check .
 pytest
-agentops harness check .
 ```
 
 ## Troubleshooting
@@ -154,14 +153,11 @@ agentops harness check .
 
 The [shared machine guide](docs/shared-machine-skills.md) covers exact source selection, content activation, source inspection, and offline rollback. Harness discovery registration and existing-home migration are separate onboarding responsibilities.
 
-## Agent Harness
+## Agent instructions
 
-This repository carries the standard Agent Ops harness:
+This repository does not carry an Agent Ops harness of its own. GitHub pull requests and the tracker are the handoff. These files guide an agent working here:
 
 - `AGENTS.md`: portable agent entry point.
 - `CLAUDE.md`: Claude Code-specific routing.
 - `ARCHITECTURE.md`: package and workflow architecture.
-- `.agentops/harness/BOOTSTRAP.md`: clock-in and clock-out contract.
-- `.agentops/harness/PROGRESS.md`: active handoff state.
-- `.agentops/harness/DECISIONS.md`: durable local decisions.
-- `.agentops/harness/VERIFY.md`: verification gates.
+- `docs/DECISIONS.md`: durable architecture and workflow decisions.
