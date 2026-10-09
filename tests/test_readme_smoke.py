@@ -14,17 +14,9 @@ def test_readme_quick_start_commands_work(tmp_path: Path) -> None:
     sample_repo = tmp_path / "agentops-example"
     job = Path("examples/local-smoke.yaml")
 
+    sample_repo.mkdir()
+
     commands = [
-        [
-            "harness",
-            "init",
-            str(sample_repo),
-            "--repo-name",
-            "agentops-example",
-            "--repo-type",
-            "python",
-        ],
-        ["harness", "check", str(sample_repo)],
         ["validate", str(job)],
         ["verify", str(job), "--json"],
         ["bootstrap", "codex", "--output-dir", str(tmp_path / "bootstrap")],

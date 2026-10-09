@@ -4,6 +4,13 @@ Repository: `agent-ops-community`
 
 Record durable architecture and workflow decisions here, newest first. Current work and handoff live in GitHub pull requests and the tracker, not in this file.
 
+### 2026-10-09: Remove the repository harness commands
+
+- Decision: delete `agentops harness init` and `agentops harness check` and the `agent_ops.harness` module that rendered and validated `.agentops/harness/`. Invoking either command now fails as an unknown command.
+- Rationale: Dan approved removing the Agent Ops harness from every repository that used it on 2026-10-09 because the tracker added more drag than benefit. Those repositories have removed their harness folders, so a command that scaffolds or requires one has no consumer and would steer agents back to the retired workflow.
+- Applies to: `src/agent_ops/cli.py`, the deleted `src/agent_ops/harness.py` and `tests/test_harness.py`, the README quick start, and architecture documentation. Earlier entries that name the harness remain as history.
+- Revisit when: a new repository handoff design is approved.
+
 ### 2026-08-26: Retire the shared Codex pull-request reviewer
 
 - Decision: Installed product repositories use CodeRabbit's built-in automatic and incremental review flow. Agent Ops Community no longer publishes a label dispatcher, reusable AI review workflow, prompt, or review script.

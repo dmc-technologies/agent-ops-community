@@ -7,7 +7,6 @@ needing access to organization-owned packages.
 
 ## Already Present
 
-- Repository harness templates and checks.
 - Generic job/result contracts.
 - Verification command execution.
 - Runner plugin interface.
