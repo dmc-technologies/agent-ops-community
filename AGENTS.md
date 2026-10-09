@@ -7,20 +7,17 @@ same generic Agent Ops workflow across common agent frameworks while excluding
 only proprietary runner/verifier implementations and organization-owned
 operational workflows.
 
-## Harness
+## Handoff
 
-- Read `.agentops/harness/BOOTSTRAP.md` at session start.
-- Use `.agentops/harness/PROGRESS.md` for active handoff state.
-- Use `.agentops/harness/DECISIONS.md` for durable local decisions.
+- GitHub pull requests and the tracker are the handoff. This repository has no Agent Ops harness, so there is no repository progress file and no clock-in or clock-out step.
+- Record durable architecture and workflow decisions in `docs/DECISIONS.md`.
 - Use shared-memory tooling only for distilled cross-agent memory.
-- When repository instructions declare an integration branch, routine feature pull requests hand off through exact pull-request and tracker evidence; the integration controller owns repository progress and stable-branch landing state.
 - Keep public-facing docs free of proprietary runner names and organization-specific references.
 
 ## Verification
 
 - `ruff check .`
 - `pytest`
-- `agentops harness check .`
 
 ## Stack and migration
 

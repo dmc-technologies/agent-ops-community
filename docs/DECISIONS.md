@@ -2,7 +2,7 @@
 
 Repository: `agent-ops-community`
 
-Record durable architecture, workflow, and harness decisions here.
+Record durable architecture and workflow decisions here, newest first. Current work and handoff live in GitHub pull requests and the tracker, not in this file.
 
 ### 2026-08-26: Retire the shared Codex pull-request reviewer
 

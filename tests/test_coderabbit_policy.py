@@ -22,7 +22,6 @@ def test_retired_review_runtime_is_absent() -> None:
 def test_current_handoff_has_no_retired_review_instruction() -> None:
     current = {
         "README.md": (ROOT / "README.md").read_text(encoding="utf-8"),
-        "PROGRESS.md": (ROOT / ".agentops/harness/PROGRESS.md").read_text(encoding="utf-8"),
     }
     for name, text in current.items():
         assert text.strip(), name

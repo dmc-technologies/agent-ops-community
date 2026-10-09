@@ -4,8 +4,6 @@ from pathlib import Path
 
 from agent_ops.harness import check_harness, init_harness
 
-ROOT = Path(__file__).resolve().parents[1]
-
 
 def test_init_harness_creates_files_that_pass_check(tmp_path: Path) -> None:
     writes = init_harness(
@@ -72,22 +70,6 @@ def test_rendered_harness_preserves_single_branch_progress_ownership(
 
     assert "If no integration branch is declared" in bootstrap_flat
     assert "update `.agentops/harness/PROGRESS.md`" in bootstrap_flat
-
-
-def test_repository_harness_exposes_the_same_branch_role_contract() -> None:
-    """The package's own entry points demonstrate the generated behavior."""
-    bootstrap = " ".join(
-        (ROOT / ".agentops/harness/BOOTSTRAP.md")
-        .read_text(encoding="utf-8")
-        .split()
-    )
-    agents = " ".join((ROOT / "AGENTS.md").read_text(encoding="utf-8").split())
-
-    for guidance in (bootstrap, agents):
-        assert "repository instructions declare an integration branch" in guidance
-        assert "routine feature pull request" in guidance
-        assert "integration controller" in guidance
-        assert "stable-branch landing" in guidance
 
 
 def test_check_harness_rejects_missing_files(tmp_path: Path) -> None:
