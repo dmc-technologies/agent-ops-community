@@ -1,0 +1,14 @@
+# Dependabot opens grouped pull requests for security fixes and no
+# version-update pull requests (a limit of 0 turns version updates off and
+# leaves security updates on).
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
+    groups:
+      security-fixes:
+        applies-to: security-updates
+        patterns: ["*"]
