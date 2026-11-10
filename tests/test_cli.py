@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 from typer.testing import CliRunner
@@ -299,4 +300,4 @@ def test_framework_command_requires_explicit_existing_directory(tmp_path: Path) 
     assert missing_result.exit_code != 0
     assert "Missing option" in missing_result.output
     assert file_result.exit_code != 0
-    assert "Directory" in file_result.output
+    assert "Invalid value for '--cwd'" in re.sub(r"\x1b\[[0-9;]*m", "", file_result.output)
