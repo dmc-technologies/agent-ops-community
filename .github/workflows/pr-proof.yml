@@ -805,11 +805,12 @@ jobs:
                   review_errors = capped_errors(review_errors, labels, rounds, listed)
                   if capped:
                       print(f"CodeRabbit review rounds: {rounds} of {TIER_ROUNDS[tier(labels)]} for '{tier(labels)}'; the cap is reached" + (", and the author's \"What's left\" comment exists." if listed else "."))
-                  if final and not review_errors:
-                      # GitHub keeps CodeRabbit's change request in force after the final approval; dismiss it so the approval is the last step there too.
+                  if (final or (listed and LABEL not in labels)) and not review_errors:
+                      # GitHub keeps CodeRabbit's change request in force after the final approval, or after the "What's left" comment on a routine or moderate pull request; dismiss it so that step is the last one there too.
+                      settled = "an independent person's approval of the head" if final else "the author's \"What's left\" comment after the last review round"
                       for review in coderabbit_change_requests(reviews):
-                          dismissed = subprocess.run(["gh", "api", "-X", "PUT", f"repos/{repo}/pulls/{number}/reviews/{review}/dismissals", "-f", "event=DISMISS", "-f", "message=Settled by an independent person's approval of the head commit."], capture_output=True, text=True)
-                          print(f"Dismissed CodeRabbit's change request {review}: an independent person's approval of the head settles it." if not dismissed.returncode else f"GitHub refused to dismiss CodeRabbit's change request {review}; it still blocks the merge. Next: a person who did not do the work dismisses it on the pull request page")
+                          dismissed = subprocess.run(["gh", "api", "-X", "PUT", f"repos/{repo}/pulls/{number}/reviews/{review}/dismissals", "-f", "event=DISMISS", "-f", f"message=Settled by {settled}."], capture_output=True, text=True)
+                          print(f"Dismissed CodeRabbit's change request {review}: {settled} settles it." if not dismissed.returncode else f"GitHub refused to dismiss CodeRabbit's change request {review}; it still blocks the merge. Next: a person who did not do the work dismisses it on the pull request page")
                   errors += review_errors
               def security_runs():
                   """The head's check runs. On a `critical` pull request past its review rounds, CodeRabbit may never review the head, so the `CodeRabbit Security` runs of the last commit it reviewed stand in when the head has none."""
