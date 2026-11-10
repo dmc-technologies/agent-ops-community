@@ -237,6 +237,23 @@ jobs:
             5. When you mark the pull request ready, run `gh pr merge <n> --auto --merge` as yourself. Without write access, ask someone who has it to turn auto-merge on. GitHub merges it once `CI`, `PR proof`, and `CodeRabbit Security` pass on the head and step 4's approval exists. If GitHub reports that auto-merge is not allowed, ask a repository admin to turn on **Allow auto-merge**. A person may merge any pull request that is green and approved. Agents never merge by hand, and nobody uses `gh pr merge --admin`.
           - PR proof's refusals name each next step. Full guide: https://github.com/dmc-technologies/coderabbit/blob/main/docs/coderabbit-for-dummies.md. The check: https://github.com/dmc-technologies/agent-ops/blob/main/.github/workflows/pr-proof.yml.
           <!-- dmc-review-policy:end -->
+          """, """\
+          <!-- dmc-review-policy:start -->
+          ## Pull requests and review
+
+          This block is the DMC review standard. Every DMC repository carries it at the top of `AGENTS.md`; the shared PR proof check refuses a pull request whose target branch lacks it. The source is https://github.com/dmc-technologies/agent-ops/blob/main/configs/global/review-policy.md; change it there.
+
+          - Open pull requests under the GitHub login this machine is configured with, and never switch to another person's login. DMC-managed machines use the agent account `dmc-agents`; `.github/agent-accounts` lists the agent accounts. Open the pull request as a draft with `Proof: pending`; mark it ready when CI is green and the proof is recorded.
+          - The description starts with `Proof: clip`, `Proof: screenshots`, or `Proof: checks - <why nothing a person runs changed>`, then the headings What problem this solves, User impact, Why this change was made, Evidence, and Excluded. Evidence holds the exact commands with their results and exit status. Write no `Criticality:` line. Set a body with `gh api -X PATCH repos/<owner>/<repo>/pulls/<n> -F body=@file`.
+          - CodeRabbit applies one tier label: `routine`, `moderate`, or `critical`. Never add or remove a tier label. A person may add `critical`. A change under `.github/workflows/` or of more than 40 files is critical whatever the label says.
+          - Every pull request follows five steps:
+            1. CodeRabbit reviews when the pull request leaves draft, and again only when you post `@coderabbitai review`. Fix only Critical and Major findings, each with a failing test first; Minor and Trivial findings are optional. Batch the fixes, reply on each thread, and never request a review after every push. Review rounds follow the tier label: `routine` gets one review, one batch of fixes, and one confirming review only when PR proof needs the head reviewed; `moderate` and `critical` get one review, one batch of fixes, and one confirming review. Findings on code that fixed an earlier finding count toward the same rounds. After the last round, change no code except for a security or correctness defect that a failing test or a concrete reproduction demonstrates, and list anything left in one pull request comment whose first line starts with `What's left`. The source is the Current standard in https://github.com/dmc-technologies/coderabbit/blob/main/README.md. Never resolve a CodeRabbit thread yourself. CodeRabbit closes what it verifies; it approves a low-risk pull request itself.
+            2. CI is green on the head commit.
+            3. For a `critical` pull request, stop after the second round. Give each point in the `What's left` comment a reason. PR proof then requests the review once, from the `dmc-developers` team, when that approval is the only thing left. The author then changes nothing. That approval settles the leftovers, except an open `CodeRabbit Security` finding, which blocks on every tier.
+            4. An approval of the head from a person who did not do the work is final: not the author, not a commit author, and not an agent account. Anyone may add another reviewer. For `routine` and `moderate`, CodeRabbit's approval is the approval.
+            5. When you mark the pull request ready, run `gh pr merge <n> --auto --merge` as yourself. Without write access, ask someone who has it to turn auto-merge on. GitHub merges it once `CI`, `PR proof`, and `CodeRabbit Security` pass on the head and step 4's approval exists. If GitHub reports that auto-merge is not allowed, ask a repository admin to turn on **Allow auto-merge**. A person may merge any pull request that is green and approved. Agents never merge by hand, and nobody uses `gh pr merge --admin`.
+          - PR proof's refusals name each next step. Full guide: https://github.com/dmc-technologies/coderabbit/blob/main/docs/coderabbit-for-dummies.md. The check: https://github.com/dmc-technologies/agent-ops/blob/main/.github/workflows/pr-proof.yml.
+          <!-- dmc-review-policy:end -->
           """)
 
           POLICY = """\
@@ -254,6 +271,7 @@ jobs:
             3. For a `critical` pull request, stop after the second round. Give each point in the `What's left` comment a reason. PR proof then requests the review once, from the `dmc-developers` team, when that approval is the only thing left. The author then changes nothing. That approval settles the leftovers, except an open `CodeRabbit Security` finding, which blocks on every tier.
             4. An approval of the head from a person who did not do the work is final: not the author, not a commit author, and not an agent account. Anyone may add another reviewer. For `routine` and `moderate`, CodeRabbit's approval is the approval.
             5. When you mark the pull request ready, run `gh pr merge <n> --auto --merge` as yourself. Without write access, ask someone who has it to turn auto-merge on. GitHub merges it once `CI`, `PR proof`, and `CodeRabbit Security` pass on the head and step 4's approval exists. If GitHub reports that auto-merge is not allowed, ask a repository admin to turn on **Allow auto-merge**. A person may merge any pull request that is green and approved. Agents never merge by hand, and nobody uses `gh pr merge --admin`.
+          - Hand a pull request to a person only when GitHub shows a pending review request to an eligible person or team, or an approval of the head from a person who did not do the work. Before you say that only an approval remains, read back `gh api repos/<owner>/<repo>/pulls/<n>/requested_reviewers` and the reviews on the head commit. PR proof makes the request itself where it runs. Where it cannot, in a public repository or in the pull request that first adds PR proof to a repository, the pull request author owns the request: request a person who did not do the work, confirm the request is listed, and keep auto-merge off until that approval is on the head. Never say an approval lands a pull request while its auto-merge is off.
           - PR proof's refusals name each next step. Full guide: https://github.com/dmc-technologies/coderabbit/blob/main/docs/coderabbit-for-dummies.md. The check: https://github.com/dmc-technologies/agent-ops/blob/main/.github/workflows/pr-proof.yml.
           <!-- dmc-review-policy:end -->
           """
@@ -385,6 +403,9 @@ jobs:
               unchanged = "Change nothing on this pull request: no push, description edit, or label"
               if not others and state == "requested":
                   step = f"Next: PR proof requested the review from the {REVIEW_TEAM} team for this head; any member who did not do the work may approve. {unchanged}"
+              elif not others and state == "unconfirmed":
+                  step = (f"Not ready for approval: PR proof could not confirm a pending review request, and no person who did not do the work has approved this head. Next: the pull request author owns the review request. "
+                          f"Request a person who did not do the work, or run `{command}`, then read back `gh api repos/{repo}/pulls/{number}/requested_reviewers` and confirm the login or team is listed. {unchanged} after that")
               elif not others and state == "asked":
                   step = f"Next: the review is already requested for this head. {unchanged}. Do not request it again"
               elif not others and state == "draft":
@@ -419,8 +440,8 @@ jobs:
                   states.append("waiting" if not found or found[-1].get("status") != "completed" else "passed")
               if "waiting" in states:
                   return "waiting"
+              # Only a pending request counts: GitHub drops a person's request once they review, so a review that only comments leaves the pull request with nobody asked.
               asked = {login for login in requested if login == REVIEW_TEAM or independent(login, workers, agents)}
-              asked |= {login for review in reviews if review.get("commit_id") == head and independent(login := (review.get("user") or {}).get("login"), workers, agents)}
               return "asked" if asked else "request"
 
 
@@ -846,10 +867,12 @@ jobs:
                           state = "superseded"
                       if state == "request":
                           asked = subprocess.run(["gh", "api", "-X", "POST", f"repos/{repo}/pulls/{number}/requested_reviewers", "-f", f"team_reviewers[]={REVIEW_TEAM}"], capture_output=True, text=True, env={**os.environ, **({"GH_TOKEN": os.environ["REVIEW_TOKEN"]} if os.environ.get("REVIEW_TOKEN") else {})})
+                          reply = json.loads(asked.stdout or "{}")
                           if asked.returncode:
-                              reason = json.loads(asked.stdout or "{}").get("message", "")
-                              print(f"GitHub refused PR proof's request for the {REVIEW_TEAM} team: {asked.stderr.strip()} {reason}".rstrip())
-                          state = None if asked.returncode else "requested"
+                              print(f"GitHub refused PR proof's request for the {REVIEW_TEAM} team: {asked.stderr.strip()} {reply.get('message', '')}".rstrip())
+                          # GitHub's reply lists the pending requests; a request it accepted without listing the team did not take.
+                          taken = not asked.returncode and any(team.get("slug") == REVIEW_TEAM for team in reply.get("requested_teams") or [])
+                          state = "requested" if taken else "unconfirmed"
                   errors = last_step(errors, repo, number, state, os.environ.get("RUN_ID"))
               others = [error for error in errors if not error.startswith(APPROVAL_REFUSAL)]
               if errors and (pull.get("head") or {}).get("sha", head) == head and not pull.get("draft"):
@@ -951,7 +974,8 @@ jobs:
               current = (api_json(f"repos/{repo}/pulls/{number}").get("head") or {}).get("sha") or ""
               runs = api_json(f"repos/{repo}/commits/{parent}/check-runs?check_name=PR%20proof%20%2F%20proof&per_page=100").get("check_runs") or []
               own = [run for run in runs if any(item.get("number") == number for item in run.get("pull_requests") or [])]
-              latest = max(own, key=lambda run: run.get("started_at") or "", default={})
+              # GitHub numbers check runs in creation order; a queued run has no start time, and overlapping runs start out of order.
+              latest = max(own, key=lambda run: run.get("id") or 0, default={})
               errors = []
               if runs and not own and all(not run.get("pull_requests") for run in runs):
                   # GitHub lists no pull request on a run from a fork branch, so the run cannot be bound to the queued pull request.
