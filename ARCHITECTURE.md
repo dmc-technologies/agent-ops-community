@@ -6,7 +6,9 @@ Agent Ops Community owns the general-purpose Agent Ops experience: job
 contracts, context handoff, framework bootstrap, common framework command
 handoff, verification helpers, and plugin interfaces. It does not own
 proprietary runner/verifier implementations or organization-specific operational
-workflows.
+workflows. One exception covers repository CI only: `.github/workflows/pr-proof.yml`
+hosts the DMC PR proof workflow for public repositories, as recorded in
+`docs/DECISIONS.md` (2026-11-10).
 
 ## Runtime And Tooling
 
