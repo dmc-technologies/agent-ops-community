@@ -4,6 +4,13 @@ Repository: `agent-ops-community`
 
 Record durable architecture and workflow decisions here, newest first. Current work and handoff live in GitHub pull requests and the tracker, not in this file.
 
+### 2026-11-10: This repository hosts the shared PR proof workflow for public repositories
+
+- Decision: `.github/workflows/pr-proof.yml` here is a byte-for-byte copy of the PR proof workflow at the organization's private Agent Ops repository `main`, and the organization's public repositories call it at `main`. This repository's own caller is `.github/workflows/pr-proof-caller.yml`. The copy is repository CI configuration, not part of the Agent Ops Community product: no package, command, or plugin interface depends on it, and changes to it are made in agent-ops first and copied here unchanged.
+- Rationale: GitHub lets only private repositories call a private repository's workflow, so PR proof could not run in this repository or the organization's public `.github` repository. Dan, 2026-11-10: "gobslack-relay, llm-ops, .github, and the two community repos need controls. I do want standardization." The private Agent Ops repository records the same choice as its 2026-11-10 decision.
+- Boundary: the Public Core Boundary in `ARCHITECTURE.md` still holds for the product. This entry is the one exception it allows for organization CI, limited to the PR proof workflow and its caller.
+- Applies to: `.github/workflows/pr-proof.yml` and `.github/workflows/pr-proof-caller.yml`.
+
 ### 2026-10-09: Remove the repository harness commands
 
 - Decision: delete `agentops harness init` and `agentops harness check` and the `agent_ops.harness` module that rendered and validated `.agentops/harness/`. Invoking either command now fails as an unknown command.

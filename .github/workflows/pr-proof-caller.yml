@@ -1,0 +1,28 @@
+# Starts the shared PR proof check, and starts it again when a pull request's
+# description, labels, or reviews change. Every DMC repository carries this file
+# byte for byte; the check refuses a pull request whose copy differs. Outside
+# agent-ops the copy lives at .github/workflows/pr-proof.yml.
+name: PR proof
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened, ready_for_review, labeled, unlabeled]
+  pull_request_review:
+    types: [submitted, dismissed]
+  merge_group:
+    types: [checks_requested]
+
+permissions:
+  actions: write
+  checks: read
+  contents: read
+  pull-requests: write
+
+
+jobs:
+  pr-proof:
+    name: PR proof
+    uses: dmc-technologies/agent-ops-community/.github/workflows/pr-proof.yml@main
+    secrets:
+      PR_PROOF_APP_ID: ${{ secrets.PR_PROOF_APP_ID }}
+      PR_PROOF_APP_KEY: ${{ secrets.PR_PROOF_APP_KEY }}
