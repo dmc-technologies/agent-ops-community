@@ -1,0 +1,5 @@
+# These entries require a review from @dan-s-mueller or @nicdavidson-dmc
+# only if the repository ruleset already requires code-owner review.
+# This change does not alter branch protection, rulesets, or required checks.
+ARCHITECTURE.md @dan-s-mueller @nicdavidson-dmc
+docs/DECISIONS.md @dan-s-mueller @nicdavidson-dmc
