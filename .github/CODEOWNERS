@@ -3,3 +3,4 @@
 # This change does not alter branch protection, rulesets, or required checks.
 ARCHITECTURE.md @dan-s-mueller @nicdavidson-dmc
 docs/DECISIONS.md @dan-s-mueller @nicdavidson-dmc
+docs/architecture/adr/ @dan-s-mueller @nicdavidson-dmc
