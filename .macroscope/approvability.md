@@ -1,5 +1,5 @@
 ---
-preview: true
+preview: false
 neverApprove:
   - "AGENTS.md"
   - "DECISIONS.md"
@@ -32,5 +32,5 @@ type-checker, LSP, or other static-analysis diagnostic is not auto-approvable an
 human review. This includes file-level, line-level, and configuration-level overrides.
 This includes noqa, type: ignore, eslint-disable, and similar suppressions.
 
-This file is inert until Dan approves a Macroscope install. preview: true must stay on;
-CTO will flip it when Dan answers go-live. Do not install the app.
+This file is live (preview: false) per CTO 2026-11-14 11:41 AM PT relaying Dan via Radar
+("Go live, T3 style"), under t702u.
