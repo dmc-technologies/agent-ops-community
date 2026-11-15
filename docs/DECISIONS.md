@@ -4,6 +4,14 @@ Repository: `agent-ops-community`
 
 Record durable architecture and workflow decisions here, newest first. Current work and handoff live in GitHub pull requests and the tracker, not in this file.
 
+### 2026-11-13: Named owners for the architecture rulebook
+
+- Decision: `ARCHITECTURE.md`, `docs/DECISIONS.md`, and `docs/architecture/adr/` are owned by `@dan-s-mueller` and `@nicdavidson-dmc`. The exact `.github/CODEOWNERS` rules are `ARCHITECTURE.md @dan-s-mueller @nicdavidson-dmc`, `docs/DECISIONS.md @dan-s-mueller @nicdavidson-dmc`, and `docs/architecture/adr/ @dan-s-mueller @nicdavidson-dmc`. Those rules require a review from one of those owners only if the repository ruleset already requires code-owner review. This pull request does not change branch protection, rulesets, or required checks, and it does not itself enable require-code-owner review.
+- Rationale: Architecture rulebook files need named owners so that, after a person enables require-code-owner review, a change to those files requests a review from one of the named owners. The three paths above are the architecture rulebook files that exist in this repository. This assignment does not replace the review path or the requirement that a person's approval of a critical head is a separate last step.
+- Applies to: `.github/CODEOWNERS`, `ARCHITECTURE.md`, `docs/DECISIONS.md`, and `docs/architecture/adr/`.
+- Revisit when: require-code-owner review is enabled, or the owned paths change.
+- Approved by: Dan Mueller Date: 2026-11-13 8:28 PM PT (👍 on t560s1913, exact text sha256 b61cffa0)
+
 ### 2026-11-10: This repository hosts the shared PR proof workflow for public repositories
 
 - Decision: `.github/workflows/pr-proof.yml` here is a byte-for-byte copy of the PR proof workflow at the organization's private Agent Ops repository `main`, and the organization's public repositories call it at `main`. This repository's own caller is `.github/workflows/pr-proof-caller.yml`. The copy is repository CI configuration, not part of the Agent Ops Community product: no package, command, or plugin interface depends on it, and changes to it are made in agent-ops first and copied here unchanged.
