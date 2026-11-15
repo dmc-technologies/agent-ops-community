@@ -7,7 +7,7 @@ Record durable architecture and workflow decisions here, newest first. Current w
 ### 2026-11-15: This repository no longer hosts the PR proof workflow
 
 - Decision: `.github/workflows/pr-proof.yml` and `.github/workflows/pr-proof-caller.yml` are removed (agent-ops-community#73). The Public Core Boundary in `ARCHITECTURE.md` holds with no CI exception. `.github/person-facing` is retired with the proof-image requirement.
-- Rationale: PR proof is retired across the organization (ENG-111), and Dan dropped the person-facing proof-image requirement on 2026-11-15, 7:49 AM PT, relayed by CTO: "Yes to 1, 2 and 3" (Dan Mueller, review Page answer, 2026-11-15 12:52 PM PT, t1030u). Authority for the rulebook change: Dan t931u.
+- Rationale: PR proof is retired across the organization (ENG-111), and Dan dropped the person-facing proof-image requirement on 2026-11-15, 7:49 AM PT, relayed by CTO: Dan's 👍 reaction (no words) on t953s3135, 2026-11-15 7:49 AM PT. Authority for the rulebook change: Dan t931u.
 - Supersedes: the 2026-11-10 entry "This repository hosts the shared PR proof workflow for public repositories".
 - Applies to: `ARCHITECTURE.md` and `.github/person-facing`.
 - Approved by: "Yes to 1, 2 and 3" (Dan Mueller, review Page answer, 2026-11-15 12:52 PM PT, t1030u)
