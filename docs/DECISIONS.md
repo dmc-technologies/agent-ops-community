@@ -4,6 +4,14 @@ Repository: `agent-ops-community`
 
 Record durable architecture and workflow decisions here, newest first. Current work and handoff live in GitHub pull requests and the tracker, not in this file.
 
+### 2026-11-15: This repository no longer hosts the PR proof workflow
+
+- Decision: `.github/workflows/pr-proof.yml` and `.github/workflows/pr-proof-caller.yml` are removed (agent-ops-community#73). The Public Core Boundary in `ARCHITECTURE.md` holds with no CI exception. `.github/person-facing` is retired with the proof-image requirement.
+- Rationale: PR proof is retired across the organization (ENG-111), and Dan dropped the person-facing proof-image requirement on 2026-11-15, 7:49 AM PT, relayed by CTO: `[Dan's exact words, message id]`. Authority for the rulebook change: Dan t931u.
+- Supersedes: the 2026-11-10 entry "This repository hosts the shared PR proof workflow for public repositories".
+- Applies to: `ARCHITECTURE.md` and `.github/person-facing`.
+- Approved by: `[Dan's exact words, message id]`
+
 ### 2026-11-10: This repository hosts the shared PR proof workflow for public repositories
 
 - Decision: `.github/workflows/pr-proof.yml` here is a byte-for-byte copy of the PR proof workflow at the organization's private Agent Ops repository `main`, and the organization's public repositories call it at `main`. This repository's own caller is `.github/workflows/pr-proof-caller.yml`. The copy is repository CI configuration, not part of the Agent Ops Community product: no package, command, or plugin interface depends on it, and changes to it are made in agent-ops first and copied here unchanged.
