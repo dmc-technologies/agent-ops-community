@@ -91,7 +91,7 @@ jobs:
 
           HEADINGS = ("What problem this solves", "User impact", "Why this change was made", "Evidence", "Excluded")
           ATTACHMENT = r"https://github\.com/user-attachments/assets/[0-9A-Za-z-]+"
-          EXEMPT_AUTHORS = ("dependabot[bot]", "renovate[bot]")
+          EXEMPT_AUTHORS = ("dependabot[bot]", "renovate[bot]", "dmc-review-sync[bot]")
           PATHS_FILE = ".github/person-facing"
           LABEL = "critical"
           APPROVAL_REFUSAL = f"a '{LABEL}' pull request needs an approving review"
@@ -110,10 +110,51 @@ jobs:
           # The author's one comment that lists what CodeRabbit left open once the rounds are used up.
           LEFTOVER = re.compile(r"^\W*what's left", re.I)
           CODERABBIT = "coderabbitai[bot]"
+          # Speed mode (Dan, 2026-11-14 11:42 AM PT, t702u): below `critical`, Macroscope's approval of the head, with its Approved verdict on that head, is the review.
+          MACROSCOPE = "macroscopeapp[bot]"
+          MACROSCOPE_APP = 900172
+          APPROVABILITY = "Macroscope - Approvability Check"
+          REVIEW_REFUSAL = "this pull request needs an approving review of its head commit"
           AGENTS_MD = "AGENTS.md"
           POLICY_SOURCE = "dmc-technologies/agent-ops/configs/global/review-policy.md"
           # Earlier review policy blocks, accepted until each AGENTS.md carries POLICY.
           POLICY_EARLIER = ("""\
+          <!-- dmc-review-policy:start -->
+          ## Pull requests and review
+
+          This block is the DMC review standard. Every DMC repository carries it at the top of `AGENTS.md`; the shared PR proof check refuses a pull request whose target branch lacks it. The source is https://github.com/dmc-technologies/agent-ops/blob/main/configs/global/review-policy.md; change it there.
+
+          - Open pull requests under the GitHub login this machine is configured with, and never switch to another person's login. DMC-managed machines use the agent account `dmc-agents`; `.github/agent-accounts` lists the agent accounts. Open the pull request as a draft with `Proof: pending`; mark it ready when CI is green and the proof is recorded.
+          - The description starts with `Proof: clip`, `Proof: screenshots`, or `Proof: checks - <why nothing a person runs changed>`, then the headings What problem this solves, User impact, Why this change was made, Evidence, and Excluded. Evidence holds the exact commands with their results and exit status. Write no `Criticality:` line. Set a body with `gh api -X PATCH repos/<owner>/<repo>/pulls/<n> -F body=@file`.
+          - CodeRabbit applies one tier label: `routine`, `moderate`, or `critical`. Never add or remove a tier label. A person may add `critical`. A change under `.github/workflows/` or of more than 40 files is critical whatever the label says.
+          - Every pull request follows five steps:
+            1. CodeRabbit reviews when the pull request leaves draft, and again only when you post `@coderabbitai review`. Fix only Critical and Major findings, each with a failing test first; Minor and Trivial findings are optional. Batch the fixes, reply on each thread, and never request a review after every push. Review rounds follow the tier label: `routine` gets one review, one batch of fixes, and one confirming review only when PR proof needs the head reviewed; `moderate` and `critical` get one review, one batch of fixes, and one confirming review. Findings on code that fixed an earlier finding count toward the same rounds. After the last round, change no code except for a security or correctness defect that a failing test or a concrete reproduction demonstrates, and list anything left in one pull request comment whose first line starts with `What's left`. The source is the Current standard in https://github.com/dmc-technologies/coderabbit/blob/main/README.md. Never resolve a CodeRabbit thread yourself. CodeRabbit closes what it verifies; it approves a low-risk pull request itself.
+            2. CI is green on the head commit.
+            3. For a `critical` pull request, stop after the second round. Give each point in the `What's left` comment a reason. PR proof then requests the review once, from the `dmc-developers` team, when that approval is the only thing left. The author then changes nothing. That approval settles the leftovers, except an open `CodeRabbit Security` finding, which blocks on every tier.
+            4. An approval of the head from a person who did not do the work is final: not the author, not a commit author, and not an agent account. Anyone may add another reviewer. For `routine` and `moderate`, CodeRabbit's approval is the approval.
+            5. Once the readiness readback for the current head passes — the pull request is not a draft, it has no merge conflicts, required checks are green, and the description has the pr-proof line where the repository uses PR proof — the agent that opened or last pushed the pull request turns on auto-merge as `dmc-agents` with `gh pr merge <n> --auto --merge --match-head-commit <headSha>`. Re-check after every push and turn it on again if it is off. Required checks are green when every required check other than `PR proof` has passed, and `PR proof` has either passed or failed only on the person-approval requirement. A missing approval from Dan (`dan-s-mueller`) does not keep auto-merge off; GitHub's required review is the final gate. Never turn auto-merge on for a draft, a pull request in an archived repository, a pull request with merge conflicts or failing required checks, business-ops#11 or momentum-utilities#24, or an openclaw-setup pull request that needs a host deploy step before it can merge, until that step is done. Without write access, ask someone who has it to turn auto-merge on. GitHub merges it once `CI`, `PR proof`, and `CodeRabbit Security` pass on the head and step 4's approval exists. If GitHub reports that auto-merge is not allowed, ask a repository admin to turn on **Allow auto-merge**. A person may merge any pull request that is green and approved. Agents never merge by hand, never use a plain `gh pr merge` without `--auto`, and nobody uses `gh pr merge --admin`. Never resolve or dismiss a CodeRabbit thread or review. agent-knowledge itself is the exception: agents commit directly to main as dmc-agents, with no pull request and no auto-merge. Every other repository follows this auto-merge flow.
+          - Hand a pull request to a person only when GitHub shows a pending review request to an eligible person or team, or an approval of the head from a person who did not do the work. Before you say that only an approval remains, read back `gh api repos/<owner>/<repo>/pulls/<n>/requested_reviewers` and the reviews on the head commit. PR proof makes the request itself where it runs. Where it cannot, in a public repository or in the pull request that first adds PR proof to a repository, the pull request author owns the request: request a person who did not do the work, confirm the request is listed, and keep auto-merge off until that approval is on the head. Never say an approval lands a pull request while its auto-merge is off.
+          - PR proof's refusals name each next step. Full guide: https://github.com/dmc-technologies/coderabbit/blob/main/docs/coderabbit-for-dummies.md. The check: https://github.com/dmc-technologies/agent-ops/blob/main/.github/workflows/pr-proof.yml.
+          <!-- dmc-review-policy:end -->
+          """, """\
+          <!-- dmc-review-policy:start -->
+          ## Pull requests and review
+
+          This block is the DMC review standard. Every DMC repository carries it at the top of `AGENTS.md`; the shared PR proof check refuses a pull request whose target branch lacks it. The source is https://github.com/dmc-technologies/agent-ops/blob/main/configs/global/review-policy.md; change it there.
+
+          - Open pull requests under the GitHub login this machine is configured with, and never switch to another person's login. DMC-managed machines use the agent account `dmc-agents`; `.github/agent-accounts` lists the agent accounts. Open the pull request as a draft with `Proof: pending`; mark it ready when CI is green and the proof is recorded.
+          - The description starts with `Proof: clip`, `Proof: screenshots`, or `Proof: checks - <why nothing a person runs changed>`, then the headings What problem this solves, User impact, Why this change was made, Evidence, and Excluded. Evidence holds the exact commands with their results and exit status. Write no `Criticality:` line. Set a body with `gh api -X PATCH repos/<owner>/<repo>/pulls/<n> -F body=@file`.
+          - CodeRabbit applies one tier label: `routine`, `moderate`, or `critical`. Never add or remove a tier label. A person may add `critical`. A change under `.github/workflows/` or of more than 40 files is critical whatever the label says.
+          - Every pull request follows five steps:
+            1. CodeRabbit reviews when the pull request leaves draft, and again only when you post `@coderabbitai review`. Fix only Critical and Major findings, each with a failing test first; Minor and Trivial findings are optional. Batch the fixes, reply on each thread, and never request a review after every push. Review rounds follow the tier label: `routine` gets one review, one batch of fixes, and one confirming review only when PR proof needs the head reviewed; `moderate` and `critical` get one review, one batch of fixes, and one confirming review. Findings on code that fixed an earlier finding count toward the same rounds. After the last round, change no code except for a security or correctness defect that a failing test or a concrete reproduction demonstrates, and list anything left in one pull request comment whose first line starts with `What's left`. The source is the Current standard in https://github.com/dmc-technologies/coderabbit/blob/main/README.md. Never resolve a CodeRabbit thread yourself. CodeRabbit closes what it verifies; it approves a low-risk pull request itself.
+            2. CI is green on the head commit.
+            3. For a `critical` pull request, stop after the second round. Give each point in the `What's left` comment a reason. PR proof then requests the review once, from the `dmc-developers` team, when that approval is the only thing left. The author then changes nothing. That approval settles the leftovers, except an open `CodeRabbit Security` finding, which blocks on every tier.
+            4. An approval of the head from a person who did not do the work is final: not the author, not a commit author, and not an agent account. Anyone may add another reviewer. For `routine` and `moderate`, CodeRabbit's approval is the approval.
+            5. When you mark the pull request ready, run `gh pr merge <n> --auto --merge` as yourself. Without write access, ask someone who has it to turn auto-merge on. GitHub merges it once `CI`, `PR proof`, and `CodeRabbit Security` pass on the head and step 4's approval exists. If GitHub reports that auto-merge is not allowed, ask a repository admin to turn on **Allow auto-merge**. A person may merge any pull request that is green and approved. Agents never merge by hand, and nobody uses `gh pr merge --admin`.
+          - Hand a pull request to a person only when GitHub shows a pending review request to an eligible person or team, or an approval of the head from a person who did not do the work. Before you say that only an approval remains, read back `gh api repos/<owner>/<repo>/pulls/<n>/requested_reviewers` and the reviews on the head commit. PR proof makes the request itself where it runs. Where it cannot, in a public repository or in the pull request that first adds PR proof to a repository, the pull request author owns the request: request a person who did not do the work, confirm the request is listed, and keep auto-merge off until that approval is on the head. Never say an approval lands a pull request while its auto-merge is off.
+          - PR proof's refusals name each next step. Full guide: https://github.com/dmc-technologies/coderabbit/blob/main/docs/coderabbit-for-dummies.md. The check: https://github.com/dmc-technologies/agent-ops/blob/main/.github/workflows/pr-proof.yml.
+          <!-- dmc-review-policy:end -->
+          """, """\
           <!-- dmc-review-policy:start -->
           ## Pull requests and review
 
@@ -254,9 +295,7 @@ jobs:
             5. When you mark the pull request ready, run `gh pr merge <n> --auto --merge` as yourself. Without write access, ask someone who has it to turn auto-merge on. GitHub merges it once `CI`, `PR proof`, and `CodeRabbit Security` pass on the head and step 4's approval exists. If GitHub reports that auto-merge is not allowed, ask a repository admin to turn on **Allow auto-merge**. A person may merge any pull request that is green and approved. Agents never merge by hand, and nobody uses `gh pr merge --admin`.
           - PR proof's refusals name each next step. Full guide: https://github.com/dmc-technologies/coderabbit/blob/main/docs/coderabbit-for-dummies.md. The check: https://github.com/dmc-technologies/agent-ops/blob/main/.github/workflows/pr-proof.yml.
           <!-- dmc-review-policy:end -->
-          """)
-
-          POLICY = """\
+          """, """\
           <!-- dmc-review-policy:start -->
           ## Pull requests and review
 
@@ -270,12 +309,112 @@ jobs:
             2. CI is green on the head commit.
             3. For a `critical` pull request, stop after the second round. Give each point in the `What's left` comment a reason. PR proof then requests the review once, from the `dmc-developers` team, when that approval is the only thing left. The author then changes nothing. That approval settles the leftovers, except an open `CodeRabbit Security` finding, which blocks on every tier.
             4. An approval of the head from a person who did not do the work is final: not the author, not a commit author, and not an agent account. Anyone may add another reviewer. For `routine` and `moderate`, CodeRabbit's approval is the approval.
+            5. Once the readiness readback for the current head passes — the pull request is not a draft, it has no merge conflicts, required checks are green, and the description has the pr-proof line where the repository uses PR proof — the agent that opened or last pushed the pull request turns on auto-merge as `dmc-agents` with `gh pr merge <n> --auto --merge --match-head-commit <headSha>`. Re-check after every push and turn it on again if it is off. Required checks are green when every required check other than `PR proof` has passed. Where PR proof runs, `PR proof` has also either passed or failed only on the person-approval requirement. A missing approval from Dan (`dan-s-mueller`) does not keep auto-merge off; GitHub's required review is the final gate. Where PR proof cannot run, in a public repository or in the pull request that first adds PR proof to a repository, keep auto-merge off until a person's approval is on the head. There the readback's `PR proof` clause does not apply, and a person's approval on the head replaces it. Before you push to such a pull request, turn auto-merge off with `gh pr merge <n> --disable-auto` as dmc-agents, and turn it on again only after a person's approval is on the new head. Never turn auto-merge on for a draft, a pull request in an archived repository, a pull request with merge conflicts or failing required checks, business-ops#11 or momentum-utilities#24, or an openclaw-setup pull request that needs a host deploy step before it can merge, until that step is done. While a pre-merge host step is pending, turn auto-merge off with `gh pr merge <n> --disable-auto` as dmc-agents, and tell CTO. Once that step is done, turn auto-merge on again through the readiness readback. Without write access, ask someone who has it to turn auto-merge on. GitHub merges it once `CI`, `PR proof`, and `CodeRabbit Security` pass on the head and step 4's approval exists. If GitHub reports that auto-merge is not allowed, ask a repository admin to turn on **Allow auto-merge**. A person may merge any pull request that is green and approved. Agents never merge by hand, never use a plain `gh pr merge` without `--auto`, and nobody uses `gh pr merge --admin`. Never resolve or dismiss a CodeRabbit thread or review. agent-knowledge itself is the exception: agents commit directly to main as dmc-agents, with no pull request and no auto-merge. Every other repository follows this auto-merge flow.
+          - Hand a pull request to a person only when GitHub shows a pending review request to an eligible person or team, or an approval of the head from a person who did not do the work. Before you say that only an approval remains, read back `gh api repos/<owner>/<repo>/pulls/<n>/requested_reviewers` and the reviews on the head commit. PR proof makes the request itself where it runs. Where it cannot, in a public repository or in the pull request that first adds PR proof to a repository, the pull request author owns the request: request a person who did not do the work, confirm the request is listed, and keep auto-merge off until that approval is on the head. Never say an approval lands a pull request while its auto-merge is off.
+          - PR proof's refusals name each next step. Full guide: https://github.com/dmc-technologies/coderabbit/blob/main/docs/coderabbit-for-dummies.md. The check: https://github.com/dmc-technologies/agent-ops/blob/main/.github/workflows/pr-proof.yml.
+          <!-- dmc-review-policy:end -->
+          """,
+          # ENG-106 merged copies (Dan t900s2951), accepted until the sync
+          """\
+          <!-- dmc-review-policy:start -->
+          ## Pull requests and review
+
+          This block is the DMC review standard. Every DMC repository carries it at the top of `AGENTS.md`; the shared PR proof check refuses a pull request whose target branch lacks it. The source is https://github.com/dmc-technologies/agent-ops/blob/main/configs/global/review-policy.md; change it there.
+
+          - Open pull requests under the GitHub login this machine is configured with, and never switch to another person's login. DMC-managed machines use the agent account `dmc-agents`; `.github/agent-accounts` lists the agent accounts. Open the pull request as a draft with `Proof: pending`; mark it ready when CI is green and the proof is recorded.
+          - The description starts with `Proof: clip`, `Proof: screenshots`, or `Proof: checks - <why nothing a person runs changed>`, then the headings What problem this solves, User impact, Why this change was made, Evidence, and Excluded. Evidence holds the exact commands with their results and exit status. Write no `Criticality:` line. Set a body with `gh api -X PATCH repos/<owner>/<repo>/pulls/<n> -F body=@file`.
+          - CodeRabbit applies one tier label: `routine`, `moderate`, or `critical`. Never add or remove a tier label. A person may add `critical`. A change under `.github/workflows/` or of more than 40 files is critical whatever the label says.
+          - Every pull request follows five steps:
+            1. CodeRabbit reviews when the pull request leaves draft, and again only when you post `@coderabbitai review`. Fix only Critical and Major findings, each with a failing test first; Minor and Trivial findings are optional. Batch the fixes, reply on each thread, and never request a review after every push. Review rounds follow the tier label: `routine` gets one review, one batch of fixes, and one confirming review only when PR proof needs the head reviewed; `moderate` and `critical` get one review, one batch of fixes, and one confirming review. Findings on code that fixed an earlier finding count toward the same rounds. After the last round, change no code except for a security or correctness defect that a failing test or a concrete reproduction demonstrates, and list anything left in one pull request comment whose first line starts with `What's left`. The source is the Current standard in https://github.com/dmc-technologies/coderabbit/blob/main/README.md. Never resolve a CodeRabbit thread yourself. CodeRabbit closes what it verifies; it approves a low-risk pull request itself.
+            2. CI is green on the head commit.
+            3. For a `critical` pull request, stop after the second round. Give each point in the `What's left` comment a reason. PR proof then requests the review once, from the `dmc-developers` team, when that approval is the only thing left. The author then changes nothing. That approval settles the leftovers, except an open `CodeRabbit Security` finding, which blocks on every tier.
+            4. An approval of the head from a person who did not do the work is final: not the author, not a commit author, and not an agent account. Anyone may add another reviewer. Merge gates are native GitHub only: required approvals (Macroscope may supply the approval on low-risk PRs), conversation resolution, the DMC Mech Eng App check, and critical-path team review. No custom AI status, label, or extra AI gate is part of the merge process.
+            5. Once the readiness readback for the current head passes — the pull request is not a draft, it has no merge conflicts, required checks are green, and the description has the pr-proof line where the repository uses PR proof — the agent that opened or last pushed the pull request turns on auto-merge as `dmc-agents` with `gh pr merge <n> --auto --merge --match-head-commit <headSha>`. Re-check after every push and turn it on again if it is off. Required checks are green when every required check other than `PR proof` has passed. Where PR proof runs, `PR proof` has also either passed or failed only on the person-approval requirement. A missing approval from Dan (`dan-s-mueller`) does not keep auto-merge off; GitHub's required review is the final gate. Where PR proof cannot run, in a public repository or in the pull request that first adds PR proof to a repository, keep auto-merge off until a person's approval is on the head. There the readback's `PR proof` clause does not apply, and a person's approval on the head replaces it. Before you push to such a pull request, turn auto-merge off with `gh pr merge <n> --disable-auto` as dmc-agents, and turn it on again only after a person's approval is on the new head. Never turn auto-merge on for a draft, a pull request in an archived repository, a pull request with merge conflicts or failing required checks, business-ops#11 or momentum-utilities#24, or an openclaw-setup pull request that needs a host deploy step before it can merge, until that step is done. While a pre-merge host step is pending, turn auto-merge off with `gh pr merge <n> --disable-auto` as dmc-agents, and tell CTO. Once that step is done, turn auto-merge on again through the readiness readback. Without write access, ask someone who has it to turn auto-merge on. GitHub merges it once `CI`, `PR proof`, and `CodeRabbit Security` pass on the head and step 4's approval exists. If GitHub reports that auto-merge is not allowed, ask a repository admin to turn on **Allow auto-merge**. A person may merge any pull request that is green and approved. Agents never merge by hand, never use a plain `gh pr merge` without `--auto`, and nobody uses `gh pr merge --admin`. Never resolve or dismiss a CodeRabbit thread or review. agent-knowledge itself is the exception: agents commit directly to main as dmc-agents, with no pull request and no auto-merge. Every other repository follows this auto-merge flow.
+          - Hand a pull request to a person only when GitHub shows a pending review request to an eligible person or team, or an approval of the head from a person who did not do the work. Before you say that only an approval remains, read back `gh api repos/<owner>/<repo>/pulls/<n>/requested_reviewers` and the reviews on the head commit. PR proof makes the request itself where it runs. Where it cannot, in a public repository or in the pull request that first adds PR proof to a repository, the pull request author owns the request: request a person who did not do the work, confirm the request is listed, and keep auto-merge off until that approval is on the head. Never say an approval lands a pull request while its auto-merge is off.
+          - PR proof's refusals name each next step. Full guide: https://github.com/dmc-technologies/coderabbit/blob/main/docs/coderabbit-for-dummies.md. The check: https://github.com/dmc-technologies/agent-ops/blob/main/.github/workflows/pr-proof.yml.
+          <!-- dmc-review-policy:end -->
+          """, """\
+          <!-- dmc-review-policy:start -->
+          ## Pull requests and review
+
+          This block is the DMC review standard. Every DMC repository carries it at the top of `AGENTS.md`; the shared PR proof check refuses a pull request whose target branch lacks it. The source is https://github.com/dmc-technologies/agent-ops/blob/main/configs/global/review-policy.md; change it there.
+
+          - Open pull requests under the GitHub login this machine is configured with, and never switch to another person's login. DMC-managed machines use the agent account `dmc-agents`; `.github/agent-accounts` lists the agent accounts. Open the pull request as a draft with `Proof: pending`; mark it ready when CI is green and the proof is recorded.
+          - The description starts with `Proof: clip`, `Proof: screenshots`, or `Proof: checks - <why nothing a person runs changed>`, then the headings What problem this solves, User impact, Why this change was made, Evidence, and Excluded. Evidence holds the exact commands with their results and exit status. Write no `Criticality:` line. Set a body with `gh api -X PATCH repos/<owner>/<repo>/pulls/<n> -F body=@file`.
+          - CodeRabbit applies one tier label: `routine`, `moderate`, or `critical`. Never add or remove a tier label. A person may add `critical`. A change under `.github/workflows/` or of more than 40 files is critical whatever the label says.
+          - Every pull request follows five steps:
+            1. CodeRabbit reviews when the pull request leaves draft, and again only when you post `@coderabbitai review`. Fix only Critical and Major findings, each with a failing test first; Minor and Trivial findings are optional. Batch the fixes, reply on each thread, and never request a review after every push. Review rounds follow the tier label: `routine` gets one review, one batch of fixes, and one confirming review only when PR proof needs the head reviewed; `moderate` and `critical` get one review, one batch of fixes, and one confirming review. Findings on code that fixed an earlier finding count toward the same rounds. After the last round, change no code except for a security or correctness defect that a failing test or a concrete reproduction demonstrates, and list anything left in one pull request comment whose first line starts with `What's left`. The source is the Current standard in https://github.com/dmc-technologies/coderabbit/blob/main/README.md. Never resolve a CodeRabbit thread yourself. CodeRabbit closes what it verifies; it approves a low-risk pull request itself.
+            2. CI is green on the head commit.
+            3. For a `critical` pull request, stop after the second round. Give each point in the `What's left` comment a reason. PR proof then requests the review once, from the `dmc-developers` team, when that approval is the only thing left. The author then changes nothing. That approval settles the leftovers, except an open `CodeRabbit Security` finding, which blocks on every tier.
+            4. An approval of the head from a person who did not do the work is final: not the author, not a commit author, and not an agent account. Anyone may add another reviewer. Merge gates are native GitHub only: required approvals (Macroscope may supply the approval on low-risk PRs), conversation resolution, the DMC Mech Eng App check, and critical-path team review. No custom AI status, label, or extra AI gate is part of the merge process.
             5. When you mark the pull request ready, run `gh pr merge <n> --auto --merge` as yourself. Without write access, ask someone who has it to turn auto-merge on. GitHub merges it once `CI`, `PR proof`, and `CodeRabbit Security` pass on the head and step 4's approval exists. If GitHub reports that auto-merge is not allowed, ask a repository admin to turn on **Allow auto-merge**. A person may merge any pull request that is green and approved. Agents never merge by hand, and nobody uses `gh pr merge --admin`.
+          - Hand a pull request to a person only when GitHub shows a pending review request to an eligible person or team, or an approval of the head from a person who did not do the work. Before you say that only an approval remains, read back `gh api repos/<owner>/<repo>/pulls/<n>/requested_reviewers` and the reviews on the head commit. PR proof makes the request itself where it runs. Where it cannot, in a public repository or in the pull request that first adds PR proof to a repository, the pull request author owns the request: request a person who did not do the work, confirm the request is listed, and keep auto-merge off until that approval is on the head. Never say an approval lands a pull request while its auto-merge is off.
+          - PR proof's refusals name each next step. Full guide: https://github.com/dmc-technologies/coderabbit/blob/main/docs/coderabbit-for-dummies.md. The check: https://github.com/dmc-technologies/agent-ops/blob/main/.github/workflows/pr-proof.yml.
+          <!-- dmc-review-policy:end -->
+          """, """\
+          <!-- dmc-review-policy:start -->
+          ## Pull requests and review
+
+          This block is the DMC review standard. Every DMC repository carries it at the top of `AGENTS.md`; the shared PR proof check refuses a pull request whose target branch lacks it. The source is https://github.com/dmc-technologies/agent-ops/blob/main/configs/global/review-policy.md; change it there.
+
+          - Open pull requests under the GitHub login this machine is configured with, and never switch to another person's login. DMC-managed machines use the agent account `dmc-agents`; `.github/agent-accounts` lists the agent accounts. Open the pull request as a draft with `Proof: pending`; mark it ready when CI is green and the proof is recorded.
+          - The description starts with `Proof: clip`, `Proof: screenshots`, or `Proof: checks - <why nothing a person runs changed>`, then the headings What problem this solves, User impact, Why this change was made, Evidence, and Excluded. Evidence holds the exact commands with their results and exit status. Write no `Criticality:` line. Set a body with `gh api -X PATCH repos/<owner>/<repo>/pulls/<n> -F body=@file`.
+          - CodeRabbit applies one tier label: `routine`, `moderate`, or `critical`. Never add or remove a tier label. A person may add `critical`. A change under `.github/workflows/` or of more than 40 files is critical whatever the label says.
+          - Every pull request follows five steps:
+            1. CodeRabbit reviews when the pull request leaves draft, and again only when you post `@coderabbitai review`. Fix only Critical and Major findings, each with a failing test first; Minor and Trivial findings are optional. Batch the fixes, reply on each thread, and never request a review after every push. Review rounds follow the tier label: `routine` gets one review, one batch of fixes, and one confirming review only when PR proof needs the head reviewed; `moderate` and `critical` get one review, one batch of fixes, and one confirming review. Findings on code that fixed an earlier finding count toward the same rounds. After the last round, change no code except for a security or correctness defect that a failing test or a concrete reproduction demonstrates, and list anything left in one pull request comment whose first line starts with `What's left`. The source is the Current standard in https://github.com/dmc-technologies/coderabbit/blob/main/README.md. Never resolve a CodeRabbit thread yourself. CodeRabbit closes what it verifies; it approves a low-risk pull request itself.
+            2. CI is green on the head commit.
+            3. For a `critical` pull request, stop after the second round. Give each point in the `What's left` comment a reason. PR proof then requests the review once, from the `dmc-developers` team, when that approval is the only thing left. The author then changes nothing. That approval settles the leftovers, except an open `CodeRabbit Security` finding, which blocks on every tier.
+            4. An approval of the head from a person who did not do the work is final: not the author, not a commit author, and not an agent account. Anyone may add another reviewer. Merge gates are native GitHub only: required approvals (Macroscope may supply the approval on low-risk PRs), conversation resolution, the DMC Mech Eng App check, and critical-path team review. No custom AI status, label, or extra AI gate is part of the merge process.
+            5. When you mark the pull request ready, run `gh pr merge <n> --auto --merge` as yourself. Without write access, ask someone who has it to turn auto-merge on. GitHub merges it once `CI`, `PR proof`, and `CodeRabbit Security` pass on the head and step 4's approval exists. If GitHub reports that auto-merge is not allowed, ask a repository admin to turn on **Allow auto-merge**. A person may merge any pull request that is green and approved. Agents never merge by hand, and nobody uses `gh pr merge --admin`.
+          - PR proof's refusals name each next step. Full guide: https://github.com/dmc-technologies/coderabbit/blob/main/docs/coderabbit-for-dummies.md. The check: https://github.com/dmc-technologies/agent-ops/blob/main/.github/workflows/pr-proof.yml.
+          <!-- dmc-review-policy:end -->
+          """, """\
+          <!-- dmc-review-policy:start -->
+          ## Pull requests and review
+
+          This block is the DMC review standard. Every DMC repository carries it at the top of `AGENTS.md`; the shared PR proof check refuses a pull request whose target branch lacks it. The source is https://github.com/dmc-technologies/agent-ops/blob/main/configs/global/review-policy.md; change it there.
+
+          - Open pull requests under the GitHub login this machine is configured with, and never switch to another person's login. DMC-managed machines use the agent account `dmc-agents`; `.github/agent-accounts` lists the agent accounts. Open the pull request as a draft with `Proof: pending`; mark it ready when CI is green and the proof is recorded.
+          - The description starts with `Proof: clip`, `Proof: screenshots`, or `Proof: checks - <why nothing a person runs changed>`, then the headings What problem this solves, User impact, Why this change was made, Evidence, and Excluded. Evidence holds the exact commands with their results and exit status. Write no `Criticality:` line, no agent attribution footer, and no Co-Authored-By trailer. Set a body with `gh api -X PATCH repos/<owner>/<repo>/pulls/<n> -F body=@file`.
+          - CodeRabbit applies one tier label: `routine`, `moderate`, or `critical`. Never add or remove a tier label. A person may add `critical`. A change under `.github/workflows/` or of more than 40 files is critical whatever the label says.
+          - Every pull request follows five steps:
+            1. CodeRabbit reviews when the pull request leaves draft, and again only when you post `@coderabbitai review`. Fix every Critical and Major finding with a failing test first, reply on its thread, and post `@coderabbitai review` once per round. Never resolve a CodeRabbit thread yourself. CodeRabbit closes what it verifies and withdraws its change request; it approves a low-risk pull request itself.
+            2. CI is green on the head commit.
+            3. For a `critical` pull request, once CodeRabbit has reviewed the head and has no change request open, request a review once from the people in `.github/critical-reviewers` with the command PR proof prints, then change nothing. A point CodeRabbit still disputes after a second round goes into that one request.
+            4. That person's approval of the head is final. Merge gates are native GitHub only: required approvals (Macroscope may supply the approval on low-risk PRs), conversation resolution, the DMC Mech Eng App check, and critical-path team review. No custom AI status, label, or extra AI gate is part of the merge process.
+            5. The CodeRabbit Triage rule merges once `CI`, `PR proof`, and `CodeRabbit Security` pass on the head. Never merge by hand and never use `gh pr merge --admin`.
+          - PR proof's refusals name each next step. Full guide: https://github.com/dmc-technologies/coderabbit/blob/main/docs/coderabbit-for-dummies.md. The check: https://github.com/dmc-technologies/agent-ops/blob/main/.github/workflows/pr-proof.yml.
+          <!-- dmc-review-policy:end -->
+          """)
+
+          POLICY = """\
+          <!-- dmc-review-policy:start -->
+          ## Pull requests and review
+
+          This block is the DMC review standard. Every DMC repository carries it at the top of `AGENTS.md`; the shared PR proof check refuses a pull request whose target branch lacks it. The source is https://github.com/dmc-technologies/agent-ops/blob/main/configs/global/review-policy.md; change it there.
+
+          - Open pull requests under the GitHub login this machine is configured with, and never switch to another person's login. DMC-managed machines use the agent account `dmc-agents`; `.github/agent-accounts` lists the agent accounts. Open the pull request as a draft with `Proof: pending`; mark it ready when CI is green and the proof is recorded.
+          - The description starts with `Proof: clip`, `Proof: screenshots`, or `Proof: checks - <why nothing a person runs changed>`, then the headings What problem this solves, User impact, Why this change was made, Evidence, and Excluded. Evidence holds the exact commands with their results and exit status. Write no `Criticality:` line. Set a body with `gh api -X PATCH repos/<owner>/<repo>/pulls/<n> -F body=@file`.
+          - CodeRabbit applies one tier label: `routine`, `moderate`, or `critical`. Never add or remove a tier label. A person may add `critical`. `critical` is a change to rulebook text (`DECISIONS.md`, `ARCHITECTURE.md`, ADRs, or `AGENTS.md`), security or access (`CODEOWNERS`, branch protection, tokens or secrets, or CI permissions or secrets, including a runner change that reads a new secret), deploys or spend, or customer-facing deliverable content; `moderate` is engineering behavior, a CodeRabbit config change, a desktop or UI change that does not change customer-facing deliverable content, or a CI change that only selects runners or caches and reads no new secret; `routine` is tests only, tooling, dependency bumps, refactors that keep behavior, or docs that are not rulebook text. A change under `.github/workflows/` or of more than 40 files is a warning to split the pull request, not a tier, unless the change also hits a critical trigger.
+          - Every pull request follows five steps:
+            1. CodeRabbit reviews when the pull request leaves draft, and again only when you post `@coderabbitai review`. Fix only Critical and Major findings, each with a failing test first; Minor and Trivial findings are optional. Batch the fixes, reply on each thread, and never request a review after every push. Review rounds follow the tier label: `routine` gets one review, one batch of fixes, and one confirming review only when PR proof needs the head reviewed; `moderate` and `critical` get one review, one batch of fixes, and one confirming review. Findings on code that fixed an earlier finding count toward the same rounds. After the last round, change no code except for a security or correctness defect that a failing test or a concrete reproduction demonstrates, and list anything left in one pull request comment whose first line starts with `What's left`. The source is the Current standard in https://github.com/dmc-technologies/coderabbit/blob/main/README.md. Never resolve a CodeRabbit thread yourself. CodeRabbit closes what it verifies; it approves a low-risk pull request itself.
+            2. CI is green on the head commit.
+            3. For a `critical` pull request, stop after the second round. Give each point in the `What's left` comment a reason. PR proof then requests the review once, from the `dmc-developers` team, when that approval is the only thing left. The author then changes nothing. That approval settles the leftovers, except an open `CodeRabbit Security` finding, which blocks on every tier.
+            4. An approval of the head from a person who did not do the work is final: not the author, not a commit author, and not an agent account. Anyone may add another reviewer. For `routine` and `moderate`, CTO's sign-off on the pull request and its head is the merge approval; CodeRabbit's approval is a review, not that approval.
+            5. Once the readiness readback for the current head passes — the pull request is not a draft, it has no merge conflicts, required checks are green, the description has the pr-proof line where the repository uses PR proof, and for `routine` and `moderate` CTO has signed off on the pull request and its head — the agent that opened or last pushed the pull request turns on auto-merge as `dmc-agents` with `gh pr merge <n> --auto --merge --match-head-commit <headSha>`. Re-check after every push and turn it on again if it is off. Required checks are green when every required check other than `PR proof` has passed. Where PR proof runs, `PR proof` has also either passed or failed only on the person-approval requirement. A missing approval from Dan (`dan-s-mueller`) does not keep auto-merge off; GitHub's required review is the final gate. Where PR proof cannot run, in a public repository or in the pull request that first adds PR proof to a repository, keep auto-merge off until a person's approval is on the head. There the readback's `PR proof` clause does not apply, and a person's approval on the head replaces it. Before you push to such a pull request, turn auto-merge off with `gh pr merge <n> --disable-auto` as dmc-agents, and turn it on again only after a person's approval is on the new head. Never turn auto-merge on for a draft, a pull request in an archived repository, a pull request with merge conflicts or failing required checks, business-ops#11 or momentum-utilities#24, or an openclaw-setup pull request that needs a host deploy step before it can merge, until that step is done. While a pre-merge host step is pending, turn auto-merge off with `gh pr merge <n> --disable-auto` as dmc-agents, and tell CTO. Once that step is done, turn auto-merge on again through the readiness readback. Without write access, ask someone who has it to turn auto-merge on. GitHub merges it once `CI`, `PR proof`, and `CodeRabbit Security` pass on the head and step 4's approval exists. If GitHub reports that auto-merge is not allowed, ask a repository admin to turn on **Allow auto-merge**. A person may merge any pull request that is green and approved. Agents never merge by hand and never use a plain `gh pr merge` without `--auto`. The one exception is an admin merge with `gh pr merge --admin` under Dan's standing rules in the 2026-11-14 entry of https://github.com/dmc-technologies/agent-ops/blob/main/docs/DECISIONS.md: only after CTO signs off on the pull request and its head, squash only, no force-push, as `dan-s-mueller`, then back to the agent account. Nobody uses `gh pr merge --admin` otherwise. Never resolve or dismiss a CodeRabbit thread or review. agent-knowledge itself is the exception: agents commit directly to main as dmc-agents, with no pull request and no auto-merge. Every other repository follows this auto-merge flow.
           - Hand a pull request to a person only when GitHub shows a pending review request to an eligible person or team, or an approval of the head from a person who did not do the work. Before you say that only an approval remains, read back `gh api repos/<owner>/<repo>/pulls/<n>/requested_reviewers` and the reviews on the head commit. PR proof makes the request itself where it runs. Where it cannot, in a public repository or in the pull request that first adds PR proof to a repository, the pull request author owns the request: request a person who did not do the work, confirm the request is listed, and keep auto-merge off until that approval is on the head. Never say an approval lands a pull request while its auto-merge is off.
           - PR proof's refusals name each next step. Full guide: https://github.com/dmc-technologies/coderabbit/blob/main/docs/coderabbit-for-dummies.md. The check: https://github.com/dmc-technologies/agent-ops/blob/main/.github/workflows/pr-proof.yml.
           <!-- dmc-review-policy:end -->
           """
           MANY = 40
+          # Rulebook text: AGENTS.md, DECISIONS.md, ARCHITECTURE.md, and ADRs, in any folder.
+          RULEBOOK = re.compile(r"(^|/)(AGENTS|DECISIONS|ARCHITECTURE)\.md$|(^|/)(adrs?|decisions)/", re.I)
+          # A workflow line that reads one secret by name, as `secrets.NAME` or `secrets['NAME']`, or inherits every secret, quoted or bare; any case.
+          SECRET = re.compile(r"""\bsecrets(?:\.|\s*:\s*['"]?|\[\s*['"])(\w+)""", re.I)
+          # A workflow line that reads secrets by a computed index or all of them through toJSON; no name to compare, so always critical.
+          DYNAMIC_SECRET = re.compile(r"""\bsecrets\s*\[(?!\s*['"])|\btojson\s*\(\s*secrets\s*\)""", re.I)
+          # A workflow line that sets the job token's permissions, with or without quotes or a trailing YAML comment.
+          PERMISSION = re.compile(r"""\s*(permissions\s*:|[\w-]+\s*:\s*(['"]?)(read|write|none)\2\s*(#.*)?$)""")
           AGENT_OPS = "dmc-technologies/agent-ops"
           CALLER_SOURCE = "CALLER in catalog/skills/capability-video/scripts/pr-proof on agent-ops main"
           CALLER = """\
@@ -324,14 +463,39 @@ jobs:
               return ["*", "!.github/**"] if paths[:1] == ["*"] and base_text is None else paths
 
 
-          def critical_reasons(files, count):
-              """Why the rule, not CodeRabbit's review, makes a pull request critical: a workflow change or more than 40 files. A person may escalate; these two cannot be downgraded."""
-              reasons = []
-              if any(fnmatch.fnmatch(path, ".github/workflows/*") for path in files):
-                  reasons.append("it changes a workflow under .github/workflows/")
-              if count > MANY:
-                  reasons.append(f"it changes {count} files, more than {MANY}")
+          def critical_reasons(items):
+              """The critical triggers PR proof can read from the change itself: rulebook text, CODEOWNERS, and a workflow that reads a new secret or changes permissions. CodeRabbit or a person labels the rest: branch protection, tokens, deploys, spend, and customer-facing deliverable content. `items` are file entries in the shape of GitHub's pull request files list."""
+              paths = changed_paths(items)
+              rulebook = [path for path in paths if RULEBOOK.search(path)]
+              access = [path for path in paths if path.rsplit("/", 1)[-1] == "CODEOWNERS"]
+              reasons = [f"it changes rulebook text: {', '.join(rulebook[:5])}"] * bool(rulebook) + [f"it changes access: {', '.join(access[:5])}"] * bool(access)
+              ci = []
+              for item in items:
+                  if not fnmatch.fnmatch(item["filename"], ".github/workflows/*"):
+                      continue
+                  if item.get("patch") is None:
+                      ci.append(f"GitHub sent no patch for {item['filename']}, so PR proof cannot rule out a new secret")
+                      continue
+                  lines = item["patch"].splitlines()
+                  added = [line[1:] for line in lines if line.startswith("+") and not line.startswith("+++")]
+                  removed = [line[1:] for line in lines if line.startswith("-") and not line.startswith("---")]
+                  new = sorted({name for line in added for name in SECRET.findall(line)} - {name for line in removed for name in SECRET.findall(line)})
+                  if new:
+                      ci.append(f"{item['filename']} reads " + ", ".join("secrets: inherit" if name == "inherit" else f"secrets.{name}" for name in new))
+                  if any(DYNAMIC_SECRET.search(line) for line in added):
+                      ci.append(f"{item['filename']} reads secrets by a computed index or with toJSON(secrets)")
+                  if any(PERMISSION.match(line) for line in added + removed):
+                      ci.append(f"{item['filename']} changes permissions")
+              if ci:
+                  reasons.append("it reads a new secret or changes CI permissions: " + "; ".join(ci))
               return reasons
+
+
+          def split_warning(files, count):
+              """A workflow change or more than 40 files is a warning to split the pull request, not a tier (Dan, 2026-11-14)."""
+              why = ["it changes a workflow under .github/workflows/"] * any(fnmatch.fnmatch(path, ".github/workflows/*") for path in files)
+              why += [f"it changes {count} files, more than {MANY}"] * (count > MANY)
+              return "a warning, not a tier: split the pull request: " + "; ".join(why) if why else None
 
 
           def facing(path, patterns):
@@ -365,6 +529,32 @@ jobs:
                   if review.get("state") in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
                       latest[(review.get("user") or {}).get("login") or ""] = review
               return sorted(login for login, review in latest.items() if review["state"] == "APPROVED" and review.get("commit_id") == head and independent(login, workers, agents))
+
+
+          def macroscope_verdict(check_runs, head):
+              """The conclusion of Macroscope's latest Approvability Check run on the head, the one GitHub created last: `success` only for the Approved verdict, `neutral` or `failure` for Needs Human Approval or a protected-path Skipped, `skipped` when a spend limit stopped it. 'running' while it has not finished, 'missing' when it has not started."""
+              found = sorted((run for run in check_runs if run.get("name") == APPROVABILITY and (run.get("app") or {}).get("id") == MACROSCOPE_APP and run.get("head_sha", head) == head), key=lambda run: (run.get("id") or 0, run.get("started_at") or ""))
+              if not found:
+                  return "missing"
+              return found[-1].get("conclusion") if found[-1].get("status") == "completed" else "running"
+
+
+          def macroscope_approved(reviews, check_runs, head):
+              """True when Macroscope's latest decision is an approval of the head commit itself and its Approvability Check concluded Approved on that same head. An approval of an earlier commit, or a verdict on one, does not cover a later push."""
+              decisions = [r for r in reviews if (r.get("user") or {}).get("login") == MACROSCOPE and r.get("state") in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED")]
+              return bool(decisions) and decisions[-1]["state"] == "APPROVED" and decisions[-1].get("commit_id") == head and macroscope_verdict(check_runs, head) == "success"
+
+
+          def review_step(verdict, critical):
+              """The next step for a pull request below `critical` that has neither a person's approval of the head nor Macroscope's. PR proof requests no review for it."""
+              person = "a person who did not do the work approves the head"
+              if critical:
+                  return f"Next: Macroscope's approval does not count for a critical change; {person}"
+              if verdict in ("running", "missing"):
+                  return f"Next: wait for {APPROVABILITY} on this head; PR proof evaluates again while it runs, and Macroscope's review starts this check again. Where Macroscope does not run, {person}"
+              if verdict == "success":
+                  return f"Next: Macroscope's verdict on this head is Approved, but {MACROSCOPE} has not approved this head; wait for its review, or {person}"
+              return f"Next: {APPROVABILITY} concluded {verdict} on this head, not Approved, so the pull request is on Dan's queue: {person}. Change no code for this refusal"
 
 
           def exempt_errors(errors):
@@ -669,8 +859,8 @@ jobs:
               return videos, images, "\n".join(evidence)
 
 
-          def check(body, files, messages, person_facing, shas, moved=lambda sha: [], labels=(), reasons=(), draft=False, approvals=None, removed_by=None, agents=frozenset(DEFAULT_AGENTS)):
-              """Every refusal for one description. `moved(sha)` names the files whose own change differs between the captured commit and the head, or None when the source listed only part of them. `approvals` lists the people whose latest review approves, or None when the caller cannot see reviews; `removed_by` names who last removed the critical label."""
+          def check(body, files, messages, person_facing, shas, moved=lambda sha: [], labels=(), reasons=(), draft=False, approvals=None, removed_by=None, agents=frozenset(DEFAULT_AGENTS), reviewed=None):
+              """Every refusal for one description. `moved(sha)` names the files whose own change differs between the captured commit and the head, or None when the source listed only part of them. `approvals` lists the people whose latest review approves, or None when the caller cannot see reviews; `removed_by` names who last removed the critical label. `reviewed` says whether a pull request below `critical` has its review: a person's approval of the head, or Macroscope's; None when the caller cannot see reviews."""
               body = re.sub(r"<!--.*?-->", "", body, flags=re.S)
               errors = []
               for heading in HEADINGS:
@@ -683,6 +873,8 @@ jobs:
                   errors.append(f"the '{LABEL}' label was removed by {removed_by}; only a person removes it, so a person must add it back or remove it themselves")
               if labeled and approvals is not None and not approvals:
                   errors.append(f"a '{LABEL}' pull request needs an approving review of its head commit from a person who did not do the work: not the author, not a commit author, and not an agent account; CodeRabbit's approval does not count as that person, and an approval of an earlier commit does not cover a later push")
+              if not labeled and reviewed is False:
+                  errors.append(f"{REVIEW_REFUSAL}: from a person who did not do the work (not the author, not a commit author, and not an agent account), or from Macroscope: {MACROSCOPE} approves the head commit and '{APPROVABILITY}' concludes Approved on that same head; CodeRabbit's approval does not count, and an approval of an earlier commit does not cover a later push")
               proof = re.search(r"^Proof:\s*(clip|screenshots|checks|pending)\b(.*)$", body, re.I | re.M)
               videos, images, evidence = read(body)
               if not person_facing:
@@ -731,9 +923,11 @@ jobs:
               return errors
 
 
-          def report(errors, examined, rerun, local=False):
-              """Print the tally and every refusal; exit 1 when there is one."""
+          def report(errors, examined, rerun, local=False, warning=None):
+              """Print the tally, the split warning, and every refusal; exit 1 when there is a refusal."""
               print(examined)
+              if warning:
+                  print(("::warning::" if os.environ.get("GITHUB_ACTIONS") and not local else "warning: ") + warning)
               if errors:
                   prefix = "::error::" if os.environ.get("GITHUB_ACTIONS") and not local else "refused: "
                   for error in errors:
@@ -747,7 +941,7 @@ jobs:
           def hosted(waited=0):
               """The check as GitHub runs it: read the pull request through the GitHub API. Returns True, instead of refusing, when every refusal only waits on a check still running on the head, so the caller evaluates again; `waited` counts the seconds this run has waited so far."""
               repo, number, head = os.environ["REPOSITORY"], os.environ["NUMBER"], os.environ["HEAD"]
-              # CodeRabbit never reviews a dependency bot's pull request, so a person's approval of the head is its only review, whatever its label.
+              # CodeRabbit never reviews a dependency bot's or the review-sync app's pull request, so a person's approval of the head is its only review, whatever its label.
               exempt = os.environ.get("AUTHOR") in EXEMPT_AUTHORS
 
               def gh_json(path):
@@ -791,15 +985,7 @@ jobs:
               doers = workers(author, commits) | co_authors(messages, all_reviews, lambda login: gh_json(f"users/{login}"))
               approvals = strict_approvals(all_reviews, head, doers, agents) if LABEL in labels or exempt else []
               removed_by = label_removed_by(gh_list(f"repos/{repo}/issues/{number}/events?per_page=100")) if LABEL not in labels else None
-              errors = check(pull.get("body") or "", files, messages, paths, [c["sha"] for c in commits], moved, labels + [LABEL] * exempt, critical_reasons(files, pull["changed_files"]), bool(pull.get("draft")), approvals, removed_by, agents)
-              if exempt:
-                  errors = exempt_errors(errors)
-              starter = starter_path(repo)
-              folder, name = starter.rsplit("/", 1)
-              listing = json.loads(subprocess.run(["gh", "api", f"repos/{repo}/contents/{folder}?ref={head}"], capture_output=True, text=True).stdout or "[]")
-              starter_text = contents(starter, head) if isinstance(listing, list) and regular_file(listing, name) else None
-              if starter_error := caller_error(starter_text):
-                  errors.append(starter_error)
+
               def head_check_runs():
                   return commit_check_runs(head)
 
@@ -808,6 +994,24 @@ jobs:
                   pages = subprocess.run(["gh", "api", "--paginate", "--slurp", f"repos/{repo}/commits/{sha}/check-runs?per_page=100"], capture_output=True, text=True, check=True).stdout
                   return [run for page in json.loads(pages) for run in page.get("check_runs") or []]
 
+              reasons = critical_reasons(file_items)
+              # Below `critical`, a person's approval of the head or Macroscope's is the review; a change PR proof reads as critical takes only the person's.
+              reviewed, verdict = None, None
+              if LABEL not in labels and not exempt and not strict_approvals(all_reviews, head, doers, agents):
+                  runs = head_check_runs()
+                  verdict = macroscope_verdict(runs, head)
+                  reviewed = not reasons and macroscope_approved(all_reviews, runs, head)
+              errors = check(pull.get("body") or "", files, messages, paths, [c["sha"] for c in commits], moved, labels + [LABEL] * exempt, reasons, bool(pull.get("draft")), approvals, removed_by, agents, reviewed)
+              errors = [f"{error}. {review_step(verdict, bool(reasons))}" if error.startswith(REVIEW_REFUSAL) else error for error in errors]
+              if exempt:
+                  errors = exempt_errors(errors)
+              starter = starter_path(repo)
+              folder, name = starter.rsplit("/", 1)
+              listing = json.loads(subprocess.run(["gh", "api", f"repos/{repo}/contents/{folder}?ref={head}"], capture_output=True, text=True).stdout or "[]")
+              starter_text = contents(starter, head) if isinstance(listing, list) and regular_file(listing, name) else None
+              if starter_error := caller_error(starter_text):
+                  errors.append(starter_error)
+
               threads, review_errors, capped, last_reviewed = [], [], False, None
               if repo in STRICT_REVIEW and not pull.get("draft") and not exempt:
                   owner, name = repo.split("/")
@@ -815,7 +1019,7 @@ jobs:
                   found = json.loads(subprocess.run(["gh", "api", "graphql", "-f", f"query={query}", "-F", f"o={owner}", "-F", f"n={name}", "-F", f"p={number}"], capture_output=True, text=True, check=True).stdout)["data"]["repository"]["pullRequest"]["reviewThreads"]
                   threads = found["nodes"]
                   reviews = gh_list(f"repos/{repo}/pulls/{number}/reviews?per_page=100")
-                  # Only a critical pull request asks a person; elsewhere CodeRabbit's approval is the approval.
+                  # Only a critical pull request asks a person; elsewhere CTO's sign-off is the merge approval.
                   final = strict_approvals(reviews, head, doers, agents) if LABEL in labels else []
                   checked = [head] * bool(coderabbit_checked([dict(run, head_sha=head) for run in head_check_runs()], int(number), pull["base"]["ref"])) if not caller_error(starter_text) else []
                   review_errors = coderabbit_errors(threads, reviews, head, doers, agents, final, found["pageInfo"]["hasNextPage"], checked)
@@ -878,12 +1082,14 @@ jobs:
               if errors and (pull.get("head") or {}).get("sha", head) == head and not pull.get("draft"):
                   runs = head_check_runs() if others else []
 
-                  def running(name):
-                      """CodeRabbit's check run of that name is queued or in progress on the head, or has not started within the grace."""
-                      own = [run for run in runs if (run.get("app") or {}).get("id") == CODERABBIT_APP and run.get("name") == name]
+                  def running(name, app=CODERABBIT_APP):
+                      """The app's check run of that name is queued or in progress on the head, or has not started within the grace."""
+                      own = [run for run in runs if (run.get("app") or {}).get("id") == app and run.get("name") == name]
                       return any(run.get("status") != "completed" for run in own) or (not own and waited < CODERABBIT_GRACE)
-                  pending = {"CodeRabbit has not reviewed": "CodeRabbit", SECURITY_PENDING: SECURITY}
-                  if (state == "waiting" and not others) or (others and all(any(error.startswith(start) and running(name) for start, name in pending.items()) for error in others)):
+                  pending = {"CodeRabbit has not reviewed": ("CodeRabbit", CODERABBIT_APP), SECURITY_PENDING: (SECURITY, CODERABBIT_APP)}
+                  if not reasons:
+                      pending[REVIEW_REFUSAL] = (APPROVABILITY, MACROSCOPE_APP)
+                  if (state == "waiting" and not others) or (others and all(any(error.startswith(start) and running(*waited_on) for start, waited_on in pending.items()) for error in others)):
                       print(f"PR proof: every refusal waits on a check still running on this head; evaluating again in {WAIT} seconds.")
                       return True
               if not errors:
@@ -895,7 +1101,7 @@ jobs:
                   if refused:
                       print(f"GitHub refused to rerun the failed PR proof runs {', '.join(map(str, refused))}, and each still blocks the merge. Next: " + "; ".join(f"gh run rerun {run} -R {repo}" for run in refused))
               report(errors, f"Examined the description, {len(labels)} labels, {len(approvals)} person approvals, {len(threads)} review threads, {len(files)} changed files, and {len(messages)} commits against {len(paths)} person-facing patterns.",
-                     f"A description edit, label change, review, or push starts this check again; otherwise run: gh run rerun {os.environ['RUN_ID']} -R {repo}")
+                     f"A description edit, label change, review, or push starts this check again; otherwise run: gh run rerun {os.environ['RUN_ID']} -R {repo}", warning=split_warning(files, pull["changed_files"]))
 
 
           def local(body_path, base, labels, draft):
@@ -907,11 +1113,14 @@ jobs:
                   read = subprocess.run(["git", "show", f"{ref}:{path}"], capture_output=True, text=True)
                   return read.stdout if read.returncode == 0 else None
 
-              def own_diff(ref):
-                  """This branch's own change to each file at one commit, compared with its merge base with the base branch."""
+              def patches(ref):
+                  """This branch's own change to each file at one commit, compared with its merge base with the base branch, as {path: patch}."""
                   merge_base = git("merge-base", base, ref).strip()
                   chunks = re.split(r"^(?=diff --git )", git("diff", "--no-renames", "--no-ext-diff", merge_base, ref), flags=re.M)
-                  return {re.match(r"diff --git a/.* b/(.*)\n", chunk).group(1): ("changed", None, normalized(chunk)) for chunk in chunks if chunk}
+                  return {re.match(r"diff --git a/.* b/(.*)\n", chunk).group(1): chunk for chunk in chunks if chunk}
+
+              def own_diff(ref):
+                  return {path: ("changed", None, normalized(chunk)) for path, chunk in patches(ref).items()}
 
               def moved(sha):
                   return differing(own_diff(sha), own_diff("HEAD"))
@@ -924,7 +1133,7 @@ jobs:
               paths = person_facing(base_text, head_text, base_text is None and head_text is not None)
               with open(body_path, encoding="utf-8") as handle:
                   body = handle.read()
-              errors = check(body, files, messages, paths, shas, moved, labels, critical_reasons(files, len(files)), draft, None, None, agent_accounts(show(base, AGENTS_FILE)))
+              errors = check(body, files, messages, paths, shas, moved, labels, critical_reasons([{"filename": path, "patch": patch} for path, patch in patches("HEAD").items()]), draft, None, None, agent_accounts(show(base, AGENTS_FILE)))
               remote = subprocess.run(["git", "remote", "get-url", "origin"], capture_output=True, text=True).stdout.strip()
               match = re.search(r"github\.com[:/]([^/]+/[^/]+?)(?:\.git)?$", remote)
               base_agents = show(base, AGENTS_MD)
@@ -935,7 +1144,7 @@ jobs:
               if starter_error := caller_error(starter_text):
                   errors.append(starter_error)
               report(errors, f"Examined {body_path}, {len(labels)} labels, {len(files)} changed files, and {len(messages)} commits since {merge_base[:7]} against {len(paths)} person-facing patterns.",
-                     "Fix the description, then run this preflight again before gh pr create or the next description edit.", local=True)
+                     "Fix the description, then run this preflight again before gh pr create or the next description edit.", local=True, warning=split_warning(files, len(files)))
 
 
           def embed(workflow_path):
