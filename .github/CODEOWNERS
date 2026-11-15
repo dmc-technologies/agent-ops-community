@@ -1,0 +1,11 @@
+# Critical paths: a change here needs a review from @dmc-technologies/dmc-developers.
+# Rulebook
+AGENTS.md                                @dmc-technologies/dmc-developers
+ARCHITECTURE.md                          @dmc-technologies/dmc-developers
+DECISIONS.md                             @dmc-technologies/dmc-developers
+/docs/architecture/adr/                  @dmc-technologies/dmc-developers
+# Access and CI
+/.github/CODEOWNERS                      @dmc-technologies/dmc-developers
+/.github/workflows/                      @dmc-technologies/dmc-developers
+/.coderabbit.yaml                        @dmc-technologies/dmc-developers
+/.github/dependabot.yml                  @dmc-technologies/dmc-developers
