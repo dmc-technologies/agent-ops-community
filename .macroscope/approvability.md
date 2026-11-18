@@ -21,6 +21,11 @@ neverApprove:
   - "deploy/**"
   - ".macroscope/ignore.md"
   - ".macroscope/check-run-agents/**"
+  - ".macroscope/approvability.md"
+  - ".coderabbit.yaml"
+  - "pyproject.toml"
+  - ".github/person-facing/**"
+  - ".github/agent-accounts/**"
 ---
 
 Use Macroscope's default approvability criteria.
