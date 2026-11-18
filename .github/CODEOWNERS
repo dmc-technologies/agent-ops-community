@@ -1,0 +1,25 @@
+# Critical paths: a change here needs a review from @dmc-technologies/dmc-developers.
+# Person-facing paths: the positive form of .github/person-facing (ENG-101).
+# CODEOWNERS has no '!' negation, so these lines name only the included paths.
+# They sit above the entries below: the last matching line wins, so every
+# entry below keeps its paths.
+/.gitignore                              @dmc-technologies/dmc-developers
+/CONTRIBUTING.md                         @dmc-technologies/dmc-developers
+/LICENSE                                 @dmc-technologies/dmc-developers
+/README.md                               @dmc-technologies/dmc-developers
+/SECURITY.md                             @dmc-technologies/dmc-developers
+/data/                                   @dmc-technologies/dmc-developers
+/docs/                                   @dmc-technologies/dmc-developers
+/examples/                               @dmc-technologies/dmc-developers
+/pyproject.toml                          @dmc-technologies/dmc-developers
+/src/                                    @dmc-technologies/dmc-developers
+# Rulebook
+AGENTS.md                                @dmc-technologies/dmc-developers
+ARCHITECTURE.md                          @dmc-technologies/dmc-developers
+DECISIONS.md                             @dmc-technologies/dmc-developers
+/docs/architecture/adr/                  @dmc-technologies/dmc-developers
+# Access and CI
+/.github/CODEOWNERS                      @dmc-technologies/dmc-developers
+/.github/workflows/                      @dmc-technologies/dmc-developers
+/.coderabbit.yaml                        @dmc-technologies/dmc-developers
+/.github/dependabot.yml                  @dmc-technologies/dmc-developers
