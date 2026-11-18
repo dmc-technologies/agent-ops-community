@@ -24,5 +24,3 @@ neverApprove:
 ---
 
 Use Macroscope's default approvability criteria.
-
-The review policy for this repository is the agent-ops review policy: https://github.com/dmc-technologies/agent-ops/pull/211 (source path: configs/global/review-policy.md).
