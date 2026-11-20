@@ -1,32 +1,32 @@
 ---
 id: severity-gate
-name: No open Critical, Major, or secret finding
+name: No open Critical, Major, or security finding
 mode: error
 report: platform
 ---
 
 <!-- Source: dmc-technologies/review-rules rules/coderabbit/pre-merge-checks/severity-gate.md (MODEV-1232). Change it there. -->
 
-Read CodeRabbit's review comments and the new findings from this review.
+Decide this check only from CodeRabbit's own review comments and the new
+findings from this review. Do not search the code for new problems.
 
-Fail if any CodeRabbit review comment or new finding with Critical or Major
-severity does not have a confirmed code fix (code=addressed). A new finding
-from the current review has no code status and counts as not fixed. A
-resolved discussion alone does not count as fixed. If the code may have
-changed since a comment was assessed, inspect the current code. This
-includes every security finding, from the review or from a scanner such as
-gitleaks, trufflehog, semgrep, or zizmor, that is rated Critical or Major.
+Fail if any CodeRabbit review comment or new finding is rated Critical or
+Major, or is one that CodeRabbit classes as a security finding, and does not
+have a confirmed code fix (code=addressed). A committed secret or a result
+from CodeRabbit's gitleaks, trufflehog, semgrep, or zizmor tools counts only
+when CodeRabbit reports it as a security finding. A new finding from the
+current review has no code status and counts as not fixed. A resolved
+discussion alone does not count as fixed. If the code may have changed since
+a comment was assessed, inspect the current code only to decide whether that
+finding is fixed.
 
-Fail if the changed lines add a credential, private key, access token, or
-other secret, including a value that looks like an example or placeholder.
-A person decides whether it is real; this check never assumes it is fake.
-
-Ignore Minor, Trivial, and Info comments. They never fail this check.
+Ignore every other Minor, Trivial, and Info comment. They never fail this
+check.
 
 This check is the findings gate. The fail_commit_status setting only fails
 a CodeRabbit review that stops because of an error; it never fails on
 findings.
 
-When this check fails because of a secret or a security finding, begin the
-explanation with HUMAN STOP: a dmc-developers member resolves it before
-merge. For every failure, name the file and line of each open finding.
+When this check fails because of a security finding, begin the explanation
+with HUMAN STOP: a dmc-developers member resolves it before merge. For every
+failure, name the file and line of each open finding.
