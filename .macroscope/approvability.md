@@ -24,8 +24,8 @@ neverApprove:
   - ".macroscope/approvability.md"
   - ".coderabbit.yaml"
   - "pyproject.toml"
-  - ".github/person-facing/**"
-  - ".github/agent-accounts/**"
+  - ".github/person-facing"
+  - ".github/agent-accounts"
 ---
 
 Use Macroscope's default approvability criteria.
