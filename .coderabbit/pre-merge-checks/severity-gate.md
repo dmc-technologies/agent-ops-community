@@ -23,6 +23,12 @@ finding is fixed.
 Ignore every other Minor, Trivial, and Info comment. They never fail this
 check.
 
+On every result, pass or fail, state the head commit whose CodeRabbit review
+it read, how many CodeRabbit review comments and new findings it examined,
+and how many of them are open Critical, Major, or security findings. If no
+CodeRabbit review of the head commit exists, or its review comments cannot be
+loaded, report the check as inconclusive, never as passed.
+
 This check is the findings gate. The fail_commit_status setting only fails
 a CodeRabbit review that stops because of an error; it never fails on
 findings.
