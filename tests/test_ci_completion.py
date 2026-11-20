@@ -70,7 +70,7 @@ def test_ci_allows_only_explicitly_unselected_windows_job():
         assert _run(results).returncode != 0, selection
 
 
-def _detect(tmp_path, event, changed):
+def _detect(tmp_path, event, changed, base=(), moves=()):
     """Run the workflow's Windows path detector on a pull-request merge commit."""
     workflow = yaml.safe_load((Path(__file__).parents[1] / ".github/workflows/ci.yml").read_text())
     script = workflow["jobs"]["windows-paths"]["steps"][1]["run"]
@@ -78,9 +78,15 @@ def _detect(tmp_path, event, changed):
     git = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t"]
     subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
     (repo / "README.md").write_text("base\n")
+    for path in base:
+        (repo / path).parent.mkdir(parents=True, exist_ok=True)
+        (repo / path).write_text("unchanged body that git can follow through a rename\n" * 20)
     subprocess.run([*git, "add", "-A"], check=True)
     subprocess.run([*git, "commit", "-qm", "base"], check=True)
     subprocess.run([*git, "checkout", "-qb", "change"], check=True)
+    for old, new in moves:
+        (repo / new).parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run([*git, "mv", old, new], check=True)
     for path in changed:
         (repo / path).parent.mkdir(parents=True, exist_ok=True)
         (repo / path).write_text("change\n")
@@ -116,3 +122,22 @@ def _detect(tmp_path, event, changed):
 )
 def test_windows_detector_skips_only_paths_it_does_not_test(tmp_path, event, changed, expected):
     assert _detect(tmp_path, event, changed) == expected
+
+
+def test_windows_detector_sees_both_sides_of_a_rename(tmp_path):
+    """A file renamed out of a Windows path changes what Windows tests."""
+    old = "src/agent_ops/moved.py"
+    result = _detect(tmp_path, "pull_request", [], base=[old], moves=[(old, "docs/moved.py")])
+    assert result == "run=true"
+
+
+def test_windows_detector_matches_a_non_ascii_path(tmp_path):
+    """git quotes a non-ASCII path by default, and a quoted path no longer starts with `src/`."""
+    assert _detect(tmp_path, "pull_request", ["src/agent_ops/r\u00e9sum\u00e9.py"]) == "run=true"
+
+
+def test_windows_detector_reads_many_matches_as_a_match(tmp_path):
+    """grep -q stops at the first match; a broken pipe must not read as no match."""
+    name = "src/agent_ops/generated/module_{:04d}_with_a_long_name_to_fill_the_pipe.py"
+    changed = [name.format(n) for n in range(3000)]
+    assert _detect(tmp_path, "pull_request", changed) == "run=true"

@@ -36,10 +36,13 @@ jobs:
           fi
           # The pull-request checkout is the merge commit; its first parent is the base.
           git rev-parse --verify HEAD^2 > /dev/null
-          changed="$(git diff --name-only HEAD^1 HEAD)"
-          printf '%s\n' "$changed"
+          # Both sides of a rename, raw (unquoted) path bytes, and a file instead of a pipe, so
+          # grep -q stopping early can never read as "no match" under pipefail.
+          changed="$(mktemp)"
+          git -c core.quotePath=false diff --no-renames --name-only HEAD^1 HEAD > "$changed"
+          cat "$changed"
           pattern='^(pyproject\.toml$|src/|examples/|tests/(conftest\.py|test_verify\.py|test_deployment_windows\.py|test_deployment_registry\.py|test_skill_installer\.py)$|\.github/workflows/ci\.yml$)'
-          if [ -z "$changed" ] || printf '%s\n' "$changed" | grep -qE "$pattern"; then
+          if [ ! -s "$changed" ] || grep -qE "$pattern" "$changed"; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
