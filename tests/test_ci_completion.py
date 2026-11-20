@@ -114,5 +114,5 @@ def _detect(tmp_path, event, changed):
         ("schedule", [], "run=true"),
     ],
 )
-def test_windows_detector_skips_only_changes_outside_windows_paths(tmp_path, event, changed, expected):
+def test_windows_detector_skips_only_paths_it_does_not_test(tmp_path, event, changed, expected):
     assert _detect(tmp_path, event, changed) == expected
